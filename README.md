@@ -1,13 +1,13 @@
 # hai
 
-A marketplace of Claude Code plugins by Yuexuan Zhang.
+A marketplace of Claude Code plugins by heiyan
 
 ## Install
 
 In Claude Code, add this marketplace once, then install any plugin from it:
 
 ```
-/plugin marketplace add <your-github-username>/hai
+/plugin marketplace add heiyan-2020/hai
 /plugin install pin@hai
 ```
 
