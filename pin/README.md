@@ -17,14 +17,14 @@ human keeps only high-level direction does not work. Two failure modes recur:
    and nobody can say, for any single data element, where it came from or how
    it was computed. Facts pile up; nobody is responsible for them.
 
-## The two disciplines
+## The three disciplines
 
-| | **Pin** | **Protocol** |
-|---|---|---|
-| Guards | A decided design is not silently changed | Every conclusion-bearing data element traces to code |
-| Direction | Inward — internal state (code/algorithm invariants) | Outward — results are reported faithfully |
-| Failure it kills | Silent rollback of a past decision | "Is this bar measured or fabricated?" being unanswerable |
-| Form | `pins.yaml` entries + `# PIN:` code anchors | a per-task `*-protocol.md` data-lineage spec |
+| | **Pin** | **Protocol** | **Fact** |
+|---|---|---|---|
+| Guards | A decided design is not silently changed | Every conclusion-bearing data element traces to code | Every citeable observation is structured and bounded |
+| Direction | Inward — internal state (code/algorithm invariants) | Outward — results are reported faithfully | Human-facing evidence records |
+| Failure it kills | Silent rollback of a past decision | "Is this bar measured or fabricated?" being unanswerable | Facts turning into untraceable prose or overclaims |
+| Form | `pins.yaml` entries + `# PIN:` code anchors | a per-task `*-protocol.md` data-lineage spec | one markdown file per fact under `.claude-research/facts/` |
 
 The shared philosophy: **close every silent channel.** The agent either follows
 a declared path or explicitly escalates to the human. There is no third option.
@@ -48,6 +48,29 @@ a verbatim **code snippet** (≤5 lines of the actual producing code), and
 elements must carry a formula. The snippet is the anchor — it survives
 line-number drift and shows the lineage logic without opening the file.
 
+### Fact
+
+A fact is a constrained markdown evidence card. It is not a `facts.yaml` row
+and not free-form prose. Each fact has yaml frontmatter for the canonical
+machine fields and a fixed body shape for human inspection.
+
+```
+.claude-research/facts/
+├── internal/   # if-001-*.md — observations from local runs
+├── external/   # ef-001-*.md — reported observations from outside sources
+└── derived/    # df-001-*.md — facts computed only from existing facts
+```
+
+Internal facts reference a protocol and element names, so the chain is:
+
+```
+code -> protocol element -> fact markdown -> paper/review citation
+```
+
+`fact_check.py` enforces the directory/type/id convention, required
+frontmatter, fixed section order, local evidence paths, protocol references,
+derived input references, and basic no-causal-overclaim rules.
+
 ## The skills
 
 | Skill | Role |
@@ -55,6 +78,7 @@ line-number drift and shows the lineage logic without opening the file.
 | `pin-aware-agent` | Orchestrator. The whole workflow; wraps the others. |
 | `pin-audit` | Machine audit primitive. Non-interactive. Also run by the git hook. |
 | `pin-codex-audit` | Adversarial independent audit via Codex. |
+| `pin-fact` | Create and validate structured markdown facts. |
 | `pin-grounding` | Interactive learning quiz — the real commit gate. |
 
 ### pin-aware-agent workflow
@@ -64,7 +88,7 @@ Phase 1  READ      pins.yaml + existing protocols
 Phase 2  ANALYZE   declare protocol (data lineage) + pin impact + light confirm
 Phase 3  IMPLEMENT do the work (may wrap /develop, /execute-plan, ...)
 Phase 4  UPDATE    draft new pins
-Phase 5  AUDIT     pin-audit: assertions pass, declared==produced, anchors resolve
+Phase 5  AUDIT     pin-audit + protocol-check + fact-check
 Phase 6  CODEX     pin-codex-audit: independent adversarial check
 Phase 7  GROUND    pin-grounding: quiz the human; passing commits the new pins
 ```
@@ -72,9 +96,10 @@ Phase 7  GROUND    pin-grounding: quiz the human; passing commits the new pins
 ## Three-layer check
 
 - **Machine** (`pin-audit`, git hook) — anchors resolve, assertions pass, the
-  set of new tracked files equals the declared set.
+  set of new tracked files equals the declared set; protocols and facts are
+  structurally valid.
 - **Adversarial** (`pin-codex-audit`) — Codex reads the code at each anchor and
-  checks the lineage description is true.
+  checks the lineage description and fact claims are true.
 - **Human** (`pin-grounding`) — a quiz verifies the human actually understands.
 
 ## Layout
@@ -83,10 +108,11 @@ Phase 7  GROUND    pin-grounding: quiz the human; passing commits the new pins
 pin/
 ├── .claude-plugin/        Claude Code plugin.json
 ├── .codex-plugin/         Codex plugin.json
-├── skills/                the 4 skills
-├── schema/                pins.schema.yaml, protocol.schema.md
+├── skills/                the 5 skills
+├── schema/                pins.schema.yaml, protocol.schema.md, facts.schema.md
 ├── hooks/                 commit-msg.sh (git hook template)
-├── scripts/               pinlib.py, pin_audit.py, protocol_check.py, pin_tamper.py, install-hook.sh
+├── scripts/               pinlib.py, factlib.py, pin_audit.py, protocol_check.py,
+│                          fact_check.py, pin_tamper.py, install-hook.sh
 ├── examples/demo/         a self-contained project the machinery runs against
 └── tests/                 unit tests + verify.sh end-to-end proof
 ```
@@ -100,6 +126,10 @@ python scripts/pin_audit.py path/to/pins.yaml
 # validate a protocol's data lineage
 python scripts/protocol_check.py path/to/task-protocol.md
 
+# validate structured markdown facts
+python scripts/fact_check.py path/to/.claude-research/facts \
+  --research-root path/to/.claude-research
+
 # install the git commit-msg hook into a project
 bash scripts/install-hook.sh path/to/project
 
@@ -109,6 +139,6 @@ bash tests/verify.sh
 
 ## Status
 
-v0.1 — `pin` and `protocol` mechanics implemented and verified end-to-end.
+v0.1 — `pin`, `protocol`, and `fact` mechanics implemented and verified end-to-end.
 See `tests/verify.sh` for the proof that the audit catches a silent rollback
 and the hook blocks both a broken pin and an untracked pin deletion.

@@ -4,7 +4,7 @@
 #
 # It proves, on a throwaway copy of examples/demo:
 #   1. the unit tests pass
-#   2. pin-audit and protocol-check pass on a clean project
+#   2. pin-audit, protocol-check, and fact-check pass on a clean project
 #   3. a SILENT ROLLBACK of a design decision is caught by pin-audit
 #   4. the git hook BLOCKS a commit that violates a pin
 #   5. the git hook BLOCKS removing a pin without a human gesture
@@ -71,6 +71,10 @@ expect $? 0 "pin-audit passes on the clean demo"
   "$WORK/clean/protocols/demo-latency-protocol.md" \
   --base "$WORK/clean" > "$WORK/proto.log" 2>&1
 expect $? 0 "protocol-check passes on the clean demo"
+"$PY" "$SCRIPTS/fact_check.py" \
+  "$WORK/clean/facts" \
+  --research-root "$WORK/clean" > "$WORK/facts.log" 2>&1
+expect $? 0 "fact-check passes on the clean demo"
 
 # --- 3. silent rollback is caught ----------------------------------------
 echo

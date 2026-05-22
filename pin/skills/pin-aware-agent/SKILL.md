@@ -23,13 +23,15 @@ fine while a past decision is silently reverted, or a number is produced that
 nobody can trace. This workflow keeps the human in real understanding without
 making them review every line.
 
-Two disciplines run through every phase:
+Three disciplines run through every phase:
 
 - **Pin** — a decided design must not change silently. Pins live in `pins.yaml`.
 - **Protocol** — every conclusion-bearing data element must trace to code. A
   protocol is a per-task data-lineage spec (`{task-id}-protocol.md`).
+- **Fact** — every citeable observation is a structured markdown evidence card
+  under `.claude-research/facts/`, created and validated through `pin-fact`.
 
-The rule under both: **close every silent channel.** You either follow a
+The rule under all three: **close every silent channel.** You either follow a
 declared path or you STOP and escalate to the human. There is no third option.
 
 Resolve paths: pins.yaml is at the project root or `.claude-research/pins.yaml`.
@@ -39,10 +41,13 @@ already point there; in Codex, resolve it from the installed skill/plugin path.
 
 ## Phase 1 — Read context
 
-Read `pins.yaml` and any existing `*-protocol.md` in this project. You must
-know every active pin's `id` and `claim` before touching anything. Run
-`pin_audit.py <pins.yaml>` once now to confirm you start from a clean state —
-if it already fails, surface that to the human before doing anything else.
+Read `pins.yaml`, any existing `*-protocol.md`, and existing facts under
+`.claude-research/facts/` in this project. You must know every active pin's
+`id` and `claim` before touching anything. Run `pin_audit.py <pins.yaml>` once
+now to confirm you start from a clean state — if it already fails, surface that
+to the human before doing anything else. If `.claude-research/facts/` exists,
+also run `fact_check.py` once; inherited fact drift is a blocker for
+data-producing work.
 
 ## Phase 2 — Analyze the task, then STOP for confirmation
 
@@ -63,7 +68,14 @@ reading the infra code; every lineage element carries the verbatim core code
 (at most 5 lines) that produces it. See `pin-grounding` for how protocol
 derivation doubles as a teaching moment.
 
-**2c. Pin impact.** Go through every active pin. Mark each:
+**2c. Fact declaration.** State whether this task will produce or modify any
+citeable observations. If yes, declare the fact type and expected path:
+`internal/if-NNN-*.md`, `external/ef-NNN-*.md`, or `derived/df-NNN-*.md`.
+Internal facts must reference the protocol declared in 2b and the relevant
+element names. Derived facts must name their input fact IDs. If a data-producing
+task would produce a result but no fact, explain why it is not citeable.
+
+**2d. Pin impact.** Go through every active pin. Mark each:
 `unaffected` / `affected-preserved` (your plan keeps it) / `conflict` (your
 plan breaks it). Any `conflict` **blocks** this phase. Escalate it with three
 options for the human: keep the pin and change the plan; update the pin and
@@ -71,18 +83,20 @@ co-decide; or retire the pin with a stated reason. Never resolve a conflict on
 your own — that is exactly the silent rollback this whole workflow exists to
 prevent.
 
-**2d. Heads-up on new pins.** Informally — one or two lines — tell the human
+**2e. Heads-up on new pins.** Informally — one or two lines — tell the human
 what new design decisions this task is likely to introduce and may be worth
 pinning later. This is not a formal proposal; it just sets direction.
 
-Present 2a–2d together and wait for the human to confirm.
+Present 2a–2e together and wait for the human to confirm.
 
 ## Phase 3 — Implement
 
-Do the work. Conform to the declared protocols. Keep every
-`affected-preserved` pin actually preserved. If, mid-implementation, you
-discover a new conflict that Phase 2 missed, STOP and escalate — do not
-absorb it silently.
+Do the work. Conform to the declared protocols and facts. Keep every
+`affected-preserved` pin actually preserved. If the task produces a citeable
+observation, invoke `pin-fact` and create/update the structured markdown fact;
+do not hand-write unconstrained fact prose. If, mid-implementation, you
+discover a new conflict or missing protocol/fact declaration that Phase 2
+missed, STOP and escalate — do not absorb it silently.
 
 ## Phase 4 — Update pins
 
@@ -96,10 +110,11 @@ them into `pins.yaml` yet — they are committed only after Phase 7.
 ## Phase 5 — Machine audit
 
 Run `pin_audit.py <pins.yaml>` (existing pins must still pass — this catches a
-silent regression you introduced) and `protocol_check.py` on each task
-protocol (every element's code snippet must still appear in its file, every
-element must have a nature tag). Also check artifact accounting: the set of new
-git-tracked files must
+silent regression you introduced), `protocol_check.py` on each task protocol
+(every element's code snippet must still appear in its file, every element must
+have a nature tag), and `fact_check.py .claude-research/facts` if the project
+has facts or this task created one. Also check artifact accounting: the set of
+new git-tracked files must
 equal the union of declared `artifacts` and `git_tracked` side effects — a
 file that is present but undeclared, or declared but absent, **blocks**.
 
@@ -108,18 +123,21 @@ file that is present but undeclared, or declared but absent, **blocks**.
 Invoke `pin-codex-audit`. Codex independently reads the code behind each
 lineage snippet and checks: did you miss a silent regression; does each pin's
 claim still hold in the code; is any lineage description false (e.g. a
-`DERIVED` value labelled `MEASURED`); is anything that deserves a pin not
-proposed. Surface its findings to the human verbatim.
+`DERIVED` value labelled `MEASURED`); does each new/changed fact truthfully
+reflect its data/protocol/source; is anything that deserves a pin not proposed.
+Surface its findings to the human verbatim.
 
 ## Phase 7 — Grounding (the real commit gate)
 
 Invoke `pin-grounding`. It quizzes the human on what was actually decided —
-each new pin's claim, each data element's lineage. **Passing the quiz is what
-commits the new pins into `pins.yaml` and accepts the protocol outputs.** A
-failed answer triggers a follow-up on the same concept. Understanding is the
-gate; nothing lands until the human genuinely holds the model in their head.
+each new pin's claim, each data element's lineage, and each new/changed fact's
+claim and limits. **Passing the quiz is what commits the new pins into
+`pins.yaml` and accepts the protocol/fact outputs.** A failed answer triggers a
+follow-up on the same concept. Understanding is the gate; nothing lands until
+the human genuinely holds the model in their head.
 
 ## Completion
 
-Report: pins added, protocols declared, audit + Codex outcomes, grounding
-result. If any phase escalated, report what the human decided and why.
+Report: pins added, protocols declared, facts created/updated, audit + Codex
+outcomes, grounding result. If any phase escalated, report what the human
+decided and why.

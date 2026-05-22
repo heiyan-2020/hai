@@ -2,7 +2,8 @@
 name: pin-grounding
 description: >-
   Interactively quiz the human until they genuinely understand the design
-  decisions and data lineage an agent just produced — then commit the new pins.
+  decisions, data lineage, and fact claims an agent just produced — then commit
+  the new pins.
   Use as the final gate of pin-aware-agent (Phase 7), or any time the user
   wants to verify they actually understand delegated work before it lands.
   This is a learning loop, not a rubber stamp: one multiple-choice question at
@@ -22,8 +23,9 @@ Nothing lands before the human holds it in their head.
 
 ## What to quiz on
 
-The anchors are concrete: each newly proposed pin's `claim`, and each protocol
-lineage element. Build one question per anchor.
+The anchors are concrete: each newly proposed pin's `claim`, each protocol
+lineage element, and each new/changed fact's `claim`, inputs, and stated
+limitations. Build one question per anchor.
 
 ## Question shape — the critical rule
 
@@ -75,8 +77,8 @@ Ask **one** question at a time and wait for the answer.
   landed. Do not ask a "now do you see why it's bad?" follow-up — that turns
   grounding into planning, which is a different skill.
 
-Default to five questions; the user may ask for more. Cover both pins and
-protocol lineage.
+Default to five questions; the user may ask for more. Cover pins, protocol
+lineage, and facts when all three changed.
 
 ## On passing
 

@@ -43,7 +43,7 @@ codex plugin marketplace upgrade hai
 
 | Plugin | What it does |
 |--------|--------------|
-| [`pin`](./pin) | Pin + Protocol disciplines for agent-driven research — lock design decisions against silent rollback, make every conclusion-bearing data element traceable to code, and keep the human genuinely in the loop via machine audit, an adversarial Codex audit, and an interactive grounding quiz. |
+| [`pin`](./pin) | Pin + Protocol + Fact disciplines for agent-driven research — lock design decisions against silent rollback, make every conclusion-bearing data element traceable to code, keep citeable observations structured, and keep the human genuinely in the loop via machine audit, an adversarial Codex audit, and an interactive grounding quiz. |
 | [`vibe-slides`](./vibe-slides) | Author academic slide decks via a markdown DSL — extract a theme and components from a `.pptx` template, iterate on a content-only outline, then compile to `.pptx` with pptxgenjs. |
 
 ## Repository layout

@@ -1,13 +1,14 @@
 ---
 name: pin-codex-audit
 description: >-
-  Run an adversarial, independent audit of newly proposed pins and protocol
-  data-lineage using Codex as a second pair of eyes. Use after pins are drafted
-  and before grounding (Phase 6 of pin-aware-agent), or any time you want an
-  outside check that a lineage description is actually true and that no silent
-  regression was missed. Self-review by the same agent that wrote the code has
-  blind spots — this skill closes them. Trigger on "codex audit the pins",
-  "independent review of the lineage", or as part of the pin-aware-agent flow.
+  Run an adversarial, independent audit of newly proposed pins, protocol
+  data-lineage, and structured facts using Codex as the default second pair of
+  eyes. Use after pins/facts are drafted and before grounding (Phase 6 of
+  pin-aware-agent), or any time you want an outside check that lineage and fact
+  claims are actually true and no silent regression was missed. Self-review by
+  the same agent that wrote the code has blind spots — this skill closes them.
+  Trigger on "codex audit the pins", "independent review of the lineage", or as
+  part of the pin-aware-agent flow.
 type: flow
 user-invocable: true
 ---
@@ -21,8 +22,8 @@ did not write this code — its independent reading is the point.
 Two things make a Codex audit useful instead of slow and vague:
 
 - **Codex must know the system, not the whole project.** It is briefed on what
-  pins and protocols are, and told its job is narrow: check this diff against
-  the *declared* pins and protocols, not audit the entire codebase.
+  pins, protocols, and facts are, and told its job is narrow: check this diff
+  against the *declared* artifacts, not audit the entire codebase.
 - **Point Codex at the repo; do not paste everything in.** `codex exec` runs
   inside the repo and can read files and run `git diff` itself. Pasting
   pins.yaml + the protocol + whole scripts + a 600-line diff into one prompt is
@@ -31,7 +32,7 @@ Two things make a Codex audit useful instead of slow and vague:
 
 ## Step 1 — Assemble the inputs as files (not pasted text)
 
-You need three paths. Locate them; do not read their contents into the prompt.
+You need these paths. Locate them; do not read their contents into the prompt.
 
 - **Existing pins** — `pins.yaml` (project root or `.claude-research/`).
 - **Proposed pins** — the pins drafted this task are not in `pins.yaml` yet
@@ -39,6 +40,8 @@ You need three paths. Locate them; do not read their contents into the prompt.
   `.claude-research/channels/<channel>/proposed-pins.yaml`, so Codex can read
   them.
 - **Protocol(s)** — each `*-protocol.md` for the task.
+- **Fact(s)** — each new or changed markdown fact under
+  `.claude-research/facts/{internal,external,derived}/`.
 
 The briefing Codex needs is fixed and lives at
 `<PLUGIN_ROOT>/skills/pin-codex-audit/references/codex-briefing.md`, where
@@ -77,6 +80,13 @@ reasoning effort `medium`):
 > `snippet` and the surrounding code in its `file`. Does the `nature` tag tell
 > the truth about what the code actually does? Also confirm the snippet still
 > appears in the file — a stale snippet means the lineage has drifted.
+>
+> Q5 FACT TRUTHFULNESS — For each new or changed fact in `<fact path(s)>`, read
+> the markdown frontmatter/body, referenced data/source, and referenced protocol
+> elements. Does the fact's `claim` truthfully reflect its evidence? Is an
+> `internal` fact supported by its data and protocol elements? Is an `external`
+> fact limited to what the quote/source reports? Is a `derived` fact computed
+> only from its `derived_from` inputs? Flag causal or over-broad claims.
 
 ### Invocation — background runs + a Monitor, never a blocking wait
 
@@ -147,8 +157,9 @@ the direct call here.
 
 Relay both calls' findings to the human **verbatim** — do not soften or
 summarize away a concern. For each finding, attach what you intend to do: fix
-the regression, re-pin to the right property, correct the nature tag, or add the
-missing pin. The human decides; you do not quietly accept or dismiss.
+the regression, re-pin to the right property, correct the nature tag, correct or
+narrow the fact, or add the missing pin. The human decides; you do not quietly
+accept or dismiss.
 
 Save both calls' final answers (the `-o` files) and their event traces (the
 `.jsonl` files) under `.claude-research/channels/<channel>/` so there is an
