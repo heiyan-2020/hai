@@ -1,15 +1,24 @@
 # vibe-slides
 
-A Claude Code plugin for authoring academic-style slide decks in two decoupled phases: collaborate with the agent on a content-only markdown outline, then have it compile to `.pptx` via pptxgenjs using a theme and component library extracted from your own template.
+An agent plugin for authoring academic-style slide decks in two decoupled phases: collaborate with the agent on a content-only markdown outline, then have it compile to `.pptx` via pptxgenjs using a theme and component library extracted from your own template. It is installable in Claude Code and Codex.
 
 ## Install
 
+### Claude Code
+
 ```
-/plugin marketplace add heiyan-2020/claude-plugins
-/plugin install vibe-slides@heiyan-2020
+/plugin marketplace add heiyan-2020/hai
+/plugin install vibe-slides@hai
 ```
 
-The marketplace at [`heiyan-2020/claude-plugins`](https://github.com/heiyan-2020/claude-plugins) is just an index — it points back to this repo. No `git clone` needed; Claude Code handles the fetch.
+### Codex
+
+```bash
+codex plugin marketplace add heiyan-2020/hai
+codex plugin add vibe-slides@hai
+```
+
+No `git clone` is needed for normal use; the agent host handles the fetch.
 
 ## Commands
 
@@ -145,10 +154,17 @@ npm install -g pptxgenjs
 
 ## Iterating on the plugin itself
 
-If you're forking this and want a tight edit loop:
+If you're forking this and want a tight Claude Code edit loop:
 
 ```bash
 claude --plugin-dir /path/to/your/clone
 ```
 
 `--plugin-dir` reads live from disk; `/reload-plugins` picks up edits. The marketplace install path is for stable use across machines, not active development.
+
+For a local Codex edit loop:
+
+```bash
+codex plugin marketplace add /path/to/your/clone
+codex plugin add vibe-slides@hai
+```

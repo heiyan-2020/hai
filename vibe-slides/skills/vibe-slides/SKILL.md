@@ -16,7 +16,9 @@ Styling lives in a template the user provides once. The skill extracts a `theme.
 
 ## Commands
 
-This is a Claude Code plugin. Slash commands are namespaced under `/vibe-slides:` and routed by Claude Code directly — this skill does not dispatch internally.
+In Claude Code, slash commands are namespaced under `/vibe-slides:` and routed
+directly. In Codex, treat those same command names as natural-language entry
+points and read the referenced command document.
 
 | Command | Purpose |
 |---|---|
@@ -25,7 +27,10 @@ This is a Claude Code plugin. Slash commands are namespaced under `/vibe-slides:
 | `/vibe-slides:author` | Collaborate with the user to author/iterate on `slides.md`. See [commands/author.md](../../commands/author.md). |
 | `/vibe-slides:build-slides` | Compile `slides.md` to `out.pptx` by writing and running a pptxgenjs script. See [commands/build-slides.md](../../commands/build-slides.md). |
 
-If the user describes a vibe-slides task in natural language (no slash command), this skill auto-triggers via its `description`. Default to the authoring flow in [commands/author.md](../../commands/author.md) unless the request is clearly a build/extract.
+If the user describes a vibe-slides task in natural language, this skill
+auto-triggers via its `description`. Default to the authoring flow in
+[commands/author.md](../../commands/author.md) unless the request is clearly a
+build/extract.
 
 ---
 
@@ -44,7 +49,7 @@ Each presentation lives in its own directory (user creates it manually — the s
 │   └── previews/*.png      ← per-component preview images
 ├── vibe-slides.md          ← project style rules (copied from skill template,
 │                              customized by the user). Named this way to
-│                              avoid colliding with a host repo's CLAUDE.md.
+│                              avoid colliding with a host repo's agent docs.
 ├── slides.md               ← iterated during the authoring phase
 ├── build.js                ← written by the agent during build
 └── out.pptx                ← final output
@@ -65,7 +70,9 @@ Everything except this plugin and the example component library is per-project. 
 | Authoring markdown | [commands/author.md](../../commands/author.md) + [schema/markdown-schema.md](../../schema/markdown-schema.md) |
 | Building a deck | [commands/build-slides.md](../../commands/build-slides.md) + [experiences.md](../../experiences.md) + the project's `vibe-slides.md` + `theme.json` + `components/_manifest.json` |
 
-Always read the project's `vibe-slides.md` during a build — it carries style constraints the user has chosen for this specific deck. (Named this way so a host repo's own `CLAUDE.md` is untouched.)
+Always read the project's `vibe-slides.md` during a build — it carries style
+constraints the user has chosen for this specific deck. (Named this way so a
+host repo's own agent instructions are untouched.)
 
 ---
 
@@ -75,7 +82,9 @@ Always read the project's `vibe-slides.md` during a build — it carries style c
 - Node.js with `pptxgenjs` installed globally (for building)
 - Optional: LibreOffice (`soffice`) and Poppler (`pdftoppm`) for visual QA
 
-pptxgenjs API reference: reuse the existing `pptx` skill's `pptxgenjs.md` — do not re-document its API here. Path: `~/.claude/skills/pptx/pptxgenjs.md`.
+pptxgenjs API reference: reuse an installed `pptx` skill's `pptxgenjs.md` when
+available; otherwise consult the local `pptxgenjs` package docs rather than
+re-documenting its API here.
 
 ---
 

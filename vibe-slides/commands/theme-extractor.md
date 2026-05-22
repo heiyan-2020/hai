@@ -21,13 +21,16 @@ Never skip stage 2. The script deliberately leaves ambiguities for you.
 
 ## Resolving plugin paths
 
-The shell snippets below reference this plugin's `lib/` and `templates/`. Discover the plugin install root once at the start of this command:
+The shell snippets below reference this plugin's `lib/` and `templates/`.
+Resolve `<PLUGIN_ROOT>` as the root of this installed plugin. In Claude Code,
+this command usually finds it:
 
 ```bash
 ls -d ~/.claude/plugins/cache/*/vibe-slides/*/ 2>/dev/null | sort -V | tail -1
 ```
 
-Note the absolute path (e.g. `/home/<you>/.claude/plugins/cache/claude-plugins/vibe-slides/0.1.0`). Substitute it for `<PLUGIN_ROOT>` in every command below.
+In Codex, resolve it from the installed skill/plugin path. Substitute the
+absolute path for `<PLUGIN_ROOT>` in every command below.
 
 ---
 

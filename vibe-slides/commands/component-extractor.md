@@ -10,7 +10,9 @@ Extract reusable visual components from a .pptx into the project's
 
 **Status: STUB — not yet implemented in round 1 of the skill.**
 
-For now, bootstrap components by copying from the example project. First discover the plugin install root:
+For now, bootstrap components by copying from the example project. Resolve
+`<PLUGIN_ROOT>` as the root of this installed plugin. In Claude Code, this
+command usually finds it:
 
 ```bash
 ls -d ~/.claude/plugins/cache/*/vibe-slides/*/ 2>/dev/null | sort -V | tail -1

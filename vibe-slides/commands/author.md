@@ -83,7 +83,7 @@ When the user describes a visual:
 - **Something the library doesn't cover** → note it as a TODO comment
   (`%% need: timeline component`) and proceed with prose on a canvas
   slide for now. Don't invent components from the authoring side —
-  the user adds them via `/vibe-slides component-extractor`.
+  the user adds them via `/vibe-slides:component-extractor`.
 
 **Proactively offer stubs.** If the user describes a visual but doesn't
 mention a file path, ask: "Do you already have the image file, or
@@ -127,7 +127,7 @@ You've reached the end of authoring when:
 4. Every component reference resolves against `_manifest.json`.
 5. The user says "let's build."
 
-Then suggest: "Run `/vibe-slides build` when ready."
+Then suggest: "Run `/vibe-slides:build-slides` when ready."
 
 ---
 

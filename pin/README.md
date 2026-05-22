@@ -1,6 +1,7 @@
 # Pin
 
-A Claude Code plugin for **agent-driven research that the human still understands**.
+An agent plugin for **agent-driven research that the human still understands**,
+installable in Claude Code and Codex.
 
 ## The problem
 
@@ -80,7 +81,8 @@ Phase 7  GROUND    pin-grounding: quiz the human; passing commits the new pins
 
 ```
 pin/
-├── .claude-plugin/        plugin.json, marketplace.json
+├── .claude-plugin/        Claude Code plugin.json
+├── .codex-plugin/         Codex plugin.json
 ├── skills/                the 4 skills
 ├── schema/                pins.schema.yaml, protocol.schema.md
 ├── hooks/                 commit-msg.sh (git hook template)

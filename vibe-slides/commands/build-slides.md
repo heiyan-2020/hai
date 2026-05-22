@@ -27,13 +27,16 @@ If any of those is missing, stop and report which — don't guess defaults.
 
 ### Resolving plugin paths
 
-The build.js example below references this plugin's `lib/render_helpers.js`. Discover the plugin install root once:
+The build.js example below references this plugin's `lib/render_helpers.js`.
+Resolve `<PLUGIN_ROOT>` as the root of this installed plugin. In Claude Code,
+this command usually finds it:
 
 ```bash
 ls -d ~/.claude/plugins/cache/*/vibe-slides/*/ 2>/dev/null | sort -V | tail -1
 ```
 
-Note the absolute path it prints (e.g. `/home/<you>/.claude/plugins/cache/claude-plugins/vibe-slides/0.1.0`). Substitute it for `<PLUGIN_ROOT>` everywhere below before writing build.js.
+In Codex, resolve it from the installed skill/plugin path. Substitute the
+absolute path for `<PLUGIN_ROOT>` everywhere below before writing build.js.
 
 ---
 
@@ -51,8 +54,8 @@ Note the absolute path it prints (e.g. `/home/<you>/.claude/plugins/cache/claude
    Also skim each `.js` file you plan to call so you know its exact signature.
 6. [`schema/markdown-schema.md`](../schema/markdown-schema.md) (this plugin) —
    the markdown syntax you're parsing.
-7. `~/.claude/skills/pptx/pptxgenjs.md` — pptxgenjs API reference for
-   anything the components don't cover.
+7. An installed `pptx` skill's `pptxgenjs.md`, or local `pptxgenjs` package
+   docs, for anything the components don't cover.
 
 ---
 
@@ -221,7 +224,7 @@ First render is rarely correct. Before declaring done:
 
    ```bash
    # requires LibreOffice + Poppler
-   python ~/.claude/skills/pptx/scripts/office/soffice.py \
+   python <PPTX_SKILL_ROOT>/scripts/office/soffice.py \
        --headless --convert-to pdf <project>/out.pptx
    pdftoppm -jpeg -r 150 <project>/out.pdf <project>/slide
    ```
@@ -232,7 +235,7 @@ First render is rarely correct. Before declaring done:
 
 2. Spawn a subagent with fresh eyes (use the Agent tool, Explore or
    general-purpose subagent) and give it the prompt in
-   `~/.claude/skills/pptx/SKILL.md` under "Visual QA". Feed it the
+   an installed `pptx` skill's `SKILL.md` under "Visual QA". Feed it the
    rendered JPGs with a one-line expected description per slide.
 
 3. For every issue the subagent reports, fix in build.js, re-run

@@ -33,7 +33,9 @@ The rule under both: **close every silent channel.** You either follow a
 declared path or you STOP and escalate to the human. There is no third option.
 
 Resolve paths: pins.yaml is at the project root or `.claude-research/pins.yaml`.
-Plugin scripts are under `${CLAUDE_PLUGIN_ROOT}/scripts/`.
+Plugin scripts are under `<PLUGIN_ROOT>/scripts/`, where `<PLUGIN_ROOT>` is
+the root of this installed plugin. In Claude Code, `${CLAUDE_PLUGIN_ROOT}` may
+already point there; in Codex, resolve it from the installed skill/plugin path.
 
 ## Phase 1 — Read context
 

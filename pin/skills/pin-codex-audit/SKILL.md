@@ -41,7 +41,8 @@ You need three paths. Locate them; do not read their contents into the prompt.
 - **Protocol(s)** — each `*-protocol.md` for the task.
 
 The briefing Codex needs is fixed and lives at
-`${CLAUDE_PLUGIN_ROOT}/skills/pin-codex-audit/references/codex-briefing.md`.
+`<PLUGIN_ROOT>/skills/pin-codex-audit/references/codex-briefing.md`, where
+`<PLUGIN_ROOT>` is the root of this installed plugin.
 
 ## Step 2 — Two Codex calls, run in parallel
 
@@ -97,7 +98,7 @@ as a file first — an unquoted heredoc would mangle the briefing's backticks:
 
 ```bash
 {
-  cat "${CLAUDE_PLUGIN_ROOT}/skills/pin-codex-audit/references/codex-briefing.md"
+  cat "<PLUGIN_ROOT>/skills/pin-codex-audit/references/codex-briefing.md"
   printf '\n## Questions\n<the two questions for this call>\n'
   printf '\n## What to read\n<the file paths for this call>\n'
 } > /tmp/pin-codex-A.txt
@@ -118,7 +119,7 @@ runs for minutes — `1800000` is safe) and this poll loop as the Monitor
 command:
 
 ```bash
-PROG="${CLAUDE_PLUGIN_ROOT}/scripts/codex_progress.py"
+PROG="<PLUGIN_ROOT>/scripts/codex_progress.py"
 while true; do
   python3 "$PROG" --oneline /tmp/pin-codex-A-events.jsonl
   python3 "$PROG" --oneline /tmp/pin-codex-B-events.jsonl

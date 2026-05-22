@@ -1,8 +1,10 @@
 # hai
 
-A marketplace of Claude Code plugins by heiyan
+A marketplace of agent plugins by heiyan, installable in Claude Code and Codex.
 
 ## Install
+
+### Claude Code
 
 In Claude Code, add this marketplace once, then install any plugin from it:
 
@@ -21,6 +23,22 @@ To pick up later updates:
 /plugin marketplace update hai
 ```
 
+### Codex
+
+In Codex, add the same repo as a marketplace, then install plugins from it:
+
+```bash
+codex plugin marketplace add heiyan-2020/hai
+codex plugin add pin@hai
+codex plugin add vibe-slides@hai
+```
+
+To pick up later updates:
+
+```bash
+codex plugin marketplace upgrade hai
+```
+
 ## Plugins
 
 | Plugin | What it does |
@@ -32,19 +50,29 @@ To pick up later updates:
 
 ```
 hai/
+├── .agents/
+│   └── plugins/marketplace.json   # Codex marketplace
 ├── .claude-plugin/
-│   └── marketplace.json   # the marketplace: lists every plugin
+│   └── marketplace.json           # Claude Code marketplace
 ├── pin/                   # one plugin = one subdirectory
-│   └── .claude-plugin/plugin.json
+│   ├── .claude-plugin/plugin.json
+│   └── .codex-plugin/plugin.json
+├── vibe-slides/
+│   ├── .claude-plugin/plugin.json
+│   └── .codex-plugin/plugin.json
 └── README.md
 ```
 
 ## Adding another plugin
 
-1. Put the plugin in its own subdirectory with a `.claude-plugin/plugin.json`
-   (it does **not** need its own `marketplace.json`).
-2. Add an entry to `.claude-plugin/marketplace.json` with `"source": "./<dir>"`.
-3. Commit and push — users get it with `/plugin marketplace update hai`.
+1. Put the plugin in its own subdirectory.
+2. Add `.claude-plugin/plugin.json` for Claude Code.
+3. Add `.codex-plugin/plugin.json` for Codex.
+4. Add an entry to `.claude-plugin/marketplace.json` with `"source": "./<dir>"`.
+5. Add an entry to `.agents/plugins/marketplace.json` with `"source": { "source": "local", "path": "./<dir>" }`.
+6. Commit and push. Claude Code users get it with `/plugin marketplace update hai`; Codex users get it with `codex plugin marketplace upgrade hai`.
 
-Plugin entries omit `version`, so every pushed commit is treated as a new
-version and `marketplace update` always pulls the latest.
+Claude Code plugin entries omit `version`, so every pushed commit is treated as
+a new version and `marketplace update` always pulls the latest. Codex plugin
+versions live in each `.codex-plugin/plugin.json` and should be bumped when you
+publish changes.

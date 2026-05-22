@@ -20,10 +20,11 @@ assertions and report.
 
 ## How to run
 
-Locate `pins.yaml` (project root or `.claude-research/pins.yaml`), then:
+Locate `pins.yaml` (project root or `.claude-research/pins.yaml`), resolve
+`<PLUGIN_ROOT>` as the root of this installed plugin, then:
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/pin_audit.py <pins.yaml>
+python3 <PLUGIN_ROOT>/scripts/pin_audit.py <pins.yaml>
 ```
 
 Useful flags:
