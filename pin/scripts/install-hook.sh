@@ -4,9 +4,9 @@
 #
 # Usage:  bash scripts/install-hook.sh <path-to-target-repo>
 #
-# The hook template's __PIN_SCRIPTS_DIR__ placeholder is replaced with this
-# plugin's absolute scripts directory, so the installed hook is self-contained
-# and keeps working wherever the target repo lives.
+# The hook is installed together with a copy of the support scripts under
+# .git/hooks/pin-scripts/. It deliberately avoids embedding the plugin cache's
+# absolute path, because Codex/Claude plugin cache paths can change on upgrade.
 
 set -euo pipefail
 
@@ -25,14 +25,19 @@ case "$GIT_DIR" in /*) ;; *) GIT_DIR="$TARGET/$GIT_DIR" ;; esac
 HOOKS_DIR="$GIT_DIR/hooks"
 mkdir -p "$HOOKS_DIR"
 DEST="$HOOKS_DIR/commit-msg"
+DEST_SCRIPTS="$HOOKS_DIR/pin-scripts"
 
 if [ -e "$DEST" ] && ! grep -q "pin plugin" "$DEST" 2>/dev/null; then
   cp "$DEST" "$DEST.pre-pin.bak"
   echo "install-hook: existing commit-msg hook backed up to $DEST.pre-pin.bak"
 fi
 
-sed "s|__PIN_SCRIPTS_DIR__|$SCRIPTS_DIR|g" "$TEMPLATE" > "$DEST"
+mkdir -p "$DEST_SCRIPTS"
+cp -p "$SCRIPTS_DIR"/*.py "$DEST_SCRIPTS"/
+
+cp "$TEMPLATE" "$DEST"
 chmod +x "$DEST"
+chmod +x "$DEST_SCRIPTS"/*.py
 
 echo "install-hook: pin commit-msg hook installed at $DEST"
-echo "install-hook: scripts dir = $SCRIPTS_DIR"
+echo "install-hook: support scripts copied to $DEST_SCRIPTS"

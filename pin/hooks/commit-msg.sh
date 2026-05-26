@@ -16,7 +16,8 @@
 
 set -euo pipefail
 
-PIN_SCRIPTS_DIR="__PIN_SCRIPTS_DIR__"
+PIN_HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PIN_SCRIPTS_DIR="${PIN_SCRIPTS_DIR:-"$PIN_HOOK_DIR/pin-scripts"}"
 MSG_FILE="${1:?commit-msg hook expects the message file as argument 1}"
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
@@ -30,6 +31,13 @@ done
 [ -z "$PINS" ] && exit 0   # repo does not use pin
 
 PY="$(command -v python3 || command -v python)"
+
+if [ ! -f "$PIN_SCRIPTS_DIR/pin_audit.py" ] || [ ! -f "$PIN_SCRIPTS_DIR/pin_tamper.py" ]; then
+  echo "pin: commit BLOCKED — hook support scripts are missing:" >&2
+  echo "     $PIN_SCRIPTS_DIR" >&2
+  echo "     Reinstall the hook with: bash <pin-plugin>/scripts/install-hook.sh <repo>" >&2
+  exit 1
+fi
 
 # --- 1. audit -------------------------------------------------------------
 if ! "$PY" "$PIN_SCRIPTS_DIR/pin_audit.py" "$PINS"; then

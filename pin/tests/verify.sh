@@ -88,6 +88,17 @@ expect $? 1 "pin-audit catches the removed tool-call marker"
 echo
 echo "[4] git hook blocks a commit that violates a pin"
 make_repo "$WORK/repo_b"
+if grep -Fq "$SCRIPTS" "$WORK/repo_b/.git/hooks/commit-msg"; then
+  fail "installed hook should not embed the plugin scripts absolute path"
+else
+  pass "installed hook avoids plugin scripts absolute path"
+fi
+if [ -f "$WORK/repo_b/.git/hooks/pin-scripts/pin_audit.py" ] \
+  && [ -f "$WORK/repo_b/.git/hooks/pin-scripts/pin_tamper.py" ]; then
+  pass "hook support scripts are vendored beside the hook"
+else
+  fail "hook support scripts should be vendored beside the hook"
+fi
 git -C "$WORK/repo_b" add -A
 git -C "$WORK/repo_b" commit -q -m "initial import" > "$WORK/b_init.log" 2>&1
 expect $? 0 "clean initial commit succeeds"
