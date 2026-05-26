@@ -5,9 +5,11 @@ description: >-
   assertion and report pass/fail. Use whenever you need to check that no
   locked design decision has been silently violated: before a commit, after a
   batch of changes, when resuming work, or as Phase 5 of pin-aware-agent. This
-  is non-interactive and mechanical; it is also what the git commit-msg hook
-  runs. Trigger on "audit the pins", "check the pins", "did anything break a
-  design decision", or after any work that touched pinned code.
+  is mechanical once started; before running it, check whether the git
+  commit-msg hook is installed and ask the user about installing it only when
+  it is missing. The audit is also what the git commit-msg hook runs. Trigger
+  on "audit the pins", "check the pins", "did anything break a design
+  decision", or after any work that touched pinned code.
 type: flow
 user-invocable: true
 ---
@@ -15,13 +17,31 @@ user-invocable: true
 # pin-audit
 
 The mechanical layer. It answers one question: **is any enforced design
-decision currently violated?** No judgement, no interaction — just run the
-assertions and report.
+decision currently violated?** No judgement once the audit starts — just run
+the assertions and report.
 
 ## How to run
 
 Locate `pins.yaml` (project root or `.claude-research/pins.yaml`), resolve
-`<PLUGIN_ROOT>` as the root of this installed plugin, then:
+`<PLUGIN_ROOT>` as the root of this installed plugin, then first check hook
+installation for the target repo:
+
+```bash
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+HOOK="$(git -C "$REPO_ROOT" rev-parse --git-path hooks/commit-msg)"
+test -f "$HOOK" && grep -q "pin plugin" "$HOOK"
+```
+
+- If that command succeeds, the pin hook is already installed. Do not ask the
+  user about hook installation; continue directly to the audit.
+- If it fails, tell the user the pin commit-msg hook is not installed for this
+  repo and ask whether to install it now. If the user agrees, run:
+
+```bash
+bash <PLUGIN_ROOT>/scripts/install-hook.sh "$REPO_ROOT"
+```
+
+Then run the audit:
 
 ```bash
 python3 <PLUGIN_ROOT>/scripts/pin_audit.py <pins.yaml>
