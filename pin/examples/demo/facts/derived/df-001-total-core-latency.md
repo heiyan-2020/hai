@@ -5,8 +5,8 @@ status: active
 created_at: "2026-05-22T00:00:00Z"
 
 question: "What is the combined prefill and decode latency in the demo?"
+tldr: "Prefill and decode latency sum to 10.6 ms in the demo."
 claim: "The demo prefill and decode latencies sum to 10.6 ms."
-tldr: "Core latency is 10.6 ms from prefill plus decode."
 
 metric:
   name: core_latency_ms
@@ -25,20 +25,21 @@ derivation:
 tags: [demo, latency, derived]
 ---
 
-# df-001 - Total Core Latency
+# df-001 — Total core latency
 
-## Observation
+## Bottom line
 
+- **Derived from `if-001` and `if-002` — no new measurement.**
+- Answer: Prefill and decode latency sum to 10.6 ms in the demo.
 - Claim: The demo prefill and decode latencies sum to 10.6 ms.
-- Metric: core_latency_ms = 10.6 ms.
-- Scope: Derived from `if-001` and `if-002`.
+- Metric: core_latency_ms = 10.6 ms (lower is better).
 
 ## Inputs
 
-| Fact | Used Field | Value | Purpose |
-|---|---|---:|---|
-| `if-001` | `metric.value` | 3.4 | Prefill latency |
-| `if-002` | `metric.value` | 7.2 | Decode latency |
+| Fact     | Field used     | Value           |
+|----------|----------------|-----------------|
+| `if-001` | `metric.value` | 3.4 ms (prefill)|
+| `if-002` | `metric.value` | 7.2 ms (decode) |
 
 ## Derivation
 
@@ -46,20 +47,9 @@ tags: [demo, latency, derived]
 3.4 + 7.2 = 10.6
 ```
 
-- Method: Add prefill latency and decode latency from the two internal facts.
-- No new run was performed for this fact.
+- Method: add prefill and decode latency from the two internal facts. No new run was performed.
 
-## Checks
+## Scope & limits
 
-- Input facts exist.
-- Input metrics use compatible units.
-- Formula result matches frontmatter metric value.
-
-## Limitations
-
-- This fact only combines the two referenced demo facts.
-
-## Links
-
-- Derived from: `if-001`, `if-002`
-- Gap addressed: none
+- Combines only the two referenced demo facts and inherits their limitations.
+- Ignores any latency outside prefill and decode (e.g. overhead).

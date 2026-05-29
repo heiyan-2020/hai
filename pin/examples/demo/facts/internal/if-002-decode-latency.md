@@ -5,8 +5,8 @@ status: active
 created_at: "2026-05-22T00:00:00Z"
 
 question: "What decode latency does the demo runner report?"
+tldr: "Decode latency is 7.2 ms, the mean of 5 demo samples."
 claim: "The demo runner reports 7.2 ms decode latency across 5 samples."
-tldr: "Decode latency is 7.2 ms in the demo summary."
 
 metric:
   name: decode_ms
@@ -34,25 +34,31 @@ repro:
 tags: [demo, latency]
 ---
 
-# if-002 - Decode Latency
+# if-002 — Decode latency
 
-## Observation
+## Bottom line
 
+- **Measured on the demo runner.**
+- Answer: Decode latency is 7.2 ms, the mean of 5 demo samples.
 - Claim: The demo runner reports 7.2 ms decode latency across 5 samples.
-- Metric: decode_ms = 7.2 ms.
-- Scope: Demo latency summary across 5 samples.
+- Metric: decode_ms = 7.2 ms (lower is better).
 
-## Evidence
+## Key evidence
 
-| Artifact | Path | Purpose |
-|---|---|---|
-| Summary | `data/if-002/summary.yaml` | Source of the decode latency value |
-| Run log | `data/if-002/run.log` | Confirms the demo run completed |
+| What it shows           | Value  | Source                        |
+|-------------------------|--------|-------------------------------|
+| Reported decode mean    | 7.2 ms | `data/if-002/summary.yaml`    |
+| Samples behind the mean | 5      | `data/if-002/run.log`         |
+
+## Scope & limits
+
+- Covers the demo runner and its bundled sample data only.
+- A single run — no variance or confidence interval is reported.
 
 ## Lineage
 
-- Protocol: `protocols/demo-latency-protocol.md`
-- Elements used: `decode_ms`
+- Protocol `protocols/demo-latency-protocol.md`, element `decode_ms` (MEASURED).
+- `summary.yaml -> decode_ms` is the per-run `decode_ms` averaged over the 5 samples in `run.yaml`.
 
 ## Reproduction
 
@@ -60,21 +66,5 @@ tags: [demo, latency]
 python src/summarize.py data/run.yaml data/summary.yaml
 ```
 
-- Commit: `0000000`
-- Hardware: local CPU
-- Software: Python 3.x
-
-## Checks
-
-- Sample count matched expected 5.
-- Summary file was recorded.
-- Run log was recorded.
-
-## Limitations
-
-- This fact only covers the demo runner and sample data.
-
-## Links
-
-- Related facts: `if-001`
-- Gap addressed: none
+- Commit `0000000` · local CPU · Python 3.x.
+- Verified: sample count = 5; summary and run log present.

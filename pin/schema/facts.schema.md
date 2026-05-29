@@ -4,6 +4,37 @@ A fact is a constrained markdown evidence card. Markdown gives the human a
 readable record with figures and tables; yaml frontmatter gives tools a stable
 machine interface. The body is not free prose.
 
+## Read it like a human reads it
+
+A fact is written for someone who wants two things, in this order: *what did we
+conclude?* and *why should I believe it?* The body is therefore ordered for
+**progressive disclosure** — three tiers a reader can stop at the moment they
+are satisfied:
+
+1. **The conclusion** — `Bottom line`. The plain answer, the exact claim, the
+   headline number. The only section a busy reader must read.
+2. **The proof and its boundary** — `Key evidence` then `Scope & limits`. The
+   two or three numbers that, if true, force the conclusion, shown as a
+   comparison you can check at a glance; then, immediately, what this does *not*
+   prove. Over-reading scope is the most common fast-reading mistake, so the
+   boundary sits right next to the proof.
+3. **The audit trail** — `Lineage`, `Reproduction`. Where the numbers came from
+   and how to regenerate them. For the skeptic.
+
+The frontmatter is machine plumbing; humans skip it. So the body must never be a
+prose re-listing of frontmatter paths. It interprets the evidence ("the run
+wrote marker 154843 into KV slot 629, the exact slot the map reserved"), it does
+not dump fields.
+
+Two rules carry most of the readability:
+
+- **`claim` is one short observational sentence.** Caveats, scope, and hedges do
+  not belong in the claim — they go in `Scope & limits`. A claim that needs the
+  word "while" is two facts.
+- **`tldr` is the plain answer plus the one caveat that matters**, and it is
+  echoed verbatim into `Bottom line` as `- Answer:`. The human takeaway and the
+  machine record stay locked together.
+
 Facts live under:
 
 ```text
@@ -49,8 +80,11 @@ tags: [evaluation]
 ---
 ```
 
-The `claim` is canonical. It must be observational: no "because", "due to",
-"causes", "therefore", "explains", or similar causal language.
+The `claim` is canonical. It must be observational (no "because", "due to",
+"causes", "therefore", "explains") and it must be **one short sentence**. If you
+are tempted to add "while", "although", or a trailing qualifier, that qualifier
+is scope — put it in `Scope & limits`, not the claim. `tldr` is the plain-English
+answer to `question`, plus the single caveat a reader most needs.
 
 ## Internal fact
 
@@ -83,18 +117,30 @@ Required body sections, in this exact order:
 
 ```text
 # <id> — <short title>
-## Observation
-## Evidence
+## Bottom line
+## Key evidence
+## Scope & limits
 ## Lineage
 ## Reproduction
-## Checks
-## Limitations
-## Links
 ```
 
-`Observation` must be bullets and repeat the frontmatter claim as
-`- Claim: ...`. `Evidence` must be a table. `Limitations` must contain at
-least one bullet.
+- `Bottom line` is bullets. It must open with `- Answer: <tldr>` (echoing the
+  frontmatter `tldr` verbatim), then `- Claim: <claim>`, then a `- Metric:`
+  bullet. A leading bold verdict such as `**Proven for the checked runs.**` is
+  encouraged — it is what lets a reader confirm in one glance.
+- `Key evidence` is the decisive proof, ideally a small table that *compares*
+  the measured value against the expected one (the reader should be able to see
+  the match, not take it on faith). Keep it to the few rows that actually carry
+  the claim; the full artifact list already lives in frontmatter `data`.
+- `Scope & limits` must contain at least one bullet stating what the fact does
+  *not* establish.
+- `Lineage` traces protocol element → measured field → data file in prose, so a
+  reader can follow how a number became a claim.
+- `Reproduction` carries the exact command, commit, hardware, and a short
+  "Verified:" note recording the checks that were run.
+
+Every repo-relative path cited in backticks under `Key evidence` or `Lineage`
+must exist on disk.
 
 ## External fact
 
@@ -112,17 +158,16 @@ Required body sections, in this exact order:
 
 ```text
 # <id> — <short title>
-## Observation
-## Evidence
-## Source Quote
-## Lineage
-## Checks
-## Limitations
-## Links
+## Bottom line
+## Source quote
+## Scope & limits
 ```
 
-The claim may only state what the source reports. It is not an independent
-verification of the source.
+`Bottom line` follows the same `- Answer:` / `- Claim:` / `- Metric:` shape as
+internal facts. `Source quote` is the verbatim text that backs the claim,
+attributed to the citation. The claim may only state what the source reports;
+`Scope & limits` should note that this fact records the source, it does not
+independently verify it.
 
 ## Derived fact
 
@@ -142,16 +187,16 @@ Required body sections, in this exact order:
 
 ```text
 # <id> — <short title>
-## Observation
+## Bottom line
 ## Inputs
 ## Derivation
-## Checks
-## Limitations
-## Links
+## Scope & limits
 ```
 
-Derived facts must not introduce new measurements. They can only use existing
-fact fields and must not cite raw data as their primary evidence.
+`Bottom line` follows the same `- Answer:` / `- Claim:` / `- Metric:` shape.
+`Inputs` is a table of the source facts and the fields used. `Derivation` shows
+the formula or method. Derived facts must not introduce new measurements; they
+use existing fact fields only and must not cite raw data as primary evidence.
 
 ## Machine checks
 
@@ -161,11 +206,13 @@ fact fields and must not cite raw data as their primary evidence.
 - IDs use the correct prefix;
 - required frontmatter fields exist;
 - body sections exist in the exact required order;
-- `Observation` repeats the canonical `claim` and contains a metric bullet;
-- `Observation` and `claim` do not contain obvious causal language;
-- `Limitations` is non-empty;
+- `Bottom line` echoes `tldr` (`- Answer:`) and `claim` (`- Claim:`) and
+  contains a `- Metric:` bullet;
+- `Bottom line` and `claim` do not contain obvious causal language;
+- `Scope & limits` is non-empty;
 - internal data paths and protocol paths exist;
 - internal protocol elements exist in the referenced protocol;
 - external source fields exist;
 - derived input facts exist;
-- markdown image paths and Evidence table paths exist.
+- markdown image paths resolve, and every repo-relative path cited in
+  `Key evidence` or `Lineage` exists on disk.

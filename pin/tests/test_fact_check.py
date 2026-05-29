@@ -66,26 +66,21 @@ def _write_internal_fact(tmp_path, claim=None, protocol_element="accuracy"):
         "  commit: abc1234\n"
         "---\n\n"
         "# if-001 - Accuracy\n\n"
-        "## Observation\n\n"
+        "## Bottom line\n\n"
+        "- Answer: Accuracy was 90%.\n"
         f"- Claim: {claim}\n"
-        "- Metric: accuracy = 90%.\n"
-        "- Scope: Tiny evaluation.\n\n"
-        "## Evidence\n\n"
-        "| Artifact | Path | Purpose |\n"
+        "- Metric: accuracy = 90%.\n\n"
+        "## Key evidence\n\n"
+        "| What it shows | Value | Source |\n"
         "|---|---|---|\n"
-        "| Result | `data/if-001/result.json` | Source metric |\n\n"
+        "| Recorded accuracy | 90% | `data/if-001/result.json` |\n\n"
+        "## Scope & limits\n\n"
+        "- This fact only covers the tiny evaluation.\n\n"
         "## Lineage\n\n"
-        "- Protocol: `protocol.md`\n"
-        "- Elements used: `accuracy`\n\n"
+        "- Protocol `protocol.md`, element `accuracy`.\n\n"
         "## Reproduction\n\n"
         "```bash\npython src/eval.py\n```\n\n"
-        "- Commit: abc1234\n\n"
-        "## Checks\n\n"
-        "- Result file recorded.\n\n"
-        "## Limitations\n\n"
-        "- This fact only covers the tiny evaluation.\n\n"
-        "## Links\n\n"
-        "- Related facts: none\n"
+        "- Commit abc1234. Verified: result file recorded.\n"
     )
 
 
@@ -116,7 +111,10 @@ def test_sections_must_be_in_order(tmp_path):
     _write_internal_fact(tmp_path)
     fact_path = tmp_path / "facts" / "internal" / "if-001-accuracy.md"
     text = fact_path.read_text()
-    text = text.replace("## Evidence", "## Checks", 1)
+    # Swap two sections so all are present but out of order.
+    text = text.replace("## Key evidence", "## __TMP__", 1)
+    text = text.replace("## Scope & limits", "## Key evidence", 1)
+    text = text.replace("## __TMP__", "## Scope & limits", 1)
     fact_path.write_text(text)
     report = factlib.validate_facts(str(tmp_path / "facts"), str(tmp_path))
     assert not report["ok"]

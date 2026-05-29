@@ -17,32 +17,28 @@ from pinlib import PinError, load_protocol
 
 VALID_FACT_TYPES = {"internal", "external", "derived"}
 TYPE_PREFIX = {"internal": "if-", "external": "ef-", "derived": "df-"}
+# Body sections are ordered for progressive disclosure: the conclusion first
+# (Bottom line), then the proof and its boundary (Key evidence, Scope & limits),
+# then the audit trail (Lineage, Reproduction). A reader can stop at any heading
+# once convinced. The frontmatter remains the machine source of truth.
 REQUIRED_SECTIONS = {
     "internal": [
-        "Observation",
-        "Evidence",
+        "Bottom line",
+        "Key evidence",
+        "Scope & limits",
         "Lineage",
         "Reproduction",
-        "Checks",
-        "Limitations",
-        "Links",
     ],
     "external": [
-        "Observation",
-        "Evidence",
-        "Source Quote",
-        "Lineage",
-        "Checks",
-        "Limitations",
-        "Links",
+        "Bottom line",
+        "Source quote",
+        "Scope & limits",
     ],
     "derived": [
-        "Observation",
+        "Bottom line",
         "Inputs",
         "Derivation",
-        "Checks",
-        "Limitations",
-        "Links",
+        "Scope & limits",
     ],
 }
 CAUSAL_RE = re.compile(
@@ -54,6 +50,10 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _H2_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
 _MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 _BACKTICK_RE = re.compile(r"`([^`]+)`")
+_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+# Sections whose backtick-quoted, repo-relative paths must resolve on disk.
+_PATH_CHECKED_SECTIONS = ("Key evidence", "Lineage")
+_PLACEHOLDER_CHARS = set("<>{}*…")
 
 
 @dataclass
@@ -187,10 +187,10 @@ def validate_fact(
                 problems.append(f"frontmatter metric missing '{key}'")
 
     problems.extend(_check_sections(fact))
-    problems.extend(_check_observation(fact))
-    problems.extend(_check_limitations(fact))
+    problems.extend(_check_bottom_line(fact))
+    problems.extend(_check_scope_limits(fact))
     problems.extend(_check_markdown_links(fact))
-    problems.extend(_check_evidence_paths(fact, research_root))
+    problems.extend(_check_path_references(fact, research_root))
 
     if fact_type == "internal":
         problems.extend(_check_internal(fact, research_root))
@@ -226,28 +226,33 @@ def _check_sections(fact: Fact) -> list[str]:
     return problems
 
 
-def _check_observation(fact: Fact) -> list[str]:
+def _check_bottom_line(fact: Fact) -> list[str]:
+    """The conclusion section. It must mirror the canonical frontmatter so the
+    human-facing summary can never silently drift from the machine record:
+    `- Answer:` echoes `tldr`, `- Claim:` echoes `claim`, plus the headline
+    metric. Causal language stays banned — facts record what was observed."""
     problems: list[str] = []
-    obs = fact.sections.get("Observation", "")
-    if "\n\n" in obs:
-        problems.append("Observation must be bullets, not paragraphs")
-    if fact.claim and f"- Claim: {fact.claim}" not in obs:
-        problems.append("Observation must repeat frontmatter claim as `- Claim: ...`")
+    bl = fact.sections.get("Bottom line", "")
+    tldr = str(fact.meta.get("tldr", "") or "")
+    if tldr and f"- Answer: {tldr}" not in bl:
+        problems.append("Bottom line must open with `- Answer: <tldr>` echoing frontmatter tldr")
+    if fact.claim and f"- Claim: {fact.claim}" not in bl:
+        problems.append("Bottom line must restate frontmatter claim as `- Claim: ...`")
     metric = fact.meta.get("metric") if isinstance(fact.meta.get("metric"), dict) else {}
     if metric:
         metric_text = f"- Metric: {metric.get('name')}"
-        if metric_text not in obs:
-            problems.append("Observation must include a `- Metric:` bullet")
-    if CAUSAL_RE.search(fact.claim) or CAUSAL_RE.search(obs):
-        problems.append("Observation/claim contains causal or explanatory language")
+        if metric_text not in bl:
+            problems.append("Bottom line must include a `- Metric:` bullet")
+    if CAUSAL_RE.search(fact.claim) or CAUSAL_RE.search(bl):
+        problems.append("Bottom line/claim contains causal or explanatory language")
     return problems
 
 
-def _check_limitations(fact: Fact) -> list[str]:
-    limitations = fact.sections.get("Limitations", "")
-    bullets = [ln for ln in limitations.splitlines() if ln.strip().startswith("- ")]
+def _check_scope_limits(fact: Fact) -> list[str]:
+    scope = fact.sections.get("Scope & limits", "")
+    bullets = [ln for ln in scope.splitlines() if ln.strip().startswith("- ")]
     if not bullets:
-        return ["Limitations must contain at least one bullet"]
+        return ["Scope & limits must contain at least one bullet"]
     return []
 
 
@@ -263,21 +268,27 @@ def _check_markdown_links(fact: Fact) -> list[str]:
     return problems
 
 
-def _check_evidence_paths(fact: Fact, research_root: str) -> list[str]:
+def _check_path_references(fact: Fact, research_root: str) -> list[str]:
+    """Every concrete repo path the proof cites must resolve on disk — that is
+    what makes the fact reproducible rather than merely plausible. We scan the
+    evidence and lineage sections (not whole-body, to avoid commands), skip
+    fenced code blocks, URLs, and placeholder tokens like `<out>/...`. A path is
+    a backtick token containing a `/`; bare values such as `629` are ignored."""
     problems: list[str] = []
-    evidence = fact.sections.get("Evidence", "")
-    for line in evidence.splitlines():
-        if not line.strip().startswith("|"):
-            continue
-        cols = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cols) < 2:
-            continue
-        for target in _BACKTICK_RE.findall(cols[1]):
-            if target in {"Path", "---"} or _is_url(target):
+    seen: set[str] = set()
+    for section in _PATH_CHECKED_SECTIONS:
+        text = _FENCE_RE.sub("", fact.sections.get(section, ""))
+        for token in _BACKTICK_RE.findall(text):
+            target = token.strip()
+            if "/" not in target or _is_url(target):
                 continue
-            full = _resolve_research_path(target, research_root)
-            if not os.path.exists(full):
-                problems.append(f"Evidence path does not exist: {target}")
+            if any(ch in target for ch in _PLACEHOLDER_CHARS):
+                continue
+            if target in seen:
+                continue
+            seen.add(target)
+            if not os.path.exists(_resolve_research_path(target, research_root)):
+                problems.append(f"path referenced in {section} does not exist: {target}")
     return problems
 
 
