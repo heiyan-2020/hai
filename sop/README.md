@@ -4,4 +4,4 @@ SOP collects standard operating procedure skills for repeatable engineering work
 
 ## Skills
 
-- `submit-mr`: create a GitLab merge request from the current branch using `glab`.
+- `submit-mr`: create a merge request (GitLab) or pull request (GitHub) from the current branch, auto-detecting the forge from the `origin` remote and driving `glab` or `gh` accordingly.
