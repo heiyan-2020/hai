@@ -79,9 +79,14 @@ then audit trail:
 ```
 
 - **Bottom line** — bullets only. Open with `- Answer: <tldr>` (verbatim copy of
-  frontmatter `tldr`), then `- Claim: <claim>`, then `- Metric: <name> = ...`. A
-  leading bold verdict (`**Proven for the checked runs.**`) helps the reader
-  confirm at a glance. No paths here.
+  frontmatter `tldr`), then `- Claim: <claim>`, then a `- Metric:` bullet. That
+  bullet must carry the machine slug (`- Metric: <metric.name> = ...` — the fact
+  check cross-references it), but pair the slug with its plain meaning in the same
+  breath: `- Metric: original_spec_gpu1_over_gpu1_synth_mean = 0.9989 (GPU1 kernels
+  ÷ a GPU1-only baseline) — no real slowdown`. The slug lives here and nowhere
+  else; everywhere else in the body, use the plain words. A leading bold verdict
+  (`**Proven for the checked runs.**`) helps the reader confirm at a glance. No
+  paths here.
 - **Key evidence** — the proof, as a small table that *compares* the measured
   value to the expected one so the match is visible, not asserted. Show only the
   few rows that carry the claim; the full file list is already in frontmatter
@@ -89,44 +94,133 @@ then audit trail:
 - **Scope & limits** — at least one bullet naming what this does *not* prove
   (this is where caveats from the claim go).
 - **Lineage** — trace protocol element → measured field → data file in prose, so
-  a reader sees how a number became a claim.
-- **Reproduction** — the exact command in a code block, then commit / hardware /
-  a short `Verified:` note of the checks that passed.
+  a reader sees how a number became a claim. This is the static map of where each
+  number lives; the runnable version is Reproduction.
+- **Reproduction** — two stages, because "reproduce" means two things at two very
+  different costs:
+  - **Recompute the number — cheap, runs now.** A command that reads the raw files
+    under `data/<fact-id>/` and *recomputes* the headline metric from them: reads
+    the rows, does the arithmetic, prints the number. It must recompute, not
+    reprint — a script that loads `summary.json` and echoes a stored field proves
+    nothing, since that field is the very thing in question. Recomputing from the
+    inputs is what shows the number is real. This is the `repro.command`.
+  - **Regenerate the raw data — expensive, points elsewhere.** One line naming the
+    protocol that declares how each raw artifact was produced (`see <protocol-path>,
+    artifacts <names>`). The protocol already carries the exact `run` command and
+    source file per artifact, so don't copy them here. If the raw data came from a
+    long sweep or specific hardware, say so in a few words, so the reader knows the
+    recompute is cheap but the regeneration is not.
+  - Close with commit / hardware / a short `Verified:` note of the checks that
+    passed — and have that note confirm the recompute matched the stored value.
+
+### Write so someone who wasn't there can follow it
+
+The worst readability failure is invisible to the author. A fact is written by the
+person who just did the run, in the names that run invented — `synthetic
+reference`, `spec run`, `joined decode rows`, a script's variable names. To that
+author every term is obvious. To the reader — a teammate who wasn't there, or you
+in a month with the context gone — they are opaque, and the fact fails at its one
+job: handing the conclusion to someone who lacks your context.
+
+So write for a competent colleague who did **not** do this run and has not read
+your code. Two habits carry most of it:
+
+- **Ground every coined term the first time it appears, in one clause.** Not "the
+  original GPU1 spec rows are divided by an interpolated GPU1 synthetic reference"
+  — but "we divided GPU1's measured kernel times by a *GPU1-only baseline* (the
+  same kernels re-run on GPU1 alone)." If a term can't be pinned down in a clause,
+  it's too deep for the body — leave it to the protocol or the data files.
+- **In prose, say what a number means, not its slug.** A bare `...synth_mean =
+  0.9989` makes the reader reverse-engineer the point. The slug belongs only in the
+  `- Metric:` bullet, paired with its meaning; in prose, state the point: "0.999× —
+  GPU1 is on the money against its own baseline."
+
+The test, before you stop: could a colleague who wasn't on this run read only
+**Bottom line** and **Key evidence** and correctly say what you concluded and why?
+If a sentence leans on something that lives only in your head or your code,
+rewrite it.
 
 ### Worked example (the shape to imitate)
 
-```markdown
+The GPU-clock fact, written the right way: every coined term grounded on first use,
+the metric in plain words, and Reproduction splitting the cheap recompute from the
+expensive regeneration.
+
+````markdown
 ## Bottom line
 
 - **Proven for the checked runs.**
-- Answer: Decode, extend, and mixed marker injection all wrote the markers into exactly the reserved KV slots. This proves laydown + slot mapping, not KV-vector readback.
-- Claim: Each of decode, extend, and mixed marker injection wrote its marker tokens into the slots reserved by the req_to_token map.
-- Metric: marker_slot_validator_pass_rate = 1.0 (3/3 modes).
+- Answer: GPU1's kernels only *looked* ~5% slower than GPU4 — GPU1 was clocked lower (1830 vs 1980 MHz). Against a GPU1-only baseline GPU1 is on the money, so there is no real GPU1 regression.
+- Claim: In the checked runs GPU1's SM clock held 1830 MHz and GPU4's held 1980 MHz.
+- Metric: original_spec_gpu1_over_gpu1_synth_mean = 0.9989 (GPU1's measured kernels ÷ a GPU1-only baseline, mean over 1950 decode rows) — no slowdown once the clock is held fixed.
 
 ## Key evidence
 
-The proof is a slot match — the slot the model wrote into equals the slot the map reserved.
+The question is whether GPU1 is slow *on its own terms* or only *next to GPU4*. So
+we re-ran the same kernels on GPU1 alone and on GPU4 alone — the GPU1-only and
+GPU4-only baselines — and divided the original GPU1 measurements by each.
 
-| Mode   | Marker tokens       | Slot written | Slot reserved | Match |
-|--------|---------------------|--------------|---------------|:-----:|
-| Decode | `[154842, 154843]`  | 629 (last)   | [628, 629]    | ✅    |
-| Extend | `[154842, 154843]`  | [628, 629]   | [628, 629]    | ✅    |
-| Mixed  | `[154842, 154843]`  | [628, 629]   | [628, 629]    | ✅    |
+| GPU1 measured ÷    | Asks                   | Rows | Mean ratio  |
+|--------------------|------------------------|-----:|------------:|
+| GPU1-only baseline | slow on its own terms? | 1950 | 0.999 → no  |
+| GPU4-only baseline | slow next to GPU4?     | 1950 | 1.051 → yes |
 
-Record of all three: `data/if-009-glm-fork-marker-slot-lineage/summary.json`.
+The clock log explains the gap — GPU1 simply ran slower:
+
+| Run                              | GPU1 clock | GPU4 clock | GPU4/GPU1 speed |
+|----------------------------------|-----------:|-----------:|----------------:|
+| GLM FlashMLA kernels             |   1830 MHz |   1980 MHz |           1.05× |
+| BF16 matmul stress (independent) |   1830 MHz |   1980 MHz |           1.09× |
+
+Full record: `data/if-010-gpu-clock-calibration/summary.json`.
 
 ## Scope & limits
 
-- Covers the sid8 / GPU7 slot-proof runs only.
-- Proves token laydown + request→slot mapping; does **not** read back KV vectors from GPU memory.
-- All runs used `generator.max_steps=1` — lineage checks, not end-to-end success.
+- Covers the GPU1/GPU4 GLM FlashMLA cells, the original GPU1 decode rows, and the matmul stress run — nothing older.
+- Shows the apparent GPU1 slowdown vanishes against a same-GPU baseline; does **not** establish *why* GPU1 clocked down (`nvidia-smi` showed no power cap or thermal throttle in the checked run).
+- Does not retroactively fix every past multi-GPU number — it flags which cross-GPU comparisons need a clock correction.
+
+## Lineage
+
+Protocol `channels/main/gpu-clock-protocol.md`, element `gpu_clock_calibration`. The
+headline ratio is each original GPU1 decode row's `kernel_total_ms` divided by the
+GPU1-only baseline's `kernel_total_ms` at the same point, averaged over the 1950
+rows — stored row-by-row in `data/if-010-gpu-clock-calibration/rootcause_ratios.csv`,
+summarized in `data/if-010-gpu-clock-calibration/summary.json`.
+
+## Reproduction
+
+**Recompute the headline ratio from the stored rows** — cheap, runs now:
+
+```bash
+.venv-sglang/bin/python - <<'PY'
+import csv, statistics
+from pathlib import Path
+rows = list(csv.DictReader(
+    Path(".claude-research/data/if-010-gpu-clock-calibration/rootcause_ratios.csv").open()))
+ratios = [float(r["gpu1_measured_ms"]) / float(r["gpu1_baseline_ms"]) for r in rows]
+print(f"{len(ratios)} rows, mean = {statistics.fmean(ratios):.4f}")  # -> 1950 rows, mean = 0.9989
+PY
 ```
 
-Contrast with the old shape, which led with a 60-word run-on `claim`, repeated it
-verbatim under `Observation`, then dumped raw fields (`batch_out_cache_loc=629`)
-as undifferentiated bullets and re-listed the same paths under Evidence, Lineage,
-and Links. The reader could not find the conclusion or the one number that
-mattered. The redesign surfaces both immediately.
+This reads the per-row times and recomputes the 0.999 mean; it does not read a
+stored mean back out.
+
+**Regenerate the raw data** — expensive (six runs on H20 GPUs 1 and 4, ~1 h): see
+`channels/main/gpu-clock-protocol.md`, artifacts `spec_e2e`, `gpu1_synth`,
+`gpu4_synth`, `matmul_stress` — each carries its exact `run` command and source.
+
+- Commit `96bfedb` · NVIDIA H20 GPUs 1 and 4 · `.venv-sglang` Python.
+- Verified: `rootcause_ratios.csv` and `summary.json` present; the recomputed mean (0.9989) matches the stored `summary.json` field; `gpu_clock_calibration` declared in the protocol.
+````
+
+Contrast with the version this replaces, whose Lineage read "the original GPU1 spec
+joined decode rows are divided by an interpolated GPU1 synthetic reference and by an
+interpolated GPU4 synthetic reference," quoted the metric as the bare slug
+`original_spec_gpu1_over_gpu1_synth_mean = 0.9989`, and whose Reproduction merely
+`print`ed fields back out of `summary.json`. Every noun assumed you had done the
+run, the number was never put in plain words, and nothing was actually recomputed —
+the three failures this shape fixes.
 
 ## External fact body
 
