@@ -34,6 +34,15 @@ Three disciplines run through every phase:
 The rule under all three: **close every silent channel.** You either follow a
 declared path or you STOP and escalate to the human. There is no third option.
 
+And one rule about *how* you talk to the human, threaded through every phase:
+**write for someone who has not read this code.** Every plan, escalation, and
+report is read by a person deciding whether to trust your work — not by you, who
+just spent an hour in the source. The instant you drop a function name, a file
+path, a pipeline stage, or a term you coined this session without saying in plain
+words what it is, the human stops being able to follow — and a human who can't
+follow can't confirm, which defeats the gates this workflow is built on. Ground
+every such term the first time it appears, in one clause.
+
 Resolve paths: pins.yaml is at the project root or `.claude-research/pins.yaml`.
 Plugin scripts are under `<PLUGIN_ROOT>/scripts/`, where `<PLUGIN_ROOT>` is
 the root of this installed plugin. In Claude Code, `${CLAUDE_PLUGIN_ROOT}` may
@@ -54,8 +63,21 @@ data-producing work.
 This phase produces a short written plan and **stops for human confirmation**.
 Do not implement anything before the human confirms.
 
-**2a. Understand the task.** State, in two or three sentences, what you are
-about to do.
+The plan *is* the gate. The human reads it to decide whether your understanding
+is right, so it has to be readable by them — not a dump of your internal
+reasoning. Before writing each part below, picture a sharp colleague who has not
+opened this codebase: say the idea and the stakes in plain words first, then
+introduce specifics, grounding every code symbol or coined term as you go. And
+wherever a part asks the human to *choose* — which protocol, how to resolve a
+conflict, what to measure — state each option as what it means and what it trades
+off, never as a bare symbol they would have to read the source to decode.
+
+**2a. Understand the task.** In two or three plain sentences, say what you are
+about to do and why it answers the human's question — no internal symbol before
+you have put the idea in words a non-reader of the code would follow. (Good: "Run
+the same bug-finder on the same code several times; if it is reliable it should
+reach the same verdict each time, so how often it contradicts itself is a floor
+on its error rate — no answer key needed.")
 
 **2b. Protocol declaration.** List every data artifact the task will produce.
 For each, name the protocol that governs it. If a suitable protocol exists,
@@ -87,7 +109,22 @@ prevent.
 what new design decisions this task is likely to introduce and may be worth
 pinning later. This is not a formal proposal; it just sets direction.
 
-Present 2a–2e together and wait for the human to confirm.
+The difference this readability rule makes, on an actual choice this workflow
+once put to a human:
+
+- **Unreadable:** "measure variance at the reasoner-verdict layer
+  (`_check_post_implies_spec`, pre-probe) or the confirmed-bug layer
+  (`bug_validation/summary.json`, post-probe)."
+- **Readable:** "Measure which judgment — the model's *first* call on each
+  function (from the spec alone, before it runs any test) or its *final* call
+  (after it runs tests to confirm)? The first is where vague specs bite hardest;
+  the second is steadier because the tests catch mistakes. I suggest both, with
+  the first as the headline."
+
+Same decision; only the second is one a human can actually answer.
+
+Present 2a–2e together, end with any open decisions as plain questions, and wait
+for the human to confirm.
 
 ## Phase 3 — Implement
 
