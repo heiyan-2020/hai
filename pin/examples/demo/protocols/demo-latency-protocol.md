@@ -10,12 +10,20 @@ parameters:
     purpose: "directory for the per-run and summary yaml files"
     required: false
     default: "data"
+  - name: "--figure-out"
+    purpose: "if set, also render the latency-breakdown figure to this path"
+    required: false
+    default: ""
 fixed:
   - "the measured kernels (a fixed prefill pass and decode loop in src/runner.py)"
 artifacts:
   - path: "data/summary.yaml"
     contains: "mean prefill_ms, decode_ms, and the derived overhead_ms"
     git_tracked: true
+  - path: "data/latency_breakdown.png"
+    contains: "the latency-breakdown figure rendered from summary.yaml"
+    git_tracked: true
+    lineage_protocol: "demo-latency-figure-protocol.md"
 side_effects:
   - path: "data/run.yaml"
     git_tracked: true

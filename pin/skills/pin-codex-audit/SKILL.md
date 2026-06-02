@@ -39,7 +39,8 @@ You need these paths. Locate them; do not read their contents into the prompt.
   (they land only at grounding). Write them to a temp file, e.g.
   `.claude-research/channels/<channel>/proposed-pins.yaml`, so Codex can read
   them.
-- **Protocol(s)** — each `*-protocol.md` for the task.
+- **Protocol(s)** — each `*-protocol.md` for the task, plus every child
+  protocol a `lineage_protocol` delegates to.
 - **Fact(s)** — each new or changed markdown fact under
   `.claude-research/facts/{internal,external,derived}/`.
 
@@ -76,7 +77,8 @@ reasoning effort `medium`):
 > audit passed but you find its claim no longer holds, say so — that is the
 > highest-severity finding, the tripwire let a real silent rollback through.
 >
-> Q3 FALSE LINEAGE — For each element in `<protocol path(s)>`, read its code
+> Q3 FALSE LINEAGE — For each element in `<protocol path(s)>` — following every
+> `lineage_protocol` into the child protocol it delegates to — read its code
 > `snippet` and the surrounding code in its `file`. Does the `nature` tag tell
 > the truth about what the code actually does? Also confirm the snippet still
 > appears in the file — a stale snippet means the lineage has drifted.

@@ -19,6 +19,8 @@ def main(argv=None) -> None:
                     help="how many measured runs to average")
     ap.add_argument("--out-dir", default="data",
                     help="directory for the per-run and summary yaml files")
+    ap.add_argument("--figure-out", default="",
+                    help="if set, also render the latency-breakdown figure here")
     args = ap.parse_args(argv)
 
     run_paths = []
@@ -26,7 +28,16 @@ def main(argv=None) -> None:
         path = os.path.join(args.out_dir, f"run_{i}.yaml")
         runner.run(path)
         run_paths.append(path)
-    summarize.summarize(run_paths, os.path.join(args.out_dir, "summary.yaml"))
+    summary_path = os.path.join(args.out_dir, "summary.yaml")
+    summarize.summarize(run_paths, summary_path)
+
+    # The figure is one of this run's artifacts. It is drawn by its own one
+    # script (plot.py), so its data lineage lives in its own protocol — this
+    # protocol delegates to it rather than re-explaining the image here.
+    if args.figure_out:
+        import plot
+
+        plot.render(summary_path, args.figure_out)
 
 
 if __name__ == "__main__":

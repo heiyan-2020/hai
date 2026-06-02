@@ -80,10 +80,12 @@ the same bug-finder on the same code several times; if it is reliable it should
 reach the same verdict each time, so how often it contradicts itself is a floor
 on its error rate — no answer key needed.")
 
-**2b. Protocol declaration.** List every data artifact the task will produce.
-For each, name the protocol that governs it. If a suitable protocol exists,
-restate its key bindings (entry point, output path, validation) so the human
-can confirm it applies. If no protocol exists, **STOP** — do not free-style
+**2b. Protocol declaration.** List every data artifact the task will produce —
+as the tree it is, so a rich node (a figure, a sub-pipeline output) shows which
+child protocol its lineage is delegated to. For each, name the protocol that
+governs it. If a suitable protocol exists, restate its key bindings (entry
+point, output path, validation) so the human can confirm it applies. If no
+protocol exists, **STOP** — do not free-style
 data production. Propose either (a) splitting off an infra/protocol task to
 derive one from the existing infrastructure, or (b) explicitly borrowing the
 closest protocol, which the human must acknowledge. When the plan requires
@@ -153,12 +155,14 @@ them into `pins.yaml` yet — they are committed only after Phase 7.
 
 Run `pin_audit.py <pins.yaml>` (existing pins must still pass — this catches a
 silent regression you introduced), `protocol_check.py` on each task protocol
-(every element's code snippet must still appear in its file, every element must
-have a nature tag), and `fact_check.py .claude-research/facts` if the project
-has facts or this task created one. Also check artifact accounting: the set of
-new git-tracked files must
-equal the union of declared `artifacts` and `git_tracked` side effects — a
-file that is present but undeclared, or declared but absent, **blocks**.
+(it recurses, so every delegated child protocol is checked too: each element's
+code snippet must still appear in its file, every element must have a nature
+tag), and `fact_check.py .claude-research/facts` if the project has facts or
+this task created one. Also check artifact accounting across the delegation
+tree: the set of new git-tracked files must equal the union of declared
+`artifacts` (the task protocol's and every child protocol's) and `git_tracked`
+side effects — a file that is present but undeclared, or declared but absent,
+**blocks**.
 
 ## Phase 6 — Adversarial audit
 

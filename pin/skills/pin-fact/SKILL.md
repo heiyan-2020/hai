@@ -60,9 +60,11 @@ creating or modifying a fact.
 4. Fill the required body sections in the exact order for the type.
 5. For internal facts, copy supporting artifacts under
    `.claude-research/data/<fact-id>/` before referencing them.
-6. For internal facts, reference the governing protocol and its element names,
-   and record the run instance the protocol can't carry — the `args` passed to
-   its script, the `commit`, and the `branch`. Do not create a citeable internal
+6. For internal facts, reference the governing protocol and its element names —
+   if the cited artifact is a delegated one (e.g. a figure), that is the
+   artifact's own child protocol, not just the top experiment protocol — and
+   record the run instance the protocol can't carry: the `args` passed to its
+   script, the `commit`, and the `branch`. Do not create a citeable internal
    fact whose data lineage is undeclared.
 7. Run `fact_check.py` and fix every structural or reference problem.
 
