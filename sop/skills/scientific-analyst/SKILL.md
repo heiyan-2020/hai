@@ -1,119 +1,106 @@
 ---
 name: scientific-analyst
-description: "Analyze surprising, inconsistent, or unexplained empirical phenomena with scientific discipline. Use when the user observes results that do not match expectations, asks why measurements differ, asks for root-cause analysis of experimental data, benchmarks, logs, metrics, or model behavior, or needs an explanation that must avoid speculation. Requires falsifiable claims, explicit evidence status, experiment designs, and clear criteria for accepting or rejecting each hypothesis."
+description: "Analyze surprising, inconsistent, or unexplained empirical phenomena without speculation. Use when the user asks why an observation happened, why results differ from expectations, what caused a metric/log/experiment/model behavior, or how to investigate an anomaly. Produce explanations that are falsifiable, evidence-grounded, logically complete, non-redundant, and written in plain language."
 ---
 
 # Scientific Analyst
 
-## Overview
+## Core Standard
 
-Use this skill to explain unexpected observations without inventing causes. Treat every explanation as a hypothesis with observable predictions, not as a conclusion unless the available evidence already tests and supports it.
+Explain surprising observations without making things up. Every causal claim must be one of:
 
-The core standard: every nontrivial claim must be either directly evidenced, explicitly marked as untested, or converted into an experiment that could falsify it.
+- supported by evidence already available,
+- explicitly marked as unproven, or
+- tied to a concrete test that could prove it wrong.
 
-## Operating Rules
+The final answer must sound like a careful human explaining their reasoning, not like a template, checklist, lab notebook, or pile of plausible causes.
 
-- Do not answer "why" with plausible mechanisms alone.
-- Do not stack multiple untested causes into a confident narrative.
-- Do not use words like "reasonable", "likely", "probably", or "usually" unless backed by evidence in the current artifact or by a proposed test.
-- Separate observation, inference, hypothesis, and conclusion.
-- Prefer one discriminating experiment over many broad diagnostics.
-- When data is insufficient, say exactly what cannot be concluded.
-- Preserve uncertainty, but make it operational: state what measurement would reduce it.
+## Rules
+
+- Say the main answer plainly before details, unless the evidence is too weak to answer.
+- Use ordinary language. Define any technical term, derived metric, abbreviation, or transformed number before using it to support a claim.
+- Do not hide reasoning inside labels like `residual`, `alignment`, `bucket`, `normalized`, `matched`, or `adjusted`. Explain what was done and why it matters.
+- Do not list possible explanations unless each one has a distinct prediction or test.
+- Do not say a cause is likely just because it sounds plausible.
+- Do not over-report analysis. Include only evidence that changes the answer, rules something out, or motivates the next experiment.
+- Do not skip steps between data and conclusion. For every important number, explain what it was computed from, what it shows, and what it does not show.
+- When the evidence is insufficient, say what cannot be concluded and what measurement would decide it.
 
 ## Workflow
 
-### 1. State the Phenomenon
+### 1. Clarify the Phenomenon
 
-Restate the anomaly as a measurable contrast:
+State the observation in a way the user can check:
 
-- What was expected?
-- What was observed?
-- How large is the effect?
-- How consistent is it across runs, slices, seeds, machines, or conditions?
-- What exact quantities are being compared?
+- what was expected,
+- what was observed,
+- how large the gap or anomaly is,
+- where it appears and where it does not,
+- what data or command output supports that statement.
 
-If the question compares two measurements, first check whether they measure the same object. List mismatches in workload, inputs, aggregation, instrumentation, warmup, filtering, units, and time windows.
+If any of these are unknown, say so before explaining causes.
 
-### 2. Build an Evidence Table
+### 2. Separate Facts From Interpretation
 
-For each relevant fact, record:
+Keep a private distinction while reasoning:
 
-- `Observed`: directly present in logs, code, data, command output, or user-provided numbers.
-- `Derived`: computed from observed data; include the formula or code path.
-- `Assumed`: not verified yet; state why it matters.
-- `Unknown`: required for a conclusion but currently missing.
+- Observation: directly present in data, logs, code, or user-provided facts.
+- Calculation: derived from observations; keep the formula or operation available.
+- Inference: a conclusion drawn from observations or calculations.
+- Hypothesis: a possible cause that still needs a test.
 
-Never promote an `Assumed` or `Unknown` item into an explanation.
+In the final answer, do not necessarily print this as a table. Use it to avoid mixing evidence with speculation.
 
-### 3. Generate Falsifiable Hypotheses
+### 3. Build Explanations That Can Fail
 
-For each hypothesis, provide:
+For each causal explanation worth mentioning, know:
 
-- Mechanism: the proposed causal path.
-- Prediction: what should be true if the mechanism is real.
-- Counter-prediction: what observation would make the hypothesis unlikely.
-- Minimal test: the smallest command, slice, perturbation, or controlled experiment that distinguishes it.
-- Acceptance criterion: a concrete threshold or qualitative pass/fail condition.
+- what it predicts should be true,
+- what observation would make it wrong,
+- what minimal experiment would distinguish it from other explanations.
 
-Good hypotheses expose risk. If no available test can distinguish two explanations, merge them into a single unresolved class instead of pretending to know which one is true.
+If two explanations make the same prediction on the current data, say the current data cannot distinguish them.
 
-### 4. Run or Propose Experiments
+### 4. Write Like a Person
 
-When local data or code is available, inspect it and run focused analyses before explaining. Use existing project tools and preserve reproducibility by reporting commands, filters, sample sizes, and paths.
-
-Design experiments that isolate one factor at a time when feasible:
-
-- Alignment tests: compare only rows with matching input conditions.
-- Ablations: remove or freeze one component of the suspected mechanism.
-- Stratification: split by the variable that should mediate the effect.
-- Negative controls: choose cases where the mechanism predicts no effect.
-- Perturbations: intentionally vary the suspected cause and check monotonic response.
-- Reproducibility checks: repeat enough times to estimate variance or confidence.
-
-### 5. Answer With Evidence Grades
-
-Use this structure:
+Use this default shape, but adapt it naturally:
 
 ```text
-Observation:
-<measured phenomenon, effect size, scope>
+Short answer:
+<plain-language answer to the user's question>
 
-What we can conclude:
-<claims directly supported by evidence>
+Reasoning:
+<a few connected steps from observation to conclusion; define computed quantities before using them>
 
-Hypotheses:
-1. <hypothesis>
-   Evidence: <observed/derived facts>
-   Prediction: <testable prediction>
-   Falsifier: <what would refute it>
-   Test: <specific experiment or command>
-   Status: supported | weakened | unresolved | untested
+What this rules out:
+<claims the evidence makes unlikely, if any>
 
-What we cannot conclude:
-<claims that would be speculation>
+What is still open:
+<important uncertainty, not every possible caveat>
 
-Next experiment:
-<single highest-information test and why>
+Next test:
+<one concrete experiment or measurement, including what result would support or refute the explanation>
 ```
 
-If the user wants a short answer, still include at least the falsifier or next experiment for each causal claim.
+Do not use section headers if a few paragraphs would be clearer. Do not force every answer into this exact form.
 
-## Anti-Patterns
+## Bad Patterns
 
-Reject explanations that have these shapes:
+Avoid these:
 
-- "This is probably due to X, Y, and Z" without showing which observation distinguishes X from Y or Z.
-- "The difference is reasonable" without defining a model or threshold that predicts the size of the difference.
-- "It may be because the real workload is messier" without naming the measurable variable and showing it correlates with the effect.
-- "The trend is consistent, so the explanation is fine" when the proposed cause was not isolated.
-- "This metric excludes CPU time, but GPU kernels can still differ" without proving the compared kernel sets, shapes, or inputs differ.
+- A long list of plausible causes with no test that separates them.
+- A dense dump of statistics without a story connecting them.
+- A terse answer that uses analysis-script vocabulary the user has not been taught.
+- A confident explanation whose key evidence is actually missing.
+- A verbose audit trail that is technically correct but unreadable.
+- A conclusion that says "reasonable", "consistent with", or "expected" without saying what would have made it unreasonable, inconsistent, or unexpected.
 
-## Example Standard
+## Good Answer Checklist
 
-For a question like "kernel_total_ms only counts kernel time, so why is e2e consistently above the microbenchmark?", do not give a causal list first. Instead:
+Before answering, check:
 
-1. Verify whether e2e and microbenchmark rows match on batch size, context length, kernel set, sequence distribution, warmup, and aggregation.
-2. Quantify the residual after exact matching, not nearest-bucket matching.
-3. Test candidate mechanisms independently, such as longer actual sequence lengths, ragged batches, different kernel mixes, or cache/page state.
-4. State which mechanisms are supported, which are only plausible, and what experiment would falsify each.
+- Would a smart user understand every term without reading the analysis script?
+- Does each paragraph advance the explanation?
+- Are unsupported claims clearly marked as unproven?
+- Is there a concrete next test with an expected discriminating outcome?
+- Did you remove details that are true but irrelevant to the user's question?
