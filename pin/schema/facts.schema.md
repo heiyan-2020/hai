@@ -86,10 +86,20 @@ are tempted to add "while", "although", or a trailing qualifier, that qualifier
 is scope — put it in `Scope & limits`, not the claim. `tldr` is the plain-English
 answer to `question`, plus the single caveat a reader most needs.
 
+The `metric` is the single quantity that tests the claim. Choose the one that
+most directly answers the question — not a best-case slice or a heavily-qualified
+minimum — compute cross-run comparisons over a comparable set, state whether a
+speed metric requires the result to be correct, and carry only the precision the
+measurement supports. `pin-fact` covers how to state it honestly; the Codex audit
+(Phase 6) is what catches a metric chosen to flatter.
+
 ## Internal fact
 
-Internal facts must additionally carry local evidence, protocol lineage, and
-reproduction fields:
+An internal fact is **one run of its protocol**. The protocol fixes the
+experiment — the single script and its parameter interface; the fact pins the
+instance the protocol cannot carry: the exact argument values, and the `commit`
+and `branch` the run was at. So internal facts add local evidence, protocol
+lineage, and the run's reproduction fields:
 
 ```yaml
 data:
@@ -105,13 +115,20 @@ protocol:
     - accuracy
     - sample_count
 
-repro:
-  command: "uv run python -m run.eval --config configs/a.yaml"
-  commit: "abc1234"
+repro:                              # this fact = one run of the protocol above
+  command: "python scripts/run_eval.py --dataset bfcl --gpu 3"  # protocol's script + this run's args
+  args: "--dataset bfcl --gpu 3"    # the argument values that identify this run
+  commit: "abc1234"                 # per-run state the protocol can't fix
+  branch: "exp/streaming-spec"
   hardware: "8x H20 96GB"
   software:
     python: "3.12"
 ```
+
+`repro.command` invokes the protocol's one script with this run's arguments —
+that script is the only entry point, so the command is not free-form. `commit`
+and `branch` record the code state, because the same protocol at a different
+commit is a different result.
 
 Required body sections, in this exact order:
 
@@ -136,8 +153,11 @@ Required body sections, in this exact order:
   *not* establish.
 - `Lineage` traces protocol element → measured field → data file in prose, so a
   reader can follow how a number became a claim.
-- `Reproduction` carries the exact command, commit, hardware, and a short
-  "Verified:" note recording the checks that were run.
+- `Reproduction` has two stages: *regenerate* the data by running the
+  protocol's script (`repro.command`) at the recorded `commit`/`branch`, and
+  *recompute* the headline number from the stored output (rebuilding it from the
+  raw rows, not reprinting a stored field). It closes with commit, hardware, and
+  a short "Verified:" note recording the checks that were run.
 
 Every repo-relative path cited in backticks under `Key evidence` or `Lineage`
 must exist on disk.
@@ -212,6 +232,7 @@ use existing fact fields only and must not cite raw data as primary evidence.
 - `Scope & limits` is non-empty;
 - internal data paths and protocol paths exist;
 - internal protocol elements exist in the referenced protocol;
+- internal facts carry `repro.command`, `repro.commit`, and `repro.branch`;
 - external source fields exist;
 - derived input facts exist;
 - markdown image paths resolve, and every repo-relative path cited in

@@ -1,12 +1,20 @@
 ---
 task: demo-latency-baseline
+script: "src/run_demo.py"
+parameters:
+  - name: "--n-runs"
+    purpose: "how many measured runs to average"
+    required: false
+    default: 5
+  - name: "--out-dir"
+    purpose: "directory for the per-run and summary yaml files"
+    required: false
+    default: "data"
+fixed:
+  - "the measured kernels (a fixed prefill pass and decode loop in src/runner.py)"
 artifacts:
   - path: "data/summary.yaml"
-    run: "python src/summarize.py data/run.yaml data/summary.yaml"
-    source: "src/summarize.py"
-    validate:
-      - "test -f data/summary.yaml"
-    provenance_fields: [produced_by]
+    contains: "mean prefill_ms, decode_ms, and the derived overhead_ms"
     git_tracked: true
 side_effects:
   - path: "data/run.yaml"

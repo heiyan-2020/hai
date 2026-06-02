@@ -78,6 +78,16 @@ different. A second high-severity finding is **overclaiming**: a fact explains
 why something happened, generalizes beyond its scope, or presents a source's
 reported result as independently verified.
 
+A third is **a metric chosen to flatter rather than to test the claim**. Watch
+for three shapes: a headline that is a best-case slice or a heavily-qualified
+`min`/`max` (`min_checked_common_completed_speedup`) while a more natural
+recomputation is worse; a cross-run comparison taken over non-comparable sets
+(run A's cases vs run B's) when the matched subset tells a different story; and a
+speed/latency metric that counts completed-but-not-correct cases, so a fast wrong
+answer inflates it. Recompute the headline the most natural way — same cases,
+correctness required where relevant — and if your number disagrees with the
+fact's, say so.
+
 ## How to answer
 
 Be concrete and terse. Cite `file:line` for every finding. If a question has no

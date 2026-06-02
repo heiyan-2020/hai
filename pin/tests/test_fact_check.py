@@ -64,6 +64,7 @@ def _write_internal_fact(tmp_path, claim=None, protocol_element="accuracy"):
         "repro:\n"
         "  command: python src/eval.py\n"
         "  commit: abc1234\n"
+        "  branch: main\n"
         "---\n\n"
         "# if-001 - Accuracy\n\n"
         "## Bottom line\n\n"
@@ -105,6 +106,16 @@ def test_internal_fact_rejects_missing_protocol_element(tmp_path):
     report = factlib.validate_facts(str(tmp_path / "facts"), str(tmp_path))
     assert not report["ok"]
     assert any("protocol element" in problem for problem in report["problems"])
+
+
+def test_internal_fact_rejects_missing_branch(tmp_path):
+    _write_internal_fact(tmp_path)
+    fact_path = tmp_path / "facts" / "internal" / "if-001-accuracy.md"
+    text = fact_path.read_text().replace("  branch: main\n", "")
+    fact_path.write_text(text)
+    report = factlib.validate_facts(str(tmp_path / "facts"), str(tmp_path))
+    assert not report["ok"]
+    assert any("repro.branch" in problem for problem in report["problems"])
 
 
 def test_sections_must_be_in_order(tmp_path):

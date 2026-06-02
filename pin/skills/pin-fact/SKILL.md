@@ -60,8 +60,10 @@ creating or modifying a fact.
 4. Fill the required body sections in the exact order for the type.
 5. For internal facts, copy supporting artifacts under
    `.claude-research/data/<fact-id>/` before referencing them.
-6. For internal facts, reference a protocol and element names. Do not create a
-   citeable internal fact whose data lineage is undeclared.
+6. For internal facts, reference the governing protocol and its element names,
+   and record the run instance the protocol can't carry — the `args` passed to
+   its script, the `commit`, and the `branch`. Do not create a citeable internal
+   fact whose data lineage is undeclared.
 7. Run `fact_check.py` and fix every structural or reference problem.
 
 ## Internal fact body
@@ -102,16 +104,53 @@ then audit trail:
     under `data/<fact-id>/` and *recomputes* the headline metric from them: reads
     the rows, does the arithmetic, prints the number. It must recompute, not
     reprint — a script that loads `summary.json` and echoes a stored field proves
-    nothing, since that field is the very thing in question. Recomputing from the
-    inputs is what shows the number is real. This is the `repro.command`.
-  - **Regenerate the raw data — expensive, points elsewhere.** One line naming the
-    protocol that declares how each raw artifact was produced (`see <protocol-path>,
-    artifacts <names>`). The protocol already carries the exact `run` command and
-    source file per artifact, so don't copy them here. If the raw data came from a
-    long sweep or specific hardware, say so in a few words, so the reader knows the
-    recompute is cheap but the regeneration is not.
-  - Close with commit / hardware / a short `Verified:` note of the checks that
-    passed — and have that note confirm the recompute matched the stored value.
+    nothing, since that field is the very thing in question. If the raw per-case
+    rows are present, rebuild the metric from them; dividing two already-summed
+    fields is still a reprint.
+  - **Regenerate the raw data — the real run.** This fact is one run of its
+    protocol, so regeneration is one complete command: check out `repro.commit`
+    (branch `repro.branch`) and run the protocol's one script with this run's
+    arguments. That invocation *is* `repro.command` — the script is the only
+    entry point, so it is a runnable command, not a pointer to prose in the
+    protocol. Say in a few words that this is the expensive path (a GPU sweep,
+    specific hardware); and if the run is non-deterministic (live queries,
+    sampling), say so — the re-run reproduces the *setup and an approximate
+    result*, while the recompute above reproduces the *number exactly*.
+  - Close with commit / branch / hardware / a short `Verified:` note of the checks
+    that passed — and have that note confirm the recompute matched the stored value.
+
+### State the result honestly, not defensibly
+
+A fact's polish can hide a result that didn't hold. The failure is subtle: the
+card reads competent, the tables are clean, the headline number is real — but it
+was *selected* to look good. These four habits keep the conclusion honest, and
+the adversarial Codex audit (Phase 6) exists to catch them when they slip.
+
+- **The metric is the quantity that tests the claim — not one chosen to survive
+  it.** A headline that is a `min`/`max`/best-case over slices, or whose name
+  needs a stack of qualifiers (`min_checked_common_completed_speedup`), is a tell
+  that it was reverse-engineered to be defensible. Report the quantity that most
+  directly answers the question, even when it is the less flattering one.
+- **Compare like with like.** A number from comparing two runs or conditions
+  must be computed over a comparable set. If one run covers 16 cases and the
+  other 19, the honest comparison is the shared 16 — lead with *that* in Key
+  evidence. "Run A = 1.37×, run B = 1.30×" over different case sets, while the
+  matched set is actually 1.24×, is the trap: the matched number is the one that
+  tests reproducibility.
+- **A speed metric must say whether it requires the result to be correct.** If
+  "faster" can be won by finishing early with a wrong answer, the metric rewards
+  the wrong thing. State the condition (completed, or correct-and-completed); if
+  you report completion time, flag that it does not require correctness — a
+  single fast-but-wrong case can inflate the whole speedup.
+- **Round to the precision the measurement supports.** A ratio of summed
+  wall-clock times is not accurate to sixteen digits, so don't write
+  `1.2958786757408544×` — carry three or four significant figures in the prose
+  and the `- Metric:` bullet. The raw float can live in the data file.
+
+The test: would the headline survive a skeptic recomputing it the most natural
+way — same cases, correctness required where relevant, sensible rounding? If the
+number only holds under a particular slice or condition, say so in the claim, or
+report the number that holds generally.
 
 ### Write so someone who wasn't there can follow it
 
@@ -206,11 +245,13 @@ PY
 This reads the per-row times and recomputes the 0.999 mean; it does not read a
 stored mean back out.
 
-**Regenerate the raw data** — expensive (six runs on H20 GPUs 1 and 4, ~1 h): see
-`channels/main/gpu-clock-protocol.md`, artifacts `spec_e2e`, `gpu1_synth`,
-`gpu4_synth`, `matmul_stress` — each carries its exact `run` command and source.
+**Regenerate the raw data** — expensive (six runs on H20 GPUs 1 and 4, ~1 h):
+check out `96bfedb` and run the protocol's one script —
+`bench/gpu_clock_calibrate.py --gpus 1,4 --kernels glm_flashmla,matmul_stress`
+(its parameters and the per-number infra lineage are in
+`channels/main/gpu-clock-protocol.md`).
 
-- Commit `96bfedb` · NVIDIA H20 GPUs 1 and 4 · `.venv-sglang` Python.
+- Commit `96bfedb` · branch `exp/gpu-clock` · NVIDIA H20 GPUs 1 and 4 · `.venv-sglang` Python.
 - Verified: `rootcause_ratios.csv` and `summary.json` present; the recomputed mean (0.9989) matches the stored `summary.json` field; `gpu_clock_calibration` declared in the protocol.
 ````
 

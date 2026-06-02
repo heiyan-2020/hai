@@ -336,7 +336,7 @@ def _check_internal(fact: Fact, research_root: str) -> list[str]:
     if not isinstance(repro, dict):
         problems.append("internal fact needs frontmatter repro mapping")
     else:
-        for key in ["command", "commit"]:
+        for key in ["command", "commit", "branch"]:
             if not repro.get(key):
                 problems.append(f"internal fact needs repro.{key}")
     return problems

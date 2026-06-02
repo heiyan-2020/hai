@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -27,6 +28,23 @@ from pinlib import VALID_NATURE, PinError, load_protocol, locate_snippet  # noqa
 # A lineage snippet must be the *core* lines, not a whole function dump.
 MAX_SNIPPET_LINES = 5
 
+# The entry script must be configured by its arguments alone — reading config
+# from the environment breaks the "script <args> fully determines the run"
+# contract. This is a shallow scan of the entry .py file, not its imports.
+_ENV_READ_RE = re.compile(r"\bos\.(?:getenv|environ)\b")
+
+
+def _script_env_reads(script_abs: str) -> list[str]:
+    """Lines in a .py entry script that read configuration from the environment."""
+    if not script_abs.endswith(".py") or not os.path.isfile(script_abs):
+        return []
+    hits: list[str] = []
+    with open(script_abs, "r", encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            if _ENV_READ_RE.search(line):
+                hits.append(f"line {n}: {line.strip()}")
+    return hits
+
 
 def check_protocol(protocol_path: str, base_dir: str) -> dict:
     proto = load_protocol(protocol_path)
@@ -34,6 +52,30 @@ def check_protocol(protocol_path: str, base_dir: str) -> dict:
 
     if not proto.task:
         problems.append("frontmatter: 'task' is missing or empty")
+
+    # The contract: one entry-point script, configured by arguments alone.
+    if not proto.script.strip():
+        problems.append(
+            "frontmatter: 'script' is missing — a protocol needs one entry-point "
+            "script that runs the experiment")
+    else:
+        script_abs = os.path.join(base_dir, proto.script)
+        if not os.path.isfile(script_abs):
+            problems.append(f"frontmatter: script not found on disk: {proto.script}")
+        else:
+            for hit in _script_env_reads(script_abs):
+                problems.append(
+                    f"script reads the environment ({hit}) — expose it as a "
+                    "parameter; the run must be determined by its arguments alone")
+
+    if not isinstance(proto.parameters, list) or not proto.parameters:
+        problems.append(
+            "frontmatter: 'parameters' must be a non-empty list — every "
+            "configurable option the script exposes")
+    else:
+        for i, par in enumerate(proto.parameters):
+            if not isinstance(par, dict) or not str(par.get("name", "")).strip():
+                problems.append(f"frontmatter: parameters[{i}] has no 'name'")
 
     for i, art in enumerate(proto.artifacts):
         if not isinstance(art, dict):

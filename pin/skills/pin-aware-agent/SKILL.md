@@ -27,7 +27,8 @@ Three disciplines run through every phase:
 
 - **Pin** — a decided design must not change silently. Pins live in `pins.yaml`.
 - **Protocol** — every conclusion-bearing data element must trace to code. A
-  protocol is a per-task data-lineage spec (`{task-id}-protocol.md`).
+  protocol is a per-task data-lineage spec (`{task-id}-protocol.md`), authored
+  and validated through `pin-protocol`.
 - **Fact** — every citeable observation is a structured markdown evidence card
   under `.claude-research/facts/`, created and validated through `pin-fact`.
 
@@ -85,9 +86,11 @@ restate its key bindings (entry point, output path, validation) so the human
 can confirm it applies. If no protocol exists, **STOP** — do not free-style
 data production. Propose either (a) splitting off an infra/protocol task to
 derive one from the existing infrastructure, or (b) explicitly borrowing the
-closest protocol, which the human must acknowledge. A protocol is derived by
-reading the infra code; every lineage element carries the verbatim core code
-(at most 5 lines) that produces it. See `pin-grounding` for how protocol
+closest protocol, which the human must acknowledge. When the plan requires
+deriving a new protocol or extending one, author it through `pin-protocol` —
+it owns *how* a protocol is written (one argument-only script as the
+experiment's single entry point, and a verbatim ≤5-line snippet tracing each
+number to the infra that computes it). See `pin-grounding` for how protocol
 derivation doubles as a teaching moment.
 
 **2c. Fact declaration.** State whether this task will produce or modify any
@@ -129,9 +132,11 @@ for the human to confirm.
 ## Phase 3 — Implement
 
 Do the work. Conform to the declared protocols and facts. Keep every
-`affected-preserved` pin actually preserved. If the task produces a citeable
-observation, invoke `pin-fact` and create/update the structured markdown fact;
-do not hand-write unconstrained fact prose. If, mid-implementation, you
+`affected-preserved` pin actually preserved. When you produce or change a data
+artifact, keep its protocol current through `pin-protocol`; do not hand-write
+lineage prose. If the task produces a citeable observation, invoke `pin-fact`
+and create/update the structured markdown fact; do not hand-write unconstrained
+fact prose. If, mid-implementation, you
 discover a new conflict or missing protocol/fact declaration that Phase 2
 missed, STOP and escalate — do not absorb it silently.
 

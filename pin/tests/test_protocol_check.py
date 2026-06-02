@@ -6,14 +6,27 @@ import protocol_check
 HERE = os.path.dirname(__file__)
 DEMO = os.path.join(HERE, "..", "examples", "demo")
 
-_FRONTMATTER = "---\ntask: t\nartifacts: [{path: 'x.yaml'}]\n---\n\n# x\n\n"
+_FRONTMATTER = (
+    "---\n"
+    "task: t\n"
+    "script: 'run.py'\n"
+    "parameters:\n"
+    "  - {name: '--gpu', purpose: 'gpu index', required: true}\n"
+    "artifacts: [{path: 'x.yaml'}]\n"
+    "---\n\n# x\n\n"
+)
+
+_VALID_ELEMENT = (
+    "## Element: foo\n- nature: MEASURED\n- file: code.py\n```python\ny = 1\n```\n"
+)
 
 
-def _write(tmp_path, code: str, element_block: str) -> str:
-    """Write a code.py + a one-element protocol; return the protocol path."""
+def _write(tmp_path, code: str, element_block: str, frontmatter: str = _FRONTMATTER) -> str:
+    """Write code.py + an arg-only run.py + a one-element protocol; return its path."""
     (tmp_path / "code.py").write_text(code)
+    (tmp_path / "run.py").write_text("import argparse\n")
     proto = tmp_path / "x-protocol.md"
-    proto.write_text(_FRONTMATTER + element_block)
+    proto.write_text(frontmatter + element_block)
     return str(proto)
 
 
@@ -80,3 +93,40 @@ def test_bad_nature_tag_is_invalid(tmp_path):
         "```python\na = 1\n```\n")
     report = protocol_check.check_protocol(proto, str(tmp_path))
     assert not report["ok"]
+
+
+def test_missing_script_is_invalid(tmp_path):
+    fm = ("---\ntask: t\nparameters: [{name: '--gpu'}]\n"
+          "artifacts: [{path: 'x.yaml'}]\n---\n\n# x\n\n")
+    proto = _write(tmp_path, "y = 1\n", _VALID_ELEMENT, frontmatter=fm)
+    report = protocol_check.check_protocol(proto, str(tmp_path))
+    assert not report["ok"]
+    assert any("script" in p for p in report["problems"])
+
+
+def test_missing_parameters_is_invalid(tmp_path):
+    fm = ("---\ntask: t\nscript: 'run.py'\n"
+          "artifacts: [{path: 'x.yaml'}]\n---\n\n# x\n\n")
+    proto = _write(tmp_path, "y = 1\n", _VALID_ELEMENT, frontmatter=fm)
+    report = protocol_check.check_protocol(proto, str(tmp_path))
+    assert not report["ok"]
+    assert any("parameters" in p for p in report["problems"])
+
+
+def test_script_not_on_disk_is_invalid(tmp_path):
+    fm = ("---\ntask: t\nscript: 'nope.py'\nparameters: [{name: '--gpu'}]\n"
+          "artifacts: [{path: 'x.yaml'}]\n---\n\n# x\n\n")
+    proto = _write(tmp_path, "y = 1\n", _VALID_ELEMENT, frontmatter=fm)
+    report = protocol_check.check_protocol(proto, str(tmp_path))
+    assert not report["ok"]
+    assert any("not found" in p for p in report["problems"])
+
+
+def test_script_reading_env_is_invalid(tmp_path):
+    (tmp_path / "code.py").write_text("y = 1\n")
+    (tmp_path / "run.py").write_text("import os\ngpu = os.getenv('GPU')\n")
+    proto = tmp_path / "x-protocol.md"
+    proto.write_text(_FRONTMATTER + _VALID_ELEMENT)
+    report = protocol_check.check_protocol(str(proto), str(tmp_path))
+    assert not report["ok"]
+    assert any("environment" in p for p in report["problems"])

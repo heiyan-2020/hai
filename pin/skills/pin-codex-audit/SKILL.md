@@ -86,7 +86,11 @@ reasoning effort `medium`):
 > elements. Does the fact's `claim` truthfully reflect its evidence? Is an
 > `internal` fact supported by its data and protocol elements? Is an `external`
 > fact limited to what the quote/source reports? Is a `derived` fact computed
-> only from its `derived_from` inputs? Flag causal or over-broad claims.
+> only from its `derived_from` inputs? Flag causal or over-broad claims. Also
+> recompute the headline metric the most natural way — same cases, correctness
+> required where relevant — and flag a metric that only holds under a flattering
+> slice, a comparison taken over non-comparable sets, or a speed number that
+> counts incorrect results.
 
 ### Invocation — background runs + a Monitor, never a blocking wait
 

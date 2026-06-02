@@ -78,6 +78,7 @@ derived input references, and basic no-causal-overclaim rules.
 | `pin-aware-agent` | Orchestrator. The whole workflow; wraps the others. |
 | `pin-audit` | Machine audit primitive. Non-interactive. Also run by the git hook. |
 | `pin-codex-audit` | Adversarial independent audit via Codex. |
+| `pin-protocol` | Author and validate a per-task data-lineage protocol. |
 | `pin-fact` | Create and validate structured markdown facts. |
 | `pin-grounding` | Interactive learning quiz — the real commit gate. |
 
@@ -108,7 +109,7 @@ Phase 7  GROUND    pin-grounding: quiz the human; passing commits the new pins
 pin/
 ├── .claude-plugin/        Claude Code plugin.json
 ├── .codex-plugin/         Codex plugin.json
-├── skills/                the 5 skills
+├── skills/                the 6 skills
 ├── schema/                pins.schema.yaml, protocol.schema.md, facts.schema.md
 ├── hooks/                 commit-msg.sh (git hook template)
 ├── scripts/               pinlib.py, factlib.py, pin_audit.py, protocol_check.py,

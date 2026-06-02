@@ -25,8 +25,9 @@ protocol:
     - prefill_ms
 
 repro:
-  command: "python src/summarize.py data/run.yaml data/summary.yaml"
+  command: "python src/run_demo.py --n-runs 5"
   commit: "0000000"
+  branch: "main"
   hardware: "local CPU"
   software:
     python: "3.x"
@@ -63,8 +64,8 @@ tags: [demo, latency]
 ## Reproduction
 
 ```bash
-python src/summarize.py data/run.yaml data/summary.yaml
+python src/run_demo.py --n-runs 5
 ```
 
-- Commit `0000000` · local CPU · Python 3.x.
+- Commit `0000000` · branch `main` · local CPU · Python 3.x.
 - Verified: sample count = 5; summary and run log present.

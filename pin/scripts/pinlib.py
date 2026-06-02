@@ -125,6 +125,8 @@ class LineageElement:
 @dataclass
 class Protocol:
     task: str
+    script: str = ""
+    parameters: list[dict[str, Any]] = field(default_factory=list)
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     side_effects: list[dict[str, Any]] = field(default_factory=list)
     elements: list[LineageElement] = field(default_factory=list)
@@ -159,6 +161,8 @@ def load_protocol(path: str) -> Protocol:
 
     return Protocol(
         task=fm.get("task", ""),
+        script=str(fm.get("script", "") or ""),
+        parameters=list(fm.get("parameters", []) or []),
         artifacts=list(fm.get("artifacts", []) or []),
         side_effects=list(fm.get("side_effects", []) or []),
         elements=elements,
