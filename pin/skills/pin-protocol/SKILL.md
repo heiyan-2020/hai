@@ -2,20 +2,18 @@
 name: pin-protocol
 description: >-
   Author and validate a data-lineage protocol — the contract for one
-  code-produced artifact: an experiment's summary, a derived table, a figure, or
-  a single number. A protocol fixes the single script that produces the artifact,
-  the parameters it exposes, the output shape, and the code behind every
-  conclusion-bearing component; it is run-agnostic, so commit/branch/argument
-  values live in the fact, not here. A run produces a whole tree of artifacts, so
-  a rich node delegates its internal lineage to a child protocol via
-  `lineage_protocol` and verifiability composes all the way down. Use whenever a
-  task is about to produce data a fact or figure will cite, before producing it;
-  when an artifact's internals are not yet traceable to the code that made them;
-  or when an existing protocol needs a new parameter, output, or delegated child.
-  This is the authoring home invoked by pin-aware-agent Phase 2b. Trigger on
-  "declare the protocol", "write the data lineage", "make this experiment or
-  figure reproducible", or any time an artifact is produced without one runnable,
-  traceable entry point.
+  code-produced artifact: a summary, a derived table, a figure, or a number. It
+  fixes the single script that produces the artifact, the parameters it exposes,
+  the output shape, and the code behind every conclusion-bearing component; it is
+  run-agnostic, so commit/branch/argument values live in the fact. A run produces
+  a tree of artifacts, so a rich node delegates its internal lineage to a child
+  protocol via `lineage_protocol`, and verifiability composes all the way down.
+  Use whenever a task is about to produce data a fact or figure will cite, before
+  producing it; when an artifact's internals aren't yet traceable to code; or
+  when a protocol needs a new parameter, output, or delegated child. Authoring
+  home invoked by pin-aware-agent Phase 2b. Trigger on "declare the protocol",
+  "write the data lineage", "make this experiment or figure reproducible", or any
+  time an artifact is produced without one runnable, traceable entry point.
 type: flow
 user-invocable: true
 ---
