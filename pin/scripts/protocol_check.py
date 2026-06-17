@@ -141,69 +141,104 @@ def check_protocol(
             if not isinstance(par, dict) or not str(par.get("name", "")).strip():
                 problems.append(f"frontmatter: parameters[{i}] has no 'name'")
 
-    artifact_paths: list[str] = []
-    delegations: list[tuple[int, str, str]] = []  # (index, ref, parent_artifact_path)
-    for i, art in enumerate(proto.artifacts):
-        if not isinstance(art, dict):
-            problems.append(f"frontmatter: artifacts[{i}] is not a mapping")
-            continue
-        path = str(art.get("path", "")).strip()
-        if not path:
-            problems.append(f"frontmatter: artifacts[{i}] has no 'path'")
-        else:
-            artifact_paths.append(path)
-        ref = str(art.get("lineage_protocol", "") or "").strip()
-        if ref:
-            delegations.append((i, ref, path))
-
-    # A protocol earns its keep with at least one own element OR at least one
-    # delegated artifact — a pure-composition protocol (all rich artifacts
-    # delegated) is valid even with no number elements of its own.
-    if not proto.elements and not delegations:
+    # ---- Run-root shape: every produced path, which bear conclusions --------
+    shape_by_path = {n.path: n for n in proto.run_root_shape}
+    bears = [n for n in proto.run_root_shape if n.bears_conclusions]
+    if not proto.run_root_shape:
         problems.append(
-            "body: no `## Element:` lineage blocks and no delegated artifacts — "
-            "nothing in this protocol is verifiable")
+            "body: no `## Run root shape` section — declare every produced path "
+            "and mark which bear conclusions")
+    elif not bears:
+        problems.append(
+            "body: nothing in this protocol bears conclusions — at least one "
+            "run-root-shape node must be marked [bears conclusions]")
 
-    element_reports = []
-    for el in proto.elements:
-        el_problems: list[str] = []
-        located_at = None
+    # ---- Artifacts: one `## Artifact:` section per bears-conclusions node ----
+    artifact_paths: list[str] = [a.path for a in proto.artifacts]
+    art_by_path = {a.path: a for a in proto.artifacts}
+    for node in bears:
+        art = art_by_path.get(node.path)
+        if art is None:
+            problems.append(
+                f"shape node '{node.path}' bears conclusions but has no "
+                "`## Artifact:` section")
+            continue
+        if node.delegated and not art.lineage_protocol:
+            problems.append(
+                f"artifact '{node.path}' is marked delegated in the shape but has "
+                "no 'lineage_protocol:'")
+        if art.lineage_protocol and not node.delegated:
+            problems.append(
+                f"artifact '{node.path}' has a 'lineage_protocol:' but is not "
+                "marked delegated in the shape")
 
-        if el.nature not in VALID_NATURE:
-            el_problems.append(
-                f"nature '{el.nature}' not in {sorted(VALID_NATURE)}"
-            )
-        if not el.file:
-            el_problems.append("missing 'file'")
-        if not el.snippet.strip():
-            el_problems.append("missing code snippet (fenced ``` block)")
-        else:
-            snippet_lines = [ln for ln in el.snippet.splitlines() if ln.strip()]
-            if len(snippet_lines) > MAX_SNIPPET_LINES:
-                el_problems.append(
-                    f"snippet is {len(snippet_lines)} lines — keep it to the "
-                    f"core {MAX_SNIPPET_LINES} or fewer"
-                )
-        if el.file and el.snippet.strip():
-            ok, detail, located_at = locate_snippet(el.snippet, el.file, base_dir)
-            if not ok:
-                el_problems.append(detail)
-        if el.nature == "DERIVED" and not el.formula:
-            el_problems.append("nature is DERIVED but no 'formula' given")
-
-        element_reports.append({
-            "name": el.name,
-            "nature": el.nature,
-            "file": el.file,
-            "located_at": located_at,
-            "ok": not el_problems,
-            "problems": el_problems,
-        })
-        problems.extend(f"element '{el.name}': {p}" for p in el_problems)
+    # ---- Field bijection + field-block contract for inline artifacts --------
+    delegations: list[tuple[str, str, str]] = []  # (artifact_path, ref, artifact_path)
+    field_reports = []
+    for art in proto.artifacts:
+        if art.lineage_protocol:
+            delegations.append((art.path, art.lineage_protocol, art.path))
+            if art.fields or art.field_blocks:
+                problems.append(
+                    f"artifact '{art.path}' delegates via lineage_protocol but also "
+                    "lists inline fields/`### Field:` blocks — a delegated artifact "
+                    "has neither")
+            continue
+        important = [f["name"] for f in art.fields if f.get("important")]
+        block_names = [b.name for b in art.field_blocks]
+        if not important:
+            problems.append(
+                f"artifact '{art.path}' bears conclusions but lists no important "
+                "field — mark at least one field (important)")
+        for name in important:
+            if block_names.count(name) == 0:
+                problems.append(
+                    f"artifact '{art.path}': important field '{name}' has no "
+                    "`### Field:` block")
+            elif block_names.count(name) > 1:
+                problems.append(
+                    f"artifact '{art.path}': important field '{name}' has "
+                    f"{block_names.count(name)} `### Field:` blocks (expected one)")
+        for name in block_names:
+            if name not in important:
+                problems.append(
+                    f"artifact '{art.path}': `### Field:` block '{name}' is not an "
+                    "important field of this artifact")
+        for lf in art.field_blocks:
+            fp: list[str] = []
+            located_at = None
+            if lf.nature not in VALID_NATURE:
+                fp.append(f"nature '{lf.nature}' not in {sorted(VALID_NATURE)}")
+            if not lf.file:
+                fp.append("missing 'file'")
+            if not lf.snippet.strip():
+                fp.append("missing code snippet (fenced ``` block)")
+            else:
+                snippet_lines = [ln for ln in lf.snippet.splitlines() if ln.strip()]
+                if len(snippet_lines) > MAX_SNIPPET_LINES:
+                    fp.append(
+                        f"snippet is {len(snippet_lines)} lines — keep it to the "
+                        f"core {MAX_SNIPPET_LINES} or fewer")
+            if lf.file and lf.snippet.strip():
+                ok, detail, located_at = locate_snippet(lf.snippet, lf.file, base_dir)
+                if not ok:
+                    fp.append(detail)
+            if lf.nature == "DERIVED" and not lf.formula:
+                fp.append("nature is DERIVED but no 'formula' given")
+            field_reports.append({
+                "artifact": art.path,
+                "name": lf.name,
+                "nature": lf.nature,
+                "file": lf.file,
+                "located_at": located_at,
+                "ok": not fp,
+                "problems": fp,
+            })
+            problems.extend(f"field '{art.path}#{lf.name}': {p}" for p in fp)
 
     # Recurse into delegated child protocols.
     lineage_reports = []
-    for i, ref, parent_art_path in delegations:
+    for art_path, ref, parent_art_path in delegations:
         child_abs = _resolve_lineage_path(ref, protocol_path)
 
         if child_abs == proto_abs or child_abs in _stack:
@@ -211,11 +246,11 @@ def check_protocol(
                 os.path.basename(p) for p in (_stack + [proto_abs, child_abs])
             )
             problems.append(
-                f"artifacts[{i}] lineage_protocol '{ref}': reference cycle ({chain})")
+                f"artifact '{art_path}' lineage_protocol '{ref}': reference cycle ({chain})")
             continue
         if not os.path.isfile(child_abs):
             problems.append(
-                f"artifacts[{i}] lineage_protocol '{ref}': child protocol not "
+                f"artifact '{art_path}' lineage_protocol '{ref}': child protocol not "
                 f"found ({child_abs})")
             continue
 
@@ -227,13 +262,13 @@ def check_protocol(
                     child_abs, base_dir, _stack + [proto_abs], _cache)
             except PinError as exc:
                 problems.append(
-                    f"artifacts[{i}] lineage_protocol '{ref}': {exc}")
+                    f"artifact '{art_path}' lineage_protocol '{ref}': {exc}")
                 continue
             _cache[child_abs] = child_report
 
         agree, matched = _paths_agree(parent_art_path, child_report["artifact_paths"])
         lineage_reports.append({
-            "artifact_index": i,
+            "artifact": art_path,
             "ref": ref,
             "child_path": child_abs,
             "agree": agree,
@@ -242,11 +277,11 @@ def check_protocol(
         })
         if not child_report["ok"]:
             problems.append(
-                f"artifacts[{i}] lineage_protocol '{ref}': child protocol is "
+                f"artifact '{art_path}' lineage_protocol '{ref}': child protocol is "
                 f"INVALID ({len(child_report['problems'])} problem(s) — see below)")
         if not agree:
             problems.append(
-                f"artifacts[{i}] '{parent_art_path}' matches no artifact declared "
+                f"artifact '{art_path}' '{parent_art_path}' matches no artifact declared "
                 f"by child protocol '{ref}' — the child should declare the artifact "
                 "it explains, so the delegation points at the right thing")
 
@@ -256,13 +291,14 @@ def check_protocol(
         "task": proto.task,
         "ok": not problems,
         "problems": problems,
-        "elements": element_reports,
+        "fields": field_reports,
         "artifact_paths": artifact_paths,
         "lineage": lineage_reports,
         "summary": {
-            "elements": len(proto.elements),
-            "elements_ok": sum(e["ok"] for e in element_reports),
+            "fields": len(field_reports),
+            "fields_ok": sum(f["ok"] for f in field_reports),
             "artifacts": len(proto.artifacts),
+            "bears_conclusions": len(bears),
             "delegated": len(delegations),
         },
     }
@@ -277,10 +313,11 @@ def print_human(report: dict, indent: int = 0) -> None:
     else:
         print(f"{pad}└─ delegated: {report['task']}  ({report['protocol_path']})")
 
-    for el in report["elements"]:
+    for el in report["fields"]:
         mark = "ok  " if el["ok"] else "FAIL"
         where = f"{el['file']}:{el['located_at']}" if el["located_at"] else el["file"]
-        print(f"{pad}  [{mark}] {el['name']}  ({el['nature'] or 'no-nature'}  {where})")
+        label = f"{el['artifact']}#{el['name']}"
+        print(f"{pad}  [{mark}] {label}  ({el['nature'] or 'no-nature'}  {where})")
         for p in el["problems"]:
             print(f"{pad}         {p}")
 
@@ -289,20 +326,20 @@ def print_human(report: dict, indent: int = 0) -> None:
         print(f"{pad}  → lineage_protocol '{ln['ref']}'  [{amark}]")
         print_human(ln["report"], indent + 2)
 
-    # Element problems already print under each element; everything else —
+    # Field problems already print under each field; everything else —
     # structural frontmatter problems and artifact/delegation problems (dangling
     # reference, cycle, path mismatch, invalid child) — must stay visible.
     for p in report["problems"]:
-        if p.startswith("element "):
+        if p.startswith("field "):
             continue
         print(f"{pad}  PROBLEM  {p}")
 
     if indent == 0:
         s = report["summary"]
         print("-" * 64)
-        print(f"  {s['elements_ok']}/{s['elements']} elements valid, "
-              f"{s['artifacts']} artifact(s) declared, "
-              f"{s['delegated']} delegated")
+        print(f"  {s['fields_ok']}/{s['fields']} fields valid, "
+              f"{s['artifacts']} artifact(s), {s['bears_conclusions']} bearing "
+              f"conclusions, {s['delegated']} delegated")
         print(f"  RESULT: {'OK' if report['ok'] else 'INVALID'}")
 
 
