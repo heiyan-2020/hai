@@ -24,7 +24,7 @@ Nothing lands before the human holds it in their head.
 ## What to quiz on
 
 The anchors are concrete: each newly proposed pin's `claim`, each protocol
-lineage element, and each new/changed fact's `claim`, inputs, and stated
+`(artifact, field)` pair, and each new/changed fact's `claim`, inputs, and stated
 limitations. Build one question per anchor.
 
 ## Question shape — the critical rule
@@ -70,7 +70,7 @@ the pattern even if you cannot.
 Ask **one** question at a time and wait for the answer.
 
 - **Correct** — confirm briefly, point at the anchor (the pin id, or the
-  element's `file` + code snippet) so it sticks, move to the next.
+  field's `file` + code snippet) so it sticks, move to the next.
 - **Wrong** — do not move on. Explain the gap between what they assumed and
   what was actually done. Then draw a **variant** question on the *same*
   concept (a different anchor under the same idea) to confirm the correction

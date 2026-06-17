@@ -11,7 +11,7 @@ You do NOT need to understand the whole codebase or the feature being built.
 The **pins**, **protocols**, and **facts** are the project's distilled design
 decisions, data lineage, and citeable observations. Your job is to check **one
 diff** against **those declared artifacts** — nothing else. Do not audit code
-that no pin, protocol element, or fact points at. Do not try to reconstruct the
+that no pin, protocol artifact field, or fact points at. Do not try to reconstruct the
 project's history. Read only what the questions point you at. Wandering the
 repo is how this gets slow and unfocused; stay on the anchors.
 
@@ -38,10 +38,10 @@ let a real silent rollback through — that is the highest-severity pin finding.
 
 ## Protocol
 
-A protocol is a data-lineage spec. For each conclusion-bearing data element —
+A protocol is a data-lineage spec. For each important field of an artifact —
 a column, segment, or row of a figure or table — it records a **nature** tag,
 the source `file`, and a verbatim **snippet** (at most 5 lines) of the actual
-code that produces the element. The snippet is the anchor.
+code that produces the field. The snippet is the anchor.
 
 Nature tags:
 
@@ -66,7 +66,7 @@ the human.
 Types:
 
 - `internal` — a local observation. It must be supported by local data and a
-  protocol path plus protocol element names.
+  protocol path plus the protocol's `(artifact, field)` pairs.
 - `external` — an outside source's reported observation. It must stay within
   what the source quote or source page supports.
 - `derived` — a second-order fact computed only from existing facts. It must

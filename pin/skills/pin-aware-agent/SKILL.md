@@ -26,7 +26,7 @@ making them review every line.
 Three disciplines run through every phase:
 
 - **Pin** — a decided design must not change silently. Pins live in `pins.yaml`.
-- **Protocol** — every conclusion-bearing data element must trace to code. A
+- **Protocol** — every conclusion-bearing artifact field must trace to code. A
   protocol is a per-task data-lineage spec (`{task-id}-protocol.md`), authored
   and validated through `pin-protocol`.
 - **Fact** — every citeable observation is a structured markdown evidence card
@@ -99,7 +99,7 @@ derivation doubles as a teaching moment.
 citeable observations. If yes, declare the fact type and expected path:
 `internal/if-NNN-*.md`, `external/ef-NNN-*.md`, or `derived/df-NNN-*.md`.
 Internal facts must reference the protocol declared in 2b and the relevant
-element names. Derived facts must name their input fact IDs. If a data-producing
+`(artifact, field)` pairs. Derived facts must name their input fact IDs. If a data-producing
 task would produce a result but no fact, explain why it is not citeable.
 
 **2d. Pin impact.** Go through every active pin. Mark each:
@@ -155,8 +155,8 @@ them into `pins.yaml` yet — they are committed only after Phase 7.
 
 Run `pin_audit.py <pins.yaml>` (existing pins must still pass — this catches a
 silent regression you introduced), `protocol_check.py` on each task protocol
-(it recurses, so every delegated child protocol is checked too: each element's
-code snippet must still appear in its file, every element must have a nature
+(it recurses, so every delegated child protocol is checked too: each field's
+code snippet must still appear in its file, every field must have a nature
 tag), and `fact_check.py .claude-research/facts` if the project has facts or
 this task created one. Also check artifact accounting across the delegation
 tree: the set of new git-tracked files must equal the union of declared
@@ -176,7 +176,7 @@ Surface its findings to the human verbatim.
 ## Phase 7 — Grounding (the real commit gate)
 
 Invoke `pin-grounding`. It quizzes the human on what was actually decided —
-each new pin's claim, each data element's lineage, and each new/changed fact's
+each new pin's claim, each artifact field's lineage, and each new/changed fact's
 claim and limits. **Passing the quiz is what commits the new pins into
 `pins.yaml` and accepts the protocol/fact outputs.** A failed answer triggers a
 follow-up on the same concept. Understanding is the gate; nothing lands until

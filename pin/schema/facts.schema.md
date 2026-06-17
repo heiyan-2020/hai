@@ -111,9 +111,9 @@ data:
 
 protocol:
   path: channels/main/eval-1-protocol.md
-  elements:
-    - accuracy
-    - sample_count
+  fields:
+    - {artifact: data/summary.json, field: accuracy}
+    - {artifact: data/summary.json, field: sample_count}
 
 repro:                              # this fact = one run of the protocol above
   command: "python scripts/run_eval.py --dataset bfcl --gpu 3"  # protocol's script + this run's args
@@ -151,8 +151,14 @@ Required body sections, in this exact order:
   the claim; the full artifact list already lives in frontmatter `data`.
 - `Scope & limits` must contain at least one bullet stating what the fact does
   *not* establish.
-- `Lineage` traces protocol element → measured field → data file in prose, so a
-  reader can follow how a number became a claim.
+- `Lineage` traces each protocol `(artifact, field)` pair → its on-disk data
+  file in prose, so a reader can follow how a number became a claim. Note the
+  two cite different paths on purpose: frontmatter `protocol.fields` names the
+  protocol's **logical** artifact path (the run-agnostic path the protocol
+  declares, e.g. `data/summary.yaml`), while the prose names the **concrete**
+  on-disk instance for *this* run (e.g. `data/if-001/summary.yaml`) — because
+  the prose is path-existence-checked against disk and the logical path does
+  not exist there.
 - `Reproduction` has two stages: *regenerate* the data by running the
   protocol's script (`repro.command`) at the recorded `commit`/`branch`, and
   *recompute* the headline number from the stored output (rebuilding it from the
@@ -231,7 +237,7 @@ use existing fact fields only and must not cite raw data as primary evidence.
 - `Bottom line` and `claim` do not contain obvious causal language;
 - `Scope & limits` is non-empty;
 - internal data paths and protocol paths exist;
-- internal protocol elements exist in the referenced protocol;
+- the artifact field pairs in `protocol.fields` exist in the referenced protocol;
 - internal facts carry `repro.command`, `repro.commit`, and `repro.branch`;
 - external source fields exist;
 - derived input facts exist;
