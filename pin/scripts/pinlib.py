@@ -256,6 +256,11 @@ def _parse_artifact(path: str, block: str) -> Artifact:
             fm = _FIELD_LIST_RE.match(line)
             if fm:
                 art.fields.append({"name": fm.group(1), "important": fm.group(2) == "important"})
+            elif line.startswith("- "):
+                # A field list item that carries no (important)/(shape-only) tag:
+                # record it as malformed (important=None) rather than dropping it,
+                # so a forgotten field stays visible to the checker.
+                art.fields.append({"name": line[len("- "):].strip(), "important": None})
 
     for i, fh in enumerate(field_headers):
         name = fh.group(1).strip()
@@ -292,7 +297,7 @@ def locate_snippet(snippet: str, file_rel: str, base_dir: str) -> tuple[bool, st
     """Check that a lineage snippet appears verbatim in its file.
 
     The snippet is the real anchor: a few lines of the actual code that
-    produces a data element. It is matched line-by-line with surrounding
+    produces a field. It is matched line-by-line with surrounding
     whitespace stripped, so indentation differences do not matter and the
     match survives line-number drift. Returns (ok, detail, start_line).
     """

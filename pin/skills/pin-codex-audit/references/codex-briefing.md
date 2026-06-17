@@ -46,7 +46,7 @@ code that produces the field. The snippet is the anchor.
 Nature tags:
 
 - `MEASURED`  — read from a real measurement (wall clock, counter, eval score)
-- `DERIVED`   — computed from other elements; must carry a `formula`
+- `DERIVED`   — computed from other fields; must carry a `formula`
 - `SYNTHETIC` — produced by a model, heuristic, or assumption — not measured
 - `EXTERNAL`  — taken from a paper, dataset, or third party
 

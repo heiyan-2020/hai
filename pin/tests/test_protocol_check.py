@@ -23,10 +23,6 @@ def _shape(*lines: str) -> str:
     return body
 
 
-def _artifact(path, fields_block, field_blocks):
-    return f"## Artifact: {path}\ncontains: c\n{fields_block}\n{field_blocks}\n"
-
-
 _INLINE_OK = (
     _FM
     + _shape("x.yaml   [bears conclusions]")
@@ -58,6 +54,16 @@ def test_bears_conclusions_node_without_artifact_section_is_invalid(tmp_path):
     report = protocol_check.check_protocol(_write(tmp_path, body), str(tmp_path))
     assert not report["ok"]
     assert any("no `## Artifact:` section" in p for p in report["problems"])
+
+
+def test_untagged_field_line_is_invalid(tmp_path):
+    # `- bar` has no (important)/(shape-only) tag — must be flagged, not dropped.
+    body = (_FM + _shape("x.yaml   [bears conclusions]")
+            + "## Artifact: x.yaml\ncontains: c\nfields:\n  - foo (important)\n  - bar\n\n"
+            + "### Field: foo\n- nature: MEASURED\n- file: code.py\n```python\ny = 1\n```\n")
+    report = protocol_check.check_protocol(_write(tmp_path, body), str(tmp_path))
+    assert not report["ok"]
+    assert any("no (important)/(shape-only) tag" in p for p in report["problems"])
 
 
 def test_inline_artifact_without_important_field_is_invalid(tmp_path):

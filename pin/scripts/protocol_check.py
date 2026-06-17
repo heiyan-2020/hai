@@ -145,7 +145,6 @@ def check_protocol(
                 problems.append(f"frontmatter: parameters[{i}] has no 'name'")
 
     # ---- Run-root shape: every produced path, which bear conclusions --------
-    shape_by_path = {n.path: n for n in proto.run_root_shape}
     bears = [n for n in proto.run_root_shape if n.bears_conclusions]
     if not proto.run_root_shape:
         problems.append(
@@ -159,7 +158,7 @@ def check_protocol(
     # ---- Artifacts: one `## Artifact:` section per bears-conclusions node ----
     artifact_paths: list[str] = [a.path for a in proto.artifacts]
     art_by_path = {a.path: a for a in proto.artifacts}
-    bears_paths = {n.path for n in shape_by_path.values() if n.bears_conclusions}
+    bears_paths = {n.path for n in bears}
     for art in proto.artifacts:
         if art.path not in bears_paths:
             problems.append(
@@ -193,6 +192,12 @@ def check_protocol(
                     "lists inline fields/`### Field:` blocks — a delegated artifact "
                     "has neither")
             continue
+        for f in art.fields:
+            if f.get("important") is None:
+                problems.append(
+                    f"artifact '{art.path}': field '{f['name']}' has no "
+                    "(important)/(shape-only) tag — tag every field so a "
+                    "forgotten one is visible")
         important = [f["name"] for f in art.fields if f.get("important")]
         block_names = [b.name for b in art.field_blocks]
         if not important:
