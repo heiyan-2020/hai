@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """protocol_check.py — validate a *-protocol.md data-lineage spec.
 
-A protocol is valid when every conclusion-bearing component of its artifact is
-accounted for: each `## Element` names its `file`, carries a short verbatim code
-`snippet` that still appears in that file, and is tagged with a nature; and each
-artifact that is itself a rich artifact (a figure, a sub-pipeline) either gives
-that lineage inline as elements or *delegates* it to a child protocol via
+A protocol is valid when every conclusion-bearing component of its run is
+accounted for: the `## Run root shape` tree declares every produced path and
+marks which `[bears conclusions]`; each bears-conclusions node gets one
+`## Artifact:` section, and each important field of an inline artifact gets a
+`### Field:` block that names its `file`, carries a short verbatim code
+`snippet` that still appears in that file, and is tagged with a nature. A node
+that is itself a rich artifact (a figure, a sub-pipeline) either gives that
+lineage inline as `### Field:` blocks or *delegates* it to a child protocol via
 `lineage_protocol:`. This is the machine layer; pin-codex-audit then checks that
 the lineage descriptions are actually *true*.
 
 Usage:
     protocol_check.py <protocol.md> [--base DIR] [--json]
 
---base is the directory that element `file` paths and the entry `script`
-resolve against; defaults to the current working directory. A `lineage_protocol`
+--base is the directory that `### Field:` block `file` paths and the entry
+`script` resolve against; defaults to the current working directory. A `lineage_protocol`
 reference resolves relative to the *referencing* protocol's own directory, so a
 graph of protocols stays self-contained and movable.
 
@@ -156,6 +159,12 @@ def check_protocol(
     # ---- Artifacts: one `## Artifact:` section per bears-conclusions node ----
     artifact_paths: list[str] = [a.path for a in proto.artifacts]
     art_by_path = {a.path: a for a in proto.artifacts}
+    bears_paths = {n.path for n in shape_by_path.values() if n.bears_conclusions}
+    for art in proto.artifacts:
+        if art.path not in bears_paths:
+            problems.append(
+                f"artifact '{art.path}' has a `## Artifact:` section but is not "
+                "marked [bears conclusions] in the run root shape")
     for node in bears:
         art = art_by_path.get(node.path)
         if art is None:
@@ -173,11 +182,11 @@ def check_protocol(
                 "marked delegated in the shape")
 
     # ---- Field bijection + field-block contract for inline artifacts --------
-    delegations: list[tuple[str, str, str]] = []  # (artifact_path, ref, artifact_path)
+    delegations: list[tuple[str, str]] = []  # (artifact_path, ref)
     field_reports = []
     for art in proto.artifacts:
         if art.lineage_protocol:
-            delegations.append((art.path, art.lineage_protocol, art.path))
+            delegations.append((art.path, art.lineage_protocol))
             if art.fields or art.field_blocks:
                 problems.append(
                     f"artifact '{art.path}' delegates via lineage_protocol but also "
@@ -238,7 +247,7 @@ def check_protocol(
 
     # Recurse into delegated child protocols.
     lineage_reports = []
-    for art_path, ref, parent_art_path in delegations:
+    for art_path, ref in delegations:
         child_abs = _resolve_lineage_path(ref, protocol_path)
 
         if child_abs == proto_abs or child_abs in _stack:
@@ -266,7 +275,7 @@ def check_protocol(
                 continue
             _cache[child_abs] = child_report
 
-        agree, matched = _paths_agree(parent_art_path, child_report["artifact_paths"])
+        agree, matched = _paths_agree(art_path, child_report["artifact_paths"])
         lineage_reports.append({
             "artifact": art_path,
             "ref": ref,
@@ -281,7 +290,7 @@ def check_protocol(
                 f"INVALID ({len(child_report['problems'])} problem(s) — see below)")
         if not agree:
             problems.append(
-                f"artifact '{art_path}' '{parent_art_path}' matches no artifact declared "
+                f"artifact '{art_path}' matches no artifact declared "
                 f"by child protocol '{ref}' — the child should declare the artifact "
                 "it explains, so the delegation points at the right thing")
 
@@ -347,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Validate a protocol data-lineage spec.")
     ap.add_argument("protocol_path", help="path to a *-protocol.md file")
     ap.add_argument("--base", default=os.getcwd(),
-                    help="dir that element file paths resolve against (default: cwd)")
+                    help="dir that `### Field:` block file paths resolve against (default: cwd)")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of text")
     args = ap.parse_args(argv)
 

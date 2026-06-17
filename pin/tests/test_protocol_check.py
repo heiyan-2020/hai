@@ -119,6 +119,30 @@ def test_no_bears_conclusions_node_is_invalid(tmp_path):
     assert any("nothing in this protocol bears conclusions" in p for p in report["problems"])
 
 
+def test_artifact_section_for_non_bears_node_is_invalid(tmp_path):
+    # x.yaml is marked [shape-only] yet still carries a `## Artifact:` section.
+    body = (_FM + _shape("x.yaml   [shape-only]", "y.yaml   [bears conclusions]")
+            + "## Artifact: x.yaml\ncontains: c\nfields:\n  - foo (important)\n\n"
+            + "### Field: foo\n- nature: MEASURED\n- file: code.py\n```python\ny = 1\n```\n"
+            + "## Artifact: y.yaml\ncontains: c\nfields:\n  - foo (important)\n\n"
+            + "### Field: foo\n- nature: MEASURED\n- file: code.py\n```python\ny = 1\n```\n")
+    report = protocol_check.check_protocol(_write(tmp_path, body), str(tmp_path))
+    assert not report["ok"]
+    assert any("not marked [bears conclusions]" in p for p in report["problems"])
+
+
+def test_artifact_section_for_path_absent_from_shape_is_invalid(tmp_path):
+    # z.yaml has a `## Artifact:` section but never appears in the run root shape.
+    body = (_FM + _shape("x.yaml   [bears conclusions]")
+            + "## Artifact: x.yaml\ncontains: c\nfields:\n  - foo (important)\n\n"
+            + "### Field: foo\n- nature: MEASURED\n- file: code.py\n```python\ny = 1\n```\n"
+            + "## Artifact: z.yaml\ncontains: c\nfields:\n  - foo (important)\n\n"
+            + "### Field: foo\n- nature: MEASURED\n- file: code.py\n```python\ny = 1\n```\n")
+    report = protocol_check.check_protocol(_write(tmp_path, body), str(tmp_path))
+    assert not report["ok"]
+    assert any("not marked [bears conclusions]" in p for p in report["problems"])
+
+
 def test_missing_script_is_invalid(tmp_path):
     fm = ("---\ntask: t\nparameters: [{name: '--gpu'}]\n---\n\n# t\n\n")
     body = fm + _shape("x.yaml   [bears conclusions]") + (
