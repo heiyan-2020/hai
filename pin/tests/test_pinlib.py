@@ -155,6 +155,20 @@ def test_load_protocol_parses_delegated_artifact(tmp_path):
     assert fig.fields == []
 
 
+def test_load_protocol_demo():
+    proto = pinlib.load_protocol(
+        os.path.join(DEMO, "protocols", "demo-latency-protocol.md"))
+    assert proto.task == "demo-latency-baseline"
+    summ = next(a for a in proto.artifacts if a.path == "data/summary.yaml")
+    blocks = {b.name: b for b in summ.field_blocks}
+    assert blocks["overhead_ms"].nature == "DERIVED"
+    assert blocks["prefill_ms"].nature == "MEASURED"
+    assert blocks["prefill_ms"].file == "src/runner.py"
+    assert "perf_counter" in blocks["prefill_ms"].snippet
+    fig = next(a for a in proto.artifacts if a.path == "data/latency_breakdown.png")
+    assert fig.lineage_protocol == "demo-latency-figure-protocol.md"
+
+
 def test_locate_snippet():
     # a real snippet locates and reports a start line
     ok, _, line = pinlib.locate_snippet(

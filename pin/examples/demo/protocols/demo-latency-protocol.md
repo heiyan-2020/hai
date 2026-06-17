@@ -16,26 +16,28 @@ parameters:
     default: ""
 fixed:
   - "the measured kernels (a fixed prefill pass and decode loop in src/runner.py)"
-artifacts:
-  - path: "data/summary.yaml"
-    contains: "mean prefill_ms, decode_ms, and the derived overhead_ms"
-    git_tracked: true
-  - path: "data/latency_breakdown.png"
-    contains: "the latency-breakdown figure rendered from summary.yaml"
-    git_tracked: true
-    lineage_protocol: "demo-latency-figure-protocol.md"
-side_effects:
-  - path: "data/run.yaml"
-    git_tracked: true
 ---
 
-# data/summary.yaml — latency summary
+# demo-latency-baseline protocol — latency summary + figure
 
-A three-row latency breakdown. Each row is one segment of total latency.
-Each element names its `file` and carries the core code that produces it —
-the snippet is the anchor, robust to line-number drift.
+## Run root shape
+```text
+<run_root>/
+  data/summary.yaml             [bears conclusions]
+  data/latency_breakdown.png    [bears conclusions, delegated]
+  data/run.yaml                 [shape-only]
+```
 
-## Element: prefill_ms
+## Artifact: data/summary.yaml
+contains: mean prefill_ms, decode_ms, and the derived overhead_ms
+git_tracked: true
+fields:
+  - prefill_ms    (important)
+  - decode_ms     (important)
+  - overhead_ms   (important)
+  - n_runs        (shape-only)
+
+### Field: prefill_ms
 - nature: MEASURED
 - source_field: summary.yaml -> prefill_ms (averaged from run.yaml -> prefill_ms)
 - file: src/runner.py
@@ -45,7 +47,7 @@ the snippet is the anchor, robust to line-number drift.
     return (time.perf_counter() - start) * 1000.0
 ```
 
-## Element: decode_ms
+### Field: decode_ms
 - nature: MEASURED
 - source_field: summary.yaml -> decode_ms (averaged from run.yaml -> decode_ms)
 - file: src/runner.py
@@ -55,7 +57,7 @@ the snippet is the anchor, robust to line-number drift.
     return (time.perf_counter() - start) * 1000.0
 ```
 
-## Element: overhead_ms
+### Field: overhead_ms
 - nature: DERIVED
 - source_field: summary.yaml -> overhead_ms
 - file: src/summarize.py
@@ -63,3 +65,8 @@ the snippet is the anchor, robust to line-number drift.
 ```python
     overhead_ms = total_ms - prefill_ms - decode_ms
 ```
+
+## Artifact: data/latency_breakdown.png
+contains: the latency-breakdown figure rendered from summary.yaml
+git_tracked: true
+lineage_protocol: "demo-latency-figure-protocol.md"

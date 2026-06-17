@@ -13,27 +13,30 @@ parameters:
 fixed:
   - "a single stacked horizontal bar, three segments left-to-right: prefill | decode | overhead"
   - "x-axis is absolute milliseconds from 0"
-artifacts:
-  - path: "data/latency_breakdown.png"
-    contains: "the latency-breakdown bar: one coloured segment per latency phase"
-    git_tracked: true
 ---
 
-# data/latency_breakdown.png — latency-breakdown figure
+# demo-latency-figure protocol — latency-breakdown figure
 
-This is the protocol for the *figure*, not the experiment. The experiment
-protocol (`demo-latency-protocol.md`) names this image as one of its artifacts
-and delegates here; this file explains how each thing you can read off the
-picture is drawn. The unit of lineage for a figure is a **visual channel** — a
-coloured segment, an axis, a series — and each one traces to the line that turns
-a number into geometry.
+This is the protocol for the *figure*. The experiment protocol
+(`demo-latency-protocol.md`) names this image as a delegated artifact and points
+here. Each important field below is a visual channel — a coloured segment — and
+traces to the line that turns a number into geometry.
 
-The value each segment *encodes* is computed upstream (in `summarize.py`, traced
-by the experiment protocol's number elements). What this protocol pins down is
-the part nothing else covers: how that value becomes a bar of a given width at a
-given position.
+## Run root shape
+```text
+<run_root>/
+  data/latency_breakdown.png    [bears conclusions]
+```
 
-## Element: prefill_segment
+## Artifact: data/latency_breakdown.png
+contains: the latency-breakdown bar — one coloured segment per latency phase
+git_tracked: true
+fields:
+  - prefill_segment    (important)
+  - decode_segment     (important)
+  - overhead_segment   (important)
+
+### Field: prefill_segment
 - nature: MEASURED
 - source_field: `prefill_ms` in summary.yaml
 - file: src/plot.py
@@ -41,7 +44,7 @@ given position.
     ax.barh(0, s["prefill_ms"], left=0.0, color=PREFILL, label="prefill")
 ```
 
-## Element: decode_segment
+### Field: decode_segment
 - nature: MEASURED
 - source_field: `decode_ms` in summary.yaml; its left edge encodes the prefill end time
 - file: src/plot.py
@@ -49,7 +52,7 @@ given position.
     ax.barh(0, s["decode_ms"], left=s["prefill_ms"], color=DECODE, label="decode")
 ```
 
-## Element: overhead_segment
+### Field: overhead_segment
 - nature: DERIVED
 - source_field: `overhead_ms` in summary.yaml; drawn after prefill+decode
 - formula: overhead_ms = total_ms - prefill_ms - decode_ms (computed in summarize.py; this segment only draws it)
