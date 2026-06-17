@@ -21,8 +21,8 @@ data:
 
 protocol:
   path: protocols/demo-latency-protocol.md
-  elements:
-    - prefill_ms
+  fields:
+    - {artifact: data/summary.yaml, field: prefill_ms}
 
 repro:
   command: "python src/run_demo.py --n-runs 5"
@@ -58,7 +58,7 @@ tags: [demo, latency]
 
 ## Lineage
 
-- Protocol `protocols/demo-latency-protocol.md`, element `prefill_ms` (MEASURED).
+- Protocol `protocols/demo-latency-protocol.md`, artifact `data/if-001/summary.yaml` field `prefill_ms` (MEASURED).
 - `summary.yaml -> prefill_ms` is the per-run `prefill_ms` averaged over the 5 samples in `run.yaml`.
 
 ## Reproduction
