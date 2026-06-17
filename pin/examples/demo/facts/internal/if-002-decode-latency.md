@@ -21,8 +21,8 @@ data:
 
 protocol:
   path: protocols/demo-latency-protocol.md
-  elements:
-    - decode_ms
+  fields:
+    - {artifact: data/summary.yaml, field: decode_ms}
 
 repro:
   command: "python src/run_demo.py --n-runs 5"
@@ -58,7 +58,7 @@ tags: [demo, latency]
 
 ## Lineage
 
-- Protocol `protocols/demo-latency-protocol.md`, element `decode_ms` (MEASURED).
+- Protocol `protocols/demo-latency-protocol.md`, artifact `data/if-002/summary.yaml` field `decode_ms` (MEASURED).
 - `summary.yaml -> decode_ms` is the per-run `decode_ms` averaged over the 5 samples in `run.yaml`.
 
 ## Reproduction

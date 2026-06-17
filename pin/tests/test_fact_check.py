@@ -22,24 +22,21 @@ def test_fact_check_main_returns_zero_for_demo():
 
 
 def _write_protocol(tmp_path):
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "eval.py").write_text("accuracy = correct / total\n")
+    (tmp_path / "code.py").write_text("acc = 1\n")
+    (tmp_path / "run.py").write_text("import argparse\n")
     (tmp_path / "protocol.md").write_text(
-        "---\n"
-        "task: eval\n"
-        "artifacts: [{path: 'data/if-001/result.json'}]\n"
-        "---\n\n"
-        "# result\n\n"
-        "## Element: accuracy\n"
-        "- nature: MEASURED\n"
-        "- file: src/eval.py\n"
-        "```python\n"
-        "accuracy = correct / total\n"
-        "```\n"
+        "---\ntask: t\nscript: 'run.py'\n"
+        "parameters: [{name: '--gpu', purpose: 'g'}]\n---\n\n# t\n\n"
+        "## Run root shape\n```text\n<run_root>/\n"
+        "  data/if-001/result.json   [bears conclusions]\n```\n\n"
+        "## Artifact: data/if-001/result.json\ncontains: c\n"
+        "fields:\n  - accuracy (important)\n\n"
+        "### Field: accuracy\n- nature: MEASURED\n- file: code.py\n```python\nacc = 1\n```\n"
     )
 
 
-def _write_internal_fact(tmp_path, claim=None, protocol_element="accuracy"):
+def _write_internal_fact(tmp_path, claim=None,
+                         protocol_field=("data/if-001/result.json", "accuracy")):
     (tmp_path / "facts" / "internal").mkdir(parents=True)
     (tmp_path / "data" / "if-001").mkdir(parents=True)
     (tmp_path / "data" / "if-001" / "result.json").write_text('{"accuracy": 0.9}\n')
@@ -60,7 +57,8 @@ def _write_internal_fact(tmp_path, claim=None, protocol_element="accuracy"):
         "  primary_path: data/if-001/result.json\n"
         "protocol:\n"
         "  path: protocol.md\n"
-        f"  elements: [{protocol_element}]\n"
+        "  fields:\n"
+        f"    - {{artifact: '{protocol_field[0]}', field: '{protocol_field[1]}'}}\n"
         "repro:\n"
         "  command: python src/eval.py\n"
         "  commit: abc1234\n"
@@ -78,7 +76,7 @@ def _write_internal_fact(tmp_path, claim=None, protocol_element="accuracy"):
         "## Scope & limits\n\n"
         "- This fact only covers the tiny evaluation.\n\n"
         "## Lineage\n\n"
-        "- Protocol `protocol.md`, element `accuracy`.\n\n"
+        "- Protocol `protocol.md`, artifact `data/if-001/result.json` field `accuracy`.\n\n"
         "## Reproduction\n\n"
         "```bash\npython src/eval.py\n```\n\n"
         "- Commit abc1234. Verified: result file recorded.\n"
@@ -101,11 +99,11 @@ def test_internal_fact_rejects_causal_claim(tmp_path):
     assert any("causal" in problem for problem in report["problems"])
 
 
-def test_internal_fact_rejects_missing_protocol_element(tmp_path):
-    _write_internal_fact(tmp_path, protocol_element="missing")
+def test_internal_fact_rejects_missing_protocol_field(tmp_path):
+    _write_internal_fact(tmp_path, protocol_field=("data/if-001/result.json", "missing"))
     report = factlib.validate_facts(str(tmp_path / "facts"), str(tmp_path))
     assert not report["ok"]
-    assert any("protocol element" in problem for problem in report["problems"])
+    assert any("protocol field" in problem for problem in report["problems"])
 
 
 def test_internal_fact_rejects_missing_branch(tmp_path):

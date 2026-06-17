@@ -60,12 +60,16 @@ creating or modifying a fact.
 4. Fill the required body sections in the exact order for the type.
 5. For internal facts, copy supporting artifacts under
    `.claude-research/data/<fact-id>/` before referencing them.
-6. For internal facts, reference the governing protocol and its element names —
-   if the cited artifact is a delegated one (e.g. a figure), that is the
-   artifact's own child protocol, not just the top experiment protocol — and
-   record the run instance the protocol can't carry: the `args` passed to its
-   script, the `commit`, and the `branch`. Do not create a citeable internal
-   fact whose data lineage is undeclared.
+6. For internal facts, reference the governing protocol and the `(artifact,
+   field)` pairs it covers — if the cited artifact is a delegated one (e.g. a
+   figure), that is the artifact's own child protocol, not just the top
+   experiment protocol — and record the run instance the protocol can't carry:
+   the `args` passed to its script, the `commit`, and the `branch`. In
+   frontmatter `protocol.fields`, cite the protocol's **logical** artifact path
+   (the run-agnostic path the protocol declares, e.g. `data/summary.yaml`); the
+   prose Lineage line cites the **concrete** on-disk instance for this run (e.g.
+   `data/if-001/summary.yaml`) — see the Lineage note below for why they differ.
+   Do not create a citeable internal fact whose data lineage is undeclared.
 7. Run `fact_check.py` and fix every structural or reference problem.
 
 ## Internal fact body
@@ -97,9 +101,14 @@ then audit trail:
   `data`. Every repo path you cite in backticks must exist.
 - **Scope & limits** — at least one bullet naming what this does *not* prove
   (this is where caveats from the claim go).
-- **Lineage** — trace protocol element → measured field → data file in prose, so
-  a reader sees how a number became a claim. This is the static map of where each
-  number lives; the runnable version is Reproduction.
+- **Lineage** — trace each protocol `(artifact, field)` pair → its on-disk data
+  file in prose, so a reader sees how a number became a claim. This is the static
+  map of where each number lives; the runnable version is Reproduction. Mind the
+  path subtlety: frontmatter `protocol.fields` cites the protocol's **logical**
+  artifact path (run-agnostic, e.g. `data/summary.yaml`), but this prose cites the
+  **concrete** on-disk instance for *this* run (e.g. `data/if-001/summary.yaml`),
+  because the prose is path-existence-checked against disk and the logical path
+  does not exist there.
 - **Reproduction** — two stages, because "reproduce" means two things at two very
   different costs:
   - **Recompute the number — cheap, runs now.** A command that reads the raw files
@@ -223,7 +232,10 @@ Full record: `data/if-010-gpu-clock-calibration/summary.json`.
 
 ## Lineage
 
-Protocol `channels/main/gpu-clock-protocol.md`, element `gpu_clock_calibration`. The
+Protocol `channels/main/gpu-clock-protocol.md`, artifact
+`data/if-010-gpu-clock-calibration/summary.json` field `original_spec_gpu1_over_gpu1_synth_mean`
+(MEASURED) — frontmatter `protocol.fields` cites this artifact by its logical path
+`data/summary.json`, the run-agnostic path the protocol declares. The
 headline ratio is each original GPU1 decode row's `kernel_total_ms` divided by the
 GPU1-only baseline's `kernel_total_ms` at the same point, averaged over the 1950
 rows — stored row-by-row in `data/if-010-gpu-clock-calibration/rootcause_ratios.csv`,
@@ -254,7 +266,7 @@ check out `96bfedb` and run the protocol's one script —
 `channels/main/gpu-clock-protocol.md`).
 
 - Commit `96bfedb` · branch `exp/gpu-clock` · NVIDIA H20 GPUs 1 and 4 · `.venv-sglang` Python.
-- Verified: `rootcause_ratios.csv` and `summary.json` present; the recomputed mean (0.9989) matches the stored `summary.json` field; `gpu_clock_calibration` declared in the protocol.
+- Verified: `rootcause_ratios.csv` and `summary.json` present; the recomputed mean (0.9989) matches the stored `summary.json` field; `(data/summary.json, original_spec_gpu1_over_gpu1_synth_mean)` declared in the protocol.
 ````
 
 Contrast with the version this replaces, whose Lineage read "the original GPU1 spec

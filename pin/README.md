@@ -14,14 +14,14 @@ human keeps only high-level direction does not work. Two failure modes recur:
    focused on the current step, only finds out when a symptom gets severe.
 
 2. **Data with no traceable origin.** The agent produces a figure or a number
-   and nobody can say, for any single data element, where it came from or how
+   and nobody can say, for any single artifact field, where it came from or how
    it was computed. Facts pile up; nobody is responsible for them.
 
 ## The three disciplines
 
 | | **Pin** | **Protocol** | **Fact** |
 |---|---|---|---|
-| Guards | A decided design is not silently changed | Every conclusion-bearing data element traces to code | Every citeable observation is structured and bounded |
+| Guards | A decided design is not silently changed | Every conclusion-bearing artifact field traces to code | Every citeable observation is structured and bounded |
 | Direction | Inward — internal state (code/algorithm invariants) | Outward — results are reported faithfully | Human-facing evidence records |
 | Failure it kills | Silent rollback of a past decision | "Is this bar measured or fabricated?" being unanswerable | Facts turning into untraceable prose or overclaims |
 | Form | `pins.yaml` entries + `# PIN:` code anchors | a per-task `*-protocol.md` data-lineage spec | one markdown file per fact under `.claude-research/facts/` |
@@ -41,11 +41,11 @@ agent learning to "delete the pin so the check passes".
 ### Protocol
 
 A protocol is **not** a file manifest — it is a data-lineage spec. The unit is
-the *data element* (each segment/column/row of a figure), not the file. For
-each element the protocol records: semantics, source field, the source `file`,
-a verbatim **code snippet** (≤5 lines of the actual producing code), and
-**nature** (`MEASURED` / `DERIVED` / `SYNTHETIC` / `EXTERNAL`). `DERIVED`
-elements must carry a formula. The snippet is the anchor — it survives
+the *artifact field* (each segment/column/row of a figure), not the file. For
+each field the protocol records: semantics, the source `file`, a verbatim
+**code snippet** (≤5 lines of the actual producing code), and **nature**
+(`MEASURED` / `DERIVED` / `SYNTHETIC` / `EXTERNAL`). `DERIVED` fields must carry
+a formula. The snippet is the anchor — it survives
 line-number drift and shows the lineage logic without opening the file.
 
 ### Fact
@@ -61,10 +61,10 @@ machine fields and a fixed body shape for human inspection.
 └── derived/    # df-001-*.md — facts computed only from existing facts
 ```
 
-Internal facts reference a protocol and element names, so the chain is:
+Internal facts reference a protocol and its `(artifact, field)` pairs, so the chain is:
 
 ```
-code -> protocol element -> fact markdown -> paper/review citation
+code -> protocol (artifact, field) -> fact markdown -> paper/review citation
 ```
 
 `fact_check.py` enforces the directory/type/id convention, required

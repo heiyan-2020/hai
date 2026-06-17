@@ -311,24 +311,33 @@ def _check_internal(fact: Fact, research_root: str) -> list[str]:
         problems.append("internal fact needs frontmatter protocol mapping")
     else:
         proto_path = protocol.get("path")
-        elements = protocol.get("elements")
+        fields = protocol.get("fields")
         if not proto_path:
             problems.append("internal fact needs protocol.path")
-        if not isinstance(elements, list) or not elements:
-            problems.append("internal fact needs non-empty protocol.elements")
-        if proto_path and isinstance(elements, list):
+        if not isinstance(fields, list) or not fields:
+            problems.append("internal fact needs non-empty protocol.fields")
+        if proto_path and isinstance(fields, list):
             full = _resolve_research_path(str(proto_path), research_root)
             if not os.path.isfile(full):
                 problems.append(f"protocol.path does not exist: {proto_path}")
             else:
                 try:
                     proto = load_protocol(full)
-                    known = {el.name for el in proto.elements}
-                    for el in elements:
-                        if el not in known:
+                    known = {
+                        (a.path, b.name)
+                        for a in proto.artifacts
+                        for b in a.field_blocks
+                    }
+                    for ref in fields:
+                        if not isinstance(ref, dict):
                             problems.append(
-                                f"protocol element '{el}' not found in {proto_path}"
-                            )
+                                "protocol.fields entries must be {artifact, field} mappings")
+                            continue
+                        key = (ref.get("artifact"), ref.get("field"))
+                        if key not in known:
+                            problems.append(
+                                f"protocol field {key[1]!r} of artifact {key[0]!r} "
+                                f"not found in {proto_path}")
                 except PinError as exc:
                     problems.append(f"protocol.path invalid: {exc}")
 

@@ -77,7 +77,8 @@ reasoning effort `medium`):
 > audit passed but you find its claim no longer holds, say so — that is the
 > highest-severity finding, the tripwire let a real silent rollback through.
 >
-> Q3 FALSE LINEAGE — For each element in `<protocol path(s)>` — following every
+> Q3 FALSE LINEAGE — For each important field of each artifact in
+> `<protocol path(s)>` — following every
 > `lineage_protocol` into the child protocol it delegates to — read its code
 > `snippet` and the surrounding code in its `file`. Does the `nature` tag tell
 > the truth about what the code actually does? Also confirm the snippet still
@@ -85,8 +86,9 @@ reasoning effort `medium`):
 >
 > Q5 FACT TRUTHFULNESS — For each new or changed fact in `<fact path(s)>`, read
 > the markdown frontmatter/body, referenced data/source, and referenced protocol
-> elements. Does the fact's `claim` truthfully reflect its evidence? Is an
-> `internal` fact supported by its data and protocol elements? Is an `external`
+> `(artifact, field)` pairs. Does the fact's `claim` truthfully reflect its
+> evidence? Is an
+> `internal` fact supported by its data and protocol `(artifact, field)` pairs? Is an `external`
 > fact limited to what the quote/source reports? Is a `derived` fact computed
 > only from its `derived_from` inputs? Flag causal or over-broad claims. Also
 > recompute the headline metric the most natural way — same cases, correctness

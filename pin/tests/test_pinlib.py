@@ -52,18 +52,121 @@ def test_load_pins_rejects_duplicate_ids(tmp_path):
         pinlib.load_pins(str(f))
 
 
+NEW_PROTO = """---
+task: demo-task
+script: "src/run.py"
+parameters:
+  - name: "--gpu"
+    purpose: "gpu index"
+    required: true
+fixed:
+  - "kernels fixed in runner.py"
+---
+
+# demo-task protocol — one-liner
+
+## Run root shape
+```text
+<run_root>/
+  data/summary.yaml          [bears conclusions]
+  data/fig.png               [bears conclusions, delegated]
+  data/run.yaml              [shape-only]
+```
+
+## Artifact: data/summary.yaml
+contains: mean prefill_ms and derived overhead_ms
+git_tracked: true
+fields:
+  - prefill_ms    (important)
+  - n_runs        (shape-only)
+  - overhead_ms   (important)
+
+### Field: prefill_ms
+- nature: MEASURED
+- source_field: summary.yaml -> prefill_ms
+- file: src/runner.py
+```python
+    start = time.perf_counter()
+```
+
+### Field: overhead_ms
+- nature: DERIVED
+- source_field: summary.yaml -> overhead_ms
+- file: src/summarize.py
+- formula: overhead_ms = total_ms - prefill_ms - decode_ms
+```python
+    overhead_ms = total_ms - prefill_ms - decode_ms
+```
+
+## Artifact: data/fig.png
+contains: the latency figure
+git_tracked: true
+lineage_protocol: "fig-protocol.md"
+"""
+
+
+def test_load_protocol_parses_frontmatter(tmp_path):
+    p = tmp_path / "x-protocol.md"
+    p.write_text(NEW_PROTO)
+    proto = pinlib.load_protocol(str(p))
+    assert proto.task == "demo-task"
+    assert proto.script == "src/run.py"
+    assert proto.parameters[0]["name"] == "--gpu"
+
+
+def test_load_protocol_parses_run_root_shape(tmp_path):
+    p = tmp_path / "x-protocol.md"
+    p.write_text(NEW_PROTO)
+    proto = pinlib.load_protocol(str(p))
+    nodes = {n.path: n for n in proto.run_root_shape}
+    assert nodes["data/summary.yaml"].bears_conclusions
+    assert not nodes["data/summary.yaml"].delegated
+    assert nodes["data/fig.png"].bears_conclusions
+    assert nodes["data/fig.png"].delegated
+    assert not nodes["data/run.yaml"].bears_conclusions
+
+
+def test_load_protocol_parses_artifacts_and_fields(tmp_path):
+    p = tmp_path / "x-protocol.md"
+    p.write_text(NEW_PROTO)
+    proto = pinlib.load_protocol(str(p))
+    arts = {a.path: a for a in proto.artifacts}
+    summ = arts["data/summary.yaml"]
+    assert summ.contains == "mean prefill_ms and derived overhead_ms"
+    assert summ.git_tracked is True
+    assert summ.lineage_protocol == ""
+    fields = {f["name"]: f["important"] for f in summ.fields}
+    assert fields == {"prefill_ms": True, "n_runs": False, "overhead_ms": True}
+    blocks = {b.name: b for b in summ.field_blocks}
+    assert set(blocks) == {"prefill_ms", "overhead_ms"}
+    assert blocks["prefill_ms"].nature == "MEASURED"
+    assert blocks["prefill_ms"].file == "src/runner.py"
+    assert "perf_counter" in blocks["prefill_ms"].snippet
+    assert blocks["overhead_ms"].formula.startswith("overhead_ms =")
+
+
+def test_load_protocol_parses_delegated_artifact(tmp_path):
+    p = tmp_path / "x-protocol.md"
+    p.write_text(NEW_PROTO)
+    proto = pinlib.load_protocol(str(p))
+    fig = next(a for a in proto.artifacts if a.path == "data/fig.png")
+    assert fig.lineage_protocol == "fig-protocol.md"
+    assert fig.field_blocks == []
+    assert fig.fields == []
+
+
 def test_load_protocol_demo():
     proto = pinlib.load_protocol(
         os.path.join(DEMO, "protocols", "demo-latency-protocol.md"))
     assert proto.task == "demo-latency-baseline"
-    assert len(proto.elements) == 3
-    natures = {e.name: e.nature for e in proto.elements}
-    assert natures["overhead_ms"] == "DERIVED"
-    assert natures["prefill_ms"] == "MEASURED"
-    # each element carries a file and a verbatim code snippet
-    prefill = next(e for e in proto.elements if e.name == "prefill_ms")
-    assert prefill.file == "src/runner.py"
-    assert "perf_counter" in prefill.snippet
+    summ = next(a for a in proto.artifacts if a.path == "data/summary.yaml")
+    blocks = {b.name: b for b in summ.field_blocks}
+    assert blocks["overhead_ms"].nature == "DERIVED"
+    assert blocks["prefill_ms"].nature == "MEASURED"
+    assert blocks["prefill_ms"].file == "src/runner.py"
+    assert "perf_counter" in blocks["prefill_ms"].snippet
+    fig = next(a for a in proto.artifacts if a.path == "data/latency_breakdown.png")
+    assert fig.lineage_protocol == "demo-latency-figure-protocol.md"
 
 
 def test_locate_snippet():
