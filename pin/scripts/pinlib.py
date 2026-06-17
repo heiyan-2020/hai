@@ -113,7 +113,7 @@ def load_pins(path: str) -> list[Pin]:
 # Protocols
 # --------------------------------------------------------------------------
 @dataclass
-class LineageElement:
+class LineageField:
     name: str
     nature: str = ""
     source_field: str = ""
@@ -123,24 +123,45 @@ class LineageElement:
 
 
 @dataclass
+class Artifact:
+    path: str
+    contains: str = ""
+    git_tracked: bool | None = None
+    lineage_protocol: str = ""
+    fields: list[dict[str, Any]] = field(default_factory=list)   # {name, important}
+    field_blocks: list[LineageField] = field(default_factory=list)
+
+
+@dataclass
+class ShapeNode:
+    path: str
+    bears_conclusions: bool = False
+    delegated: bool = False
+
+
+@dataclass
 class Protocol:
     task: str
     script: str = ""
     parameters: list[dict[str, Any]] = field(default_factory=list)
-    artifacts: list[dict[str, Any]] = field(default_factory=list)
-    side_effects: list[dict[str, Any]] = field(default_factory=list)
-    elements: list[LineageElement] = field(default_factory=list)
+    run_root_shape: list[ShapeNode] = field(default_factory=list)
+    artifacts: list[Artifact] = field(default_factory=list)
     path: str = ""
 
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-_ELEMENT_HEADER_RE = re.compile(r"^##\s+Element:\s*(.+?)\s*$", re.MULTILINE)
+_SECTION_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+_FIELD_HEADER_RE = re.compile(r"^###\s+Field:\s*(.+?)\s*$", re.MULTILINE)
 _BULLET_RE = re.compile(r"^-\s*([A-Za-z_]+)\s*:\s*(.*)$")
 _FENCE_RE = re.compile(r"```[^\n]*\n(.*?)\n```", re.DOTALL)
+_SHAPE_MARKER_RE = re.compile(r"\[([^\]]*)\]")
+_FIELD_LIST_RE = re.compile(r"^-\s*(\S+)\s*\((important|shape-only)\)\s*$")
 
 
 def load_protocol(path: str) -> Protocol:
-    """Parse a *-protocol.md file: yaml frontmatter + `## Element:` lineage blocks."""
+    """Parse a *-protocol.md file: yaml frontmatter + a body of a `## Run root
+    shape` section and one `## Artifact:` section per produced artifact, each
+    with nested `### Field:` lineage blocks."""
     if not os.path.isfile(path):
         raise PinError(f"protocol file not found: {path}")
     with open(path, "r", encoding="utf-8") as fh:
@@ -157,53 +178,111 @@ def load_protocol(path: str) -> Protocol:
         raise PinError(f"{path}: frontmatter must be a mapping")
 
     body = text[fm_match.end():]
-    elements = _parse_elements(body)
+    run_root_shape, artifacts = _parse_body(body)
 
     return Protocol(
         task=fm.get("task", ""),
         script=str(fm.get("script", "") or ""),
         parameters=list(fm.get("parameters", []) or []),
-        artifacts=list(fm.get("artifacts", []) or []),
-        side_effects=list(fm.get("side_effects", []) or []),
-        elements=elements,
+        run_root_shape=run_root_shape,
+        artifacts=artifacts,
         path=path,
     )
 
 
-def _parse_elements(body: str) -> list[LineageElement]:
-    """Split the body on `## Element:` headers.
-
-    Within each element block, the `- key: value` bullets are read from the
-    text *before* the fenced code block, and the first fenced code block is
-    captured verbatim as the element's `snippet`. Parsing bullets only before
-    the fence keeps a line of code that happens to look like a bullet from
-    being misread.
-    """
-    headers = list(_ELEMENT_HEADER_RE.finditer(body))
-    elements: list[LineageElement] = []
+def _parse_body(body: str) -> tuple[list[ShapeNode], list[Artifact]]:
+    """Split the body on top-level `## ` headers into the run-root-shape section
+    and the per-artifact sections."""
+    headers = list(_SECTION_RE.finditer(body))
+    shape: list[ShapeNode] = []
+    artifacts: list[Artifact] = []
     for idx, hdr in enumerate(headers):
-        name = hdr.group(1).strip()
+        title = hdr.group(1).strip()
         start = hdr.end()
         end = headers[idx + 1].start() if idx + 1 < len(headers) else len(body)
         block = body[start:end]
+        if title.lower().startswith("run root shape"):
+            shape = _parse_shape(block)
+        elif title.lower().startswith("artifact:"):
+            path = title.split(":", 1)[1].strip()
+            artifacts.append(_parse_artifact(path, block))
+    return shape, artifacts
 
-        el = LineageElement(name=name)
-        fence = _FENCE_RE.search(block)
-        if fence:
-            el.snippet = fence.group(1)
-            bullet_region = block[:fence.start()]
-        else:
-            bullet_region = block
 
-        for line in bullet_region.splitlines():
-            m = _BULLET_RE.match(line.strip())
-            if not m:
-                continue
-            key, val = m.group(1).lower(), m.group(2).strip()
-            if key in {"nature", "source_field", "file", "formula"}:
-                setattr(el, key, val)
-        elements.append(el)
-    return elements
+def _parse_shape(block: str) -> list[ShapeNode]:
+    """Read the fenced tree; a line bearing a `[...]` marker is one node."""
+    fence = _FENCE_RE.search(block)
+    region = fence.group(1) if fence else block
+    nodes: list[ShapeNode] = []
+    for line in region.splitlines():
+        m = _SHAPE_MARKER_RE.search(line)
+        if not m:
+            continue
+        path = line[:m.start()].strip()
+        if not path:
+            continue
+        markers = [x.strip().lower() for x in m.group(1).split(",")]
+        nodes.append(ShapeNode(
+            path=path,
+            bears_conclusions="bears conclusions" in markers,
+            delegated="delegated" in markers,
+        ))
+    return nodes
+
+
+def _parse_artifact(path: str, block: str) -> Artifact:
+    """Parse one `## Artifact:` section: its `contains`/`git_tracked`/
+    `lineage_protocol`/`fields:` preamble plus nested `### Field:` blocks."""
+    art = Artifact(path=path)
+    field_headers = list(_FIELD_HEADER_RE.finditer(block))
+    preamble_end = field_headers[0].start() if field_headers else len(block)
+    preamble = block[:preamble_end]
+
+    in_fields = False
+    for raw in preamble.splitlines():
+        line = raw.strip()
+        if line.startswith("contains:"):
+            art.contains = line[len("contains:"):].strip()
+            in_fields = False
+        elif line.startswith("git_tracked:"):
+            art.git_tracked = line[len("git_tracked:"):].strip().lower() == "true"
+            in_fields = False
+        elif line.startswith("lineage_protocol:"):
+            art.lineage_protocol = line[len("lineage_protocol:"):].strip().strip('"\'')
+            in_fields = False
+        elif line.startswith("fields:"):
+            in_fields = True
+        elif in_fields:
+            fm = _FIELD_LIST_RE.match(line)
+            if fm:
+                art.fields.append({"name": fm.group(1), "important": fm.group(2) == "important"})
+
+    for i, fh in enumerate(field_headers):
+        name = fh.group(1).strip()
+        fstart = fh.end()
+        fend = field_headers[i + 1].start() if i + 1 < len(field_headers) else len(block)
+        art.field_blocks.append(_parse_field_block(name, block[fstart:fend]))
+    return art
+
+
+def _parse_field_block(name: str, block: str) -> LineageField:
+    """The `- key: value` bullets before the fence, plus the first fenced
+    block captured verbatim as the snippet."""
+    lf = LineageField(name=name)
+    fence = _FENCE_RE.search(block)
+    if fence:
+        lf.snippet = fence.group(1)
+        bullet_region = block[:fence.start()]
+    else:
+        bullet_region = block
+    for line in bullet_region.splitlines():
+        m = _BULLET_RE.match(line.strip())
+        if not m:
+            continue
+        key, val = m.group(1).lower(), m.group(2).strip()
+        if key in {"nature", "source_field", "file", "formula"}:
+            setattr(lf, key, val)
+    return lf
 
 
 # --------------------------------------------------------------------------
