@@ -45,7 +45,7 @@ codex plugin marketplace upgrade hai
 |--------|--------------|
 | [`pin`](./pin) | Pin + Protocol + Fact disciplines for agent-driven research — lock design decisions against silent rollback, make every conclusion-bearing data element traceable to code, keep citeable observations structured, and keep the human genuinely in the loop via machine audit, an adversarial Codex audit, and an interactive grounding quiz. |
 | [`vibe-slides`](./vibe-slides) | Author academic slide decks via a markdown DSL — extract a theme and components from a `.pptx` template, iterate on a content-only outline, then compile to `.pptx` with pptxgenjs. |
-| [`sop`](./sop) | Standard operating procedure skills for repeatable engineering and analysis workflows — submit merge/pull requests, walk through branch diffs before a merge, triage public-safe files from a mixed private branch, analyze surprising empirical results with falsifiable hypotheses, and fix problems at the root cause instead of overfitting a patch to the one example you saw. |
+| [`sop`](./sop) | Standard operating procedure skills for repeatable engineering and analysis workflows — submit merge/pull requests, walk through branch diffs before a merge, triage public-safe files from a mixed private branch, initialize local-only files across workspaces, analyze surprising empirical results with falsifiable hypotheses, and fix problems at the root cause instead of overfitting a patch to the one example you saw. |
 
 ## Repository layout
 
