@@ -1,12 +1,13 @@
 ---
 name: review-pr
-description: "Use when the user wants an interactive, educational review of merging one Git branch into another, especially with a source branch and target branch, branch diff walkthroughs, per-file explanations, comprehension checks, or merge conflict decisions."
+description: "Use when the user wants an interactive, educational review of merging one Git branch or GitHub PR URL into another, especially with a source branch, target branch, PR URL, branch diff walkthroughs, per-file explanations, comprehension checks, or merge conflict decisions."
 ---
 
 # Review PR
 
-Guide the user through a source-branch-to-target-branch review. The output is
-an interactive understanding session, not an automatic merge.
+Guide the user through a source-branch-to-target-branch review. The source can
+be a local ref or a GitHub PR URL. The output is an interactive understanding
+session, not an automatic merge.
 
 ## Completion Status
 
@@ -21,13 +22,62 @@ End with exactly one state:
 
 ## Inputs
 
-Require:
+Accept either:
 
-- `SOURCE`: branch or ref to merge.
-- `TARGET`: branch or ref to merge into.
+- `SOURCE`: branch or ref to merge, plus `TARGET`: branch or ref to merge
+  into.
+- `PR_URL`: GitHub pull request URL, such as
+  `https://github.com/fmagent-project/FM-Agent/pull/91`. `TARGET` is optional
+  because it can usually be read from the PR base branch.
 
-If either is missing, ask for only the missing value. Do not infer the target
-branch unless the user explicitly asks you to choose one.
+If branch inputs are used and either `SOURCE` or `TARGET` is missing, ask for
+only the missing value. Do not infer the target branch unless the user
+explicitly asks you to choose one.
+
+If `PR_URL` is used, do not ask for `SOURCE`. Resolve it by checking out the PR
+branch with GitHub CLI in the matching repository, then set `SOURCE` to the
+checked-out branch. Derive `TARGET` from the PR base branch unless the user
+provided an explicit target.
+
+## Step 0: Resolve a GitHub PR URL
+
+Skip this step when the user provided branch refs instead of a PR URL.
+
+For a URL shaped like `https://github.com/OWNER/REPO/pull/NUMBER`:
+
+1. Confirm the current git repository matches `OWNER/REPO`. If it does not,
+   stop with `NEEDS_CONTEXT` and ask the user for the checkout path for that
+   repository.
+2. Check for local changes before switching branches:
+
+   ```bash
+   git status --short
+   ```
+
+   If the worktree has changes, ask before running checkout.
+3. Read the PR base branch:
+
+   ```bash
+   BASE_REF_NAME=$(gh pr view NUMBER --repo OWNER/REPO --json baseRefName --jq .baseRefName)
+   ```
+
+   If `gh` is unavailable, unauthenticated, or cannot read the PR, stop with
+   `BLOCKED` and report the failing command.
+4. In the matching repository, check out the PR branch:
+
+   ```bash
+   gh pr checkout NUMBER
+   ```
+
+5. Set refs for the rest of the workflow:
+
+   ```bash
+   SOURCE=$(git branch --show-current)
+   git fetch origin "$BASE_REF_NAME"
+   TARGET="origin/$BASE_REF_NAME"
+   ```
+
+   If the user supplied an explicit `TARGET`, use that instead of the PR base.
 
 ## Step 1: Resolve Refs
 
@@ -47,6 +97,8 @@ ambiguous or invalid revision, ask the user for the exact branch name.
 
 Do not check out branches, modify files, stage changes, or run an actual merge
 while reviewing unless the user explicitly asks for that separate operation.
+The only checkout allowed by this skill is the `gh pr checkout NUMBER` operation
+in Step 0 when the user provided a GitHub PR URL.
 
 ## Step 2: Understand the Diff
 
