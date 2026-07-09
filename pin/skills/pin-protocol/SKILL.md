@@ -59,11 +59,15 @@ one field.
 
 ## Required layout
 
-One file per artifact-producer, named `{task-id}-protocol.md`. A per-task
-protocol lives under `.claude-research/channels/{channel}/`. A *reusable*
-artifact protocol that several experiments share — a figure kind, a standard
-table — lives under `.claude-research/general_protocols/` and is referenced by
-path from each experiment that produces it.
+One file per artifact-producer, named `{task-id}-protocol.md`. Every protocol
+lives under `.claude-research/protocols/` — never inside a channel directory. A
+protocol is a durable contract, not run scratch; keeping all of them in one
+dedicated directory keeps them findable next to each other instead of buried
+among a channel's raw outputs and per-run files, and makes `lineage_protocol`
+references plain same-directory paths. A *reusable* artifact protocol that
+several experiments share — a figure kind, a standard table — is simply another
+file in the same directory, referenced by path from each parent that delegates
+to it.
 
 ## One script is the only entry point — and you own it
 
@@ -326,7 +330,7 @@ answer is no — fix it before validating.
 
 ```bash
 python3 <PLUGIN_ROOT>/scripts/protocol_check.py \
-  .claude-research/channels/<channel>/<task-id>-protocol.md
+  .claude-research/protocols/<task-id>-protocol.md
 ```
 
 Exit `0` means structurally valid, **recursively across the whole delegation

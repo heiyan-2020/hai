@@ -110,7 +110,7 @@ data:
     - data/if-001/figure.png
 
 protocol:
-  path: channels/main/eval-1-protocol.md
+  path: protocols/eval-1-protocol.md
   fields:
     - {artifact: data/summary.json, field: accuracy}
     - {artifact: data/summary.json, field: sample_count}

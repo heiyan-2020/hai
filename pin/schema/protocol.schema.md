@@ -9,11 +9,11 @@ at the top (a run root + its summary); a figure rendered from that run is
 another artifact one level down. The goal is that **every artifact is
 verifiable**, all the way down.
 
-One file per artifact-producer, named `{task-id}-protocol.md`. A per-task
-protocol lives under `.claude-research/channels/{channel}/`; a *reusable*
-artifact protocol that several experiments share (a figure kind, a standard
-table) lives under `.claude-research/general_protocols/` and is referenced by
-path.
+One file per artifact-producer, named `{task-id}-protocol.md`. Every protocol —
+per-task or reusable (a figure kind, a standard table, shared across
+experiments) — lives under `.claude-research/protocols/`, referenced by path.
+Protocols are durable contracts, so they get their own directory rather than
+sitting inside `.claude-research/channels/{channel}/` among per-run files.
 
 It is markdown — not yaml — because the lineage layer needs logical description
 a flat key/value file cannot carry, and the `### Field:` blocks carry fenced

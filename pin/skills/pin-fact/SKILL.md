@@ -232,7 +232,7 @@ Full record: `data/if-010-gpu-clock-calibration/summary.json`.
 
 ## Lineage
 
-Protocol `channels/main/gpu-clock-protocol.md`, artifact
+Protocol `protocols/gpu-clock-protocol.md`, artifact
 `data/if-010-gpu-clock-calibration/summary.json` field `original_spec_gpu1_over_gpu1_synth_mean`
 (MEASURED) — frontmatter `protocol.fields` cites this artifact by its logical path
 `data/summary.json`, the run-agnostic path the protocol declares. The
@@ -263,7 +263,7 @@ stored mean back out.
 check out `96bfedb` and run the protocol's one script —
 `bench/gpu_clock_calibrate.py --gpus 1,4 --kernels glm_flashmla,matmul_stress`
 (its parameters and the per-number infra lineage are in
-`channels/main/gpu-clock-protocol.md`).
+`protocols/gpu-clock-protocol.md`).
 
 - Commit `96bfedb` · branch `exp/gpu-clock` · NVIDIA H20 GPUs 1 and 4 · `.venv-sglang` Python.
 - Verified: `rootcause_ratios.csv` and `summary.json` present; the recomputed mean (0.9989) matches the stored `summary.json` field; `(data/summary.json, original_spec_gpu1_over_gpu1_synth_mean)` declared in the protocol.
