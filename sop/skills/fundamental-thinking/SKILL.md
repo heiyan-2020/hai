@@ -10,7 +10,12 @@ description: >-
   breaks for the same reason still broken. This skill makes you first figure out the whole
   group of cases like it, find why they break, and fix that instead. The tell is always
   the same, in code or data or a prompt: your fix names the exact case you just saw. Reach
-  for it even when asked for a small fix — the small fix is usually the trap.
+  for it even when asked for a small fix — the small fix is usually the trap. Also use it
+  whenever you set out to solve a problem or implement a requirement: split the task into
+  the classic problem it is an instance of (solve that with a proven method or an existing
+  open-source tool) plus a thin custom layer, and step back to design for every situation
+  the system will realistically face, not just the environment in front of you — general
+  enough, without over-designing.
 ---
 
 # Fundamental thinking
@@ -99,6 +104,41 @@ which is worse than leaving it visibly broken.
 - It comes with a test that covers the class — the boundary plus a couple of typical
   members — not just the single input that started this.
 
+## When you solve a problem or build something
+
+The same habit — look past the one case in front of you — applies before anything is
+broken, whenever you set out to solve a problem or implement a requirement.
+
+### Split it: classic problem + custom part
+
+Almost no problem is brand new. Most of it is an instance of a classic problem —
+parsing, scheduling, caching, retries, diffing, dedup, search, rate limiting, a state
+machine, a queue — that already has a well-tested solution, often an existing library or
+open-source tool. Before designing anything, write down the split:
+
+- **Classic part:** which known problem is this? What's the standard algorithm, pattern,
+  library, or tool for it? Solve this part with the proven method or reuse the existing
+  solution; don't reinvent it.
+- **Custom part:** what is genuinely specific to this task? Keep it as small as possible —
+  a thin layer of glue, config, or adapter on top of the classic part.
+
+If the custom part is large, check again: usually a classic problem is hiding inside it
+that you haven't named yet. A hand-rolled solution to a classic problem is where the
+subtle bugs live — the edge cases the standard solution already handles.
+
+### Step back: design for the system, not just this environment
+
+Your solution won't only run where you're testing it now. Step back and ask what the
+system as a whole will have to handle: other inputs, other users, other machines and
+operating systems, other data sizes, other configurations, the next similar requirement.
+List those situations, then design a solution that covers them — general enough that it
+doesn't break the first time it leaves the current environment.
+
+But stay within what the system will really meet. Generality is for situations that
+actually exist or clearly will; hooks, options, and abstractions for imagined futures are
+over-design. The test is the same as for a fix: the solution should be as large as the
+real class of situations, and no larger.
+
 ## Examples
 
 **Prompt / experiment.** Your agent pipeline gives a malformed answer on one eval
@@ -125,6 +165,15 @@ such an edge, so fix the comparison and check it on a fresh random graph.
 row. Fundamental: ask why a month-13 date exists — it's a `DD/MM` vs `MM/DD` mix-up that
 hits *every* row where the day is over 12, a big silent class. Detect the format; don't
 delete the evidence.
+
+**Requirement.** You're asked to "sync files from this folder to the server every
+night." Custom-from-scratch: write a loop that walks the folder, compares timestamps, and
+uploads changed files. Fundamental: the classic part is file synchronization plus job
+scheduling — use `rsync` and cron (or a systemd timer); the custom part is just which
+paths, which host, and the schedule. Then step back: paths with spaces, a server that's
+down, a partial transfer, a second folder next month — `rsync` and a config list already
+cover these, with no new code. Not needed: a plugin system for cloud storage backends
+nobody has asked for.
 
 ## When to keep it light
 
