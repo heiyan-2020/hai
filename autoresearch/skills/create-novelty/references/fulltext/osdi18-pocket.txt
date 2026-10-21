@@ -1,0 +1,1259 @@
+           Pocket: Elastic Ephemeral Storage
+               for Serverless Analytics
+Ana Klimovic and Yawen Wang, Stanford University; Patrick Stuedi, Animesh Trivedi,
+     and Jonas Pfefferle, IBM Research; Christos Kozyrakis, Stanford University
+              https://www.usenix.org/conference/osdi18/presentation/klimovic
+
+
+
+
+         This paper is included in the Proceedings of the
+      13th USENIX Symposium on Operating Systems Design
+                 and Implementation (OSDI ’18).
+                      October 8–10, 2018 • Carlsbad, CA, USA
+                                 ISBN 978-1-939133-08-3
+
+
+
+                                             Open access to the Proceedings of the
+                                         13th USENIX Symposium on Operating Systems
+                                                 Design and Implementation
+                                                   is sponsored by USENIX.
+             Pocket: Elastic Ephemeral Storage for Serverless Analytics
+
+                          Ana Klimovic1              Yawen Wang1              Patrick Stuedi 2
+
+                       Animesh Trivedi2             Jonas Pfefferle2        Christos Kozyrakis1
+
+                                    1 Stanford University       2 IBM Research
+
+
+
+
+Abstract
+                                                                                        Pareto frontier
+Serverless computing is becoming increasingly popu-
+lar, enabling users to quickly launch thousands of short-
+lived tasks in the cloud with high elasticity and fine-
+grain billing. These properties make serverless comput-
+ing appealing for interactive data analytics. However
+exchanging intermediate data between execution stages
+in an analytics job is a key challenge as direct commu-
+nication between serverless tasks is difficult. The nat-
+ural approach is to store such ephemeral data in a re-
+mote data store. However, existing storage systems are
+not designed to meet the demands of serverless applica-
+tions in terms of elasticity, performance, and cost. We
+present Pocket, an elastic, distributed data store that au-   Figure 1: Example of performance-cost trade-off for
+tomatically scales to provide applications with desired       a serverless video analytics job using different storage
+performance at low cost. Pocket dynamically rightsizes        technologies and VM types in Amazon EC2
+resources across multiple dimensions (CPU cores, net-
+work bandwidth, storage capacity) and leverages multi-        able parallelism in an analytics job and achieve near real-
+ple storage technologies to minimize cost while ensuring      time performance [32, 45, 27]. In contrast to traditional
+applications are not bottlenecked on I/O. We show that        serverless applications that consist of a single function
+Pocket achieves similar performance to ElastiCache Re-        executed when a new request arrives, analytics jobs typ-
+dis for serverless analytics applications while reducing      ically consist of multiple stages and require sharing of
+cost by almost 60%.                                           state and data across stages of tasks (e.g., data shuffling).
+                                                                 Most analytics frameworks (e.g., Spark) implement
+1   Introduction                                              data sharing with a long-running framework agent on
+                                                              each node buffering intermediate data in local stor-
+Serverless computing is becoming an increasingly popu-        age [78]. This enables tasks from different execution
+lar cloud service due to its high elasticity and fine-grain   stages to directly exchange intermediate data over the
+billing. Serverless platforms like AWS Lambda, Google         network. However, in serverless deployments, there is
+Cloud Functions, and Azure Functions enable users to          no long-running application framework agent to manage
+quickly launch thousands of light-weight tasks, as op-        local storage. Furthermore, serverless applications have
+posed to entire virtual machines. The number of server-       no control over task scheduling or placement, making di-
+less tasks scales automatically based on application de-      rect communication among tasks difficult. As a result of
+mands and users are charged only for the resources their      these limitations, the natural approach for data sharing in
+tasks consume, at millisecond granularity [17, 36, 56].       serverless applications is to use a remote storage service.
+   While serverless platforms were originally developed       For instance, early frameworks for serverless analytics
+for web microservices and IoT applications, their elas-       either use object stores (e.g., S3 [16]), databases (e.g.,
+ticity and billing advantages make them appealing for         CouchDB [1]) or distributed caches (e.g., Redis [51]).
+data intensive applications such as interactive analytics.       Unfortunately, existing storage services are not a good
+Several recent frameworks launch large numbers of fine-       fit for sharing short-lived intermediate data in server-
+grain tasks on serverless platforms to exploit all avail-     less applications. We refer to the intermediate data as
+
+
+
+USENIX Association                 13th USENIX Symposium on Operating Systems Design and Implementation               427
+ephemeral data to distinguish it from input and out-                In summary, our contributions are as follows:
+put data which requires long-term storage. File sys-
+tems, object stores and NoSQL databases prioritize pro-             • We identify the key characteristics of ephemeral
+viding durable, long-term, and highly-available storage               data in serverless analytics and synthesize require-
+rather than optimizing for performance and cost. Dis-                 ments for storage platforms used to share such data
+tributed key-value stores offer good performance, but                 among serverless tasks.
+burden users with managing the storage cluster scale and            • We introduce Pocket, a distributed data store whose
+configuration, which includes selecting the appropriate               control, metadata and data planes are designed
+compute, storage and network resources to provision.                  for sub-second response times, automatic resource
+   The availability of different storage technologies (e.g.,          scaling and intelligent data placement across stor-
+DRAM, NVM, Flash, and HDD) increases the complex-                     age tiers. To our knowledge, Pocket is the first plat-
+ity of finding the best cluster configuration for perfor-             form targeting data sharing in serverless analytics.
+mance and cost. However, the choice of storage tech-                • We show that Pocket’s data plane delivers sub-
+nology is critical since jobs may exhibit different stor-             millisecond latency and scalable bandwidth while
+age latency, bandwidth and capacity requirements while                the control plane rightsizes resources based on the
+different storage technologies vary significantly in terms            number of jobs and their attributes. For a video an-
+of their performance characteristics and cost [48]. As                alytics job, Pocket reduces the average time server-
+an example, Figure 1 plots the performance-cost trade-                less tasks spend on ephemeral I/O by up to 4.1×
+off for a serverless video analytics application using a              compared to S3 and achieves similar performance
+distributed ephemeral data store configured with differ-              to ElastiCache Redis while saving 59% in cost.
+ent storage technologies, number of nodes, compute re-
+sources per node, and network bandwidth (see §6.1 for              Pocket is open-source software. The code is available
+our AWS experiment setup). Each resource configura-             at: https://github.com/stanford-mast/pocket.
+tion leads to different performance and cost. Finding
+Pareto efficient storage allocations for a job is non-trivial   2     Storage for Serverless Analytics
+and gets more complicated with multiple jobs.
+   We present Pocket, a distributed data store designed         Early work in serverless analytics has identified the chal-
+for efficient data sharing in serverless analytics. Pocket      lenge of storing and exchanging data between hundreds
+offers high throughput and low latency for arbitrary size       of fine-grain, short-lived tasks [45, 32]. We build on our
+data sets, automatic resource scaling, and intelligent data     study of ephemeral storage requirements for serverless
+placement across multiple storage tiers such as DRAM,           analytics applications [49] to synthesize essential prop-
+Flash, and disk. The unique properties of Pocket result         erties for an ephemeral data storage solution. We also
+from a strict separation of responsibilities across three       discuss why current systems are not able to meet the
+planes: a control plane which determines data placement         ephemeral I/O demands of serverless analytics applica-
+policies for jobs, a metadata plane which manages dis-          tions. Our focus is on ephemeral data as the original in-
+tributed data placement, and a ‘dumb’ (i.e., metadata-          put and final output data of analytics jobs typically has
+oblivious) data plane responsible for storing data. Pocket      long-term availability and durability requirements that
+scales all three planes independently at fine resource and      are well served by the variety of file systems, object
+time granularity based on the current load. Pocket uses         stores, and databases available in the cloud.
+heuristics, which take into account job characteristics, to
+allocate the right storage media, capacity, bandwidth and
+CPU resources for cost and performance efficiency. The
+                                                                2.1     Ephemeral Storage Requirements
+storage API exposes deliberately simple I/O operations          High performance for a wide range of object sizes:
+for sub-millisecond access latency. We intend for Pocket        Serverless analytics applications vary considerably in the
+to be managed by cloud providers and offered to users           way they store, distribute, and process data. This diver-
+with a pay-what-you-use cost model.                             sity is reflected in the granularity of ephemeral data that
+   We deploy Pocket on Amazon EC2 and evaluate the              is generated during a job. Figure 2 shows the ephemeral
+system using using three serverless analytics workloads:        object size distribution for a distributed lambda compi-
+video analytics, MapReduce sort, and distributed source         lation of the cmake program, a serverless video analyt-
+code compilation. We show that Pocket is capable                ics job using the Thousand Island (THIS) video scan-
+of rightsizing the type and number of resources such            ner [63], and a 100 GB MapReduce sort job on lamb-
+that jobs achieve similar performance compared to us-           das. The key observation is that ephemeral data ac-
+ing ElastiCache Redis, a DRAM-based key-value store,            cess granularity varies greatly in size, ranging from hun-
+while saving almost 60% in cost.                                dreds of bytes to hundreds of megabytes. We observe a
+
+
+
+428   13th USENIX Symposium on Operating Systems Design and Implementation                            USENIX Association
+      1.0                                                                 1.0
+              λ-cc cmake
+      0.8     video analytics                                             0.8
+              sort100GB
+      0.6                                                                 0.6
+CDF
+
+
+
+
+                                                                    CDF
+      0.4                                                                 0.4
+                                                                                                                          λ-cc cmake
+      0.2                                                                 0.2                                             video-analytics
+                                                                                                                          sort 100 GB
+      0.0 1                                                               0.0
+        10    102    103    104      105      106    107   108                  0       20       40           60         80         100
+                     Ephemeral Object Size (bytes)                                       Ephemeral Object Lifetime (seconds)
+
+
+  Figure 2: Objects are 100s of bytes to 100s of MBs.                               Figure 3: Objects have short lifetime.
+
+
+straight line for sorting as its ephemeral data size is equal      The variety of storage media available in the cloud al-
+to the partition size. However, with a different dataset           low for different performance-cost trade-offs, as shown
+size and/or number of workers, the location of the line            in Figure 1. Each storage technology differs in terms of
+changes. Applications that read/write large objects de-            I/O latency, throughput and IOPS per GB of capacity,
+mand high throughput (e.g., we find that sorting 100 GB            and the cost per GB. The optimal choice of storage me-
+with 500 lambdas requires up to 7.5 GB/s of ephemeral              dia for a job depends on its characteristics. Hence, the
+storage throughput) while low latency is important for             ephemeral data store must place application data on the
+small object accesses. Thus, an ephemeral data store               right storage technology tier(s) for performance and cost
+must deliver high bandwidth, low latency, and high IOPS            efficiency.
+for the entire range of object sizes.                                 Fault-(in)tolerance: Typically a data store must deal
+   Automatic and fine-grain scaling: One of the key                with failures while keeping the service up and run-
+promises of serverless computing is agility to dynam-              ning. Hence, it is common for storage systems to use
+ically meet application demands. Serverless frame-                 fault-tolerance techniques such as replication and era-
+works can launch thousands of short-lived tasks instan-            sure codes [42, 66, 46]. For data that needs to be stored
+taneously. Thus, an ephemeral data store for serverless            long-term, such as the original input and final output data
+applications can observe a storm of I/O requests within a          for analytics workloads, the cost of data unavailability
+fraction of a second. Once the load dissipates, the stor-          typically outweighs the cost of fault-tolerance mecha-
+age (just like the compute) resources should be scaled             nisms. However, as shown in Figure 3, ephemeral data
+down for cost efficiency. Scaling up or down to meet               has a short lifetime of 10-100s of seconds. Unlike the
+elastic application demands requires a storage solution            original input and final output data, ephemeral data is
+capable of growing and shrinking in multiple resource              only valuable during the execution of a job and can eas-
+dimensions (e.g., adding/removing storage capacity and             ily be regenerated. Furthermore, fault tolerance is typi-
+bandwidth, network bandwidth, and CPU cores) at a fine             cally baked into compute frameworks, such that storing
+time granularity on the order of seconds. In addition,             the data and computing it become interchangeable [39].
+users of serverless platforms desire a storage service that        For example, Spark uses a data abstraction called re-
+automatically manages resources and charges users only             silient distributed datasets (RDDs) to mitigate stragglers
+for the fine-grain resources their jobs actually consume,          and track lineage information for fast data recovery [78].
+so as to match the abstraction that serverless comput-             Hence, we argue that an ephemeral storage solution does
+ing already provides for compute and memory resources.             not have to provide high fault-tolerance as expected of
+Automatic resource management is important since nav-              traditional storage systems.
+igating cluster configuration performance-cost trade-offs
+is a burden for users. For example, finding the Pareto
+                                                                   2.2          Existing Systems
+optimal point outlined in Figure 1 is non-trivial; it is the
+point beyond which adding resources only increases cost            Existing storage systems do not satisfy the combination
+without improving execution time while using any lower-            of requirements outlined in § 2.1. We describe different
+cost resource allocation results in sub-optimal execution          categories of systems and summarize why they fall short
+time. In summary, an ephemeral data store must auto-               for elastic ephemeral storage in Table 1.
+matically rightsize resources to satisfy application I/O              Severless applications commonly use fully-managed
+requirements while minimizing cost.                                cloud storage services, such as Amazon S3, Google
+   Storage technology awareness: In addition to right-             Cloud Storage, and DynamoDB. These systems extend
+sizing cluster resources, the storage system also needs to         the ‘serverless’ abstraction to storage, charging users
+decide which storage technology to use for which data.             only for the capacity and bandwidth they use [16, 28].
+
+
+
+USENIX Association                          13th USENIX Symposium on Operating Systems Design and Implementation                            429
+                      Elastic scaling         Latency          Throughput          Max object size            Cost
+ S3                        Auto,               High             Medium                 5 TB                    $
+                       coarse-grain
+ DynamoDB             Auto, fine-grain,       Medium                 Low                400 KB                 $$
+                       pay per hour
+ Elasticache              Manual                Low                  High               512 MB                $$$
+ Redis
+ Aerospike                Manual                Low                  High                1 MB                  $$
+ Apache Crail             Manual                Low                  High               any size               $$
+ Desired for λ s      Auto, fine-grain,         Low                  High               any size               $
+                      pay per second
+
+Table 1: Comparison of existing storage systems and desired properties for ephemeral storage in serverless analytics.
+
+
+While such services automatically scale resources based       3     Pocket Design
+on usage, they are optimized for high durability hence
+their agility is limited and they do not meet the perfor-     We introduce Pocket, an elastic distributed storage ser-
+mance requirements of serverless analytics applications.      vice for ephemeral data that automatically and dynam-
+For example, S3 has high latency overhead (e.g., a 1          ically rightsizes storage cluster resource allocations to
+KB read takes ∼12 ms) and insufficient throughput for         provide high I/O performance while minimizing cost.
+highly parallel applications. For example, sorting 100        Pocket addresses the requirements outlined in §2.1 by
+GB with 500 or more workers results in request rate limit     applying the following key design principles:
+errors when S3 is used for intermediate data.
+                                                                  1. Separation of responsibilities: Pocket divides re-
+   In-memory key-value stores, such as Redis and Mem-
+                                                                     sponsibilities across three different planes: the con-
+cached, provide another option for storing ephemeral
+                                                                     trol plane, the metadata plane, and the data plane.
+data [51, 8]. These systems offer low latency and high
+                                                                     The control plane manages cluster sizing and data
+throughput but at the higher cost of DRAM. They also
+                                                                     placement. The metadata plane tracks the data
+require users to manage their own storage instances and
+                                                                     stored across nodes in the data plane. The three
+manually scale resources. Although Amazon and Azure
+                                                                     planes can be scaled independently based on vari-
+offer managed Redis clusters through their ElastiCache
+                                                                     ations in load, as described in §4.2.
+and Redis Cache services respectively, they do not au-
+tomate storage management as desired by serverless ap-            2. Sub-second response time: All I/O operations are
+plications [13, 57]. Users must still select instance types          deliberately simple, targeting sub-millisecond la-
+with the appropriate memory, compute and network re-                 tencies. Pocket’s storage servers are optimized for
+sources to match their application requirements. In addi-            fast I/O and are only responsible for storing data
+tion, changing instance types or adding/removing nodes               (not metadata), making them simple to scale up or
+can require tearing down and restarting clusters, with               down. The controller scales resources at second
+nodes taking minutes to start up while the service is                granularity and balances load by intelligently steer-
+billed for hourly usage.                                             ing incoming job data. This makes Pocket elastic.
+   Another category of systems use Flash storage to de-
+crease cost, while still offering good performance. For           3. Multi-tier storage: Pocket leverages different stor-
+example, Aerospike is a popular Flash-based NoSQL                    age media (DRAM, Flash, disk) to store a job’s data
+database [69]. Alluxio/Tachyon is designed to enable                 in the tier(s) that satisfy the I/O demands of the ap-
+fast and fault-tolerant data sharing between multiple                plication while minimizing cost (see §4.1).
+jobs [53]. Apache Crail is a distributed storage system
+that uses multiple media tiers to balance performance and     3.1      System Architecture
+cost [2]. Unfortunately, users must manually configure
+and scale their storage cluster resources to adapt to elas-   Figure 4 shows Pocket’s system architecture. The system
+tic job I/O requirements. Finding Pareto optimal deploy-      consists of a logically centralized controller, one or more
+ments for performance and cost efficiency is non-trivial,     metadata servers, and multiple data plane storage servers.
+as illustrated for a single job in Figure 1. Cluster con-       The controller, which we describe in §4, allocates stor-
+figuration becomes even more complex when taking into         age resources for jobs and dynamically scales Pocket
+account the requirements of multiple overlapping jobs.        metadata and storage nodes up and down as the number
+
+
+
+430   13th USENIX Symposium on Operating Systems Design and Implementation                           USENIX Association
+of jobs and their requirements vary over time. The con-                       Job A                    Job B                     Job C
+                                                                            λλλλλλλ                   λλλλλ                   λλλλλλλλλλ
+troller also makes data placement decisions for jobs (i.e.,                 λλλλλλλ                   λλλλ                   λλλλλλλλλλλ
+which nodes and storage media to use for a job’s data).                            i. Register job
+                                                                                                                               PUT ‘x’
+
+   Metadata servers enforce coarse-grain data placement                                              iii. De-register job
+                                                                                                                              1.    2.           3.
+
+policies generated by the controller by steering client re-                  Controller                                            Namenode(s)
+quests to appropriate storage servers. Pocket’s metadata                app-driven resource                                    Metadata    server(s)
+                                                                                                                                route requests
+                                                                        allocation & scaling                                    request routing
+                                                                                                     ii. Allocate & assign
+plane manages data at the granularity of blocks, whose                                                 resources for job
+size is configurable. We use a 64 KB block size in our
+                                                                 Storage server           Storage server              Storage server         Storage server
+deployment. Objects larger than the block size are di-           CPU                       CPU                       CPU                     CPU
+                                                                  Net                       Net                       Net                     Net
+vided into blocks and distributed across storage servers,        HDD                      Flash                     DRAM                    DRAM
+
+
+enabling Pocket to support arbitrary object sizes. Clients
+access data blocks on metadata-oblivious, performance-         Figure 4: Pocket system architecture and the steps to reg-
+optimized storage servers equipped with different stor-        ister job C, issue a PUT from a lambda and de-register
+age media (DRAM, Flash, and/or HDD).                           the job. The colored bars on storage servers show used
+                                                               and allocated resources for all jobs in the cluster.
+3.2    Application Interface
+Table 2 outlines Pocket’s application interface. Pocket        different metadata servers. In §6.2 we show that a sin-
+exposes an object store API with additional functions tai-     gle metadata server in our deployment supports 175K re-
+lored to the ephemeral storage use-case. We describe           quests per second, which for the applications we study is
+these functions and how they map to Pocket’s separate          sufficient to support jobs with thousands of lambdas.
+control, metadata and data planes.                                Storage functions: Clients put and get data to/from
+   Control functions: Applications use two API calls,          objects at a byte granularity. Clients provide their job
+register job and deregister job, to interact with              identifier for all operations. Put and get operations first
+the Pocket controller. The register job call accepts           involve a metadata lookup. Pocket enhances the basic
+hints about a job’s characteristics (e.g., degree of par-      put and get object store API calls by accepting an op-
+allelism, latency-sensitivity) and requirements (e.g., ca-     tional data lifetime management hint for these two calls.
+pacity, throughput). These optional hints help the con-        Since ephemeral data is usually only valuable during the
+troller rightsize resource allocations to optimize perfor-     execution of a job, Pockets default coarse-grained be-
+mance and cost (see §4.1). The register job call re-           havior is to delete a job’s data when the job deregisters.
+turns a job identifier and the metadata server(s) assigned     However, applications can set flags to override the de-
+for managing the job’s data. The deregister job call           fault deletion policy for particular objects.
+notifies the controller that a serverless job has completed.      If a client issues a put with the PERSIST flag set to
+   Metadata functions: While control API calls are is-         true, the object will persist after the job completes. The
+sued once per job, serverless tasks in a job can inter-        object is stored on long-running Pocket storage nodes
+act with Pocket metadata servers multiple times during         (see §4.2) and will remain in Pocket until it is explicitly
+their lifetime to write and read ephemeral data. Server-       deleted or a (configurable) timeout period has elapsed.
+less clients use the connect call to establish a connec-       The ability to persist objects beyond the duration of a
+tion with Pocket’s metadata service. Data in Pocket is         job is useful for piping data between jobs. If a client is-
+stored in objects which are organized in buckets. Ob-          sues a get with the DELETE flag set to true, the object
+jects and buckets are identified using names (strings).        will be deleted as soon as it is read, allowing for more
+Clients can create and delete buckets and enumerate ob-        efficient garbage collection. Our analysis of ephemeral
+jects in buckets by passing their job identifier and the       I/O characteristics for serverless analytics applications
+bucket name. Clients can also lookup and delete existing       reveals that ephemeral data is often written and read only
+objects. These metadata operations are similar to those        once. For example, a mapper writes an intermediate ob-
+supported by other object stores like Amazon S3.               ject destined to a particular reducer. Such data can be
+   In our current design, Pocket stores all of a job’s data    deleted as soon as it is consumed instead of waiting for
+in a top-level bucket identified by the job’s ID, which        the job to complete and deregister.
+is created during job registration by the controller. This
+implies each job is assigned to a single metadata server,      3.3        Life of a Pocket Application
+since a bucket is only managed by one metadata server, to
+simplify consistency management. However, a job is not         We now walk through the life of a serverless analytics
+fundamentally limited to one metadata server. In general,      application using Pocket. Before launching lambdas, the
+jobs can create multiple top-level buckets which hash to       application first registers with the controller and option-
+
+
+
+USENIX Association                  13th USENIX Symposium on Operating Systems Design and Implementation                                               431
+ Client API Function                                           Description
+ register job(jobname, hints=None)                             register job with controller and provide optional hints,
+                                                               returns a job ID and metadata server IP address
+ deregister job(jobid)                                         notify controller job has finished, delete job’s
+                                                               non-PERSIST data
+ connect(metadata server address)                              open connection to metadata server
+ close()                                                       close connection to metadata server
+ create bucket(jobid, bucketname)                              create a bucket
+ delete bucket(jobid, bucketname)                              delete a bucket
+ enumerate(jobid, bucketname)                                  enumerate objects in a bucket
+ lookup(jobid, obj name)                                       return true if obj name data exists, else false
+ delete(jobid, obj name)                                       delete data
+ put(jobid, src filename, obj name, PERSIST=false)             write data, set PERSIST flag if want data to remain
+                                                               after job finishes
+ get(jobid, dst filename, obj name, DELETE=false)              read data, set DELETE true if data is only read once
+
+               Table 2: Main control, metadata, and storage functions exposed by Pocket’s client API.
+
+
+ally provides hints about the job’s characteristics (step i    3.4    Handling Node Failures
+in Figure 4). The controller determines the storage tier
+to use (DRAM, Flash, disk) and the number of storage           Though Pocket is not designed to provide high data dura-
+servers across which to distribute the job’s data to meet      bility, the system has mechanisms in place to deal with
+its throughput and capacity requirements. The controller       node failures. Storage servers send heartbeats to the con-
+generates a weight map, described in §4.1, to specify the      troller and metadata servers. When a storage server fails
+job’s data placement policy and sends this information         to send heartbeats, metadata servers automatically mark
+to the metadata server which it assigned for managing          its blocks as invalid. As a result, client read operations
+the job’s metadata and steering client I/O requests (step      to data that was stored on the faulty storage server will
+ii). If the controller needs to launch new storage servers     return a ‘data unavailable’ error. Pocket currently ex-
+to satisfy a job’s resource allocation, the job registration   pects the application framework to re-launch serverless
+call stalls until these nodes are available.                   tasks to regenerate lost ephemeral data. A common ap-
+                                                               proach is for application frameworks to track data lin-
+   When registration is complete, the job launches lamb-
+                                                               eage, which is the sequence of tasks that produces each
+das. Lambdas first connect to their assigned metadata
+                                                               object [78, 39]. For metadata fault tolerance, Pocket sup-
+server, whose IP address is provided by the controller
+                                                               ports logging of all metadata RPC operations on shared
+upon job registration. Lambda clients write data by
+                                                               storage. When a metadata server fails, its state can be re-
+first contacting the metadata server to get the IP address
+                                                               constructed by replaying the shared log. Controller fault
+and block address of the storage server to write data to.
+                                                               tolerance can be achieved through master-slave replica-
+For writes to large objects which span multiple blocks,
+                                                               tion, though we do not evaluate this in our study.
+the client requests capacity allocation from the metadata
+server in a streaming fashion; when the capacity of a sin-
+gle block is exhausted, the client issues a new capacity       4     Rightsizing Resource Allocations
+allocation request to the metadata server. Pocket’s client
+library internally overlaps metadata RPCs for the next         Pocket’s control plane elastically and automatically
+block while writing data for the current block to avoid        rightsizes cluster resources. When a job registers,
+stalls. Similarly, lambdas read data by first contacting the   Pocket’s controller leverages optional hints passed
+metadata server in a similar fashion. Clients cache meta-      through the API to conservatively estimate the job’s la-
+data in case they need to read an object multiple times.       tency, throughput and capacity requirements and find a
+   When the last lambda in a job finishes, the job deregis-    cost-effective resource assignment, as described in §4.1.
+ters the job to free up Pocket resources (step iii). Mean-     In addition to rightsizing resource allocations for jobs
+while, as jobs execute, the controller ontinuously moni-       upfront, Pocket continuously monitors the cluster’s over-
+tors resource utilization in storage and metadata servers      all utilization and decides when and how to scale stor-
+(the horizontal bars on storage servers in Figure 4) to ad-    age and metadata nodes based on load. §4.2 describes
+d/remove servers as needed to minimize cost while pro-         Pocket’s resource scaling mechanisms along with its data
+viding high performance (see §4.2).                            steering policy to balance load.
+
+
+
+432   13th USENIX Symposium on Operating Systems Design and Implementation                          USENIX Association
+ Hint                            Impact on throughput T         Impact on capacity C             Impact on storage media
+ No hint (default policy)         T = Tdefault                   C = Cdefault                    Fill storage tiers in order of
+                                 (T = 50× 8 Gb/s)               (C = 50× 1960 GB)                high to low performance
+                                                                                                 (DRAM first, then Flash)
+ Latency sensitivity             -                              -                                If latency sensitive, use
+ Maximum number of                T = N× per-λ Gb/s limit        C ∝ N× per-λ Gb/s limit         default policy above.
+ concurrent lambdas N            (T = N × 0.6 Gb/s)             (C = N×0.6
+                                                                     8 Gb/s × 1960 GB)           Otherwise, choose the
+ Total ephemeral                  T ∝D                           C=D                             storage tier with the lowest
+                                         D
+ data capacity D                 (T = 1960GB × 8 Gb/s)                                           cost for the estimated
+ Peak aggregate bandwidth B       T =B                           C∝B                             throughput T and capacity C
+                                                                       B
+                                                                (C = 8 Gb/s × 1960GB)            required for the job.
+
+Table 3: The impact that hints provided about the application have on Pocket’s resource allocation decisions for
+throughput, capacity and the choice of storage media (with specific examples in parentheses for our AWS deployment
+with i3.2xl instances, each with 8 cores, 60 GB DRAM, 1.9 TB Flash and ∼8 Gb/s network bandwidth).
+
+
+4.1    Rightsizing Application Allocation                           throughput hint with no capacity hint, the controller allo-
+                                                                    cates capacity proportional to the job’s throughput allo-
+When a job registers, the controller first determines its           cation. The proportion is set by the storage throughput to
+resource allocation across three dimensions: throughput,            capacity ratio on the VMs used (e.g., i3.2xl instances
+capacity, and the choice of storage media. The controller           in AWS provide 1.9 TB of capacity per ∼ 8 Gb/s of net-
+then uses an online bin-packing algorithm to translate the          work bandwidth). Vice versa, if only a capacity hint is
+resource allocation into a resource assignment on nodes.            provided, Pocket allocates throughput based on the VM
+    Determining job I/O requirements: Pocket uses                   capacity:throughput ratio. In the future, we plan to allow
+heuristics that adapt to optional hints passed through the          jobs to specify their average per-lambda throughput and
+register job API. Table 3 lists the hints that Pocket               capacity requirements, as these can be more meaningful
+supports and their impact on the throughput, capacity,              than aggregate throughput and capacity hints for a job
+and choice of storage media allocated for a job, with ex-           when the number of lambdas used is subject to change.
+amples (in parentheses) for our deployment on AWS.                     The hints in Table 3 can be specified by applica-
+    Given no hints about a job, Pocket uses a default re-           tion developers or provided by the application frame-
+source allocation that conservatively over-provisions re-           work. For example, the framework we use to run lambda-
+sources to achieve high performance, at high cost. In               distributed software compilation automatically infers and
+our AWS deployment, this consists of 50 i3.2xl nodes,               synthesizes a job’s dependency graph [31]. Hence, this
+providing DRAM and NVMe Flash storage with 50 GB/s                  framework can provide Pocket with hints about the job’s
+aggregate throughput. By default, Pocket conservatively             maximum degree of parallelism, for instance.
+assumes that a job is latency sensitive. Hence, Pocket                 Assigning resources: Pocket translates a job’s re-
+fills the job’s DRAM resources before spilling to other             source allocation into a resource assignment on specific
+storage tiers, in order of increasing storage latency. If a         storage servers by generating a weight map for the job.
+job hints that it is not sensitive to latency, the controller       The weight map is an associative array mapping each
+does not allocate DRAM for the job and instead uses the             storage server (identified by its IP address and port) to
+most cost-effective storage technology for the through-             a weight from 0 to 1, which represents the fraction of a
+put and capacity the controller estimates the job needs.            job’s dataset to place on that storage server. If a storage
+    Knowing a job’s maximum number of concurrent                    server is assigned a weight of 1 in a job’s weight map,
+lambdas, N, allows Pocket to compute a less conserva-               it will store all of the job’s data. The controller sends
+tive estimate of the job’s throughput requirement. If this          the weight map to metadata servers, which enforce the
+hint is provided, Pocket allocates throughput equal to N            data placement policy by routing client requests to stor-
+times the peak network bandwidth limit per lambda (e.g.,            age servers using weighted random selection based on
+∼600 Mb/s per lambda on AWS). N can be limited by                   the weights in the job’s weight map.
+the job’s inherent parallelism or the cloud provider’s task            The weight map depends on the job’s resource re-
+invocation limit (e.g., 1000 default on AWS).                       quirements and the available cluster resources. Pocket
+    Pocket’s API also accepts hints for the aggregate               uses an online bin-packing algorithm which first tries to
+throughput and capacity requirements of a job, which                fit a job’s throughput, capacity and storage media allo-
+override Pocket’s heuristic estimates. This informa-                cation on active storage servers and only launches new
+tion can come from profiling. When Pocket receives a                servers if the job’s requirements cannot be satisfied by
+
+
+
+USENIX Association                   13th USENIX Symposium on Operating Systems Design and Implementation                    433
+sharing resources with other jobs [67]. If a job requires       close, the metadata server terminates. Storage servers
+more resources than are currently available, the con-           then register their capacity that was managed by the old
+troller launches the necessary storage nodes while the          metadata server across new metadata servers.
+application waits for its job registration command to re-          In addition to horizontal scaling, the controller man-
+turn. Nodes take a few seconds or minutes to launch,            ages vertical scaling. When the controller observes that
+depending on whether a new VM is required (§6.2).               CPU utilization is high and additional cores are available
+                                                                on a node, the controller instructs the node via a heart-
+                                                                beat response to use additional CPU cores.
+4.2    Rightsizing the Storage Cluster
+                                                                   Cluster sizing policy: Pocket elastically scales the
+In addition to rightsizing the storage allocation for each      cluster using a policy that aims to maintain overall uti-
+job, Pocket dynamically scales cluster resources to ac-         lization for each resource type (CPU, network band-
+commodate elastic application load for multiple jobs            width, and the capacity of each storage tier) within a tar-
+over time. At its core, the Pocket cluster consists of a        get range. The target utilization range can be configured
+few long-running nodes used to run the controller, the          separately for each resource type and managed sepa-
+minimum number of metadata servers (one in our de-              rately for metadata servers, long-running storage servers
+ployment), and the minimum number of storage servers            (which store data written with the PERSIST flag set) and
+(two in our deployment). In particular, data written with       regular storage servers. For our deployment, we use a
+the PERSIST flag described in §3.2, which has longer            lower utilization threshold of 60% and a upper utiliza-
+lifetime, is always stored on long-running storage servers      tion threshold of 80% for all resource dimensions, for
+in the cluster. Beyond these persistent resources, Pocket       both the metadata and storage nodes. The range is em-
+scales resources on demand based on load. We first de-          pirically tuned and depends on the time it takes to add/re-
+scribe the mechanism for horizontal and vertical scaling        move nodes. Pocket’s controller scales down the cluster
+and then discuss the policy Pocket uses to balance cluster      by removing a storage server if overall CPU, network
+load by carefully steering requests across servers.             bandwidth and capacity utilization is below the lower
+   Mechanisms: The controller monitors cluster re-              limit of the target range. In this case, Pocket removes
+source utilization by processing heartbeats from storage        a storage server belonging to the tier with lowest capac-
+and metadata servers containing their CPU, network, and         ity utilization. Pocket adds a storage server if overall
+storage media capacity usage. Nodes send statistics to          CPU, network bandwidth or capacity utilization is above
+the controller every second. The interval is configurable.      the upper limit of the target range. To respond to CPU
+   When launching a new storage server, the controller          load spikes or lulls, Pocket first tries to vertically scale
+provides the IP addresses of all metadata servers that the      CPU resources on metadata and storage servers before
+storage server must establish connections with to join the      horizontally scaling the number of nodes.
+cluster. The new storage server registers a portion of             Balancing load with data steering: To balance load
+its capacity with each of these metadata servers. Meta-         while dynamically sizing the cluster, Pocket leverages
+data servers independently manage their assigned capac-         the short-lived nature of ephemeral data and serverless
+ity and do not communicate with each other. Storage             jobs. As ephemeral data objects only live for tens to
+servers periodically sends heartbeats to metadata servers.      hundreds of seconds (see Figure 3), migrating this data
+   To remove a storage server, the controller blacklists        to re-distribute load when nodes are added or removed
+the storage server by assigning it a zero weight in the         has high overhead. Instead, Pocket focuses on steering
+weight maps of incoming jobs. This ensures that meta-           data for incoming jobs across active and new storage
+data servers do not steer data from new jobs to this node.      servers joining the cluster. Pocket controls data steering
+The controller instructs a randomly selected metadata           by assigning specific weights for storage servers in each
+server to set a ‘kill’ flag in the heartbeat responses of the   job’s weight map. To balance load, the controller assigns
+blacklisted storage server. The blacklisted storage server      higher weights to under-utilized storage servers.
+waits until its capacity is entirely freed, as jobs termi-         The controller uses a similar approach, at a coarser
+nate and their ephemeral data are garbage collected. The        granularity, to balance load across metadata servers. As
+storage server then terminates and releases its resources.      noted in §3.2, the controller currently assigns each job
+   When the controller launches a new metadata server,          to one metadata server. The controller estimates the
+the metadata server waits for new storage servers to also       load a job will impose on a metadata server based on
+be launched and register their capacity. To remove a            its throughput and capacity allocation. Combining this
+metadata server, the controller sends a ‘kill’ RPC to the       estimate with metadata server resource utilization statis-
+node. The metadata server waits for all the capacity it         tics, the controller selects a metadata server to use for
+manages to be freed, then notifies all connected storage        an incoming job such that the predicted metadata server
+servers to close their connections. When all connections        resource utilization remains within the target range.
+
+
+
+434   13th USENIX Symposium on Operating Systems Design and Implementation                            USENIX Association
+5   Implementation                                               Pocket         EC2        DRAM Storage Network $ / hr
+                                                                 server        server      (GB) (TB) (Gb/s)
+Controller: Pocket’s controller, implemented in Python,          Controller    m5.xl        16    0      ∼8     0.192
+leverages the Kubernetes container orchestration system          Metadata      m5.xl        16    0      ∼8     0.192
+                                                                 DRAM          r4.2xl       61    0      ∼8     0.532
+to launch and tear down metadata and storage servers,
+                                                                 NVMe          i3.2xl       61   1.9     ∼8     0.624
+running in separate Docker containers [7]. The controller
+                                                                 SSD           i2.2xl       61   1.6    .2     1.7051
+uses Kubernetes Operations (kops) to spin up and down            HDD           h1.2xl       32    2      ∼8     0.468
+virtual machines that run containers [6]. As explained
+in §4.2, Pocket rightsizes cluster resources to maintain a       Table 4: Type and cost of EC2 VMs used for Pocket
+target utilization range. We implement a resource moni-
+toring daemon in Python which runs on each node, send-
+ing CPU and network utilization statistics to the con-       via a standard kernel device driver. Similar to ReFlex,
+troller every second. Metadata servers also send stor-       this tier is implemented in C and uses DPDK for effi-
+age tier capacity utilization statistics. We empirically     cient, userspace networking. However, instead of using
+tune the target utilization range based on node startup      SPDK to access NVMe Flash devices from userspace,
+time. For example, we use a conservative target utiliza-     this tier uses the Linux libaio library to submit asyn-
+tion range when the controller needs to launch new VMs       chronous block storage requests to a kernel block device
+compared to when VMs are running and the controller          driver. Leveraging userspace APIs for the Pocket NVMe
+simply launches containers.                                  and generic block device tiers allows us to increase per-
+   Metadata management: We implement Pocket’s                formance and resource efficiency. For example, ReFlex
+metadata and storage server architecture on top of the       can process up to 11× more requests per core than a con-
+Apache Crail distributed data store [2, 71]. Crail is de-    ventional Linux network-storage stack [47].
+signed for low latency, high throughput storage of arbi-        Client library: Since the serverless applications we
+trarily sized data with low durability requirements. Crail   use are written in Python, we implement Pocket’s ap-
+provides a unified namespace across a set of heteroge-       plication interface (Table 2) as a Python client library.
+neous storage resources distributed in a cluster. Its mod-   The core of the library is implemented in C++ to opti-
+ular architecture separates the data and metadata plane      mize performance. We use Boost to wrap the code into
+and supports pluggable storage tier and RPC library im-      a Python library. The library internally manages TCP
+plementations. While Crail is originally designed for        connections with metadata and storage servers.
+RDMA networks, we implement a TCP-based RPC li-
+brary for Pocket since RDMA is not readily available in      6     Evaluation
+public clouds. Like Crail, Pocket’s metadata servers are
+implemented in Java. Each metadata server logs its meta-
+                                                             6.1      Methodology
+data operations to a file on a shared NFS mount point,
+such that the log can be accessed and replayed by a new      We deploy Pocket on Amazon Web Service (AWS). We
+metadata server in case a metadata server fails.             use EC2 instances to run Pocket storage, metadata, and
+   Storage tiers: We implement three different storage       controller nodes. We use four different kinds of storage
+tiers for Pocket. The first is a DRAM tier implemented       media: DRAM, NVMe-based Flash, SATA/SAS-based
+in Java, using NIO APIs to efficiently serve requests        Flash (which we refer to as SSD), and HDD. DRAM
+from clients over TCP connections. The second tier uses      servers run on r4.2xl instances, NVMe Flash servers
+NVMe Flash storage. We implement Pocket’s NVMe               run on i3.2xl instances, SSD servers run on i2.2xl in-
+storage servers on top of ReFlex, a system that allows       stances, and HDD servers run on h1.2xl instances. We
+clients (i.e., lambdas) to access Flash over commodity       choose the instance families based on their local storage
+Ethernet networks with high performance [47]. ReFlex         media, shown in Table 4. We choose the VM size to pro-
+is implemented in C and leverages Intel’s DPDK [43]          vide a good balance of network bandwidth and storage
+and SPDK [44] libraries to directly access network and       capacity for the serverless applications we study.
+NVMe device queues from userspace. ReFlex uses a                We run Pocket storage and metadata servers as con-
+polling-based execution model to efficiently process net-    tainers on EC2 VMs, orchestrated with Kubernetes v1.9.
+work storage requests over TCP. The system also uses         We use AWS Lambda as our serverless computing plat-
+a quality of service (QoS) aware scheduler to manage         form. We enable lambdas to access Pocket EC2 nodes by
+read/write interference on Flash and provide predictable     deploying them in the same virtual private cloud (VPC).
+performance to clients. The third tier we implement is           1 The cost of the i2 instance is particularly high since it is an old
+a generic block storage tier that allows Pocket to use       generation instance that is being phased out by AWS and replaced by
+any block storage device (e.g., HDD or SATA/SAS SSD)         the newer generation i3 instances with NVMe Flash devices.
+
+
+
+
+USENIX Association                 13th USENIX Symposium on Operating Systems Design and Implementation                          435
+We configure lambdas with 3 GB of memory. Ama-                                30000
+
+
+
+
+                                                               Latency (us)
+                                                                                                                           25819                                                            PUT
+zon allocates lambda compute resources proportional to                                                                                                                                      GET
+memory resources [18]. We compare Pocket’s perfor-                            20000
+
+mance and cost-efficiency to ElastiCache Redis (cluster-                                                                       12102
+
+                                                                              10000______
+mode enabled) and Amazon S3 [13, 51, 16]. We present                                                               _
+                                                                                                                 __ ____
+                                                                                                                  __
+                                                                                                                     _
+
+
+results from experiments conducted in April 2018.                                      2000                                                232 230     437 317     539 422     604 516
+                                                                                                                                                                                             1975
+                                                                                                                                                                                         712 1975
+
+   We study three different serverless analytics applica-
+tions, described below. The applications differ in their                               1000
+                                                                                                                                                                   539         604 516
+                                                                                                                                                                                         712
+                                                                                                                                                       437               422
+degree of parallelism, ephemeral object size distribution                                                                                  232 230           317
+
+                                                                                                                 0
+(Figure 2), and throughput requirements.                                                                                     S3            Redis       Pocket      Pocket      Pocket    Pocket
+                                                                                                                                                       DRAM        NVMe         SSD       HDD
+   Video analytics: We use the Thousand Island Scanner
+(THIS) for distributed video processing [63]. Lambdas          Figure 5: Unloaded latency for 1KB access from lambda
+in the first stage read compressed video frame batches,
+decode, and write the decoded frames to ephemeral stor-                                                      5
+
+
+
+
+                                                                              Cumulative Throughput (GB/s)
+                                                                                                                            S3
+age. Each lambda fetches a 250 MB decoder executable                                                                        Redis
+
+from S3 as it does not fit in the AWS Lambda deploy-                                                         4              Pocket-DRAM
+                                                                                                                            Pocket-NVMe
+ment package. Each first stage lambda then launches                                                                         Pocket-SSD-i2.2xl
+                                                                                                             3              Pocket-SSD-i2-8xl
+second stage lambdas, which read decoded frames from                                                                        Pocket-HDD
+
+ephemeral storage, compute a MXNET deep learning                                                             2
+classification algorithm and output an object detection
+                                                                                                             1
+result. We use a 25 minute video with 40K 1080p frames.
+We tune the batch size for each stage to minimize the                                                        0
+job’s end-to-end execution time; the first stage consists                                                            1                 2               3        4                5             6
+                                                                                                                                                     Number of nodes
+of 160 lambdas while the second has 305 lambdas.
+   MapReduce Sort: We implement a MapReduce sort               Figure 6: Total GB/s for 1MB requests from 100 lambdas
+application on AWS Lambda, similar to PyWren [45].
+Map lambdas fetch input files from long-term storage
+(we use S3) and write intermediate files to ephemeral          latency is higher than put latency since lambdas issue
+storage. Reduce lambdas merge and sort intermediate            random reads while writes are sequential; the metadata
+data and upload output files to long-term storage. We          server routes writes to sequential logical block addresses.
+run a 100 GB sort, which generates 100 GB of ephemeral         Pocket-DRAM has higher latency than Redis mainly due
+data. We run the job with 250, 500, and 1000 lambdas.          to the metadata lookup RPC, which takes 140 µs. While
+   Distributed software compilation (λ -cc): We use            Redis cluster clients simply hash keys to Redis nodes,
+gg to infer software build dependency trees and in-            Pocket clients must contact a metadata server. While this
+voke lambdas to compile source code with high par-             extra RPC increases request latency, it allows Pocket to
+allelism [4, 31]. Each lambda fetches its dependen-            optimize data placement per job and dynamically scale
+cies from ephemeral storage, computes (i.e., compiles,         the cluster without redistributing data across nodes.
+archives or links), and writes its output to ephemeral stor-      Storage request throughput: We measure the get
+age, including the final executable for the user to down-      throughput of S3, Redis (cache.r4.2xl) and various
+load. We present results for compiling the cmake project       Pocket storage tiers by issuing 1 MB requests from 100
+source code. This build job has a maximum inherent par-        concurrent lambdas. In Figure 6, we sweep the num-
+allelism of 650 tasks and generates a total of 850 MB          ber of nodes in the Redis and Pocket clusters and com-
+ephemeral data. Object size ranges from 10s of bytes to        pare the cumulative throughput to that achieved with
+MBs, as shown in Figure 2.                                     S3. Pocket-DRAM, Pocket-NVMe and Redis all achieve
+                                                               similar throughput. With a single node, the bottle-
+6.2    Microbenchmarks                                         neck is the 1 GB/s VM network bandwidth. With two
+                                                               nodes, Pocket’s DRAM and NVMe tiers achieve higher
+Storage request latency: Figure 5 compares the 1               throughput than S3. Pocket’s SSD and HDD tiers have
+KB request latency of S3, Redis, and various Pocket            significantly lower throughput. The HDD tier is limited
+storage tiers measured from a lambda client. Pocket-           by the 40 MB/s random access bandwidth of the disk on
+DRAM, Pocket-NVMe and Redis latency is below 540               each node. The SSD tier is limited by poor network-
+µs, which is over 45× faster than S3. The latency of           ing (less than ∼2 Gb/s) on the old generation i2.2xl
+the Pocket-SSD and Pocket-HDD tiers is higher due to           instances. Hence, we also plot the throughput using
+higher storage media access times. Pocket-HDD get              i2.8xl instances which have 10 Gb/s networking. The
+
+
+
+436   13th USENIX Symposium on Operating Systems Design and Implementation                                                                                                 USENIX Association
+           250     VM Startup
+                                                                                                         1.2   No Knowledge        Latency Sensitivity
+
+
+
+
+                                                                              Normalized Resource Cost
+                   Container Image Pull                                                                        Num Lambdas         Data Capacity + Peak Throughput
+           200     Container Startup
+                                                                                                         1.0
+                   Datanode Registration
+Time (s)
+
+
+
+
+           150                                                                                           0.8
+
+
+
+
+                                                                                       ($/hr)
+                                                                                                         0.6
+           100
+                                                                                                         0.4
+            50
+                                                                                                         0.2
+             0                                                                                           0.0
+             Metadata Server           DRAM Server      NVMe Server                                            Sort           Video Analytics          λ-cc
+
+
+                  Figure 7: Node startup time breakdown                     Figure 8: Pocket leverages cumulative hints about job
+                                                                            characteristics to allocate resources cost-efficiently.
+
+bottleneck becomes the 500 MB/s throughput limit of the
+SATA/SAS SSD.                                                               6.3                           Rightsizing Resource Allocations
+   We focus the rest of our evaluation of Pocket on the                     We now evaluate Pocket with the three different server-
+DRAM and NVMe Flash tiers as they demand the high-                          less applications described in §6.1.
+est data plane software efficiency due to the technology’s
+                                                                               Rightsizing with application hints: Figure 8 shows
+low latency and high throughput. We also find that in our
+                                                                            how Pocket leverages user hints to make cost-effective
+AWS deployment, the DRAM and NVMe tiers offer sig-
+                                                                            resource allocations, assuming each hint is provided in
+nificantly higher performance-cost efficiency compared
+                                                                            addition to the previous ones. With no knowledge of ap-
+to the HDD and SSD tiers. For example, NVMe Flash
+                                                                            plication requirements, Pocket defaults to a policy that
+servers, which run on on i3.2xl instances, provide 1
+                                                                            spreads data for a job across a default allocation of 50
+GB/s per 1900 GB capacity at a cost of $0.624/hour.
+                                                                            nodes, filling DRAM first, then Flash. With knowledge
+Meanwhile, HDD servers, which run on h1.2xl in-
+                                                                            of the maximum number of concurrent lambdas (250,
+stances, provide only 40 MB/s per 2000 GB capacity at
+                                                                            160, and 650 for the sort, video analytics and λ -cc jobs,
+a cost of $0.468/hour. Thus, the NVMe tier offers 19.7×
+                                                                            respectively), Pocket allocates lower aggregate through-
+higher throughput per GB per dollar.
+                                                                            put than the default allocation while maintaining simi-
+   Metadata throughput: We measure the number of                            lar job execution time (within 4% of the execution time
+metadata operations that a metadata server can handle                       achieved with the default allocation). Furthermore, these
+per second. A single core metadata server on the m5.xl                      jobs are not sensitive to latency; the sort job and the
+instance supports up to 90K operations per second and                       first stage of the video analytics job are throughput in-
+up to 175K operations per second with four cores. The                       tensive while λ -cc and the second stage of the video
+peak metadata request rate we observe for the serverless                    analytics job are compute limited. The orange bars in
+analytics applications we study is 75 operations per sec-                   Figure 8 show the cost savings of using NVMe Flash as
+ond per lambda. Hence, a multi-core metadata server can                     opposed to DRAM when the latency insensitivity hint is
+support jobs with thousands of lambdas.                                     provided for these jobs. The green bar shows the rela-
+   Adding/removing servers: Since Pocket runs in con-                       tive resource allocation cost when applications provide
+tainers on EC2 nodes, we measure the time it takes to                       explicit hints for their capacity and peak throughput re-
+launch a VM, pull the container image, and launch the                       quirements; such hints can be obtained from a profiling
+container. Pocket storage servers must also register their                  run. Across all scenarios, each job’s execution time re-
+storage capacity with metadata servers to join the cluster.                 mains within 4% of its execution time with the default
+Figure 7 shows the time breakdown. VM launch time                           resource allocation.
+varies across EC2 instance types. The container image                          Reclaiming capacity using hints: Figure 9 shows
+for the metadata server and DRAM server has a com-                          the capacity used over time for the video analytics job,
+pressed size of 249 MB while the Pocket-NVMe com-                           with and without data lifetime management hints. All
+pressed container image is 540 MB due to dependencies                       ephemeral data in this application is written and read
+for DPDK and SPDK to run ReFlex. The image pull                             only once, since each first stage lambda writes ephemeral
+time depends on the VM’s network bandwidth. The VM                          data destined to a single second stage lambda. Hence for
+launch time and container image pull time only need to                      all get operations, this job can make use of the DELETE
+be done once when the VM is first started. Once the VM                      hint which informs Pocket to promptly garbage collect an
+is warm, meaning the image is available locally, starting                   object as soon as it has been read. By default, when the
+and stopping containers takes only a few seconds. The                       DELETE hint is not specified, Pocket waits until the job
+time to terminate a VM is tens of seconds.                                  deregisters to delete the job’s data. The job in Figure 9
+
+
+
+USENIX Association                                   13th USENIX Symposium on Operating Systems Design and Implementation                                            437
+                     25
+                                                                                                         6
+                             No data lifetime hints                                                                 Total GB/s allocated
+                     20      With data lifetime hints                                                    5          Total GB/s used
+Capacity used (GB)
+
+
+
+
+                                                                                     Throughput (GB/s)
+                                                                                                         4
+                     15
+                                                                                                         3
+                     10
+                                                                                                         2
+
+                      5                                                                                  1
+
+                                                                                                         0
+                      0
+                       0    20     40     60     80    100   120   140   160   180                           0          50       100     150     200     250     300     350
+                                                  Time (s)                                                                                  Time (s)
+                                                                                                                 Job1        Job1 Job2   Job3     Job3            Job2
+
+
+Figure 9: Example of using the DELETE hint for get
+                                                                                          Figure 10: Pocket’s controller dynamically scales cluster
+operations in a video analytics job, enabling Pocket to
+                                                                                          resources to meet I/O requirements as jobs come and go.
+readily reclaim capacity by deleting objects after they
+have been read versus waiting for the job to complete.
+                                                                                          6.4                     Comparison to S3 and Redis
+                                                                                          Job execution time: Figure 11 plots the per-lambda ex-
+completes at the 158 second mark. We show that leverag-                                   ecution time breakdown for the MapReduce 100 GB sort
+ing the DELETE hint allows Pocket to reclaim capacity                                     job, run with 250, 500, and 1000 concurrent lambdas.
+more promptly, making more efficient use of resources                                     The purple bars show the time spent fetching original in-
+as this capacity can be offered to other jobs.                                            put data and writing final output data to S3 while the blue
+   Rightsizing cluster size: Elastic and automatic re-                                    bars compare the time for ephemeral data I/O with S3,
+source scaling is a key property of Pocket. Figure 10                                     Redis and Pocket-NVMe. S3 does not support sufficient
+shows how Pocket scales cluster resources as multiple                                     request rates when the job is run with 500 or more lamb-
+jobs register and deregister with the controller. Job regis-                              das. S3 returns errors, advising to reduce the I/O rate.
+tration and deregistration times are indicated by upwards                                 Pocket provides similar throughput to Redis, however
+and downwards arrows along the x-axis, respectively. In                                   since the application is not sensitive to latency, Pocket
+this experiment, we assume Pocket receives capacity and                                   uses NVMe Flash instead of DRAM to reduce cost.
+throughput hints for each job’s requirements. The first                                      Similarly, for the video analytics job, we observe that
+job is a 10 GB sort application requesting 3 GB/s, the                                    Pocket-NVMe achieves the same performance as Redis.
+second job is a video analytics application requesting 2.5                                However, using S3 for the video analytics job increases
+GB/s and the third job is a different invocation of a 10                                  the average time spent on ephemeral I/O by each lambda
+GB sort also requesting 3 GB/s. Each storage server pro-                                  in the first stage (video decoding) by 3.2× and 4.1×
+vides 1 GB/s. We use a minimum of two storage servers                                     for lambdas in the second stage (MXNET classification),
+in the cluster. We provision seven VMs for this exper-                                    compared to using Pocket or Redis.
+iment and ensure that storage server containers are lo-                                      The performance of the distributed compilation job
+cally available, such that when the controller launches                                   (λ -cc cmake) is limited by lambda CPU resources [49].
+new storage servers, only container startup and capacity                                  A software build job has inherently limited parallelism;
+registration time is included.                                                            early-stage lambdas compile independent files in paral-
+   Figure 10 shows that Pocket quickly and effectively                                    lel, however lambdas responsible for archiving and link-
+scales the allocated storage bandwidth (dotted line) to                                   ing are serialized as they depend on the outputs of the
+meet application throughput demands (solid line). The                                     early-stage lambdas. We observe that the early-stage
+spike surpassing the allocated throughput is due to a                                     lambdas are compute-bound on current serverless infras-
+short burst in EC2 VM network bandwidth. The VMs                                          tructure. Although using Pocket or Redis reduces the
+provide ‘up to 10 Gb/s’, but since we typically observe                                   fraction of time each lambda spend on ephemeral I/O,
+a ∼8 Gb/s bandwidth limit in practice, the controller al-                                 the overall execution time for this job remains the same
+locates throughput assuming each node provides 8 Gb/s.                                    as when using S3 for ephemeral storage, since the bottle-
+As the controller rightsizes resources for each job, job                                  neck is dependencies on compute-bound lambdas.
+execution time stays within 5% of its execution time                                         Cost analysis: Table 4 shows the hourly cost of run-
+when running on 50 nodes, the conservative default re-                                    ning Pocket nodes on EC2 VMs in April 2018. Our min-
+source allocation. If the controller had to spin up new                                   imum size Pocket cluster, consisting of one controller
+VMs to accommodate a job’s requirements instead of                                        node, one metadata server and two i3.2xl storage nodes
+just launching containers, the job’s start time would be                                  costs $1.632 per hour on EC2. However, Pocket’s fixed
+delayed by up to 215 seconds (see EC2 NVMe server                                         cost can be amortized as the system is designed to sup-
+startup time in Figure 7) since the register job call                                     port multiple concurrent jobs from one or more tenants.
+blocks until the required storage servers are available.                                  We intend for Pocket to be operated by a cloud provider
+
+
+
+438                        13th USENIX Symposium on Operating Systems Design and Implementation                                                                USENIX Association
+Average Time per Lambda (s)
+                              100
+                                                                             S3 I/O                   for appending or accessing parts of objects could ben-
+                                                                             Compute
+                               80                                            Ephemeral Data I/O       efit other applications. Pocket’s get/put API is imple-
+                               60                                                                     mented on top of Apache Crail’s append-only stream ab-
+                                                                                                      straction which allows clients to read at file offsets and
+                               40
+                                                                                                      append to files with single-writer semantics [3]. Thus,
+                               20
+                                                                                                      Pocket’s API could easily be modified to expose Crail’s
+                                0   S3     Redis Pocket-NVMe    Redis Pocket-NVMe Redis Pocket-NVMe
+                                                                                                      I/O semantics. Other operators such as filters or multi-
+                                         250 lambdas           500 lambdas        1000 lambdas
+                                                                                                      gets could also help optimize the number of RPCs and
+            Figure 11: Execution time breakdown of 100GB sort.                                        bytes transferred. The right choice of API for ephemeral
+                                                                                                      storage remains an open question.
+                                                                                                         Security: Pocket uses access control to secure appli-
+                                    Job                            S3         Redis       Pocket      cations in a multi-tenant environment. To prevent mali-
+                                    100 GB sort                 0.05126       5.320       2.1648      cious users from accessing other tenants’ data, metadata
+                                    Video analytics             0.00034       1.596       0.6483      servers issue single-use certificates to clients which are
+                                    λ -cc cmake                 0.00005       1.596       0.6480
+                                                                                                      verified at storage servers. An I/O request that is not
+                                                                                                      accompanied with a valid certificate is denied. Clients
+                              Table 5: Hourly ephemeral storage cost (in USD)
+                                                                                                      communicate with metadata servers over SSL to protect
+                                                                                                      against man in the middle attacks. Users set cloud net-
+and offered as a storage service with a pay-what-you-use                                              work security rules to prevent TCP traffic snooping on
+cost model for users, similar to the cost model of server-                                            connections between lambdas and storage servers. Al-
+less computing platforms. Hence, for our cost analysis,                                               ternatively, users can encrypt their data. Pocket does
+we derive fine-grain resource costs, such as the cost of                                              not currently prevent jobs from issuing higher load than
+a CPU core and the cost of storage per GB, using AWS                                                  specified in job registration hints. Request throttling can
+EC2 instance pricing. For example, we calculate NVMe                                                  be implemented at metadata servers to mitigate interfer-
+Flash $/GB by taking the difference between i3.2xl and                                                ence when a job tries to exceed its allocation.
+r4.2xl instance costs (since these VMs have the same                                                     Learning job characteristics: Pocket currently re-
+CPU and DRAM configurations but i3.2xl includes a                                                     lies on user or application framework hints to cost-
+1900 GB NVMe drive) and dividing by the GB capacity                                                   effectively rightsize resource allocations for a job. Cur-
+of the i3.2xl NVMe drive.                                                                             rently, Pocket does not autonomously learn application
+   Using this fine-grain resource pricing model for                                                   properties. Since users may repeatedly run jobs on differ-
+Pocket, Table 5 compares the cost of running the 100                                                  ent datasets, as many data analytics and modern machine
+GB sort, video analytics and distributed compilation jobs                                             learning jobs are recurring [55], Pocket’s controller can
+with S3, ElastiCache Redis, and Pocket-NVMe. We use                                                   maintain statistics about previous invocations of a job
+reduced redundancy pricing for S3 and assume the GB-                                                  and use this information combined with machine learn-
+month cost is charged hourly [15]. We base Redis costs                                                ing techniques to rightsize resource allocations for future
+on the price of entire VMs, not only the resources con-                                               runs [48, 10]. We plan to explore this in future work.
+sumed, since ElastiCache Redis clusters are managed                                                      Applicability to other cloud platforms: While we
+by individual users rather than cloud providers. Pocket                                               evaluate Pocket on the AWS cloud platform, the sys-
+achieves the same performance as Redis for all three jobs                                             tem addresses a real problem applicable across all cloud
+while saving 59% in cost. S3 is still orders of magnitude                                             providers as no available platform provides an optimized
+cheaper. However, S3’s cloud provider based cost is not                                               way for serverless tasks to exchange ephemeral data.
+a fair comparison to the cloud user based cost model we                                               Pocket’s performance will vary with network and storage
+use for Pocket and Redis. Furthermore, while the λ -cc                                                capabilities of different infrastructure. For example, if a
+job has similar performance with Pocket, Redis and S3                                                 low latency network is available, the DRAM storage tier
+due to a lambda compute bottleneck, the video analytics                                               provides significantly lower latency than the NVMe tier.
+and sort job execution time is 40 to 65% higher with S3.                                              Such variations emphasize the need for a control plane to
+                                                                                                      automate resource allocation and data placement.
+7                               Discussion                                                               Applicability to other cloud workloads: Though we
+                                                                                                      presented Pocket in the context of ephemeral data shar-
+Choice of API: Pocket’s simple get/put interface pro-                                                 ing in serverless analytics, Pocket can also be used for
+vides sufficient functionality for the applications we                                                other applications that require distributed, scalable tem-
+studied. Lambdas in these jobs consume entire data ob-                                                porary storage. For instance, Google’s Cloud Dataflow,
+jects that they read and they do not require updating or                                              a fully-managed data processing service for streaming
+appending files. However, POSIX-like I/O semantics                                                    and batch data analytics pipelines, implements the shuf-
+
+
+
+USENIX Association                                                           13th USENIX Symposium on Operating Systems Design and Implementation            439
+fle operator – used for transforms such as GroupByKey –         access pattern simulations and monitoring to find a cost-
+as part of its service backend [35]. Pocket can serve as        efficient storage solution for a workload across multiple
+fast, elastic storage for the intermediate data generated       storage tiers [38]. The access pattern of ephemeral data is
+by shuffle operations in this kind of service.                  often simple (e.g., write-once-read-once) and the data is
+   Reducing cost with resource harvesting: Cloud jobs           short-lived, hence it is not worth migrating between tiers.
+are commonly over-provisioned in terms CPU, DRAM,               Multiple systems make storage configuration recommen-
+network, and storage resources due to the difficulty of         dation based on workload traces [19, 70, 9, 59, 12].
+rigthsizing general jobs and the need to accommodate            Given I/O traces for a job, Pocket could apply similar
+diurnal load patterns and unexpected load spikes. The           techniques to assign resources when a job registers.
+result is significant capacity underutilization at the clus-       Fully managed data warehousing: Cloud providers
+ter level [21, 74, 29]. Recent work has shown that the          offer fully managed infrastructure for querying large
+plethora of allocated but temporarily unused resources          amounts of structured data with high parallelism and
+provide a stable substrate that can be used to run ana-         elasticity. Examples include Amazon Redshift [14],
+lytics job [22, 79]. We can similarly leverage harvested        Google BigQuery [37], Azure SQL Data Ware-
+resources to dramatically reduce the total cost of running      house [58], and Snowflake [26]. These systems are de-
+Pocket. Pocket’s storage servers are particularly well          signed to support relational queries and high data dura-
+suited to run on temporarily idle resource as ephemeral         bility, while Pocket is designed for elastic, fast, and
+data has short lifetime and low durability requirements.        fully managed storage of data with low durability re-
+                                                                quirements. However, a cloud data warehouse like
+                                                                Snowflake, which currently stores temporary data gener-
+8     Related Work
+                                                                ated by query operators on local disk or S3, could lever-
+Elastic resource scaling: Various reactive [34], predic-        age Pocket to improve elasticity and resource utilization.
+tive [25, 50, 65, 30, 62, 72, 75] and hybrid [24, 41, 33, 60]
+approaches have been proposed to automatically scale re-        9   Conclusion
+sources based on demand [64, 61]. Muse takes an eco-
+nomic approach, allocating resources to their most effi-        General-purpose analytics on serverless infrastructure
+cient use based on a utility function that estimates the        presents unique opportunities and challenges for perfor-
+impact of resource allocations on job performance [23].         mance, elasticity and resource efficiency. We analyzed
+Pocket provisions resources upfront for a job based on          challenges associated with efficient data sharing and pre-
+hints and conservative heuristics while using a reactive        sented Pocket, an ephemeral data store for serverless an-
+approach to adjust cluster resources over time as jobs          alytics. In a similar spirit to serverless computing, Pocket
+enter and leave the system. Pocket’s reactive scaling           aims to provide a highly elastic, cost-effective, and fine-
+is similar to Horizontal Pod autoscaling in Kubernetes          grained storage solution for analytics workloads. Pocket
+which collects multidimensional metrics and adjusts re-         achieves these goals using a strict separation of respon-
+sources based on utilization ratios [5]. Petal [52] and the     sibilities for control, metadata, and data management.
+controller by Lim et al. [54] propose data re-balancing         To the best of our knowledge, Pocket is the first sys-
+strategies in elastic storage clusters while Pocket avoids      tem designed specifically for ephemeral data sharing in
+redistributing short-lived data due to the high overhead.       serverless analytics workloads. Our evaluation on AWS
+CloudScale [68], Elastisizer [40], CherryPick [11], and         demonstrates that Pocket offers high performance data
+other systems [73, 77, 48] take an application-centric          access for arbitrary size data sets, combined with auto-
+view to rightsize a job at the coarse granularity of tra-       matic fine-grain scaling, self management and cost ef-
+ditional VMs as opposed to determining fine-grain stor-         fective data placement across multiple storage tiers.
+age requirements. Nevertheless, the proposed cost and
+performance modeling approaches can also be applied to
+Pocket to autonomously learn job resource preferences.          Acknowledgements
+   Intelligent data placement: Mirador is a dynamic
+storage service that optimizes data placement for per-          We thank our shepherd, Hakim Weatherspoon, and
+formance, efficiency, and safety [76]. Mirador focuses          the anonymous OSDI reviewers for their helpful feed-
+on long-running jobs (minutes to hours), while Pocket           back. We thank Qian Li, Francisco Romero, and Sadjad
+targets short-term (seconds to minutes) ephemeral stor-         Fouladi for insightful technical discussions. This work is
+age. Tuba manages geo-replicated storage and, simi-             supported by the Stanford Platform Lab, Samsung, and
+lar to Pocket, optimizes data placement based on per-           Huawei. Ana Klimovic is supported by a Stanford Grad-
+formance and cost constraints received from applica-            uate Fellowship. Yawen Wang is supported by a Stanford
+tions [20]. Extent-based Dynamic Tiering (EDT) uses             Electrical Engineering Department Fellowship.
+
+
+
+440    13th USENIX Symposium on Operating Systems Design and Implementation                           USENIX Association
+References                                                    [13] A MAZON. Amazon ElastiCache. https://aws.
+                                                                   amazon.com/elasticache, 2018.
+ [1] Apache CouchDB.        http://couchdb.apache.
+     org, 2018.                                               [14] A MAZON. Amazon redshift.           https://aws.
+                                                                   amazon.com/redshift, 2018.
+ [2] Apache Crail (incubating).  http://crail.
+     incubator.apache.org, 2018.                              [15] A MAZON. Amazon S3 reduced redundancy stor-
+                                                                   age. https://aws.amazon.com/s3/reduced-
+ [3] Crail Storage Performance – Part I: DRAM.                     redundancy, 2018.
+     http://crail.incubator.apache.org/
+     blog/2017/08/crail-memory.html, 2018.                    [16] A MAZON. Amazon simple storage service. https:
+                                                                   //aws.amazon.com/s3, 2018.
+ [4] gg: The Stanford Builder. https://github.com/
+     stanfordsnr/gg, 2018.                                    [17] A MAZON. AWS lambda. https://aws.amazon.
+                                                                   com/lambda, 2018.
+ [5] Horizontal Pod Autoscaler.       https:
+     //kubernetes.io/docs/tasks/run-                          [18] A MAZON.    AWS lambda limits.   https:
+     application/horizontal-pod-autoscale,                         //docs.aws.amazon.com/lambda/latest/
+     2018.                                                         dg/limits.html, 2018.
+
+ [6] Kubernetes operations (kops). https://github.            [19] A NDERSON , E., H OBBS , M., K EETON , K.,
+     com/kubernetes/kops, 2018.                                    S PENCE , S., U YSAL , M., AND V EITCH , A. Hip-
+                                                                   podrome: Running circles around storage admin-
+ [7] Kubernetes: Production-Grade Container Orches-                istration. In Proc. of the 1st USENIX Conference
+     tration. https://kubernetes.io, 2018.                         on File and Storage Technologies (2002), FAST’02,
+                                                                   pp. 13–13.
+ [8] Memcached – a distributed memory object caching
+     system. https://memcached.org, 2018.                     [20] A RDEKANI , M. S., AND T ERRY, D. B. A self-
+                                                                   configurable geo-replicated cloud storage system.
+ [9] A LBRECHT, C., M ERCHANT, A., S TOKELY, M.,
+                                                                   In Proc. of the 11th USENIX Symposium on Oper-
+     WALIJI , M., L ABELLE , F., C OEHLO , N., S HI , X.,
+                                                                   ating Systems Design and Implementation (2014),
+     AND S CHROCK , E. Janus: Optimal flash provi-
+                                                                   OSDI’14, pp. 367–381.
+     sioning for cloud storage workloads. In Proc. of
+     the USENIX Annual Technical Conference (2013),           [21] BARROSO , L. A., C LIDARAS , J., AND H LZLE , U.
+     ATC’13, pp. 91–102.                                           The Datacenter as a Computer: An Introduction to
+                                                                   the Design of Warehouse-Scale Machines, Second
+[10] A LIPOURFARD , O., L IU , H. H., C HEN , J.,
+                                                                   Edition. 2013.
+     V ENKATARAMAN , S., Y U , M., AND Z HANG ,
+     M. CherryPick: Adaptively unearthing the best            [22] C ARVALHO , M., C IRNE , W., B RASILEIRO , F.,
+     cloud configurations for big data analytics. In 14th          AND W ILKES , J. Long-term SLOs for reclaimed
+     USENIX Symposium on Networked Systems De-                     cloud computing resources. In Proc. of the ACM
+     sign and Implementation (NSDI 17) (Boston, MA,                Symposium on Cloud Computing (2014), SOCC
+     2017), pp. 469–482.                                           ’14, pp. 20:1–20:13.
+[11] A LIPOURFARD , O., L IU , H. H., C HEN , J.,             [23] C HASE , J. S., A NDERSON , D. C., T HAKAR ,
+     V ENKATARAMAN , S., Y U , M., AND Z HANG , M.                 P. N., VAHDAT, A. M., AND D OYLE , R. P. Man-
+     Cherrypick: Adaptively unearthing the best cloud              aging energy and server resources in hosting cen-
+     configurations for big data analytics. In Proc. of the        ters. In Proc. of the Eighteenth ACM Symposium
+     USENIX Symposium on Networked Systems Design                  on Operating Systems Principles (2001), SOSP ’01,
+     and Implementation (NSDI’17) (2017), pp. 469–                 pp. 103–116.
+     482.
+                                                              [24] C HEN , G., H E , W., L IU , J., NATH , S., R IGAS ,
+[12] A LVAREZ , G. A., B OROWSKY, E., G O , S.,                    L., X IAO , L., AND Z HAO , F. Energy-aware server
+     ROMER , T. H., B ECKER -S ZENDY, R., G OLDING ,               provisioning and load dispatching for connection-
+     R., M ERCHANT, A., S PASOJEVIC , M., V EITCH ,                intensive internet services. In Proc. of the 5th
+     A., AND W ILKES , J. Minerva: An automated re-                USENIX Symposium on Networked Systems Design
+     source provisioning tool for large-scale storage sys-         and Implementation (2008), NSDI’08, pp. 337–
+     tems. ACM Trans. Comput. Syst. 19, 4 (Nov. 2001),             350.
+     483–518.
+
+
+USENIX Association                 13th USENIX Symposium on Operating Systems Design and Implementation            441
+[25] C ORTEZ , E., B ONDE , A., M UZIO , A., RUSSI -               AND W INSTEIN , K. Encoding, fast and slow:
+     NOVICH , M., F ONTOURA , M., AND B IANCHINI ,                 Low-latency video processing using thousands of
+     R. Resource central: Understanding and predict-               tiny threads. In Proc. of the 14th USENIX Sympo-
+     ing workloads for improved resource management                sium on Networked Systems Design and Implemen-
+     in large cloud platforms. In Proc. of the 26th Sym-           tation (2017), NSDI’17, pp. 363–376.
+     posium on Operating Systems Principles (2017),
+                                                              [33] G ANDHI , A., C HEN , Y., G MACH , D., A RLITT,
+     SOSP ’17, pp. 153–167.
+                                                                   M., AND M ARWAH , M. Minimizing data center
+[26] DAGEVILLE , B., C RUANES , T., Z UKOWSKI , M.,                sla violations and power consumption via hybrid
+     A NTONOV, V., AVANES , A., B OCK , J., C LAY-                 resource provisioning. In Proc. of the 2011 Inter-
+     BAUGH , J., E NGOVATOV, D., H ENTSCHEL , M.,                  national Green Computing Conference and Work-
+     H UANG , J., L EE , A. W., M OTIVALA , A., M UNIR ,           shops (2011), IGCC ’11, pp. 1–8.
+     A. Q., P ELLEY, S., P OVINEC , P., R AHN , G., T RI -
+                                                              [34] G ANDHI , A., H ARCHOL -BALTER , M., R AGHU -
+     ANTAFYLLIS , S., AND U NTERBRUNNER , P. The
+                                                                   NATHAN , R., AND KOZUCH , M. A. Autoscale:
+     snowflake elastic data warehouse. In Proc. of the
+                                                                   Dynamic, robust capacity management for multi-
+     International Conference on Management of Data
+                                                                   tier data centers. ACM Trans. Comput. Syst. 30, 4
+     (2016), SIGMOD ’16, pp. 215–226.
+                                                                   (Nov. 2012), 14:1–14:26.
+[27] DATABRICKS.       Databricks serverless: Next
+                                                              [35] G OOGLE. Introducing Cloud Dataflow Shuffle:
+     generation resource management for Apache
+                                                                   For up to 5x performance improvement in data
+     Spark.       https://databricks.com/blog/
+                                                                   analytic pipelines. https://cloud.google.
+     2017/06/07/databricks-serverless-next-
+                                                                   com/blog/products/gcp/introducing-
+     generation-resource-management-for-
+                                                                   cloud-dataflow-shuffle-for-up-to-
+     apache-spark.html, 2017.
+                                                                   5x-performance-improvement-in-data-
+[28] D E C ANDIA , G., H ASTORUN , D., JAMPANI , M.,               analytic-pipelines, 2017.
+     K AKULAPATI , G., L AKSHMAN , A., P ILCHIN , A.,
+                                                              [36] G OOGLE. Cloud functions. https://cloud.
+     S IVASUBRAMANIAN , S., VOSSHALL , P., AND
+                                                                   google.com/functions, 2018.
+     VOGELS , W. Dynamo: Amazon’s highly avail-
+     able key-value store. In Proceedings of Twenty-          [37] G OOGLE. Google bigquery. https://cloud.
+     first ACM SIGOPS Symposium on Operating Sys-                  google.com/bigquery, 2018.
+     tems Principles (2007), SOSP ’07, pp. 205–220.
+                                                              [38] G UERRA , J., P UCHA , H., G LIDER , J., B ELLUO -
+[29] D ELIMITROU , C., AND KOZYRAKIS , C. Quasar:                  MINI , W., AND R ANGASWAMI , R. Cost effective
+     Resource-efficient and QoS-aware cluster manage-              storage using extent based dynamic tiering. In Proc.
+     ment. In Proc. of the 19th International Conference           of the 9th USENIX Conference on File and Stroage
+     on Architectural Support for Programming Lan-                 Technologies (2011), FAST’11, pp. 20–20.
+     guages and Operating Systems (2014), ASPLOS
+     ’14, pp. 127–144.                                        [39] G UNDA , P. K., R AVINDRANATH , L., T HEKKATH ,
+                                                                   C. A., Y U , Y., AND Z HUANG , L. Nectar: Auto-
+[30] D OYLE , R. P., C HASE , J. S., A SAD , O. M., J IN ,         matic management of data and computation in dat-
+     W., AND VAHDAT, A. M. Model-based resource                    acenters. In Proceedings of the 9th USENIX Con-
+     provisioning in a web service utility. In Proc. of the        ference on Operating Systems Design and Imple-
+     4th USENIX Symposium on Internet Technologies                 mentation (2010), OSDI’10, pp. 75–88.
+     and Systems (2003), USITS’03, pp. 5–5.
+                                                              [40] H ERODOTOU , H., D ONG , F., AND BABU , S. No
+[31] F OULADI , S., I TER , D., C HATTERJEE , S.,                  one (cluster) size fits all: Automatic cluster sizing
+     KOZYRAKIS , C., Z AHARIA , M., AND W INSTEIN ,                for data-intensive analytics. In Proceedings of the
+     K. A thunk to remember: make -j1000 (and                      2Nd ACM Symposium on Cloud Computing (2011),
+     other jobs) on functions-as-a-service infrastructure          SOCC ’11, pp. 18:1–18:14.
+     (preprint).   http://stanford.edu/~sadjad/
+     gg-paper.pdf.                                            [41] H ORVATH , T., AND S KADRON , K. Multi-mode
+                                                                   energy management for multi-tier server clusters.
+[32] F OULADI , S., WAHBY, R. S., S HACKLETT,                      In Proc. of the 17th International Conference on
+     B., BALASUBRAMANIAM , K. V., Z ENG , W.,                      Parallel Architectures and Compilation Techniques
+     B HALERAO , R., S IVARAMAN , A., P ORTER , G.,                (2008), PACT ’08, pp. 270–279.
+
+
+
+
+442   13th USENIX Symposium on Operating Systems Design and Implementation                        USENIX Association
+[42] H UANG , C., S IMITCI , H., X U , Y., O GUS ,           [53] L I , H., G HODSI , A., Z AHARIA , M., S HENKER ,
+     A., C ALDER , B., G OPALAN , P., L I , J., AND               S., AND S TOICA , I. Tachyon: Reliable, memory
+     Y EKHANIN , S. Erasure coding in windows azure               speed storage for cluster computing frameworks. In
+     storage. In Proc. of the USENIX Conference on An-            Proc. of the ACM Symposium on Cloud Computing
+     nual Technical Conference (2012), ATC’12, pp. 2–             (2014), SOCC ’14, pp. 6:1–6:15.
+     2.
+                                                             [54] L IM , H. C., BABU , S., AND C HASE , J. S. Au-
+[43] I NTEL C ORP. Dataplane Performance Develop-                 tomated control for elastic storage. In Proceedings
+     ment Kit. https://dpdk.org, 2018.                            of the 7th International Conference on Autonomic
+                                                                  Computing (2010), ICAC ’10, pp. 1–10.
+[44] I NTEL C ORP. Storage Performance Development
+     Kit. https://01.org/spdk, 2018.                         [55] M ASHAYEKHI , O., Q U , H., S HAH , C., AND
+                                                                  L EVIS , P. Execution templates: Caching control
+[45] J ONAS , E., P U , Q., V ENKATARAMAN , S., S TO -
+                                                                  plane decisions for strong scaling of data analytics.
+     ICA , I., AND R ECHT, B. Occupy the cloud: dis-
+                                                                  In Proceedings of the 2017 USENIX Conference
+     tributed computing for the 99%. In Proceedings of
+                                                                  on Usenix Annual Technical Conference (Berkeley,
+     the 2017 Symposium on Cloud Computing (2017),
+                                                                  CA, USA, 2017), USENIX ATC ’17, USENIX As-
+     SOCC’17, pp. 445–451.
+                                                                  sociation, pp. 513–526.
+[46] K HAN , O., B URNS , R., P LANK , J., P IERCE , W.,
+                                                             [56] M ICROSOFT. Azure functions. https://azure.
+     AND H UANG , C. Rethinking erasure codes for
+                                                                  microsoft.com/en-us/services/functions,
+     cloud file systems: Minimizing i/o for recovery and
+                                                                  2018.
+     degraded reads. In Proc. of the 10th USENIX Con-
+     ference on File and Storage Technologies (2012),        [57] M ICROSOFT A ZURE.       Azure redis cache.
+     FAST’12, pp. 20–20.                                          https://azure.microsoft.com/en-
+[47] K LIMOVIC , A., L ITZ , H., AND KOZYRAKIS , C.               us/services/cache, 2018.
+     Reflex: Remote flash == local flash. In Proc. of        [58] M ICROSOFT A ZURE.      SQL data ware-
+     the 22nd International Conference on Architectural           house.  https://azure.microsoft.com/en-
+     Support for Programming Languages and Operat-                us/services/sql-data-warehouse, 2018.
+     ing Systems (2017), ASPLOS ’17, pp. 345–359.
+                                                             [59] NARAYANAN , D., T HERESKA , E., D ONNELLY,
+[48] K LIMOVIC , A., L ITZ , H., AND KOZYRAKIS , C.               A., E LNIKETY, S., AND ROWSTRON , A. Migrat-
+     Selecta: Heterogeneous cloud storage configura-              ing server storage to ssds: Analysis of tradeoffs.
+     tion for data analytics. In Proc. of the USENIX              In Proc. of the 4th ACM European Conference on
+     Annual Technical Conference (ATC’18) (2018),                 Computer Systems (2009), EuroSys ’09, pp. 145–
+     pp. 759–773.                                                 158.
+[49] K LIMOVIC , A., WANG , Y., KOZYRAKIS , C.,              [60] N ETFLIX. Scryer: Netflixs predictive auto scal-
+     S TUEDI , P., P FEFFERLE , J., AND T RIVEDI , A.             ing engine. https://medium.com/netflix-
+     Understanding ephemeral storage for serverless an-           techblog/scryer-netflixs-predictive-
+     alytics. In Proc. of the USENIX Annual Technical             auto-scaling-engine-a3f8fc922270, 2013.
+     Conference (ATC’18) (2018), pp. 789–794.
+                                                             [61] N ETTO , M. A. S., C ARDONHA , C., C UNHA ,
+[50] K RIOUKOV, A., M OHAN , P., A LSPAUGH , S.,
+                                                                  R. L. F., AND A SSUNCAO , M. D. Evaluating
+     K EYS , L., C ULLER , D., AND K ATZ , R. H.
+                                                                  auto-scaling strategies for cloud computing envi-
+     Napsac: Design and implementation of a power-
+                                                                  ronments. In Proceedings of the 2014 IEEE 22Nd
+     proportional web cluster. In Proc. of the First
+                                                                  International Symposium on Modelling, Analysis
+     ACM SIGCOMM Workshop on Green Networking
+                                                                  & Simulation of Computer and Telecommunication
+     (2010), Green Networking ’10, pp. 15–22.
+                                                                  Systems (2014), MASCOTS ’14, pp. 187–196.
+[51] L ABS , R. Redis. https://redis.io, 2018.
+                                                             [62] N GUYEN , H., S HEN , Z., G U , X., S UBBIAH , S.,
+[52] L EE , E. K., AND T HEKKATH , C. A. Petal: Dis-              AND W ILKES , J. AGILE: Elastic distributed re-
+     tributed virtual disks. In Proc. of the International        source scaling for infrastructure-as-a-service. In
+     Conference on Architectural Support for Program-             Proc. of the 10th International Conference on Au-
+     ming Languages and Operating Systems (1996),                 tonomic Computing (2013), ICAC’13, pp. 69–82.
+     ASPLOS VII, pp. 84–92.
+
+
+
+USENIX Association                 13th USENIX Symposium on Operating Systems Design and Implementation            443
+[63] Q IAN L I , JAMES H ONG , D. D. Thousand island             its applications. In Proc. of the 2005 ACM SIG-
+     scanner (THIS): Scaling video analysis on AWS               METRICS International Conference on Measure-
+     lambda. https://github.com/qianl15/this,                    ment and Modeling of Computer Systems (2005),
+     2018.                                                       SIGMETRICS ’05, pp. 291–302.
+[64] Q U , C., C ALHEIROS , R. N., AND B UYYA , R.          [73] V ENKATARAMAN , S., YANG , Z., F RANKLIN ,
+     Auto-scaling web applications in clouds: A taxon-           M., R ECHT, B., AND S TOICA , I. Ernest: Ef-
+     omy and survey. ACM Computing Surveys 51, 4                 ficient performance prediction for large-scale ad-
+     (July 2018), 73:1–73:33.                                    vanced analytics. In 13th USENIX Symposium
+                                                                 on Networked Systems Design and Implementation
+[65] ROY, N., D UBEY, A., AND G OKHALE , A. Effi-                (NSDI 16) (Santa Clara, CA, 2016), pp. 363–378.
+     cient autoscaling in the cloud using predictive mod-
+     els for workload forecasting. In Proc. of the 2011     [74] V ERMA , A., P EDROSA , L., KORUPOLU , M. R.,
+     IEEE 4th International Conference on Cloud Com-             O PPENHEIMER , D., T UNE , E., AND W ILKES ,
+     puting (2011), CLOUD ’11, pp. 500–507.                      J. Large-scale cluster management at Google with
+                                                                 Borg. In Proc. of the European Conference on
+[66] S ATHIAMOORTHY, M., A STERIS , M., PAPAIL -                 Computer Systems (Bordeaux, France, 2015), Eu-
+     IOPOULOS , D., D IMAKIS , A. G., VADALI , R.,               roSys’15.
+     C HEN , S., AND B ORTHAKUR , D. Xoring ele-
+     phants: novel erasure codes for big data. In Proc.     [75] WAJAHAT, M., G ANDHI , A., K ARVE , A., AND
+     of the 39th international conference on Very Large          KOCHUT, A. Using machine learning for black-
+     Data Bases (2013), PVLDB’13, pp. 325–336.                   box autoscaling. In 2016 Seventh International
+                                                                 Green and Sustainable Computing Conference
+[67] S EIDEN , S. S. On the online bin packing problem.          (IGSC) (Nov 2016), pp. 1–8.
+     J. ACM 49, 5 (Sept. 2002), 640–671.
+                                                            [76] W IRES , J., AND WARFIELD , A. Mirador: An ac-
+[68] S HEN , Z., S UBBIAH , S., G U , X., AND W ILKES ,
+                                                                 tive control plane for datacenter storage. In Proc. of
+     J. Cloudscale: Elastic resource scaling for multi-
+                                                                 the 15th USENIX Conference on File and Storage
+     tenant cloud systems. In Proceedings of the 2Nd
+                                                                 Technologies (2017), FAST’17, pp. 213–228.
+     ACM Symposium on Cloud Computing (2011),
+     SOCC ’11, pp. 5:1–5:14.                                [77] YADWADKAR , N. J., H ARIHARAN , B., G ONZA -
+                                                                 LEZ , J. E., S MITH , B., AND K ATZ , R. H. Se-
+[69] S RINIVASAN , V., B ULKOWSKI , B., C HU , W.-
+                                                                 lecting the best VM across multiple public clouds:
+     L., S AYYAPARAJU , S., G OODING , A., I YER , R.,
+                                                                 a data-driven performance modeling approach. In
+     S HINDE , A., AND L OPATIC , T. Aerospike: Ar-
+                                                                 Proceedings of the 2017 Symposium on Cloud
+     chitecture of a real-time operational DBMS. Proc.
+                                                                 Computing (2017), SOCC’17, pp. 452–465.
+     VLDB Endow. 9, 13 (Sept. 2016), 1389–1400.
+                                                            [78] Z AHARIA , M., C HOWDHURY, M., DAS , T.,
+[70] S TRUNK , J. D., T HERESKA , E., FALOUTSOS , C.,
+                                                                 DAVE , A., M A , J., M C C AULY, M., F RANKLIN ,
+     AND G ANGER , G. R. Using utility to provision
+                                                                 M. J., S HENKER , S., AND S TOICA , I. Resilient
+     storage systems. In 6th USENIX Conference on File
+                                                                 distributed datasets: A fault-tolerant abstraction
+     and Storage Technologies, FAST 2008, February
+                                                                 for in-memory cluster computing. In Proc. of the
+     26-29, 2008, San Jose, CA, USA (2008), pp. 313–
+                                                                 USENIX Symposium on Networked Systems Design
+     328.
+                                                                 and Implementation (2012), NSDI’12, pp. 15–28.
+[71] S TUEDI , P., T RIVEDI , A., P FEFFERLE , J., S TO -
+     ICA , R., M ETZLER , B., I OANNOU , N., AND
+                                                            [79] Z HANG , Y., P REKAS , G., F UMAROLA , G. M.,
+     KOLTSIDAS , I. Crail: A high-performance i/o ar-            F ONTOURA , M., G OIRI , I., AND B IANCHINI , R.
+     chitecture for distributed data processing. IEEE            History-based harvesting of spare cycles and stor-
+     Data Engineering Bulletin 40, 1 (2017), 38–49.              age in large-scale datacenters. In Proc. of the 12th
+                                                                 USENIX Symposium on Operating Systems Design
+[72] U RGAONKAR , B., PACIFICI , G., S HENOY, P.,                and Implementation (2016), OSDI’16, pp. 755–
+     S PREITZER , M., AND TANTAWI , A. An ana-                   770.
+     lytical model for multi-tier internet services and
+
+
+
+
+444   13th USENIX Symposium on Operating Systems Design and Implementation                       USENIX Association
+

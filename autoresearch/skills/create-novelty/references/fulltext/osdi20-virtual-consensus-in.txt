@@ -1,0 +1,1042 @@
+               Virtual Consensus in Delos
+Mahesh Balakrishnan, Jason Flinn, Chen Shen, Mihir Dharamshi, Ahmed Jafri,
+Xiao Shi, Santosh Ghosh, Hazem Hassan, Aaryaman Sagar, Rhed Shi, Jingming
+  Liu, Filip Gruszczynski, Xianan Zhang, Huy Hoang, Ahmed Yossef, Francois
+                    Richard, and Yee Jiun Song, Facebook, Inc.
+         https://www.usenix.org/conference/osdi20/presentation/balakrishnan
+
+
+
+
+       This paper is included in the Proceedings of the
+       14th USENIX Symposium on Operating Systems
+                Design and Implementation
+                              November 4–6, 2020
+                                 978-1-939133-19-9
+
+
+
+                                        Open access to the Proceedings of the
+                                        14th USENIX Symposium on Operating
+                                         Systems Design and Implementation
+                                               is sponsored by USENIX
+                                                     Virtual Consensus in Delos
+
+           Mahesh Balakrishnan, Jason Flinn, Chen Shen, Mihir Dharamshi, Ahmed Jafri, Xiao Shi
+         Santosh Ghosh, Hazem Hassan, Aaryaman Sagar, Rhed Shi, Jingming Liu, Filip Gruszczynski
+                 Xianan Zhang, Huy Hoang, Ahmed Yossef, Francois Richard, Yee Jiun Song
+                                              Facebook, Inc.
+
+
+
+                               Abstract                                        etcd [2] runs on Raft [39]). Contrast this state of affairs with
+                                                                               other areas such as OSes and networks, where modular de-
+   Consensus-based replicated systems are complex, mono-
+                                                                               sign and clean layering allow plug-and-play adoption of new
+lithic, and difficult to upgrade once deployed. As a result,
+                                                                               mechanisms and incremental improvement of existing ones:
+deployed systems do not benefit from innovative research,
+                                                                               for example, a new type of SSD, a new filesystem layout, or
+and new consensus protocols rarely reach production. We
+                                                                               a new key-value store like RocksDB can each be deployed
+propose virtualizing consensus by virtualizing the shared log
+                                                                               with no modification to the layers above or below it.
+API, allowing services to change consensus protocols without
+downtime. Virtualization splits the logic of consensus into                       Recently, the shared log has gained traction as an API for
+the VirtualLog, a generic and reusable reconfiguration layer;                  consensus in research [7–9, 16, 37] and industry [1, 3, 23, 47].
+and pluggable ordering protocols called Loglets. Loglets are                   Applications can replicate state via this API by appending
+simple, since they do not need to support reconfiguration                      updates to the shared log, checking its tail, and reading back
+or leader election; diverse, consisting of different protocols,                updates from it. The consensus protocol is hidden behind the
+codebases, and even deployment modes; and composable,                          shared log API, allowing applications to bind to any imple-
+via RAID-like stacking and striping. We describe a produc-                     mentation at deployment time.
+tion database called Delos1 which leverages virtual consensus                     Unfortunately, an API on its own is not sufficient to en-
+for rapid, incremental development and deployment. Delos                       able incremental evolution. First, new implementations of
+reached production within 8 months, and 4 months later up-                     the shared log are difficult to deploy and operate: no support
+graded its consensus protocol without downtime for a 10X                       exists for upgrading and migrating applications to different
+latency improvement. Delos can dynamically change its per-                     implementations without downtime, which is untenable for
+formance properties by changing consensus protocols: we                        highly available services. Second, new implementations are
+can scale throughput by up to 10X by switching to a disaggre-                  difficult to develop: the consensus protocol implementing the
+gated Loglet, and double the failure threshold of an instance                  shared log is itself a complex distributed system containing a
+without sacrificing throughput via a striped Loglet.                           data plane (for ordering and storing commands durably) and a
+                                                                               control plane (for reconfiguring leadership, roles, parameters,
+                                                                               and membership). Existing protocols such as Raft aggres-
+1     Introduction                                                             sively combine both planes into a single protocol; in doing so,
+                                                                               they give up the ability to incrementally change the data plane
+The last decade has seen significant research advances in                      (i.e., the ordering mechanism) without reimplementing the
+faster and more flexible consensus protocols. Unfortunately,                   entire control plane. As a result of these two limitations, sys-
+systems that use consensus to replicate state are monolithic,                  tems have to be written and deployed from scratch around new
+complex, and difficult to evolve. As a result, deployed systems                consensus protocols (e.g., ZooKeeper cannot be upgraded to
+rarely benefit from new research ideas (e.g., ZooKeeper [20]                   run over Raft [39] or CORFU [7]); and protocols have to be
+still runs a decade-old protocol [22]); in turn, such ideas only               rewritten around new ordering mechanisms (e.g., Raft cannot
+have real-world impact when entire new production systems                      be changed easily to support sharded acceptors).
+and applications are built from scratch around them (e.g.,                        In this paper, we virtualize consensus by virtualizing the
+VMware’s CorfuDB [1] uses sharded acceptors [7, 16]; Face-                     shared log API. We propose the novel abstraction of a virtu-
+book’s LogDevice [3] implements flexible quorums [19];                         alized shared log (or VirtualLog). The VirtualLog exposes a
+    1 Delos is an island in the Cyclades, a few hundred miles from Paxos and   conventional shared log API; applications above it are oblivi-
+Corfu.                                                                         ous to its virtualized nature. Under the hood, the VirtualLog
+
+
+
+USENIX Association                                    14th USENIX Symposium on Operating Systems Design and Implementation                617
+                                                                     Delos to provide operators with a point-in-time restore capa-
+                                                                     bility. Loglets can be converged (i.e., collocated on the same
+ Database
+                                                                     machines as the database) or disaggregated (i.e., running on
+                                                      append         an entirely different set of machines), allowing operators to
+                                                      checkTail
+                                                      readNext
+                                                                     switch the Delos deployment mode on the fly to obtain differ-
+                                                                     ent performance and fault-tolerance properties.
+ VirtualLog
+                                                      append            Virtual consensus also simplifies the development of new
+                                                      checkTail
+                                                      readNext       consensus implementations. Virtualization splits the complex
+                                                      seal
+ Loglets                                                             functionality of consensus into separate layers: a control plane
+                                                                     (the VirtualLog) that provides a generic reconfiguration capa-
+                                                                     bility; and a data plane (the Loglet) that provides critical-path
+       BackupLoglet     ZKLoglet
+                                                                     ordering. While the VirtualLog’s reconfiguration mechanism
+                                       NativeLoglet
+                                                                     can be used solely for migrating between entirely different
+                                                                     Loglet implementations, it can also switch between different
+Figure 1: Virtual consensus: servers replicate state via a           instances of the same Loglet protocol with changes to lead-
+VirtualLog, which is mapped to underlying Loglets.                   ership, roles, parameters, and membership. As a result, the
+                                                                     Loglet itself can be a statically configured protocol, without
+                                                                     any internal support for reconfiguration. In fact, the Loglet
+chains multiple shared log instances (called Loglets) into a         does not even have to implement fault-tolerant consensus (i.e.,
+single shared log. Different Loglets in a VirtualLog can be          be highly available for appends via leader election), as long as
+instances of the same ordering protocol with different pa-           it provides a fault-tolerant seal command, which is theoreti-
+rameters, leadership, or membership (e.g., different instances       cally weaker and practically simpler to implement. When a
+of MultiPaxos [45]); they can be entirely distinct log imple-        Loglet fails for appends, the VirtualLog seals it and switches
+mentations (e.g., Raft [39], LogDevice [3], Scalog [16], or          to a different Loglet, providing leader election and reconfig-
+CORFU [7]); or they can be simple log shims over external            uration as a separate, reusable layer that can work with any
+storage systems (e.g., ZooKeeper [20] or HDFS [43]). Vir-            underlying Loglet.
+tualization enables heterogeneous reconfiguration: a single             Accordingly, new Loglets are simple to design and imple-
+VirtualLog can span different types of Loglets and dynami-           ment since they are not required to implement fault-tolerant
+cally switch between them.                                           consensus or reconfiguration. To demonstrate this point, we
+   We implemented virtual consensus in Delos, a database             describe the Delos NativeLoglet, which uses a primary-driven
+that stores control plane state for Facebook. Delos has been in      protocol that is unavailable for appends if the primary fails, but
+production for over 18 months and currently processes over           can support seals as long as a quorum is alive. New Loglets
+1.8 billion transactions per day across all our deployments.         are also easy to construct via RAID-like composition; for
+One of its use cases is Twine’s Resource Broker [44], which          example, we describe StripedLoglet, a thin shim layer that
+stores metadata for the fleet of servers in Facebook; each           stitches together multiple Loglets to enable behavior equiva-
+Delos deployment runs on 5 to 9 machines and manages                 lent to rotating sequencers [35] and sharded acceptors [7, 16].
+server reservations for a fraction of the fleet. Internally, Delos      Virtual consensus has some limitations. The reusability of
+is a shared log database [7, 8, 33]; it replicates state across      VirtualLog-driven reconfiguration comes with a latency hit
+servers by appending and playing back commands on the                for certain types of reconfigurations such as planned leader
+VirtualLog. Delos supports multiple application-facing APIs;         changes. Loglets can optimize for specific cases by relying on
+we have a Table API in production, while a second ZooKeeper          their own in-band reconfiguration instead of the VirtualLog.
+API is under development.                                            A second limitation relates to generality: since we virtualize a
+   Virtual consensus in Delos simplified the deployment              specific API for consensus that captures a total order of com-
+and operation of consensus implementations. Virtualization           mands, we do not currently support protocols that construct
+slashed time to deployment since we had the ability to de-           partial orders based on operation commutativity [26, 36]. In
+ploy the system rapidly with an initial Loglet implementation,       future work, we plan to extend virtual consensus to partially
+and later upgrade it without downtime. We reached produc-            ordered shared logs [33].
+tion within eight months with a simple Loglet implemented               We are the first to propose a virtualized shared log
+as a shim over ZooKeeper (ZKLoglet); later, we obtained a            composed from heterogeneous log implementations. Prior
+10X improvement in end-to-end latency in production by mi-           work composes a logical shared log directly from storage
+grating online to a new, custom-built Loglet implementation          servers [7, 9, 16, 47]; or virtualizes in the opposite direc-
+(NativeLoglet). We also enabled seemingly infinite capacity          tion, multiplexing homogenous streams over a single shared
+for the VirtualLog by migrating older segments to a Loglet           log [8, 48]. Delos is the first replicated database that can
+layered on cold storage (BackupLoglet); in turn, this allowed        switch its consensus implementation on the fly to different
+
+
+
+618    14th USENIX Symposium on Operating Systems Design and Implementation                                     USENIX Association
+protocols, deployment modes, or codebases. While the theory       perpetuity to the fault-tolerance and performance properties
+of consensus has always allowed learners and acceptors to be      of that consensus implementation.
+disaggregated, Delos is also the first production system that        Our solution was to virtualize consensus. In the remainder
+can switch between converged and disaggregated acceptors.         of this paper, we describe how virtual consensus allowed us
+   In this paper, we make the following contributions:            to reach production quickly with an existing implementation
+                                                                  of consensus, and then migrate without downtime to new
+    • We propose virtualizing consensus via the novel Vir-        implementations.
+      tualLog and Loglet abstractions; and describe Delos, a         Virtualization for faster development: Beyond fast ini-
+      storage system that implements these abstractions.          tial deployment and online migration, virtualization also en-
+                                                                  abled faster development of new consensus implementations.
+    • Using production data, we show Delos upgrading to           On its own, the shared log abstraction simplifies consensus-
+      NativeLoglet without downtime for a 10X latency im-         based systems, separating applications from the logic of con-
+      provement.                                                  sensus via a data-centric API. Virtualizing the shared log
+                                                                  further splits the consensus protocol into two layers: a control
+    • Using experiments, we show that Delos can: A) switch
+                                                                  plane, which includes the logic for reconfiguration, and a data
+      to a disaggregated Loglet for a 10X improvement in
+                                                                  plane, which orders commands on the critical path.
+      throughput under a 15ms p99 SLA; B) double its failure
+      threshold without lowering throughput via a Striped-           In practice, such separation allowed us to incrementally
+      Loglet that rotates sequencers. Further, we show that       improve the system by re-implementing just the data plane of
+      StripedLoglet can support over a million 1KB appends/s      the consensus protocol via new Loglets, while reusing the Vir-
+      on a log-only workload by sharding acceptors.               tualLog control plane for features such as leader election and
+                                                                  membership changes. In the process, we completely changed
+                                                                  the operational characteristics and performance of the system,
+2    The Path to Virtual Consensus                                as we describe later.
+                                                                     Importantly, such a separation also enables diversity in the
+Virtualization for faster deployment: In 2017, Facebook           data plane. The last few years have seen a number of consen-
+needed a table store for its core control plane services with     sus protocols with novel ordering mechanisms [3, 7, 14–16,
+strong guarantees on durability, consistency, and availability.   22, 24, 31, 35, 37, 39, 42], providing vastly different trade-offs
+Two practical imperatives drove the design and development        between performance and fault-tolerance. By making it easier
+of this system: fast deployment (it had to reach production       to implement such protocols and deploy them within running
+within 6-9 months) and incremental evolution (it had to sup-      systems, virtualization lowers the barrier to innovation.
+port better performance over time).
+    At the time, Facebook already operated four different stor-
+age systems: a ZooKeeper service; a shared log service based      3   Abstractions for Virtual Consensus
+on LogDevice [3]; a key-value service called ZippyDB [5];
+and a replicated MySQL service [13]. None of these systems        In this paper, we propose virtualizing consensus by virtual-
+fit the exact use case, either due to a mismatch in API (e.g.,    izing the shared log abstraction. We have three design goals
+ZooKeeper does not provide a table API) or fault-tolerance        for virtualization. First, virtualization should be transparent
+guarantees (e.g., the MySQL service provided inadequate           to applications, which should be unmodified and oblivious to
+availability).                                                    the virtualized nature of the log. Second, virtualization should
+    Further, these systems could not be easily modified to pro-   allow underlying logs to be simple and diverse, lowering
+vide the required API or guarantees. Each of them was a mono-     the barrier to new log implementations. Third, virtualization
+lith: the database API could not be easily changed, nor could     should allow for migration between implementations without
+the underlying consensus protocol be re-used. In some sys-        downtime. We obtain these properties via two core abstrac-
+tems, no abstraction boundary existed between the database        tions.
+and the consensus protocol. In other systems, an abstraction         In virtual consensus, the application operates above a Virtu-
+boundary did exist in the form of a shared log API, allowing      alLog, which stitches together multiple independent Loglets.
+the underlying consensus protocol to be reused; however, no       The VirtualLog and Loglets expose a conventional shared log
+support existed to migrate from one implementation of the         API (see Figure 2). Applications can append an entry, receiv-
+abstraction to another.                                           ing back a log position; call checkTail to obtain the first
+    Building yet another monolithic system from scratch – in-     unwritten position; call readNext to read the first entry in the
+cluding a new consensus implementation – was not feasible         passed-in range; and call prefixTrim to indicate that a prefix
+since we had to hit deployment within 6-9 months. Layering        of the log can be trimmed. Virtualization requires two addi-
+the system over an existing shared log such as LogDevice          tions to this basic API: a seal command, which ensures that
+would allow us to reach production quickly, but also tie us for   any new appends fail; and an augmented checkTail response
+
+
+
+USENIX Association                          14th USENIX Symposium on Operating Systems Design and Implementation               619
+class ILoglet {                                                                                            {trimmed}
+                                                                            0   1   2             VL       0   1   2    3       4       5       VL
+       logpos_t append(Entry payload);
+       pair<logpos_t,bool> checkTail();
+       Entry readNext(logpos_t min, logpos_t                            0   1   2            SL                             0       1   2       SL
+           max);
+       logpos_t prefixTrim(logpos_t trimpos);                        I: before reconfig                    IV: after reconfigTruncate
+
+       void seal();
+}                                                                           0   1   2             VL       0   1   2    3       4       5       VL
+class IVirtualLog : public ILoglet {
+       bool reconfigExtend(LogCfg newcfg);
+       bool reconfigTruncate();                                         0   1   2       SL             0   1   2   SL       0       1   2       SL
+
+       bool reconfigModify(LogCfg newcfg);                           II: during reconfigExtend             III: after reconfigExtend
+}
+                                                                    Figure 3: The VirtualLog reconfigures from a single Loglet
+           Figure 2: Loglet and VirtualLog APIs.                    (I) by first sealing the Loglet (II) and installing a new Loglet
+                                                                    (III). Later, the old Loglet is removed (IV).
+
+that indicates via a boolean whether the log is sealed. In ad-                                                 A            B               C
+dition, the VirtualLog also implements extra reconfiguration        ing notation for such a chain: [0 ! 100 ! 150 ! •].
+APIs to add and remove Loglets.                                        Any append and checkTail commands on a VirtualLog
+   The VirtualLog is the only required source of fault-tolerant     are directed to the last Loglet in the chain, while readNext
+consensus in the system, providing a catch-all mechanism            commands on a range are routed to the Loglet storing that
+for any type of reconfiguration. The Loglet does not have to        range. In the process, log positions are translated from the
+support fault-tolerant consensus, instead acting as a pluggable     virtual address space to each Loglet’s individual address space
+data plane for failure-free ordering. Existing systems typically    (for example, in the chain described above, if an append that is
+struggle to implement monolithic consensus protocols that           routed to Loglet C returns position 10, we map it to position
+are simple, fast, and fault-tolerant. In virtual consensus, we      160 on the VirtualLog). Log positions can be contiguous
+divide and conquer: consensus in the VirtualLog is simple           (i.e., every position has an entry) or sparse (i.e., positions
+and fault-tolerant (but not necessarily fast, since it is invoked   can be left unoccupied), depending on the underlying Loglet.
+only on reconfigurations), while consensus in the Loglet is         Importantly, only the last log in the chain is appendable (we
+simple and fast (but not necessarily fault-tolerant). We now        call this the active segment); the other logs are sealed and
+describe these abstractions and their interaction in detail.        return errors on appends (we call these sealed segments).
+                                                                       The VirtualLog can be reconfigured to a new chain via its
+                                                                    API (see Figure 2). The reconfigExtend call changes the
+3.1    The VirtualLog abstraction                                   active segment of the VirtualLog so that new appends are
+The VirtualLog implements a logical shared log by chaining          directed to an entirely different Loglet. Reconfigurations can
+a collection of underlying Loglets. In this section, we use the     also modify sealed segments via the reconfigModify call
+term ‘client’ to refer to an application process that accesses      (e.g., to replace failed servers within a sealed Loglet). The
+the VirtualLog. Clients accessing the VirtualLog see a shared,      reconfigTruncate call is used to remove the first sealed
+append-only virtual address space that is strongly consistent       segment from the chain (e.g., when the VirtualLog’s address
+(i.e., linearizable [18]), failure-atomic, and highly available.    space is trimmed).
+Internally, this address space is mapped to the individual
+address spaces of different Loglets in a chain. Operations          3.2     VirtualLog design
+to the VirtualLog are translated to operations on underlying
+Loglets based on this chain-structured mapping.                     The VirtualLog is composed of two distinct components: a
+   The simplest possible VirtualLog is a trivial singleton chain:   client-side layer exposing the shared log API, which routes op-
+[0, •) of the VirtualLog is mapped to [0, •) of a single Loglet.    erations to underlying Loglets based on the chain-structured
+In this case, commands to the VirtualLog are passed through         mapping; and a logically centralized metadata component
+unmodified to the underlying Loglet. A more typical chain           (MetaStore) that durably stores the chain. Each client main-
+consists of multiple Loglets, mapping different segments of         tains a local (potentially stale) cached copy of the chain.
+the virtual address space to each log: for example, [0, 100)           The MetaStore component has a simple API: it is a single
+is mapped to [0, 100) of Loglet A; [100, 150) is mapped to          versioned register supporting a conditional write. Reading the
+[0, 50) of Loglet B; [150, •) to [0, •) of C. We use the follow-    MetaStore returns a value with an attached version. Writing
+
+
+
+620   14th USENIX Symposium on Operating Systems Design and Implementation                                                  USENIX Association
+to it requires supplying a new value and an expected existing           A checkTail to the VirtualLog using the sealed chain also
+version.                                                            gets routed to the last Loglet in the chain. In response, the
+    The primary technical challenge for the VirtualLog is pro-      Loglet returns not just its tail position, but also a bit indicating
+viding clients with a shared, strongly consistent, and highly       whether or not it is sealed. If the Loglet has been sealed, then
+available virtual address space. In steady-state, when the chain    the client knows that it is operating on a stale chain, which
+remains unchanged, this task is trivial: the client-side layer      means in turn that the computed tail is likely to not be the true
+can use its locally cached copy of the chain to route opera-        tail of the VirtualLog. In this case, it fetches the latest chain
+tions. However, the chain can be changed via the VirtualLog         from the MetaStore and retries.
+reconfiguration APIs shown in Figure 2.                             Failure Atomicity: When a client encounters a sealed chain,
+    Any client can initiate a reconfiguration, or complete a        it is possible that it does not find a newer chain in the MetaS-
+reconfiguration started by some other client. Reconfigura-          tore. This can happen if the reconfiguring client (which sealed
+tion involves three steps: sealing the old chain, installing        the chain) either failed or got delayed after the seal step but
+the new chain on the MetaStore, and fetching the new chain          before installing the new chain. In this case, after a time-out
+from the MetaStore. The following reconfiguration protocol          period, the client ‘rolls forward’ the reconfiguration by in-
+is expressed entirely in the form of data-centric operations        stalling its own new chain. Note that the client completing the
+against the Loglet and MetaStore; it assumes nothing about          reconfiguration does not know the original intention of the
+the internal implementation of either component.                    failed client (e.g., if it was reconfiguring to a different Loglet
+    Step 1: Sealing the current chain by sealing its last           type); hence, it creates a default new chain by cloning the
+Loglet: The first step of a reconfiguration involves sealing        configuration of the previous active segment.
+the current chain (Ci ) to stop new appends from succeeding         Reconfiguration Policy: The protocol above provides a
+within it. To seal the current chain, the reconfiguring client      generic mechanism for reconfiguration. However, it has to
+simply calls seal on the active segment, since this is the only     be invoked based on some policy. There are three primary
+segment that receives appends, and all other segments are           drivers of reconfiguration. First, planned reconfigurations
+already sealed. Seals on a Loglet are idempotent; accordingly,      (e.g., upgrading to a faster Loglet) are driven via a com-
+multiple clients can concurrently seal the current chain. Once      mand line tool by operators. Second, the VirtualLog calls
+the current chain is sealed by the reconfiguring client, any        reconfigTruncate on itself when it trims the entirety of
+subsequent append on the current chain by a client returns          its first sealed Loglet while servicing a prefixTrim. For ex-
+an error. After sealing the active segment, the client calls        ample, if the application calls prefixTrim(100) on chain
+                                                                         A       B
+checkTail to retrieve its tail; this determines the start of the    [0 ! 100 ! •]; the VirtualLog trims all of A and then re-
+new active segment.                                                                              B
+                                                                    configures to chain [100 ! •]. Third, individual Loglets that
+    Step 2: Installing the new chain in the MetaStore: Once         do not implement their own leader election or reconfigura-
+the old chain Ci is sealed, the reconfiguring client writes a       tion are responsible for detecting failures and requesting a
+new chain Ci+1 to the MetaStore. The MetaStore is simply a          reconfigExtend on the VirtualLog, as we describe later.
+versioned register supporting a conditional write; accordingly,         A subtle point is that an old chain only has to be sealed
+it only accepts the new chain Ci+1 if the existing chain is         if it conflicts with a newer chain: i.e., the new chain remaps
+Ci . In effect, multiple reconfiguring clients – after running      some unwritten virtual address to a different Loglet. Recon-
+step 1 idempotently – can race to install the new chain in the      figurations for sealed segments (e.g., to rebuild failed servers
+MetaStore, with at most one guaranteed to win. The chain            in a sealed Loglet, or to copy and remap a sealed segment to a
+is stored as a list of segments with start/stop positions, each     different Loglet) do not change the locations of unwritten vir-
+with an opaque Loglet-specific configuration.                       tual addresses. As a result, they do not necessarily require the
+    Step 3: Fetching the new chain from the MetaStore: In           old chain to be sealed first before the new chain is installed;
+the final step, the reconfiguring client fetches the latest chain   different clients can concurrently operate in the old and new
+from the MetaStore. In the common case, this step can be            chains. Similarly, truncation (i.e., removing the first segment)
+omitted if the reconfiguring client succeeded in installing its     does not require the old chain to be sealed; if a client with
+candidate chain in Step 2. Alternatively, if the write in Step 2    the old chain tries to access an address on a truncated Loglet,
+failed, some other client may have won the race and installed       it may succeed or receive an error saying the entry has been
+a different chain, which we have to fetch.                          deleted. In practice, this means rebuild and GC activity on
+Concurrency: After a client seals a chain in Step 1, it is          sealed segments does not interfere with appends at the tail of
+possible that other clients continue operating within it. An        the VirtualLog.
+append to the VirtualLog using the sealed chain will be routed
+to its last Loglet, which is now sealed in the new chain. As
+                                                                    3.3    The VirtualLog MetaStore
+a result, a client issuing appends in the old chain will obtain
+an error code indicating that the Loglet is sealed; it will then    As described above, the VirtualLog stores a mapping – its
+fetch the latest chain from the MetaStore and retry.                chain of constituent Loglets – in a MetaStore: a single ver-
+
+
+
+USENIX Association                            14th USENIX Symposium on Operating Systems Design and Implementation                 621
+sioned register supporting a conditional write predicated on          calls. Instead, the Loglet provides a highly available seal
+the current version. We now discuss the requirements and              command that prevents new appends from being successfully
+design space for this component.                                      acknowledged. The VirtualLog uses such a sealing capability
+   The VirtualLog MetaStore is a necessary and sufficient             to support highly available append calls via reconfiguration,
+source of fault-tolerant consensus in our architecture; as we         as described earlier in this section.
+describe later, Loglets are not required to implement con-               A seal bit does not require fault-tolerant consensus. Com-
+sensus. The MetaStore has to be highly available for writes;          pared to similar data types that are equivalent to consensus, it
+accordingly, it requires a fault-tolerant consensus protocol          differs from a write-once register [42], since only one ‘value’
+like Paxos. Since the VirtualLog (and its MetaStore) is a sep-        can be proposed (i.e., the bit can be set); and a sticky bit [40],
+arate, reusable layer, we need to implement this fault-tolerant       since it has only two states (undefined and set) rather than
+consensus protocol only once. Further, the MetaStore is not           three. It can be implemented via a fault-tolerant atomic regis-
+required to be particularly fast, since it is accessed by the         ter that stores arbitrary values [6, 11], which in turn is weaker
+VirtualLog only during reconfigurations.                              than consensus and not subject to the FLP impossibility re-
+   Why does the VirtualLog require its own MetaStore? Ex-             sult [17]. As we describe later, a seal is also much simpler
+isting reconfigurable systems often store similar information         to implement than a highly available append.
+(e.g., the set of servers in the next configuration) inline with         In addition to supporting seal, the Loglet provides an
+the same total order as other commands (within the last con-          augmented checkTail to return its sealed status along with
+figuration [34] or a combination of the old and new configu-          the current tail (i.e., checkTail returns a (tail pos, sealbit)
+rations [39]). In this case, the steps of sealing the old chain       tuple rather than a single tail position). To lower the burden
+and writing the membership of the new chain can be done in            of implementing this extra call on each Loglet, it is designed
+a single combined operation. In the VirtualLog, this would be         to have weak semantics: the tail position and seal status do
+equivalent to storing the identity of the next Loglet within the      not need to be checked atomically. Instead, the checkTail
+current active Loglet while sealing it. However, such a design        call is equivalent to a conventional checkTail and a checkSeal
+requires the Loglet itself to be highly available for writes (i.e.,   executed in parallel, combined in a single call for efficiency.
+implement fault-tolerant consensus), since reconfiguring to              In similar vein, a successful seal call ensures that any new
+a new Loglet would require a new entry to be written to the           append call will not be successfully acknowledged to the ap-
+current Loglet. With a separate MetaStore, we eliminate the           pending client; however, these failed appends can become
+requirement of fault-tolerant consensus for each Loglet. Since        durable and be reflected by future checkTail calls on the
+one of our design goals is to make Loglets simple and diverse,        Loglet due to specific failure scenarios. As a result, calling
+we choose to use a separate MetaStore.                                checkTail on a sealed log can return increasing values for
+   Using a separate MetaStore means the common-case la-               the tail position even after the log is successfully sealed. These
+tency of a reconfiguration consists of a seal, a checkTail,           ‘zombie’ appends on a sealed log do not appear on the Vir-
+and a write to the MetaStore. In our current setting (con-            tualLog’s address space, which maps to fixed-size segments
+trol plane applications running within a single data center),         of the Loglet’s address space (i.e., if the VirtualLog chain
+reconfiguration latencies of 10s of ms are tenable. If recon-                A        B
+                                                                      is [0 ! 100 ! •], appends on log A can become durable
+figuration is driven by failure, the latency of failure detection     beyond 100 without any impact on the VirtualLog). These
+is typically multiple seconds in any case, to avoid false posi-       semantics are sufficient to implement a linearizable Virtual-
+tives [30]. In the future, when we run across regions, it may         Log: all we need is that any append on a sealed log throws
+be important to optimize for planned reconfiguration (e.g., re-       an exception, and that any checkTail returns the seal status
+placing servers); since the Loglet is still available in this case,   correctly.
+we can potentially reconfigure by storing inline commands                The Loglet API provides a common denominator interface
+within the Loglet itself, borrowing existing techniques such          for different log implementations. Such implementations may
+as a-windows [25, 34].                                                provide availability for appends via internal leader election
+                                                                      protocols; they may even support their own reconfiguration
+3.4    The Loglet abstraction                                         protocols for adding and removing storage servers. In such
+                                                                      cases, the VirtualLog can be used to reconfigure across dif-
+The Loglet is the data plane abstraction in virtual consensus:        ferent Loglet types, while each Loglet can perform its own
+a shared log designed to operate as a segment of the Virtual-         leader election and membership changes. To draw an analogy
+Log. The requirements for a Loglet are minimal: it provides           with storage stacks, Loglets can be functionally simple (e.g.,
+totally ordered, durable storage via the shared log API. Sig-         like hard disks) or rich (e.g., like SSDs).
+nificantly, the Loglet can operate within a static configuration;        The log positions returned by a Loglet can be contiguous
+it does not have to provide support for role or membership            or sparse, depending on its internal implementation. Loglets
+changes. It does not have to support leader election, either;         that implement their own leader election or reconfiguration
+i.e., it is not required to provide high availability for append      protocols typically expose sparse address spaces, since the log
+
+
+
+622    14th USENIX Symposium on Operating Systems Design and Implementation                                      USENIX Association
+        production                                                                    local RocksDB store. To perform a read-only transaction, the
+                                         client                                       server first checks the current tail of the VirtualLog (obtaining
+          experimental
+                                                                                      a linearization position); it then synchronizes its local state
+ API
+                                      Table API        ZK API        more APIs        with the VirtualLog until that position. The read-only trans-
+                                                                                      action is then executed on the local RocksDB snapshot. For
+                     propose/sync       apply
+                                                                                      efficiency, Delos borrows a technique from Tango, queuing
+                                Delos             local storage
+                               runtime              (RocksDB)                         multiple read-only transactions behind a single outstanding
+ Core
+                   append/read/…                                                      synchronization with the VirtualLog.
+                              VirtualLog             MetaStore
+                                                                                         As Figure 4 shows, the logic described above is separated
+                                                                                      into three layers on each Delos server: an API-specific wrap-
+             append/read/…
+                                                                                      per at the top; a common Core consisting of a runtime that
+ Loglet        (converged)          (disagg)      (disagg)
+               NativeLoglet         ZKLoglet      LDLoglet
+                                                                   more Loglets       exposes an SMR interface, which in turn interacts with the
+                                                                                      VirtualLog; and individual Loglets under the VirtualLog. This
+                                                                                      layered design provides extensibility in two dimensions. First,
+Figure 4: Delos design: multiple APIs can run over a Core                             Delos can support multiple Loglets under the VirtualLog,
+platform, which in turn can switch dynamically between mul-                           which is the focus of this paper. Second, Delos can support
+tiple Loglet implementations.                                                         multiple application-facing APIs on a single platform. Each
+                                                                                      API wrapper is a thin layer of code that interacts with the De-
+                                                                                      los runtime and provides serialization logic against RocksDB.
+position often embeds some notion of a membership epoch.                              We support a Table API in production, with support for trans-
+   In the case where the Loglet operates within a static con-                         actions, range queries, and secondary indices; we are currently
+figuration and relies on the VirtualLog for any form of recon-                        deploying a second API identical to ZooKeeper. The ability
+figuration, it reacts to failures by invoking reconfigExtend                          to support multiple APIs on a common base is not novel:
+on the VirtualLog, which seals it and switches to a different                         most state machine replication libraries treat the application
+Loglet. In this case, each Loglet is responsible for its own fail-                    as a black box. However, Delos provides a larger subset of
+ure detection, and for supplying a new Loglet configuration                           application-agnostic functionality within the common Core,
+minus the failed servers. In other words, while the Virtual-                          including local durable storage, backups, and state transfer
+Log provides the mechanism for reconfiguration, Loglets are                           when new servers join.
+partially responsible for the policy of reconfiguration.
+
+                                                                                      4.1    The Delos VirtualLog
+4      Delos: Design and Implementation
+                                                                                      In Delos, the VirtualLog is implemented via a combination
+Delos is a replicated storage system for control plane services.                      of a client-side library and a MetaStore implementation. The
+The design of Delos is driven by a number of requirements                             library code implements the protocol described in Section
+unique to control plane services: low dependencies on other                           3.2, interacting with underlying Loglet implementations and
+services; strong guarantees for durability, availability, and                         the MetaStore. Initially, Delos went to production with the
+consistency; and rich and flexible storage APIs. Delos is a                           MetaStore residing on an external ZooKeeper service as a
+fully replicated ACID database providing strict serializability.                      single key/value pair. Later, to remove this external depen-
+It does not implement transparent sharding or multi-shard                             dency, we implemented an embedded MetaStore that runs
+transactions, but can be layered under other systems that pro-                        on the same set of Delos servers as the database layer and
+vide these capabilities. Delos occupies a similar role in the                         VirtualLog library code.
+Facebook stack to Google’s Chubby [12], or the open-source                               To implement this embedded MetaStore, we used Lam-
+etcd [2] and ZooKeeper [20].                                                          port’s construction of a replicated state machine from the orig-
+   The Delos database is similar to Tango [8]. Each Delos                             inal Paxos paper [25], which uses a sequence of independent
+server maintains a local copy of state in RocksDB and keeps                           Paxos instances. Each such instance is a simple, unoptimized
+this state synchronized via state machine replication (SMR)                           implementation of canonical single-slot Paxos, incurring two
+over the VirtualLog. When a server receives a read-write trans-                       round-trips to a quorum for both writes and reads. As in Lam-
+action, it serializes and appends it to the VirtualLog without                        port’s description, each Paxos instance stores the membership
+executing it. The server then synchronizes with the Virtual-                          of the next instance. We further simplify the protocol by dis-
+Log; when it encounters a transaction in the log (whether                             allowing pipelined writes at each proposer, and removing
+appended by itself or other servers), it executes the operation                       liveness optimizations such as leader election across multiple
+within a single thread as a failure-atomic transaction on its                         slots.
+local RocksDB. The transaction returns when the appending                                Such a protocol has inadequate latency and throughput to be
+server encounters it in the VirtualLog and applies it to the                          used in the critical path of ordering commands, which is why
+
+
+
+USENIX Association                                                14th USENIX Symposium on Operating Systems Design and Implementation            623
+ Loglet         Consensus     Deployment       Prod    Use            We first define some terms before describing the protocol.
+ ZK             Yes           Disagg           Yes     Bootstrap   A command is locally committed on a particular LogServer
+ Native         No            Conv/Disagg      Yes     Primary     after it has been written and synced to its local log. The local
+ Backup         Yes           Disagg           Yes     Backup      tail for a particular LogServer is the first unwritten position
+ LogDevice      Yes           Disagg           No      Perf        in its local log. A command is globally committed once it is
+ Striped        No            Conv/Disagg      No      Perf        locally committed on a majority of LogServers and all pre-
+                                                                   vious commands have been globally committed. The global
+   Figure 5: Different Loglet implementations in Delos.            tail of the NativeLoglet is the first globally uncommitted log
+                                                                   position. The NativeLoglet does not have gaps; i.e., every
+                                                                   position from 0 up to the global tail stores a globally com-
+so many (complex) variants of Multi-Paxos exist. However,          mitted command. Each component (i.e., LogServers, clients,
+it is more than sufficient for a control plane protocol that is    and the sequencer) maintains a knownTail variable: the global
+invoked only for reconfigurations.                                 tail it currently knows about, which can trail the actual global
+                                                                   tail. Components piggyback knownTail on the messages they
+                                                                   exchange, updating their local value if they see a higher one.
+4.2     The Delos Loglet(s)                                        append: To append commands to the NativeLoglet, Delos
+Loglets can be converged, running on the Delos database            servers send requests to the sequencer. The sequencer assigns
+servers; or disaggregated, as shims on the Delos servers ac-       a position to each command and forwards the request to all
+cessing an external service. Each deployment model has its         LogServers. It considers the append globally committed (and
+benefits: a converged log allows Delos to operate without a        acknowledges to the client) once it receives successful re-
+critical path service dependency, and without incurring the        sponses from a majority of unsealed LogServers. If a majority
+extra latency of accessing an external service. Disaggrega-        of LogServers report that they have been sealed, an error is
+tion enables higher throughput by placing the log on a stor-       returned indicating that the NativeLoglet is sealed. In all other
+age tier that can be independently scaled and I/O-isolated         cases where a majority of LogServers respond negatively or
+from the database servers. Delos currently supports three          fail to respond before a timeout, the sequencer retries the
+disaggregated Loglets (see Figure 5): ZKLoglet stores log          append. Retries are idempotent (i.e., the same command is
+entries on a ZooKeeper namespace; LogDeviceLoglet is a             written to the same position), and the sequencer continues to
+pass-through wrapper for a LogDevice service; BackupLoglet         retry until the append succeeds or the NativeLoglet is sealed.
+layers over an HDFS-like filesystem service used for cold             Each LogServer locally commits a particular log position
+storage. All three backing systems – ZooKeeper, LogDevice,         n only after the previous position n 1 has either (1) been
+and the HDFS-like filesystem – internally implement fault-         locally committed on the same server, or (2) has been globally
+tolerant consensus, including leader election and reconfigu-       committed on a majority of servers (i.e., knownTail > n 1).
+ration; Delos uses the VirtualLog solely to switch to/from         The sequencer maintains an outgoing queue of appends for
+them.                                                              each LogServer, and omits sending a command to a particular
+                                                                   LogServer if it knows the command has already been globally
+                                                                   committed. As a result, slow LogServers do not block appends
+4.2.1    Loglets sans consensus: NativeLoglet
+                                                                   from completing on other LogServers and a trailing LogServer
+We argued earlier that Loglets can be simple since they do         can catch up more easily because it is allowed to omit storing
+not require fault-tolerant consensus (i.e., highly available ap-   commands that are already globally committed.
+pends) or any form of reconfiguration. We now describe the         seal: Any client can seal the NativeLoglet by contacting each
+NativeLoglet, which illustrates this point. A NativeLoglet         LogServer to set its seal bit. If the seal completes successfully
+can be either converged or disaggregated; we describe its          – i.e., a majority of LogServers respond – future appends are
+converged form, which is how we use it in production.              guaranteed to return an error code indicating the NativeLoglet
+   Each Delos server – in addition to running the materializa-     is sealed. Note that a successful seal operation can leave
+tion logic and the VirtualLog code – runs a NativeLoglet client    different LogServers with different local tails.
+and a NativeLoglet server (or LogServer). One of the Delos         checkTail: This call returns both the current global tail of
+servers also runs a sequencer component. The NativeLoglet          the NativeLoglet, as well as its current seal status. Any client
+is available for seal and checkTail as long as a majority of       can issue a checkTail by sending a command to all the
+LogServers are alive; and for append if the sequencer is also      LogServers and waiting for a majority to respond. Once a ma-
+alive. Each LogServer stores a local on-disk log, along with       jority responds, the checkTail call follows a simple 5-state
+a seal bit; once the seal bit is set, the LogServer rejects new    state machine, as described in Figure 6. For ease of exposition,
+appends to its local log. The local log stores commands in a       we assume that no more than a majority responds; if this is not
+strictly ascending order that can have gaps (i.e., it may not      true, the protocol below can work trivially by discarding the
+store every command).                                              extra responses, though in practice we use the additional infor-
+
+
+
+624     14th USENIX Symposium on Operating Systems Design and Implementation                                 USENIX Association
+                 wait for                                                  previous checkTail call from the same client. As a result, a
+   none-sealed   max tail
+                            some-sealed
+                                              seal +    all-sealed         readNext call translates to a read on a particular log position
+                                              retry      diff-tail
+     diff-tail                                                             that is already known to exist. This simplifies the readNext
+                                                                           implementation: the client first checks the locally collocated
+          wait for                        seal +       repair
+          max tail                        retry                            LogServer to find the entry. If it can’t find the entry locally, it
+                               seal +
+                                                                           issues a read to some other LogServer. Note that a quorum is
+   none-sealed                 retry                    all-sealed         not required for reads, since we already know that the entry
+     max-tail                                            max-tail          has been committed; we merely have to locate a copy.
+                                                                               To reiterate, the NativeLoglet does not implement fault-
+                                                                           tolerant consensus: it becomes unavailable for appends if the
+    Figure 6: NativeLoglet checkTail state machine.                        sequencer fails. As a result, the append path has no complex
+                                                                           leader election logic. Instead, the NativeLoglet implements
+                                                                           a highly available seal, which is a trivial operation that sets
+mation for better performance. Three outcomes are possible                 a bit on a quorum of servers. The checkTail call follows
+for the returned seal bits:                                                a compact state machine for determining the seal status and
+   1. all-sealed: In the case where all responding LogServers              global tail of the NativeLoglet. Practically, we found this
+are sealed and they all return the same local tail X, the return           protocol much easier to implement than fault-tolerant consen-
+value is (X, true). However, it is possible that the LogServers            sus: it took just under 4 months to implement and deploy a
+can have different local tails (e.g., if a seal arrives while an           production-quality NativeLoglet.
+append is ongoing). In this case, the client ‘repairs’ the re-                 When the sequencer or one of the LogServers fails, the
+sponding LogServers to the maximum returned position Xmax ,                NativeLoglet is responsible for detecting this failure and in-
+copying over entries from the LogServers that have them (and               voking reconfiguration on the VirtualLog (which in turn seals
+bypassing the seal bit). It then returns Xmax to the application.          it and switches to a new NativeLoglet). In our implementation,
+Note that repair is safe: the single sequencer ensures that there          we use a combination of in-band detection (e.g., the sequencer
+can never be different entries for the same position on differ-            detecting that it has rebooted, or that other servers are per-
+ent LogServers. This repair activity can result in the ‘zombie’            sistently down) and out-of-band signals (via a gossip-based
+appends described in Section 3.4, where appends on a sealed                failure detector, as well as information from the container
+Loglet are not acknowledged but can complete later due to                  manager) to trigger reconfiguration. In other words, the Vir-
+repairs.                                                                   tualLog provides the mechanism of reconfiguration / leader
+   2. some-sealed: In the case where the responding                        election, while the NativeLoglet handles the policy by select-
+LogServers have a mix of sealed and unsealed status bits,                  ing the LogServers and sequencer of the new NativeLoglet
+the client issues a seal first and then reissues the checkTail.            instance.
+In the absence of an adversarial failure pattern (e.g., where the
+seal continually lands on a different majority), the subsequent
+checkTail should return the all-sealed case above where all                4.2.2   Loglets via composition: StripedLoglet
+responding LogServers are sealed.                                          The StripedLoglet stripes a logical address space across multi-
+   3. none-sealed: In the case where none of the respond-                  ple underlying Loglets. The mapping between address spaces
+ing LogServers are sealed, the client picks the maximum                    is a simple and deterministic striping: logical position L0
+position Xmax and then waits for its own knownTail to reach                maps to position A0 on stripe A; L1 maps to position B0 ; L2
+this position. While waiting, if the client discovers that some            to C0 ; L3 to A1 ; and so on (see Figure 7).
+LogServer is sealed, the checkTail is in the some-sealed                      Incoming append calls to the StripedLoglet are routed to
+state described above, and proceeds accordingly. If the se-                individual stripe Loglets in round-robin order. This routing
+quencer fails, the client’s knownTail may never reach Xmax ;               is done independently at each StripedLoglet client (i.e., the
+in this case, the Loglet will eventually be sealed, putting the            Delos database servers). When the append on an individual
+client in the some-sealed or all-sealed state.                             Loglet returns with a stripe-specific position (e.g., A1 ), we
+   The latency of the checkTail in the none-sealed case                    map it back to a logical position (e.g., L3 ). However, we do
+depends on how quickly the client’s knownTail is updated,                  not acknowledge the append to the StripedLoglet client im-
+along with its knowledge of the seal status of a majority                  mediately; instead, we wait until all prior logical positions
+of LogServers. Clients quickly and efficiently discover this               have been filled, across all stripes. This ensures linearizability
+information via an extra API exposed by each LogServer,                    for the StripedLoglet: if an append starts after another append
+which allows them to ask for notification when the local tail              completes, it obtains a greater logical position. For example,
+reaches a particular position or the LogServer is sealed.                  in Figure 7, an append is routed to stripe B at position B2
+readNext: Loglet semantics dictate that readNext behavior                  or L7 ; but it is not acknowledged or reflected by checkTail
+is defined only for log positions before the return value of a             until L6 appears on stripe A at position A2 .
+
+
+
+USENIX Association                                     14th USENIX Symposium on Operating Systems Design and Implementation              625
+                                   StripedLoglet                                  Loglets. These Loglets can have different memberships (and
+           L0     L1   L2   L3    L4    L5         L7                             even entirely different Loglet implementations) in the sharded
+                                                                                  acceptor case; or identical membership (and the same Loglet
+                                                                                  implementation) but different sequencers in the rotating se-
+           L0 L3                 L1 L4 L7               L2 L5                     quencer case.
+           A0 A1 A2              B0 B1 B2               C0 C1 C2
+            Stripe A               Stripe B               Stripe C
+                                                                                     From the viewpoint of the VirtualLog, the StripedLoglet is
+                                                                                  like any other Loglet; it has to be sealed as a whole (i.e., every
+             (sharded acceptors)                           (rotating sequencer)   stripe has to be sealed) even if only one of its stripes needs to
+                                                                  Stripe A        be changed via the VirtualLog reconfiguration mechanism. In
+       Stripe A                  Stripe B
+                                                                                  the future, we plan to explore schemes for selectively sealing
+                                                                                  and replacing a single stripe.
+                                                                  Stripe B
+
+                                                                                  5     Evaluation
+Figure 7: The StripedLoglet stripes over underlying Loglets.
+Loglets can be disjoint (sharded acceptors) or have over-                         We use two hardware setups for evaluating Delos. The first
+lapping membership but different sequencers (rotating se-                         is the production hardware that most of our instances run on,
+quencer).                                                                         which consists of 5 servers with shared boot SSDs. Since De-
+                                                                                  los has to run in a variety of data centers, we cannot assume
+                                                                                  specific or dedicated storage hardware. The second is bench-
+                                                                                  mark hardware with dedicated NVMe SSDs. In both setups,
+   A checkTail call fans out to all stripes and returns the first
+                                                                                  we run within Twine [44] containers, and have production-
+unfilled logical position, while readNext calls are directed
+                                                                                  grade debug logging and monitoring enabled.
+to the corresponding stripe. For this protocol to work, the
+                                                                                     We show numbers for two workloads. The first is real pro-
+StripedLoglet requires the stripe Loglets to have contiguous
+                                                                                  duction traffic. For a representative deployment, the workload
+log positions. While the NativeLoglet provides this property,
+                                                                                  consists of 425 queries/sec and 150 puts/sec on the Delos
+LogDeviceLoglet does not: LogDevice embeds an epoch num-
+                                                                                  Table API. Write size has a median of 500 bytes and a max
+ber (generated by its own internal reconfiguration mechanism)
+                                                                                  of 150KB. Each deployment stores between 1GB and 10GB.
+within the log position, so that positions are typically contigu-
+                                                                                  In production, Delos takes local snapshots every 10 minutes
+ous but can skip forward if an internal reconfiguration takes
+                                                                                  and ships them to a backup service every 20 minutes.
+place.
+                                                                                     The second workload is a synthetic one consisting of single-
+   We found composition to be a simple and effective way to                       key puts and gets. The value consists of a single 1KB blob.
+create protocols with new properties. The StripedLoglet is a                      The keys are chosen from an address space of 10M keys; we
+shim layer with only around 300 lines of code and consists                        select keys randomly with a uniform distribution and generate
+entirely of invocations on the underlying Loglets; yet it pro-                    random values, since this provides a lower bound for perfor-
+vides a versatile building block for scaling throughput. We                       mance by reducing caching and compression opportunities,
+experimented with two uses of it (shown in Figure 7):                             respectively. We pre-write the database before each run with
+Rotating sequencer: A StripedLoglet can be composed from                          10GB; this matches our production data sizes.
+NativeLoglets with identical LogServers but different se-                            Delos runs with two Loglets in production: ZKLoglet and
+quencers. For instance, a 9-node NativeLoglet will bottleneck                     NativeLoglet. In our experiments, we additionally use LogDe-
+on the single sequencer, which has to transmit each entry 8                       viceLoglet (or LDLoglet) and StripedLoglet. The external
+times. Instead, a StripedLoglet can be layered over two Na-                       ZooKeeper service used by ZKLoglet lives on a set of 5
+tiveLoglet stripes, each of which uses the same LogServers                        servers similar to our production hardware, running on shared
+but a different sequencer.                                                        boot SSDs and collocated with other jobs. LDLoglet uses a
+Sharded acceptors: A StripedLoglet can be layered over                            LogDevice service deployed on a set of 5 servers similar to
+multiple disaggregated Loglets, achieving a linear scaling                        our benchmark hardware, with dedicated NVMe SSDs.
+of throughput similar to CORFU [7] or Scalog [16], albeit via                        In all the graphs, we report 99th percentile latency over
+a design that doesn’t require a centralized sequencer or sepa-                    1-minute windows. We assume a p99 SLA of 15ms, which
+rate ordering layer. StripedLoglet also differs by relying on                     matches our production requirements.
+virtualization: it implements a Loglet API over other Loglets.
+As a result, StripedLoglet can scale any existing Loglet while
+inheriting its fault-tolerance properties (i.e., the StripedLoglet                5.1    The Benefit of Virtualization
+fails if any of its stripes fail).                                                Virtual consensus allowed Delos to upgrade its consensus
+   Note that the StripedLoglet code is identical for both these                   protocol in production without downtime. In Figure 8, we
+use cases: what changes is the composition of the individual                      show the actual switch-over happening from ZKLoglet to
+
+
+
+626   14th USENIX Symposium on Operating Systems Design and Implementation                                                   USENIX Association
+                                                                                                                                   50
+
+
+
+
+                                                                             Latency (ms) Latency (ms) Latency (ms) Latency (ms)
+                                                                                                                                            Prod HW
+   Latency (ms)
+
+                                            Multi-Puts                                                                             40                    Puts (NativeLoglet)
+                  100                                                                                                                                       Puts (LDLoglet)
+                                                                                                                                   30
+                   10                                                                                                              20                                      15ms SLA
+                    1                                                                                                              10
+                  0.1                                                                                                               0
+                                                                                                                                   50
+                                                                                                                                            Prod HW
+   Latency (ms)
+
+
+
+
+                                                                                                                                   40                    Gets (NativeLoglet)
+                  100                       Multi-Gets                                                                                                     Gets (LDLoglet),
+                                                                                                                                   30
+                   10                                                                                                              20
+                    1                                                                                                              10
+                                                                                                                                    0
+                  0.1                                                                                                              50
+                                                                                                                                            Bench HW     Puts (NativeLoglet)
+                                                                                                                                   40
+   Latency (ms)
+
+
+
+
+                  100                          Queries                                                                             30                       Puts (LDLoglet)
+                   10                                                                                                              20
+                                                                                                                                   10
+                    1                                                                                                               0
+                  0.1                                                                                                              50
+                                                                                                                                            Bench HW     Gets (NativeLoglet)
+                                                                                                                                   40
+   Latency (ms)
+
+
+
+
+                  100                         Indexed                                                                              30                      Gets (LDLoglet),
+                                              Queries                                                                              20
+                   10                                                                                                              10
+                    1                                                                                                               0
+                  0.1                                                                                                                   0         50        100       150      200
+                        0   50 100 150 200 250 300 350 400                                                                                     Tput (KOps/s): 10% Puts 90% Gets
+                                   Time (minutes)                       Figure 9: Delos can scale throughput between 10X (top) and
+Figure 8: Production upgrade from ZKLoglet to NativeLoglet              33% (bottom) for different HW types with a disaggregated
+(log-scale y-axis).                                                     LDLoglet instead of a converged NativeLoglet.
+
+
+a converged NativeLoglet for the first time on a Delos pro-             tency with NativeLoglet starts rising at 15K ops/s for puts due
+duction instance on April 2nd 2019. Switching to a different            to contention between the Loglet and the database. With a dis-
+log implementation provides substantially lower latency for a           aggregated LDLoglet running on 5 other machines, through-
+production workload. The graph shows p99 latencies for four             put scales 10X higher at 150K ops/s without breaching 15ms
+categories of Table operations: we see 10X improvements                 p99 latency for either puts or gets. This 10X improvement
+for multi-gets and indexed queries, and a 5X improvement                is partly due to more HW (twice the machines); better HW
+for multi-puts. Additionally, the switch-over happens with-             for the log (LDLoglet runs over dedicated NVMe SSDs); and
+out downtime: p99 latency spikes for indexed queries during             less I/O contention (the database and log are on different
+reconfiguration, but otherwise service availability is not dis-         machines).
+rupted. The latency improvement is largely due to the unopti-              In the bottom two graphs, Delos runs on benchmark HW
+mized nature of our ZKLoglet implementation, which simply               with dedicated SSDs; the performance hit for the converged
+writes a new sequential ZooKeeper key on each append.                   NativeLoglet is less stark due to more IOPS to share between
+   Interestingly, the graph shows two reconfigurations: the             the log and database, with latency rising for both puts and gets
+first is a reconfigExtend that seals the ZKLoglet and                   at around 139K ops/s. The disaggregated LDLoglet provides
+switches the active segment to a NativeLoglet, causing the              33% higher throughput at 190k ops/s. For both types of HW,
+visible shift in performance; the second, which happens a few           disaggregation allows the shared log to utilize a separate,
+minutes later, is a reconfigTruncate that removes the old               dedicated set of resources. We get similar results running
+ZKLoglet segment from the VirtualLog, but does not require              against a disaggregated NativeLoglet instead of LDLoglet,
+a seal (as described in Section 3.2) and hence does not cause           but wanted to highlight Delos’ ability to run over different
+any disruption. The hourly spikes in multi-puts are due to              consensus implementations.
+periodic large writes from the application.                                Delos can switch dynamically between converged and dis-
+   Delos can scale throughput by running over a disaggre-               aggregated modes without downtime. Figure 10 (Left) demon-
+gated Loglet. In Figure 9, we plot throughput on the x-axis and         strates the ability of Delos to change dynamically between
+p99 latency on the y-axis, for the synthetic workload with 90%          converged and disaggregated modes, and the utility of doing
+gets and 10% puts. We compare the converged NativeLoglet                so in order to handle workload shifts. In this experiment, we
+vs. the disaggregated LDLoglet. In the top two graphs, the              run the synthetic workload on the high-contention production
+Delos database runs on production HW with shared SSDs; la-              HW. We want to maintain a 15ms p99 latency SLA.
+
+
+
+USENIX Association                                  14th USENIX Symposium on Operating Systems Design and Implementation                                                              627
+                                                        Throughput (KOps/s)
+
+
+
+
+                                                                                                                     Throughput (KOps/s)
+                          Put p99                                             35       NativeLoglet                                        1200     StripedLoglet
+                                                                              30
+  Latency (ms)
+
+
+                 1000     Put p50                                                      StripedLoglet                                       1000
+                                                                              25                                                            800
+                  100                                                         20
+                                                                              15                                                            600
+                   10                                                         10                                                            400
+                                                                               5                                                            200
+                    1                                                          0                                                              0
+                        0 100 200 300 400 500 600 700                              5         7            9                                       1   10 20 30 40
+                               Time (secs)                                             Number of Replicas                                         Number of 3-node Stripes
+
+Figure 10: Left: Delos can dynamically switch from converged (NativeLoglet) to disaggregated (LDLoglet) logging to handle
+workload shifts (log-scale y-axis). Middle: StripedLoglet (rotating sequencer) alleviates the sequencer bottleneck as Delos
+scales. Right: StripedLoglet (sharded acceptors) scales to 1M+ appends/s for a log-only workload.
+
+
+   For the first 180 secs, we run a constant, low workload of                                    mum throughput for each configuration with a p99 latency of
+100 puts/sec; after that, we increase the workload to 2500 put-                                  under 75ms. We obtained similar results with 4KB payloads
+s/sec. Delos initially runs over the NativeLoglet, which meets                                   (750K appends/s with 30 shards); this is the highest reported
+the 15ms SLA for the low workload. But when the workload                                         single-log throughput in a non-emulated experiment, exceed-
+switches, Delos+NativeLoglet is no longer able to keep up                                        ing CORFU (570K/s) and Scalog (255K/s). Delos cannot
+due to I/O contention for the SSDs, with p99 latency degrad-                                     leverage such a high-throughput log, since it bottlenecks on
+ing to over a second. At around 530 secs, we reconfigure to                                      log playback; we plan to explore selective playback [8], as
+use LDLoglet; this reduces I/O pressure on the local SSDs,                                       well as compare against Scalog’s higher emulated numbers.
+allowing p99 latencies to drop back to under 15ms (after a
+60-second lag due to the 1-minute sliding window).
+   If a disaggregated log provides better throughput and lower                                   5.2   The Cost of Virtualization
+latency, why not always use one? First, disaggregation is inef-                                 Virtualization is inexpensive in terms of critical path latency.
+ficient from a resource standpoint for low workloads, using                                     In most cases, the VirtualLog acts as a simple pass-through
+10 machines compared to 5 with a converged log. Second,                                         layer. Figure 11 (Left) shows the p99 latency of VirtualLog
+converged Delos does not depend on any external service in                                      and NativeLoglet operations; this data is measured over a
+the critical path, which is important for some control plane                                    one-hour time period on a production cluster running over
+applications.                                                                                   the NativeLoglet. For append and checkTail, virtualization
+   New protocols with useful properties can be implemented                                      adds 100-150 µseconds to p99 latency; this is largely due
+via Loglet composition. In the NativeLoglet, all appends are                                    to the overhead of an asynchronous Future-based API. In
+routed via the sequencer node. For a 100% 1KB put workload                                      contrast, readNext is a synchronous pass-through call and
+on a 5-node cluster, Delos is bottlenecked by the IOPS of the                                   adds only a few µseconds.
+NativeLoglet LogServers. However, when we run Delos over                                           Reconfigurations occur within 10s of ms. In Figure 11
+9 LogServers for higher fault-tolerance, the bottleneck shifts                                  (Middle), we show a histogram of all reconfigurations
+to the NativeLoglet sequencer, which now has to send out                                        in a 1-month period on our production clusters. Since
+each entry 8 times. If we instead use a StripedLoglet over 2                                    reconfigTruncate does not call seal, it has lower latency
+NativeLoglets (each with the same set of LogServers but dif-                                    than reconfigExtend. For our applications, reconfiguration
+ferent sequencers), we rotate the sequencing load across two                                    latencies of 10s of ms are tenable. The vast majority of these
+servers. As Figure 10 (Middle) shows, Delos+StripedLoglet                                       reconfigurations are triggered by 1) continuous deployment of
+runs 25% faster than Delos+NativeLoglet with 9 nodes on the                                     software upgrades; and 2) machine preemptions for hardware
+benchmark HW.                                                                                   maintenance, kernel upgrades, etc. Actual failures constitute a
+   We also ran log-only experiments with StripedLoglet in                                       small percentage of the reconfigurations. In practice, clusters
+Figure 10 (Right). We created a StripedLoglet over multi-                                       see a few reconfigurations per day; for example, one of our
+ple 3-node NativeLoglets, and appended 1KB payloads from                                        production clusters was reconfigured 98 times in the 1-month
+20 VirtualLog clients. We see linear scaling of throughput                                      period.
+as we go from 1 stripe (3 LogServers) to 30 stripes (i.e.,                                         Virtualization does not affect peak throughput. We
+90 LogServers); beyond that, our clients became the bottle-                                     performed an apples-to-apples comparison of Delos to
+neck. The LogServers run on shared NVMe SSDs, which                                             ZooKeeper on our benchmark HW. We translate puts into
+provide 30K IOPS with a p99 of 75ms; we report the maxi-                                        SetData commands and gets into GetData commands on the
+
+
+
+628              14th USENIX Symposium on Operating Systems Design and Implementation                                                                      USENIX Association
+    p99 Latency (microsecs)
+
+
+
+
+                                                                      Number of Recongs
+                                          NativeLoglet                                     300     reconfgTruncate                                                Delphi
+                              100000       VirtualLog                                                reconfgExtend                                           ZooKeeper
+
+
+
+
+                                                                                                                                  Latency (ms)
+                              10000                                                        250                                                   1000     Delphi InMem
+                                                                                           200                                                    100
+                               1000
+                                                                                           150                                                          15ms SLA
+                                100                                                                                                                10
+                                                                                           100
+                                 10                                                                                                                 1
+                                                                                            50
+                                   1
+                                         rx           il                                    0                                                    0.1
+                                                     Te         rna
+                                    ad            ck        epp                                  0 20 40 60 80 100120140160                             0 5 10 15 20 25 30 35 40 45
+                                 re           chr
+                                                                                                       Latency (ms)                                      Tput (KOps/s): 100% Puts
+
+Figure 11: Left: virtualization overhead is low in production: 6 µs for readNext and 100 to 150 µs for append / checkTail p99.
+Middle: reconfigurations take tens of ms in production. Right: Delos+NativeLoglet matches ZooKeeper performance.
+
+
+ZooKeeper API. Since ZooKeeper does not support more                                                         we may explore automated switching.
+than a few GB of data, we ran with a 1GB database. Figure 11                                                    Consensus is forever... until it’s not: Deletion of arbitrary
+(Right) shows that ZooKeeper can provide over 30K puts/sec                                                   entries is typically quite difficult in conventional consensus
+before p99 latency degrades beyond 15ms. In contrast, De-                                                    protocols. However, with virtual consensus, we can delete
+los+NativeLoglet manages around 26K puts/sec. The primary                                                    an entry simply by changing the metadata of the VirtualLog.
+reason for the performance difference is that ZooKeeper stores                                               Similarly, altering written entries is possible via remapping.
+its materialized state in memory while Delos uses RocksDB.                                                   We found this kind of surgical editing capability useful when
+We also ran a version of Delos where the materialized state                                                  faced with site-wide outages: on one occasion, a “poison”
+lives in memory; this prototype hit 40K puts/sec. While stor-                                                entry caused hangs on all learners processing the log.
+ing state in RocksDB causes a performance hit at small sizes,                                                   ZooKeeper over Delos... over ZooKeeper: Virtualization
+it enables us to scale; the Delos+NativeLoglet curve for a 100                                               often enables interesting and practically useful layerings; for
+GB database (not shown in the graph) is nearly identical to                                                  example, it is routine in storage stacks to run a filesystem
+the 1GB case. These results show that Delos performance is                                                   over a virtual block device that in turn is stored on a different
+comparable to unvirtualized systems.                                                                         instance of the same filesystem. Virtual consensus brings sim-
+                                                                                                             ilar flexibility to replicated databases: in our current stack, we
+                                                                                                             have the ability to run our experimental ZooKeeper API over
+6                         Discussion                                                                         the VirtualLog, which in turn can run over the ZooKeeper-
+                                                                                                             based ZKLoglet.
+Virtual consensus provided a number of ancillary benefits for
+the operation of Delos.
+   Fate-sharing... but only when my fate is good: In produc-                                                 7    Related Work
+tion, Delos typically runs as a converged database with no
+external dependencies, where all logic and state (including the                                              Virtual consensus builds upon a large body of work in
+database and the log) resides on a set of 5 machines. However,                                               fault-tolerant distributed systems. Most approaches to re-
+the database / learner layer is simultaneously more fragile                                                  configurable replication (including Viewstamped Replica-
+than the log / acceptor layer (since it is updated frequently                                                tion [32, 38], ZAB [22], Raft [39], Vertical Paxos [27], and
+to add features) and requires lower fault-tolerance (only one                                                SMART [34]) use protocols for leader election and reconfigu-
+learner needs to survive, compared to a quorum of acceptors).                                                ration that are tightly intertwined with the ordering protocol.
+If two converged replicas crash out of five, another failure can                                             Virtual Synchrony [10, 46] is an exception: it uses a unified
+cause unavailability and data loss for the log. In this situation                                            view change protocol for leader election and reconfiguration
+(which was not uncommon), we found it valuable to reconfig-                                                  that sits above the ordering mechanism used within each view.
+ure the system to a disaggregated log, temporarily decoupling                                                This unified approach is also found in more recent systems
+the fate of the database and the log. Once the database was                                                  such as Derecho [21] and CORFU [7]. Reconfiguration has
+restored to five replicas, we reconfigured back. This style                                                  been explored as a layer above a generic state machine by
+of temporary decoupling also proved valuable when we dis-                                                    Stoppable Paxos [28, 29]; unlike Loglets, the underlying state
+covered latent bugs in the NativeLoglet; we reconfigured to                                                  machine has to implement fault-tolerant consensus.
+ZKLoglet, rolled out hotfixes, and then reconfigured back.                                                      Virtual consensus borrows many ideas from this literature,
+Currently, switching between converged and disaggregated                                                     combines them, and applies them to a production system:
+logs is a manual operation driven by operators; in the future,                                               for example, unified leader election and reconfiguration (Vir-
+
+
+
+USENIX Association                                                    14th USENIX Symposium on Operating Systems Design and Implementation                                        629
+tual Synchrony); a segmented total order with potentially           Acknowledgments
+disjoint configurations (SMART); an external auxiliary (Ver-
+tical Paxos); and a generic ordering abstraction (Stoppable         We would like to thank our shepherd, Jay Lorch, and the
+Paxos). However, virtual consensus also differs from all this       anonymous OSDI reviewers. Many people contributed to the
+prior work in several important aspects. First, we target and       Delos project, including Adrian Hamza, Mark Celani, Andy
+demonstrate diversity in the ordering layer (e.g., deploying        Newell, Artemiy Kolesnikov, Ali Zaveri, Ben Reed, Denis
+new layers, switching to disaggregated mode, etc.). Second,         Samoylov, Grace Ko, Ivailo Nedelchev, Mingzhe Hao, Maxim
+the ordering layer is only required to provide a highly avail-      Khutornenko, Peter Schuller, Suyog Mapara, Rajeev Nagar,
+able seal, which is weaker than fault-tolerant consensus and        Russ Arun, Soner Terek, Terence Feng, and Vidhyashankar
+easier to implement. Finally, virtual consensus applies and         Venkataraman. Marcos Aguilera, Jose Faleiro, Dahlia Malkhi,
+extends these ideas to shared logs, which pose unique op-           and Vijayan Prabhakaran provided valuable feedback on early
+portunities (e.g., data-centric APIs that hide complexity) and      iterations of this work.
+challenges (e.g., application-driven trims and explicit reads).
+   To assess the generality of the Loglet abstraction, we did an
+informal survey of recent replication protocols. The majority       References
+of these protocols either directly expose a log API [3,7,16,37,
+42] or can be wrapped as a Loglet [14, 15, 22, 24, 31, 35, 39].      [1] CorfuDB. https://github.com/corfudb.
+Virtualization gives us the ability to easily experiment with
+                                                                     [2] etcd. https://etcd.io/.
+these protocols under Delos and deploy them to production.
+Other work – such as protocols that exploit speculation [41]         [3] LogDevice. https://logdevice.io/.
+or commutativity [4, 26, 36] – does not currently fit under the
+Loglet API.                                                          [4] A ILIJIANG , A., C HARAPKO , A., D EMIRBAS , M., AND
+   Virtual consensus is based on the shared log approach for             KOSAR , T. WPaxos: Wide Area Network Flexible Con-
+building replicated systems; we leverage the existence of                sensus. IEEE Transactions on Parallel and Distributed
+the shared log API as a boundary between the database and                Systems 31, 1 (2019), 211–223.
+consensus mechanism. Shared logs were first introduced by
+CORFU [7] and Hyder [9] as an API for consensus. Subse-              [5] A NNAMALAI , M., R AVICHANDRAN , K., S RINIVAS ,
+quently, CorfuDB [1] was the first production database to be             H., Z INKOVSKY, I., PAN , L., S AVOR , T., NAGLE , D.,
+deployed over a shared log API. Along similar lines, systems             AND S TUMM , M. Sharding the Shards: Managing Data-
+such as Kafka [23] and LogDevice [3] have become popular in              store Locality at Scale with Akkio. In Proceedings of
+industry, exposing large numbers of individual, independently            USENIX OSDI 2018.
+ordered logs. In contrast, research has largely focused on scal-
+ing a single log, either via faster ordering protocols [16] or       [6] ATTIYA , H., BAR -N OY, A., AND D OLEV, D. Sharing
+different forms of selective playback [8,48]. Rather than build          Memory Robustly in Message-Passing Systems. Journal
+a faster shared log or a more scalable database above it, virtual        of the ACM (JACM) 42, 1 (1995), 124–142.
+consensus seeks to make such systems simpler to build and
+deploy as they become commonplace in industry.                       [7] BALAKRISHNAN , M., M ALKHI , D., P RABHAKARAN ,
+                                                                         V., W OBBER , T., W EI , M., AND DAVIS , J. D. CORFU:
+                                                                         A Shared Log Design for Flash Clusters. In USENIX
+8     Conclusion                                                         NSDI 2012.
+Virtual consensus enables faster deployment and development          [8] BALAKRISHNAN , M., M ALKHI , D., W OBBER , T., W U ,
+of replicated systems. Reconfiguration and leader election is            M., P RABHAKARAN , V., W EI , M., DAVIS , J. D., R AO ,
+encapsulated in a control plane (the VirtualLog) that can be             S., Z OU , T., AND Z UCK , A. Tango: Distributed Data
+reused across any data plane (Loglets). Delos is the first sys-          Structures over a Shared Log. In Proceedings of ACM
+tem that supports heterogeneous reconfiguration, allowing                SOSP 2013.
+changes to not just the leader or the set of servers in the sys-
+tem, but also the protocol, codebase, and deployment model           [9] B ERNSTEIN , P. A., DAS , S., D ING , B., AND P ILMAN ,
+of the consensus subsystem. As a result, new systems can                 M. Optimizing Optimistic Concurrency Control for
+be developed and deployed rapidly (e.g., Delos hit produc-               Tree-Structured, Log-Structured Databases. In Proceed-
+tion within 8 months by leveraging an external service for its           ings of ACM SIGMOD 2015.
+Loglet); and upgraded without downtime to provide signif-
+icantly different performance and fault-tolerance properties        [10] B IRMAN , K. P., AND J OSEPH , T. A. Reliable Commu-
+(e.g., we hot-swapped Loglets in production for a 10X latency            nication in the Presence of Failures. ACM Transactions
+reduction).                                                              on Computer Systems (TOCS) 5, 1 (1987), 47–76.
+
+
+
+630    14th USENIX Symposium on Operating Systems Design and Implementation                                USENIX Association
+[11] B URKE , M., C HENG , A., AND L LOYD , W. Gryff: Uni-        [24] KOGIAS , M., AND B UGNION , E. HovercRaft: Achiev-
+     fying Consensus and Shared Registers. In Proceedings              ing Scalability and Fault-tolerance for microsecond-
+     of USENIX NSDI 2020.                                              scale Datacenter Services. In Proceedings of ACM Eu-
+                                                                       roSys 2020.
+[12] B URROWS , M. The Chubby lock service for loosely-
+     coupled distributed systems. In Proceedings of USENIX        [25] L AMPORT, L. The Part-Time Parliament. ACM Trans-
+     OSDI 2006.                                                        actions on Computer Systems (TOCS) 16, 2 (1998), 133–
+                                                                       169.
+[13] C AO , Z., D ONG , S., V EMURI , S., AND D U , D. H.
+     Characterizing, Modeling, and Benchmarking RocksDB           [26] L AMPORT, L. Generalized Consensus and Paxos. Mi-
+     Key-Value Workloads at Facebook. In Proceedings of                crosoft Research Technical Report MSR-TR-2005-33
+     USENIX FAST 2020.                                                 (2005).
+[14] C HARAPKO , A., A ILIJIANG , A., AND D EMIRBAS , M.          [27] L AMPORT, L., M ALKHI , D., AND Z HOU , L. Vertical
+     PigPaxos: Devouring the communication bottlenecks in              Paxos and Primary-Backup Replication. In Proceedings
+     distributed consensus. arXiv preprint arXiv:2003.07760            of ACM PODC 2009.
+     (2020).
+                                                                  [28] L AMPORT, L., M ALKHI , D., AND Z HOU , L. Stoppable
+[15] DANG , H. T., C ANINI , M., P EDONE , F., AND S OULÉ ,            Paxos. Microsoft Research Technical Report (unpub-
+     R. Paxos Made Switch-y. ACM SIGCOMM Computer                      lished) (2008).
+     Communication Review 46, 2 (2016), 18–24.
+                                                                  [29] L AMPORT, L., M ALKHI , D., AND Z HOU , L. Recon-
+[16] D ING , C., C HU , D., Z HAO , E., L I , X., A LVISI , L.,
+                                                                       figuring a State Machine. SIGACT News 41, 1 (2010),
+     AND VAN R ENESSE , R. Scalog: Seamless Reconfig-
+                                                                       63–73.
+     uration and Total Order in a Scalable Shared Log. In
+     Proceedings of USENIX NSDI 2020.                             [30] L ENERS , J. B., W U , H., H UNG , W.-L., AGUILERA ,
+                                                                       M. K., AND WALFISH , M. Detecting failures in dis-
+[17] F ISCHER , M. J., LYNCH , N. A., AND PATERSON , M. S.
+                                                                       tributed systems with the FALCON spy network. In
+     Impossibility of Distributed Consensus with One Faulty
+                                                                       Proceedings of ACM SOSP 2011.
+     Process. Journal of the ACM (JACM) 32, 2 (1985),
+     374–382.                                                     [31] L I , J., M ICHAEL , E., S HARMA , N. K., S ZEKERES , A.,
+                                                                       AND P ORTS , D. R. Just say NO to Paxos Overhead:
+[18] H ERLIHY, M. P., AND W ING , J. M. Linearizability:
+     A Correctness Condition for Concurrent Objects. ACM               Replacing Consensus with Network Ordering. In Pro-
+     Trans. Program. Lang. Syst. 12, 3 (July 1990), 463–492.           ceedings of USENIX OSDI 2016.
+
+[19] H OWARD , H., M ALKHI , D., AND S PIEGELMAN , A.             [32] L ISKOV, B., AND C OWLING , J. Viewstamped Replica-
+     Flexible Paxos: Quorum intersection revisited. In Pro-            tion Revisited. In MIT Technical Report (2012).
+     ceedings of OPODIS 2016.
+                                                                  [33] L OCKERMAN , J., FALEIRO , J. M., K IM , J.,
+[20] H UNT, P., KONAR , M., J UNQUEIRA , F. P., AND R EED ,            S ANKARAN , S., A BADI , D. J., A SPNES , J., S EN , S.,
+     B. ZooKeeper: Wait-free Coordination for Internet-                AND BALAKRISHNAN , M. The FuzzyLog: a Partially
+     scale Systems. In Proceedings of USENIX ATC 2010.                 Ordered Shared Log. In Proceedings of USENIX OSDI
+                                                                       2018.
+[21] J HA , S., B EHRENS , J., G KOUNTOUVAS , T., M ILANO ,
+     M., S ONG , W., T REMEL , E., R ENESSE , R. V., Z INK ,      [34] L ORCH , J. R., A DYA , A., B OLOSKY, W. J., C HAIKEN ,
+     S., AND B IRMAN , K. P. Derecho: Fast State Machine               R., D OUCEUR , J. R., AND H OWELL , J. The SMART
+     Replication for Cloud Services. ACM Transactions on               Way to Migrate Replicated Stateful Services. In Pro-
+     Computer Systems (TOCS) 36, 2 (2019), 1–49.                       ceedings of ACM EuroSys 2006.
+
+[22] J UNQUEIRA , F. P., R EED , B. C., AND S ERAFINI , M.        [35] M AO , Y., J UNQUEIRA , F. P., AND M ARZULLO , K.
+     Zab: High-performance broadcast for primary-backup                Mencius: Building Efficient Replicated State Machines
+     systems. In Proceedings of IEEE DSN 2011.                         for WANs. In Proceedings of USENIX OSDI 2008.
+
+[23] K LEPPMANN , M., AND K REPS , J. Kafka, Samza and            [36] M ORARU , I., A NDERSEN , D. G., AND K AMINSKY, M.
+     the Unix Philosophy of Distributed Data. IEEE Data                There Is More Consensus in Egalitarian Parliaments. In
+     Engineering Bulletin, 38 (4) (2015).                              Proceedings of ACM SOSP 2013.
+
+
+
+USENIX Association                          14th USENIX Symposium on Operating Systems Design and Implementation           631
+[37] NAWAB , F., A RORA , V., AGRAWAL , D., AND E L A B -        [44] TANG , C., Y U , K., V EERARAGHAVAN , K., K ALDOR ,
+     BADI , A. Chariots: A Scalable Shared Log for Data               J., M ICHELSON , S., KOOBURAT, T., A NBUDURAI , A.,
+     Management in Multi-Datacenter Cloud Environments.               C LARK , M., G OGIA , K., C HENG , L., C HRISTENSEN ,
+     In Proceedings of EDBT 2015.                                     B., G ARTRELL , A., K HUTORNENKO , M., K ULKARNI ,
+                                                                      S., PAWLOWSKI , M., P ELKONEN , T., RODRIGUES , A.,
+[38] O KI , B. M., AND L ISKOV, B. H. Viewstamped Replica-            T IBREWAL , R., PAWLOWSKI , M., P ELKONEN , T., RO -
+     tion: A New Primary Copy Method to Support Highly-               DRIGUES , A., T IBREWAL , R., V ENKATESAN , V., AND
+     Available Distributed Systems. In Proceedings of ACM             Z HANG , P. Twine: A Unified Cluster Management
+     PODC 1988.                                                       System for Shared Infrastructure. In Proceedings of
+[39] O NGARO , D., AND O USTERHOUT, J. K. In Search of                USENIX OSDI 2020.
+     an Understandable Consensus Algorithm. In Proceed-
+                                                                 [45] VAN R ENESSE , R., AND A LTINBUKEN , D. Paxos
+     ings of USENIX ATC 2014.
+                                                                      Made Moderately Complex. ACM Computing Surveys
+[40] P LOTKIN , S. A. Sticky Bits and Universality of Con-            (CSUR) 47, 3 (2015), 1–36.
+     sensus. In Proceedings of ACM PODC 1989.
+                                                                 [46] VAN R ENESSE , R., B IRMAN , K. P., AND M AFFEIS ,
+[41] P ORTS , D. R., L I , J., L IU , V., S HARMA , N. K., AND        S. Horus: A Flexible Group Communication System.
+     K RISHNAMURTHY, A. Designing Distributed Systems                 Communications of the ACM 39, 4 (1996), 76–83.
+     Using Approximate Synchrony in Data Center Net-
+     works. In Proceedings of USENIX NSDI 2015.                  [47] V ERBITSKI , A., G UPTA , A., S AHA , D., B RAHMADE -
+                                                                      SAM , M., G UPTA , K., M ITTAL , R., K RISHNAMURTHY,
+[42] S HIN , J.-Y., K IM , J., H ONORÉ , W., VANZETTO , H.,           S., M AURICE , S., K HARATISHVILI , T., AND BAO ,
+     R ADHAKRISHNAN , S., BALAKRISHNAN , M., AND                      X. Amazon Aurora: Design Considerations for High
+     S HAO , Z. WormSpace: A Modular Foundation for Sim-              Throughput Cloud-Native Relational Databases. In
+     ple, Verifiable Distributed Systems. In Proceedings of           ACM SIGMOD 2017.
+     ACM SoCC 2019.                                              [48] W EI , M., TAI , A., ROSSBACH , C. J., A BRAHAM , I.,
+                                                                      M UNSHED , M., D HAWAN , M., S TABILE , J., W IEDER ,
+[43] S HVACHKO , K., K UANG , H., R ADIA , S., AND                    U., F RITCHIE , S., S WANSON , S., ET AL . vCorfu: A
+     C HANSLER , R. The Hadoop Distributed File System.               Cloud-Scale Object Store on a Shared Log. In USENIX
+     In Proceedings of IEEE MSST 2010.                                NSDI 2017.
+
+
+
+
+632   14th USENIX Symposium on Operating Systems Design and Implementation                            USENIX Association
+

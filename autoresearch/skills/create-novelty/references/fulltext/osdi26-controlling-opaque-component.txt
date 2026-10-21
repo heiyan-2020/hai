@@ -1,0 +1,1224 @@
+     Controlling Opaque-Component Effects with
+                 Semisolates and Try
+   Evangelos Lamprou, Brown University; Tianyu (Ezri) Zhu, Stevens Institute of
+Technology; Di Jin and Grigoris Ntousakis, Brown University; Georgios Liargkovas,
+Columbia University; Calvin Eng, Brown University; Konstantinos Kallas, University
+  of California, Los Angeles; Michael Greenberg, Stevens Institute of Technology;
+                         Nikos Vasilakis, Brown University
+            https://www.usenix.org/conference/osdi26/presentation/lamprou
+
+
+
+
+  This paper is included in the Proceedings of the 20th USENIX
+ Symposium on Operating Systems Design and Implementation.
+                       July 13–15, 2026 • Seattle, WA, USA
+                               ISBN 978-1-939133-55-7
+
+
+           Open access to the Proceedings of the 20th USENIX Symposium on
+            Operating Systems Design and Implementation is sponsored by
+                Controlling Opaque-Component Effects with Semisolates and Try
+                                                       https://binpa.sh/try
+
+
+                 Evangelos Lamprou*                     Tianyu (Ezri) Zhu*                              Di Jin
+                  Brown University                Stevens Institute of Technology                   Brown University
+        Grigoris Ntousakis             Georgios Liargkovas               Calvin Eng                      Konstantinos Kallas
+        Brown University               Columbia University            Brown University                         UCLA
+                                    Michael Greenberg                              Nikos Vasilakis
+                               Stevens Institute of Technology                    Brown University
+                            Abstract                                curl -sL https://sh.rustup.rs | try sh                         semisolate
+                                                                                    /bin/, /proc, …
+Many developers and systems today rely on opaque software                           /home/user/.cargo/bin/
+                                                                                    /home/user/rustup/
+                                                                                                                ✗ /home/user/.cargo (modified)
+                                                                                                                ✓ /home/user/rustup/ (added)
+                                                                    current         /home/user/work/            ✗ /home/user/work/ (deleted)
+components. When executing, these components affect each                            /etc/passwd                 ✗ /etc/passwd (hidden)
+                                                                    environment
+other and the broader environment in which they execute.
+Some of these effects are expected and desired; others not          Figure 1: Applying try. Execute a command in its own try semiso-
+so. This paper introduces semisolates, an abstraction and cor-      late to control its effects: inspect, selectively apply, revert, partially
+responding subsystem for controlling and manipulating the           hide (all shown) or otherwise manipulate them—all within the cur-
+effects of opaque components. Available as an unprivileged,         rent environment rather than a new isolated container.
+higher-order, language-agnostic command, try interposes on
+a component’s execution to automatically capture and con-           find -exec as suggested by an LLM may result in deleting
+trol its effects. Effect control includes introspection, optional   critical user files [52]. These and other cases (§2) hint at the
+application, effect stacking, and further manipulation—all          necessity to control these effects during component execution.
+driven by several real-world case studies. Today try is used            This paper presents a new abstraction, the semisolate (§3),
+in research and production applications across several organi-      and corresponding implementation, try (§4), for controlling
+zations, mediating potentially undesired effects, maintaining       the effects of such opaque components. Semisolates offer
+full compatibility with real-world components, and incurring        the ability to execute a component in the current environ-
+a modest performance overhead well within each case’s ac-           ment via an unprivileged, language-agnostic, higher-order
+ceptable levels.                                                    command that allows its users to inspect and manipulate a
+                                                                    completely unmodified component’s externally observable
+                                                                    behavior. But rather than focusing on the behavior encoded
+1     Introduction                                                  in standard streams, easily controllable by the usual pipe-and-
+                                                                    filter patterns, try focuses on side effects such as filesystem
+Modern software systems contain many intercommunicating
+                                                                    modifications. And contrary to various forms of containment
+components, including various subsystems, programs, com-
+                                                                    and virtualization [10, 54, 68], which create a new environ-
+mands, and packages [11, 44, 45, 93]. These components are
+                                                                    ment that fully isolates all effects, try allows the executing
+often available in diverse programming languages, interact
+                                                                    components to access the current environment in which they
+opaquely with the broader environment, and are developed
+                                                                    execute and enables effect manipulation directly in that envi-
+by developers of varying skill and care. Even quick-and-dirty
+                                                                    ronment; the term semisolate (from semi-, meaning “partially,”
+data-processing scripts pull together many polyglot compo-
+                                                                    and isolate) reflects this partial rather than complete isolation.
+nents [44, 71] and simple update scripts or AI agents invoke
+                                                                        More specifically, try allows introspecting, selectively ap-
+other commands to complete their jobs [45, 93].
+                                                                    plying, stacking, and further manipulating a component’s ef-
+   Unfortunately, the execution of these components—during
+                                                                    fects to the filesystem and the broader environment. To auto-
+e.g., exploration or development—results in unpredictable
+                                                                    matically capture these effects, try limits the component’s
+and often-irreversible effects. These effects are a direct and
+                                                                    view of the filesystem: it first sets up a semisolate to create a
+necessary byproduct of the computation encoded by a com-
+                                                                    view of the filesystem and environment that retains partial iso-
+ponent: executing npm install downloads and installs new
+                                                                    lation; it then executes the component inside the semisolate,
+software packages, directly altering several files and directo-
+                                                                    collecting effects into a writable temporary directory; finally,
+ries [1]. At times, effects are unintentional: naively running a
+                                                                    either during its (streaming) execution or upon completion,
+    * Equal contribution.                                           the semisolate allows manipulating the collected effects by
+
+
+
+USENIX Association                            20th USENIX Symposium on Operating Systems Design and Implementation                        453
+staging them, reverting them or applying them to the underly-        commands inside the host system [2, 3, 7]. Consider using
+ing filesystem—either wholly or partially (Fig. 1).                  an LLM to generate a script that “cleans up its containing
+   This opaque effect control is applicable broadly (§2): it         directory”; it generates delete.sh containing the following:
+can be used to inspect the effects of risky or cryptic LLM
+                                                                         rm -fr "$(cd "${0%/*}" && echo $PWD)"/*
+suggestions before applying them [26]; track the dependency
+graph for systems composed of opaque components, useful              Unfortunately, when called from some paths, the runtime
+for parallelization or reordering [65]; provide a --dry-run          expansion ${0%/*} will expand to the script’s path, cd will
+capability, found today in some commands, that is general            fail, and rm will delete everything user-writable. Prefixing
+and command-agnostic [89]; and support specification infer-          this line with try indicates the deletion of all user-writable
+ence for opaque components [45]. These and other examples            directories and offers the option to discard these changes.
+drive try’s design requirements: effect control that allows
+                                                                     1 try sh delete.sh
+hiding state, stacking effects, and partially or fully applying or
+                                                                     2   /home (deleted)
+rolling them back. No current abstraction and corresponding
+                                                                     3   /etc (deleted)
+subsystem offers granular effect control with try’s wealth of        4   ...
+features.                                                            5   Apply these changes? [y/i/N]
+   Applying try to real-world cases (§5) indicates that try
+controls all relevant component effects, maintains behavior          A developer or system calling try can decide whether to
+equivalence with non-semisolated execution, and incurs a             inspect these changes and choose to discard them, or inspect
+modest performance overhead relative to the needs of each            them individually and choose which ones to apply.
+use case. Semisolates and try offer a distinct set of features       Dependency tracking: Speculative execution reordering of-
+from, and better performance than, container systems such            fers significant speedups [65], but ensuring it respects read-
+as Docker, OrbStack, and Podman [54], built using similar            after-write dependencies across opaque components is par-
+components arranged quite differently.                               ticularly challenging. Consider the following program that
+   In summary, this paper makes several contributions: it            compiles three and links two C files:
+    • identifies the shared needs of several case studies for
+                                                                     1   gcc -c a.c -o a.o; gcc b.c -o a
+      which today’s effect control is insufficient (§2);
+                                                                     2   gcc -c c.c -o c.o; gcc a.o c.o -o b
+    • presents a novel effect-control abstraction, a semisolate,
+      that meets the needs of these case studies (§3);               The second call to gcc does not depend on the first, thus
+    • describes the implementation of try, a new effect-             it can be executed in parallel. Unfortunately, detecting this
+      control subsystem built for Linux environments (§4);           opportunity automatically at runtime requires detecting ef-
+    • characterizes try by applying it to several real-world         fects and postponing their application to the broader environ-
+      components drawn from the earlier case studies (§5).           ment until they are confirmed to not violate read-after-write
+It also discusses try’s limitations and the experiences of or-       dependencies—at times discarding these effects to effectively
+ganizations using try (§6), as well as prior related work (§7).      roll back command misspeculation. Crucially, subsequent in-
+Appendix A contains all LLM prompts used in the evaluation,          vocations must start their execution with the illusion that prior
+Appendix B collects several testimonials on try’s potential          effects have been applied—necessitating chaining reversible
+impact, and Appendix C describes the artifact accompanying           effect application across component invocations.
+this paper. The try subsystem is open-source, MIT-licensed              Prefixing gcc with try while explicitly asking it to stack
+software, publicly available on GitHub [92].                         sets of effects solves both problems:
+                                                                     1   try -t trace1.log -N env1 gcc -c c.c -o c.o
+2     Examples and Goals                                             2   try -t trace2.log -N env2 -L env1 gcc a.o c.o -o b
+
+To understand the need for controlling component effects,            The -N option instructs try to store, instead of directly ap-
+this section describes several real-world case studies (§2.1).       plying, gcc’s effects for later use with a configurable name.
+Combined, these case studies highlight several shared require-       The -t flag enables system-call tracing to capture ordered
+ments for the design of a flexible effect-control abstraction        filesystem effects. Next, -L injects gcc’s uncommitted effects
+and corresponding subsystem (§2.2).                                  from env1 into its own view, making c.o visible to try’s
+                                                                     second invocation.
+                                                                     Third-party library risks: Public third-party libraries am-
+2.1    Motivating Examples                                           plify developer capabilities, but risk introducing undesired ef-
+                                                                     fects [15,56,63]. Consider the popular node-ipc library [72],
+Risky or cryptic LLM suggestions: Recent agentic systems             invoked as part of a larger codebase:
+have incorporated large language models (LLMs), allowing
+them to act on behalf of the developer by executing arbitrary            npm test node-ipc
+
+
+
+454    20th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+Earlier versions of node-ipc included undesired effects mod-      1 r /usr/bin/grep
+ifying critical system files [18, 86]. Prefixing npm test with    2 r /usr/lib/libc.so.6
+try highlights files about to be modified without making any      3 r one.txt
+
+                                                                  4 r two.txt
+modifications prior to approval:
+                                                                  5 w stdout
+
+ 1 try npm test node-ipc
+ 2   /etc/passwd (modified)                                       This order of effects extracted by try -t reveals invariants
+ 3   /bin/bash (modified)                                         (e.g., one.txt preceding two.txt) that need to be maintained
+ 4   /sbin/init (modified)                                        when optimizing programs that invoke grep.
+ 5   ...
+ 6   Commit these changes? [y/i/N]
+                                                                  2.2    Desiderata for the Missing Abstraction
+The output of try shows all such effects, allowing a developer
+                                                                  The aforementioned case studies illustrate an underlying com-
+to review any unexpected effects and, if necessary, selectively
+                                                                  mon need to abstract away effect control. A suitable effect-
+apply only the relevant ones. It is also possible to filter or
+                                                                  control abstraction has several core requirements: (1, I) effect
+aggregate over the set of effects to make review easier (§6).
+                                                                  introspection, i.e., the ability to detect, collect, present, and
+Dry-run execution: Some commands offer specially                  inspect a component’s side effects in the same environment
+configured dry-run modes (e.g., --dry-run, --fake,                directly executing the component; (2, A) selective applica-
+--no-commit, --print, --just-print, --simulate, -n,               tion, i.e., the ability to decide whether to apply effects to the
+-s) that show the effects of simulating a command’s execu-        broader environment or roll them back; (3, S) effect stacking,
+tion [67]. Consider an invocation about to clean temporary        allowing commands to execute in the context of earlier effects
+files in the current directory using find:                        that have not been applied yet, potentially rolling back multi-
+                                                                  ple stacks of effects; (4, M) further effect manipulation beyond
+     find . -name '*tmp*' -delete
+                                                                  direct application or discard, including partial application of
+                                                                  only some effects, effect recording and delayed propagation,
+Unfortunately, find does not offer a built-in dry-run function-
+                                                                  and selective hiding of the underlying environment. These
+ality. Prefixing the command with try -n instead executes
+                                                                  requirements typically need to be met in the context of the cur-
+the command in a semisolate, collecting and presenting its
+                                                                  rent executing environment—not a virtualized or contained
+actual effects to the user while discarding them.
+                                                                  environment fully isolated from the current environment.
+     try -n find . -name '*tmp*' -delete                             Apart from these core requirements, the abstraction’s ap-
+       ./tmp_build/ (deleted)                                     plicability and reach would further benefit from an implemen-
+       ./tmp.log (deleted)                                        tation that combines streaming support, allowing its users to
+                                                                  manipulate the effects of long-running components as they
+Using try, a user sees the concrete effects that the command’s    are generated; configurable effect handlers for tuning the gran-
+execution would have produced, even if it does not implement      ularity of effects; and runtime performance overheads that
+built-in dry-run functionality.                                   do not affect interactive use. These features are not essential
+Partial-specification mining: Automated acceleration of           to the core abstraction—i.e., a batch-only, non-configurable,
+programs that use opaque components [38, 71] depends on           slow implementation would still fit all of §2.1’s case studies—
+partial component specifications—e.g., the order in which         but they broaden its applicability and reach.
+a component reads its input streams [34]. Generating such            Other characteristics such as complete mediation against
+specifications automatically requires exploring a command’s       arbitrary adversarial behavior are out of scope: the abstrac-
+invocation space while carefully collecting the effects of dif-   tion aims at the inconvenient or undesired effects of every-
+ferent invocations. Consider the following invocation of grep:    day mistakes or accidents—not actively malicious, try-aware
+                                                                  components trying to bypass its underlying mechanisms [49].
+     grep -oE [a-zA-Z]+ one.txt two.txt
+
+Unfortunately, understanding that grep first reads one.txt        3     Abstracting Away Effect Control
+and then reads two.txt requires a more detailed view of its
+effects. Prefixing grep with try -t offers a detailed, ordered    To meet the aforementioned desiderata (§2.2) and abstract
+log of grep’s read and write effects:                             away effect control, try offers a language-agnostic and con-
+                                                                  figurable abstraction that launches one or more components
+     try -t trace.log grep -oE [a-zA-Z]+ one.txt two.txt          in a semisolate. A semisolate offers a constrained and config-
+                                                                  urable (Tab. 1) private view of the real host environment—i.e.,
+The resulting trace.log file contains information that can        not a fresh environment in a container or virtual machine. In
+then be compiled into a partial specification for grep.           the example below, sh runs in the exact same environment as
+
+
+
+USENIX Association                           20th USENIX Symposium on Operating Systems Design and Implementation             455
+Table 1: Control configuration and try flags. Controlling effects      Which effects are controllable: Unix and its descendants
+with try supports significant configurability during semisolate cre-   offer many well-studied, fine-grained tools for the pipe-
+ation, execution, and conclusion—including core options (in black,     and-filter abstractions—for program output. There are only
+Cf.§3) and peripheral features and subsystems (faded, Cf.§6).          coarser, less well-studied tools to help manage program ef-
+                                                                       fects. Analogizing the Unix environment to a single exe-
+  Semisolate stage     Configuration                     Flag          cutable, existing abstractions focus on function inputs and
+  Creation             Stack over prior effects          -L            outputs (Unix: standard streams, exit status), but not the heap
+                       Name current effect group         -N            (Unix: the filesystem). Semisolates offer a new, fine-grained
+                       Ignore specific paths             -i            tool for effect management. They add abstractions for ma-
+  Execution            Disable the network               -x            nipulating effects around a child command—for example,
+                       Create filesystem trace           -t            the initial filesystem view, the final filesystem view, and the
+                       Collect effect delta              --diff        filesystem access trace. They can optionally be configured to
+  Conclusion           Apply all effects                 -y            support additional system, network, and stream effects as part
+                       Discard all effects               -n
+                                                                       of a unified abstraction.
+                       Inspect effects                   -e
+                       Include, exclude specific paths   -I, -E           Effects are made available to the semisolate caller as a com-
+                       Summarize effects                 -s            bination of (1) filesystem paths or stream identifiers, and (2)
+                       Offer friendlier summary          -h            optional metadata such as effect type and success. Each path
+                                                                       can be a valid path pointing to an existing file or directory;
+                                                                       it can also be a non-existent path that might lead to access
+curl, but within a private view that controls, manipulates, and        failure—still useful when a command relies on a file’s absence
+potentially discards the application of effects to the broader         to exhibit the intended behavior. The effect type includes in-
+environment:                                                           formation such as read-only, write-only, and read-write: a
+                                                                       read-write effect is, for example, opening a file with any flag
+  curl -sL https://sh.rustup.rs | try sh                               other than O_RDONLY; a read-only effect includes operations
+                                                                       that only interrogate a file’s metadata through, for example,
+This private view can be configured to, for example, com-              stating a file; a write effect includes modifying filesystem
+pletely mirror the global filesystem, partially mirror it while        metadata through, for example, chmoding or unlinking a file.
+hiding subtrees, or correspond to one or more layers of as-yet-        Each recorded effect instance is accompanied by metadata
+unapplied effects from previous try executions.                        that indicates whether an effect succeeded; or—if it failed—
+Semisolates: The abstraction of a semisolate provides the              the reason for its failure.
+illusion of direct access to its outer environment and supports           By default, try manipulates effects across entire process
+flexible effect manipulation. Semisolates collect the effects          subtrees. For example, if a try-controlled process launches a
+of opaque components in this private view and expose them              subprocess that writes to the filesystem, then try will include
+to their callers for further manipulation. Using semisolates,          those write effects in the group of effects directly available
+try allows its callers to (1) selectively apply or discard these       for manipulation. A parent process can also use try to wrap
+effects, with options to view partial earlier state; (2) collect       and programmatically control child effects.
+the effects for possible application later; and (3) stack and ex-      Semisolate creation: Upon creation, a semisolate config-
+pose as-yet-unapplied effects across invocations. This design          ures the private view of the executing component—to allow
+allows the effect-mediated component to execute in partial iso-        both stacking the effects of different semisolates and prevent
+lation, without affecting the global filesystem until the caller       unintended effects (including reads), useful for hiding sensi-
+explicitly consents.                                                   tive information from the executing component. Configuring
+   To achieve effect control, a semisolate operates in three           this initial view translates to setting up a virtual-filesystem
+configurable stages: (1) creation: the semisolate sets up the          environment before any modifications to the filesystem.
+appropriate view for the executing component to ensure appro-             Upon creation, semisolates may configure effect stacking
+priate effect mediation; (2) execution: the semisolate launches        and hiding. Stacking configures the component’s initial view
+the target component within a private view, collecting relevant        to import the effects produced from a previous semisolate.
+effects; and (3) conclusion: the semisolate optionally and se-         Selective hiding masks certain parts of the underlying filesys-
+lectively applies recorded effects into the main environment.          tem from the executing component, given a specification that
+   All three stages typically operate on the current directory         describes a filesystem subtree. These are implemented by
+and are highly configurable to support the nuances of various          try’s interface as -L, which accepts the name of a previous
+real-world uses (§2). The next few paragraphs detail such              semisolate, itself produced by a previous call to try with the
+tuning, both at the level of individual stages and the current         -N flag; and -i, which takes as input a regular expression that
+try flags summarized in Tab. 1, after first establishing which         matches filesystem paths to be hidden from the component’s
+effects are controllable and their level of control.                   view. The latter is semantically equivalent to stacking the
+
+
+
+456    20th USENIX Symposium on Operating Systems Design and Implementation                                      USENIX Association
+effects of try -n N rm dir1 dir2. . . over try -L N—but               To instantiate the concept of effect layers, try leverages
+-i is more efficient as it directly sets up exclusions without     OverlayFS—a specific implementation of a union filesystem
+first running an additional (potentially expensive) command.       part of the Linux kernel [24]. Union filesystems are a class of
+Semisolate execution: During execution, semisolates ad-            filesystems that allow multiple directories to be presented as
+ditionally configure the classes of effects to interpose on        a single unified directory without modifying the underlying
+and the corresponding interposition granularity—for example,       kernel structures [70]. A union filesystem layers an upper
+whether to include system-call tracing. The current classes        directory (upperdir) and one or more lower directories (low-
+of effects include filesystem effects, network effects, signals,   erdirs) into a single merged view—without merging their
+and interprocess streams.                                          underlying data.
+   The current interface of try supports: -t, which makes
+                                                                      In the merged view, the content at a specific path p is de-
+try produce a filesystem access trace, containing an ordered
+                                                                   termined by searching for p in the upperdir, followed by all
+list of effects; and -x, which prevents the component from
+                                                                   lowerdirs in order until p is found. The first match is presented
+accessing the network. Apart from the effect path, this detailed
+                                                                   in the merged view; if p exists in multiple layers, content from
+view consists of the mode and the return code, which can be
+                                                                   the higher layer takes precedence.
+inspected to infer negative effects like failed accesses.
+Semisolate conclusion: Upon conclusion, semisolates offer             Changes to the merged view are forwarded to the upperdir
+the ability to decide which effects to apply and which to          and persist inside it, even after unmounting the union filesys-
+discard, eventually generating the final filesystem view. They     tem directory. Changing a file at p in the merged view places
+allow selective effect application at multiple granularities,      the new version of the file at p in the upperdir. Removing p
+from binary all-or-nothing to per-effect application, while        places a whiteout file at the corresponding upperdir location.
+also supporting path-oriented filtering. They can also hold
+individual effects and allow inspecting them directly using        Namespaces: To execute privileged actions—while execut-
+conventional Unix abstractions.                                    ing in an unprivileged manner—and interpose on the exe-
+   These options can be configured when a semisolate con-          cution context of the component, try leverages Linux pro-
+cludes. The current interface supports inspecting individual       cess namespaces. Namespaces isolate resources such as the
+effects (-e) and, based on predefined caller policies, program-    network, pseudo-filesystems like procfs, permissions, and
+matically filtering these changes (-E and -I). It also supports    signals from the rest of the system, offering (groups of) pro-
+applying, discarding, or mixing them (-y, -n, and -e). And         cesses the illusion of exclusive ownership of those resources—
+-N stores effects in a named effect directory, potentially used    enabling the creation of a private (and controllable) view of
+earlier during creation with -L.                                   the underlying system state. For example, the PID namespace
+                                                                   assigns new PIDs to processes inside the namespace: pro-
+                                                                   cesses in the namespace can only see and interact with each
+4    The Try Subsystem                                             other using the PIDs assigned in the namespace.
+This section describes how try implements the aforemen-               Process-related interactions such as signaling between pro-
+tioned abstraction (§3) for programs executing in Linux            cesses and adjustment of scheduling priorities are contained
+userspace. It first outlines try’s use of union filesystems,       to the namespace. Components in try are only partly able
+namespaces, and system-call tracing before diving into the         to interact with ambient resources and objects such as pro-
+details of semisolate creation (§4.1), execution (§4.2), and       cesses, users, or network devices—with try interposing on
+conclusion (§4.3), closing with a detailed walkthrough of          all accesses to the broader system.
+multiple try invocations put together (§4.4).
+Union filesystems: To achieve effect control, try needs to         System-call tracing: To observe the order of a component’s
+interpose on the component’s view of the filesystem. This          effects, and go beyond effects that modify the filesystem,
+interposition is responsible for manipulating the underlying       try leverages system-call tracing—interposing between the
+filesystem view, creating a partially private view that allows     operating system kernel and user-space components to moni-
+accessing the underlying contents while capturing and con-         tor and record their interactions. Tracing commands such as
+taining effects. This private view is implemented as a union       strace on Linux offer visibility into exact calls performed
+filesystem, configured appropriately to either mirror the un-      by a process, their order, and their arguments, as well as the
+derlying filesystem, partially mirror it with sensitive paths      signals received by the process. Combined, they offer a wealth
+hidden, or correspond to the as-yet-uncommitted state of a         of information about the process—including filesystem op-
+previously executed run of try. To contain effects, try uses       erations, process management, inter-process communication,
+the configured union filesystem to record filesystem changes       and network access. By selectively enabling tracing when nec-
+into a temporary directory—without affecting the host envi-        essary, try extracts ordered, finer-grained information about
+ronment until effects are applied.                                 component effects beyond filesystem modifications.
+
+
+
+USENIX Association                           20th USENIX Symposium on Operating Systems Design and Implementation              457
+Algorithm 1 Semisolate creation. Key steps in setting up a          sented to the executing component (§4.2).
+new semisolate, before running a component;                            Once inside the new namespace, try iterates over
+Require: path                                                       the mount options constructed in the previous step and
+ 1: if path is not provided then                                    mounts the union filesystem (Alg. 1, lines 12–14). It
+ 2:     path ← mktemp -d                                            mounts the /proc, /dev, and /devpts pseudo-filesystems
+ 3: end if                                 ▷ Set up directories     within the tmproot directory and symlinks all special files
+ 4: if path’s filesystem is overlayfs then                          through which the component interacts with its standard
+ 5:     mount -t tmpfs tmpfs path                                   input and output streams—i.e., /proc/self/fd/{0,1,2}
+ 6: end if                                                          and /dev/{stdin,stdout,stderr,fd,pts}. Using bind-
+ 7: for all dir in topLevelDirs do                                  mounts [23], it duplicates device files such as zero, null,
+ 8:     mkdir -p path/{upperdir,workdir,tmp}/dir                    and random, into the tmproot’s /dev directory.
+ 9: end for                                                            To implement file hiding, try creates an additional direc-
+10: unshare ...                         ▷ Prepare namespaces        tory called excldir. This excldir directory is mounted as
+11: for all dir in topLevelDirs do                                  an intermediate layer right above the lower directory and con-
+12:     mount -t overlayfs ...path/tmp/dir                          tains whiteout files corresponding to files that will be hidden
+13:     if overlay failed then                                      from the merged view.
+14:         mergerfs path/tmp/dir...                                Submount permissions: Unfortunately, filesystem sub-
+15:         mount -t overlayfs...path/tmp/dir                       mounts within any OverlayFS layer cannot be unmounted
+16:     end if                                                      by the current user: mount points inside layers are ignored
+17: end for                                                         because these layers correspond to overlapping filesystem
+18: mount path/tmp/dev/...                    ▷ Mount devices       fragments. Consider an initial filesystem A that contains paths
+19: unshare ...                           ▷ Enter environment       /x, /x/y, and /x/y/z, and a new filesystem B mounted at
+                                                                    /x/y, effectively hiding /x/y/z as contents at that mount
+                                                                    point by B. If /x is specified as an OverlayFS lower directory,
+4.1    Semisolate creation                                          it will include only the contents of A and ignore the submount
+                                                                    to B—thus including /x/y/z in the merged view.
+Each semisolate uses its own special writable directory                As try aims to limit access to information otherwise in-
+to record effects—the upperdir—and a second temporary               accessible without its use, it prevents unprivileged access to
+directory—the workdir—used by the union filesystem for              directories with submounts as lower or upper layers. Although
+internal bookkeeping (Alg. 1, lines 1–5). Each of these di-         the fresh mount namespace grants try the capability to create
+rectories can be (1) a new, appropriately prefixed temporary        new overlay mounts, among other root-like capabilities, it is
+directory created with mktemp; (2) a new directory whose            forbidden to unmount existing submounts.
+name is provided by the try caller; or (3) an existing direc-          To address this problem, try uses an additional union
+tory, potentially used in previous try invocations.                 filesystem to “flatten” all content within the directory into
+   OverlayFS does not support certain filesystems to host the       a single filesystem (Alg. 1, line 14) when submounts are
+upperdir or the workdir. One such filesystem is OverlayFS           present. The union filesystem used by try for this purpose is
+itself, a common scenario when using try within Docker. In          mergerfs [62], which combines the entire directory, including
+this case, try mounts an additional tmpfs over the semisolate       its submounts, into a single, unified filesystem view. This con-
+directory (Alg. 1, line 5). This ensures that all of try’s side     trasts with OverlayFS, which does not support submounts. By
+effects prior to the conclusion stage are confined within the       creating this flattened view of the directory, submounts are ef-
+semisolate directory.                                               fectively eliminated, allowing OverlayFS to use the directory
+Setting up mounting options: To bypass OverlayFS’s restric-         as a lowerdir without issues.
+tion of overlapping the lower and upper directory, try cre-
+ates an individual union filesystem mount for each top-level        4.2    Semisolate execution
+directory—e.g., /bin, /usr, and /home—instead of using the
+root directory / as the union filesystem’s lower directory.         After preparing a semisolate, try launches the effect-
+   Specifically, try first creates directories upperdir,            controlled component in its own dedicated namespace and
+workdir, and tmproot (Alg. 1, lines 5–12). In these top-level       optionally traces its execution.
+directories, it then creates a child directory for each top-level   Execution namespacing: The semisolate executes compo-
+directory in the filesystem, such as /etc, /usr, and /home.         nents within a new user, PID, mount, and network names-
+Additional lower directories already containing effects are         pace (Alg. 1, line 10). There are two distinct reasons for
+added to the mount options during this step—layered on top          which try uses namespaces: (1) namespaces offer controlled
+of the corresponding union filesystem merged views. The             isolation from the broader environment, restricting the pro-
+tmproot directory will become the final merged view pre-            cess’s view so that all effects—together with the filesys-
+
+
+
+458   20th USENIX Symposium on Operating Systems Design and Implementation                                   USENIX Association
+tem view shaped by the semisolate (§4.1)—are contained,            new file. For directories, it either (1) replaces the original
+(2) namespaces create the illusion of administrative privi-        file with the new directory, if a regular file exists at the direc-
+leges, allowing a semisolate to mount /proc and the union          tory’s original path; (2) replaces the original file or directory
+filesystem itself, which would otherwise require elevated priv-    with the new file, if the directory has the extended attribute
+ileges. The capability for user namespaces requires setting        user.overlay.opaque, indicating that directories in lower
+the unprivileged_userns_clone kernel flag, enabled by              layers have been shadowed by new definitions in the merged
+default in most modern Linux distributions and depended            view; or (3) replaces the original directory with the new direc-
+on by container runtimes like Podman [30]. This avoids the         tory. For symlinks, it removes any existing file at the original
+need to implement try as a setuid binary requiring elevated        path and recreates the symlink with the same target as the one
+privileges to execute.                                             in the upper directory. If try encounters a whiteout file—a
+   Finally, try enters a second new namespace (Alg. 1,             character device with 0 major and minor numbers—in the
+line 19) to isolate the component’s process tree from try’s        upperdir, it deletes the original file or directory at that path.
+own process, setting the component’s root directory to                If the semisolate directory resides on the same filesystem as
+tmproot using unshare, and finally executes the component          the target location, rename is used to avoid unnecessary disk
+under optional system-call tracing.                                copying. Otherwise, try falls back to the host’s mv utility.
+Execution tracing: To extract additional information about
+filesystem effects, try can interpose on relevant system-call
+                                                                   4.4    Putting it all together
+invocations using strace. Rather than tracing all filesystem-
+related system calls when they occur, try focuses on col-          Fig. 2 illustrates the internals of four try invocations.
+lecting relevant information upon open—as this is typically           The first invocation wraps p1 , eliding all network access
+a necessary step before subsequent operations on the file          inside the semisolate. It prepares an overlay layer with a white-
+descriptor such as reads, writes, random accesses, or direct       out mask at path π, and mounts it on top of the host filesys-
+memory mapping. This approach lowers try’s performance             tem’s lowerdir, ignoring the underlying π in the filesystem.
+overhead, as it avoids tracing reads, writes, and other latency-   It then enters the new namespace, and launches p1 inside it.
+critical data manipulation operations, omitting further tracing    While p1 is running, try captures five effects in the upperdir,
+during subsequent use of the file descriptor.                      which it later processes to summarize the order of effects (-t):
+   To improve its reach while still avoiding finer-grained trac-   (1) reading α hits the lowerdir, which forwards the call to
+ing, try additionally traces other system calls that take paths    the underlying filesystem, (2) writing to β hits the upperdir,
+as arguments—e.g., open, mkdir, and unlink. To trap only           copying β there, (3) reading β hits the upperdir, which sees
+this preconfigured set of system calls, try uses Seccomp-          the latest write, (4) reading path π, masked in the overlay
+BPF [42] with a predefined filter—but allows users to pass         layer, thus failing and resulting in try recording a negative
+additional filters if they need to track additional effects, in-   dependency; and deleting path δ, which places a mask file at
+cluding operations on already-opened file descriptors.             δ in the upperdir, effectively hiding it from the merged view.
+Non-existent paths: Non-existent or missing paths pose a           The sequence of collected effects (αR , βW , βR , πR , δD ) is fed
+challenge, as ignoring their accesses risks introducing effect     to stdout but the effects themselves are discarded alongside
+holes: accessing non-existent paths generates an observable        the semisolate (-n).
+effect—e.g., negative return value from open. Therefore, try          Next, try wraps p2 , creating a new namespace and mount-
+records such accesses as negative dependencies. Such nega-         ing the host filesystem inside a fresh overlay filesystem low-
+tive dependencies are useful for recording effects of searching    erdir, now without any path masking or network isolation.
+dynamic library paths and configuration files.                     The three component effects it captures are: (1) writing β,
+                                                                   with identical effects as before, (2) writing ψ, and (3) deleting
+                                                                   δ—both operations captured in the upperdir. This time, try
+4.3    Semisolate conclusion
+                                                                   stores the semisolate (and by extension, its effects) inside a
+Semisolates conclude their execution by going through all          named directory on the host filesystem (-N σ), after filtering
+the effects in the upperdir and either applying predefined         out excluded effects (-E ψ) by iterating over the upperdir and
+policies or logging effects to one of the standard streams. As     deleting them.
+all changes are captured in the effect directory, applying these      Next try wraps p3 while stacking the effects of the lat-
+effects amounts to carefully comparing the captured effects        est try invocation (-L σ). It captures: (1) writing α, which
+to the underlying filesystem and environment.                      brings it to the upperdir, (2) reading β, which hits the stacked
+   To apply filesystem-related effects, try recursively pro-       lowerdir from semisolate σ, and (3) writing π—recorded in
+cesses the upper directory in a preorder fashion, moving files     the upperdir. The effects stored in the semisolate are the two
+out of the semisolate and into the real filesystem by han-         writes to α and π, and the delete of δ inherited from σ.
+dling directories before their contents. For regular files in         Finally, try commits the effects (-y). It iterates from bot-
+the upper directory, try replaces the original file with the       tom to top, first applying the effects from the stacked semiso-
+
+
+
+USENIX Association                           20th USENIX Symposium on Operating Systems Design and Implementation                459
+                                                                      mount       proc    user        net    mount       proc       user   net   mount      proc       user   net   mount   proc       user   net
+ Α process… w/ effects… results in ef-internal state
+
+
+                                                                                                      ✘
+
+                                                                           try -ntx -i π p1                       try -Eψ -Nσ p2                  try -y -Iζ -Lσ p3                  try -y -Iζ -Lσ p3
+
+                                                                     (1)R (2)W (3)R      (4)R (5)D                   W          W          D       W           R       W
+
+                                                                                                                                ψ                                  ζ                               ζ
+
+
+                                                       upper dir:             β     β             δ                  β          β                  a                   π              a     β          π
+
+                                                       layers:                                                                                                 β                            β
+
+
+                                                       lower dir:      α                   π      δ         ✘α                       π δ          α                    π      δ      α                  π     δ
+
+                                                       filesystem:    α                   π       δ           α                      π     δ σ    α                    π      δ      α                  π     δ            α    β     π   δ
+                                                                              (i) p1 invocation                  (ii) p2 invocation                   (iii) p3 in p2's effects                         (iv) p3's effect application
+
+
+Figure 2: Detailed walkthrough of the internals of multiple try invocations. A detailed walkthrough of these invocations is presented in
+§4.4. From top to bottom: try’s invocation, component effects, try internal state, and host filesystem state. From left to right: different try
+invocations on different components on the same host filesystem. Single arrows indicate effects; double arrows indicate effect discard, storage,
+stacking, and application; and certain colors correspond to certain try invocation options.
+
+
+late σ, followed by the current semisolate’s effects, applying                                                                                           3.70 GHz Intel Xeon W-2145. Software used is the Linux
+each one based on its type. It focuses on paths in ζ (-I ζ), i.e.,                                                                                       kernel v6.1 on Debian GNU/Linux 13 (trixie), GNU coreutils
+the writes to β and π, which are applied to the host system.                                                                                             v9.7, Node.js v18.19.0, and Python v3.13.5.
+   This approach implements the semisolate abstraction, al-                                                                                                 Benchmark results are summarized in Table 2. In terms
+lowing for effect control on arbitrary components without                                                                                                of effect control, try mediates desired effects, propagates
+requiring any invasive instrumentation or modification.                                                                                                  them appropriately, and hides sensitive environment state. In
+                                                                                                                                                         terms of behavioral equivalence, try behaves equivalently to
+                                                                                                                                                         try-free execution, confirmed both via manual inspection and
+5                                                       Evaluation                                                                                       automated checksum comparison between the entire filesys-
+This section reports on the results of applying try in several                                                                                           tem tree after executing each benchmark with and without
+instances of each case-study application presented earlier (§2).                                                                                         try. In terms of performance, try incurs a 1.0×–8.3× perfor-
+Key dimensions of each study’s characterization (§5.1–5.5)                                                                                               mance overhead over vanilla, try-free execution and enjoys
+include (1) try’s ability to control all relevant effects; (2)                                                                                           a 1.1×–225.7× performance improvement over containment
+try’s behavioral equivalence to semisolate-free execution                                                                                                in Docker. We do not provide a geomean or other statisti-
+when effects are finally applied to the host environment; and                                                                                            cal summary for overhead over vanilla execution or speedup
+(3) try’s runtime performance relative to semisolate-free exe-                                                                                           over Docker, as each case study requires different semiso-
+cution and full isolation (§2.2). A series of microbenchmarks                                                                                            late configurations and corresponding try flags to control
+zoom into try’s sources of overhead (§5.6).                                                                                                              effects—and thus incur different overheads.
+   Control focuses on confirming that try correctly identifies                                                                                              We discuss the benchmarks grouped by use case below.
+I, applies or discards A, selects S, or manipulates M all rele-
+vant effects during a component’s execution in a semisolate.                                                                                             5.1           Risky or cryptic LLM suggestions
+   Behavioral equivalence focuses on confirming two aspects
+of try: (1) the in-semisolate behavior during execution, mean-                                                                                           These benchmarks consist of five scripts generated by Chat-
+ing that the computation in the semisolate executes as ex-                                                                                               GPT for tasks distilled from a survey of LLM-mediated work-
+pected and produces results identical to the non-semisolated                                                                                             flows, spanning conventional chat interfaces and autonomous
+execution; and (2) the eventual state of the filesystem, mean-                                                                                           agents such as Codex and OpenClaw [82] (prompts included
+ing that the filesystem state is indistinguishable from try-free                                                                                         in Appendix §A): (1) crawl, updates the timestamps of
+execution. The former confirms that try does not affect the                                                                                              10,000 files in a directory, using find, exec, and touch [90];
+internal computation, including its direct effects; and the latter                                                                                       (2) fresh, compressing 10,000 10KB files that exceed a
+confirms that it correctly applies the manipulated effects.                                                                                              certain size, using find, exec, and gzip [35]; (3) archive,
+   Performance characterization compares runtime without                                                                                                 searching for files with a .txt extension in 100 directories
+isolation, with try, and with Docker v28.4.0 configured with                                                                                             of 10,000 files each, using find [37]; (4) logs, checking for
+full isolation; performing container (not image) creation, input                                                                                         errors in a 10-million-line file using grep [40]; (5) order,
+copy-in, execution, container teardown, and copy-out. Experi-                                                                                            sorting a 10-million-line file using sort [6]. Benchmarks
+ments use an environment with 64 GB of RAM and an 8-core                                                                                                 were executed with try -y and try -n.
+
+
+
+460                                                       20th USENIX Symposium on Operating Systems Design and Implementation                                                                                       USENIX Association
+Table 2: Benchmark summary. The benchmark applications for the five use cases evaluated. The Control column indicates try’s effect
+control between effect introspection (I), application and discard (A), stacking (S), and manipulation (M). The Equivalence columns indicate
+whether the output (O) and side effects (SE) match those of vanilla execution. The Performance columns show the execution time ratio
+relative to the baseline (Docker or Vanilla), and whether try comparatively has a speedup (↑) or slowdown (↓). The Description column
+describes each benchmark’s purpose and try’s invocation. The Source column provides references to the original benchmark sources.
+
+                                           Control    Equivalence       Performance vs.
+Use case                Name                                                                  Description               Source
+                                                      O     SE          Docker    Vanilla
+                        crawl          ✓     IAM      ✓       ✓         1.4 × ↑     1.4 × ↓
+Risky or                fresh          ✓     IAM      ✓       ✓         1.3 × ↑     1.8 × ↓             try
+cryptic LLM             archive        ✓     IAM      ✓       ✓       225.7 × ↑     1.3 × ↓   LLM-generated shell        [6, 35, 37, 40, 90]
+suggestions (§5.1)      logs           ✓     IAM      ✓       ✓        58.2 × ↑     1.9 × ↓   pipelines
+                        order          ✓     IAM      ✓       ✓         2.0 × ↑     1.1 × ↓
+                        covid          ✓    IASM      ✓       ✓         1.5 × ↑     1.0 × ↓
+                        nlp            ✓    IASM      ✓       ✓         3.4 × ↑     1.2 × ↓          try -t -L
+Dependency
+                        spell          ✓    IASM      ✓       ✓         2.3 × ↑     1.0 × ↓   Script with dependency     [13, 19, 41, 94, 95]
+tracking (§5.2)
+                        unixfun        ✓    IASM      ✓       ✓        18.7 × ↑     1.7 × ↓   tracking
+                        ci-cd          ✓    IASM      ✓       ✓         1.1 × ↑     1.0 × ↓
+                        LinOTP         ✓     IAM      ✓       ✓         2.0 × ↑     1.2 × ↓
+                        frogmouth      ✓     IAM      ✓       ✓         4.2 × ↑     1.0 × ↓            try -i
+Third-party
+                        kibble         ✓     IAM      ✓       ✓         1.4 × ↑     1.2 × ↓   Git repos with risky       [8, 28, 64, 66, 73]
+library risks (§5.3)
+                        okteto         ✓     IAM      ✓       ✓         1.7 × ↑     1.3 × ↓   pre-commit hooks
+                        uv-metrics     ✓     IAM      ✓       ✓         3.1 × ↑     1.0 × ↓
+                        git            ✓      IA      ✓       ✓         3.2 × ↑    69.8 × ↓
+                        patch          ✓      IA      ✓       ✓         3.0 × ↑    82.6 × ↓            try -n
+Dry-run
+                        rename         ✓      IA      ✓       ✓         2.8 × ↑     4.9 × ↓   Dry-run command            [27, 31, 32, 75, 96]
+execution (§5.4)
+                        rsync          ✓      IA      ✓       ✓         1.2 × ↑     7.8 × ↓   invocations
+                        stow           ✓      IA      ✓       ✓         2.8 × ↑     6.3 × ↓
+                        cp             ✓     IAS      ✓       ✓         2.2 × ↑     8.3 × ↓
+                        ls             ✓     IAS      ✓       ✓         1.9 × ↑     3.7 × ↓
+Partial-specification                                                                                 try -t
+                        rm             ✓     IAS      ✓       ✓         1.6 × ↑     7.1 × ↓                              [38, 71]
+mining (§5.5)                                                                                 Standard Unix utilities
+                        sed            ✓     IAS      ✓       ✓         1.9 × ↑     8.1 × ↓
+                        xargs          ✓     IAS      ✓       ✓         1.6 × ↑     1.7 × ↓
+
+
+Control: All computations executing in semisolates config-              standard output stream (find’s output) which is effectively a
+ured with try -n mediated all effects that were applied to              symlink to the same file descriptor in the host environment,
+the filesystem by try-free executions.                                  meaning that try boils down to vanilla execution, paying
+Equivalence: All computations executing in semisolates                  only the flat cost of semisolate creation, while Docker still
+configured with try -y produce correct results; and their               pays the full container setup and teardown costs. Similarly,
+effects on the filesystem are identical to try-free executions.         the logs benchmark reads from and writes to a single large
+                                                                        file, meaning that again try pays only a single creation and
+Performance: When compared to vanilla execution, try                    copy-up cost, while Docker with full isolation needs to pay
+introduces runtime overheads 1.1×–1.9×. Variations come                 the copy-in and copy-out costs as well.
+from the complexity of effects interposed during execution.
+For example, in order, try achieves the lowest overhead
+(1.1×) as it interposes on a single write effect, writing the           5.2       Dependency tracking
+sorted file to disk. The crawl, fresh, and archive tasks
+exhibit higher overheads (up to 1.9×) because they operate on           These benchmarks consist of several real-world shell pro-
+many files from the host system (use of find), which results            grams from the Koala suite [44] with many and complex run-
+in more upperdir copy-ups. Relative to Docker-contained exe-            time dependencies between their components. (1) the covid
+cution, try demonstrates substantial performance improve-               benchmark, which processes bus schedule data collected dur-
+ments across all five benchmarks, achieving performance im-             ing COVID-19 to generate summary statistics [94]; (2) the
+provements of 1.3×–225.7×. Two benchmarks incur outlier                 nlp benchmark, which performs natural language processing
+speedups: the archive benchmark only interacts with its                 tasks on a text corpus [41]; (3) the spell benchmark, which
+
+
+
+USENIX Association                              20th USENIX Symposium on Operating Systems Design and Implementation                    461
+checks spelling in a large text file [13]; (4) the unixfun         duce correct results, correctly committing the intended
+benchmark, which solves challenges from Unix 50th anniver-         changes, and the resulting filesystem state remains identi-
+sary game [95]; and (5) the ci-cd benchmark, which com-            cal to that of try-free execution. Across both the vanilla
+piles several C source files [19]. These programs contain a        pre-commit hook workloads and the five code-injection vul-
+diverse set of commands that include GNU Coreutils, POSIX,         nerabilities evaluated, try preserves correctness.
+and third-party commands. To stack effects across all com-         Performance: When compared to vanilla execution, try has
+ponent invocations without applying them on the host envi-         a performance impact of up to a 1.3×. The performance of
+ronment (§2.1), try was configured with -L and with -t to          try is comparable to vanilla execution for the frogmouth
+extract dependencies.                                              and uv-metrics, while maintaining low overheads for
+Control: All computations executed with try -t -n -L               LinOTP (1.2×), okteto (1.3×), and kibble (1.2×),
+mediated all effects that were applied to the filesystem by try-   whose pre-commit hooks perform short-running computa-
+free executions. Manual inspection and multiple re-executions      tions, comparable with try’s semisolate setup overhead. It
+confirm that executing these benchmarks with try -t -L             outperforms Docker-contained execution across all five bench-
+identifies all true dependencies between components.               marks, achieving speedups 1.4×–4.2×. With blocking en-
+Equivalence: Tracking the dependencies discovered by try           abled, try reduces the effect surface and thus computation
+-t and later applying them with try -y -L produces correct         performed by the injected pre-commit hooks. This leads to
+results. Their effects on the filesystem are identical to the      try improving the runtime of the frogmouth and kibble
+ones produced by try-free executions.                              workloads by 0.8× and 0.9× respectively.
+Performance: When compared to vanilla execution, try
+introduces absolute overheads 1.0×–1.7×, which is the flat
+cost of setting up the semisolate environment for each tracked     5.4    Dry-run execution
+command. However, while the semisolate setup cost is flat,
+tracing overheads scale with the number of effects a com-          These benchmarks consist of commands with built-in dry-
+ponent produces. This is less evident in statically compiled       run functionality: (1) git [31], using git clean; (2)
+components, such as commands from GNU coreutils, which             patch [32]; (3) rename [96]; (4) rsync [75]; and (5)
+are tightly packed binaries with very minimal dependencies         stow [27]. Each workload was executed twice: once with
+(often just libc), but evident with components relying on          dry-run enabled, without try; once with try -n, without
+interpreted runtimes (e.g., a custom lowercase.py utility          dry-run.
+in nlp), which need to resolve their entire dependency tree
+during execution. The performance of try significantly out-        Control: All computations executed with try -n except
+performs fully-isolated execution across all five dependency       two mediated on and reported the exact same effects as the
+tracking benchmarks, demonstrating speedups 1.1×–18.7×.            corresponding --dry-run executions. One of the two excep-
+                                                                   tions was rename: instead of reporting a -> b, try reports
+                                                                   equivalent a (deleted) b (created) pairs.
+5.3    Third-party library risks                                      The second exception is more interesting: when combined
+These benchmarks consist of git repositories with                  with the --log-file flag, rsync’s dry-run mode omits ef-
+pre-commit hooks that introduce undesirable effects:               fects in the produced log file [74], whereas try captures and
+(1) LinOTP [64] multi-factor authenticator; (2) the                reports all produced effects.
+frogmouth [28] markdown reader; (3) Apache                         Equivalence: All computations executed with try -n cor-
+kibble [8] aggregating and visualizing software data;              rectly suppress all effects to the host environment and present
+(4) the okteto [66] container orchestrator; and (5)                the same output and side effects as the dry-run executions
+uv-metrics [73], a machine-learning metrics reporter.              (excluding rename’s representation difference). Invocations
+The pre-commit hooks perform several operations on the             executed with try -y correctly apply all effects to the host
+filesystem, communicate with the network, and include a            environment, equivalent to try-free execution.
+code-injection attack that leads to data exfiltration. They were
+                                                                   Performance: When compared to dry-run execution try
+prefixed with try -i, excluding the /etc/passwd file from
+                                                                   demonstrates overheads of 4.9×–82.6×. These overheads are
+the semisolate.
+                                                                   expected since each command’s native dry-run mode avoids
+Control: All computations executed with try -i medi-               performing any filesystem action and is implemented as a
+ated across all effects present in the try-free executions,        separate path that does not perform any effectful computation
+except /etc/passwd. This effect originated from the pre-           (average time 0.03s), whereas try executes the real computa-
+commit hook at .git/hooks, which attempted to append               tion and then discards its effects (average time 0.26s). Com-
+/etc/passwd to README.md.                                          pared to full isolation in Docker, try improves performance
+Equivalence: All computations executed with try -i pro-            across all five benchmarks between 1.2×–3.2×.
+
+
+
+462    20th USENIX Symposium on Operating Systems Design and Implementation                                 USENIX Association
+5.5    Partial-specification mining                                       echo
+These benchmarks evaluate try’s capability to support auto-               files
+matic specification mining for shell commands, focusing on             big_file
+determining the order of their read and write effects to their                0.0           0.2        0.4          0.6         0.8      1.0
+standard streams or the filesystem. These properties corre-                                             Time ratio
+spond to the ones required by PaSh [38] and POSH [71] to                          startup   enter_ns   mount_devs         unmount_devs   commit
+parallelize or distribute shell scripts. The commands evalu-                      mkdirs    overlay    exe                exit_ns
+ated in this section are: (1) ls, a command that lists directory
+contents; (2) cp, a command that copies files and directories;        Figure 3: The performance breakdown of try. The performance
+(3) rm, a command that removes filesystem entries; (4) sed,           of try in three microbenchmarks and its overhead breakdown across
+a stream editor that filters and transforms text; and (5) xargs,      different execution stages.
+a higher-order command that executes command lines from
+standard input. The specification miner explores 11, 100, 40,
+1408, and 3 configurations for these commands respectively.           on performance breakdown (Fig. 3).
+For xargs, it uses the rm, ls, and cat commands as argu-                 The performance analysis breaks down the try runtime
+ments. All workloads were executed using try -t.                      into nine stages: (i) startup parses command-line arguments
+                                                                      and enumerates top-level directories; (ii) mkdirs provisions
+Control: All computations executed with try -t mediate
+                                                                      the upper, work, and temporary directories; (iii) enter_ns cre-
+all observed effects, capturing every read and write operation
+                                                                      ates a fresh namespace; (iv) overlay establishes the Over-
+performed by the evaluated commands.
+                                                                      layFS mount points; (v) mount_devs bind-mounts selected
+Equivalence: All computations executed with try -t pro-               device files; (vi) exe executes the target process; (vii) un-
+duce correct results, and the resulting filesystem state remains      mount_devs unmounts the device files; (viii) exit_ns exits the
+identical to that of try-free execution. Across all commands          namespace, triggering the automatic unmount of remaining
+evaluated, the inferred specifications match or extend PaSh’s         OverlayFS layers; and (ix) commit moves output files from
+handwritten specifications. In three cases, try enables the           the upper directory to the host filesystem. For the baseline
+miner to detect effects omitted from the original PaSh specifi-       echo command, which completes in 165ms, the overhead is
+cations. For example, although cp is marked as side-effectful         caused by filesystem and namespace operations. Creating the
+in the original specifications, its behavior in these evaluation      OverlayFS (overlay) accounts for 25% (42ms), followed by
+scenarios is effectively pure, as it modifies only files explicitly   directory creation (mkdirs) at 22% (37ms). Device manage-
+listed in its arguments.                                              ment also creates measurable overhead, with unmount_devs
+Performance: Since the configuration miner needs to ex-               taking 16% (26ms) and mount_devs taking 11% (19ms). In
+plore a large number of command invocations to infer their            longer-running benchmarks, such as big_file (9.2s) and
+specifications, try’s overheads compound significantly. Com-          files (11s), these setup and teardown costs remain roughly
+pared to vanilla execution, try increases execution time 1.7×–        constant, making the relative overhead comparable to the ac-
+8.3×, caused by try’s flat cost of setting up the semisolate          tual exe time. However, files presents an outlier in the
+environment and its tracing overhead. Vanilla execution is not        teardown phase as exit_ns takes 6.3s. This latency is caused
+meaningful in this use case, as the specification miner needs         at semisolate conclusion because try needs to iterate over the
+to observe effects to infer specifications. The performance of        many files created in the OverlayFS upperdir.
+try improves relative to Docker-contained execution across
+all five mining benchmarks, achieving speedups 1.6×–2.2×.
+Benefits from try’s lighter semisolate setup and teardown             6    Discussion, Limitations & Experiences
+times compound over the many invocations required by the
+specification miner (here, 1562 in total).                            Limitations: Current try limitations primarily impact com-
+                                                                      patibility in specific scenarios: restrictions and altered appli-
+                                                                      cation behavior due to its use of user namespaces, challenges
+5.6    Microbenchmarks
+                                                                      in handling pseudo-filesystems and physical devices, and in-
+The goal of the set of microbenchmarks is to analyze try’s            ability to fully disable certain isolation mechanisms.
+sources of overhead. These benchmarks consist of three work-             Due to its use of user namespaces, try-semisolated pro-
+loads: (1) echo, a Rust function that creates zero files, in-         cesses cannot interact with other users. Even when a process
+voked 100 times; (2) files, a Rust function that creates              appears to be root in the namespace, it cannot switch UID or
+10, 000 small files of size 16 bytes each; and (3) big_file,          operate on files owned by other users. Components that rely
+a Rust function that creates five large files of size 1GB each.       on creating or switching users may behave unexpectedly.
+All workloads were executed using try -y and try -n,                     Processes inside semisolates bypass writable permissions
+yielding complete control and equivalence, thus we focus              without needing to change the file permissions (a special
+
+
+
+USENIX Association                             20th USENIX Symposium on Operating Systems Design and Implementation                         463
+feature of UID 0 in Linux). This may affect components that       example, the effect of creating file f in directory d depends on
+rely on write permissions or ones running without elevated        the effect of creating directory d. When try applies an incon-
+privileges, such as npm, when the user ID is 0.                   sistent update, it issues a warning similar to standard filesys-
+   As try requires user and PID namespaces for unprivileged       tem manipulation commands (e.g., mv). Since the semisolate
+OverlayFS mounting, it creates a non-configurable isolation       is stored on disk, users are able to re-apply a different subset
+barrier for IPC mechanisms such as signals, complicating          of effects or reorder semisolates differently—a capability that
+interprocess coordination when such isolation is not desired.     hS depends on [48].
+External modules: Two additional modules augment try.
+For namespace-local root-like capabilities without host root
+privileges, try maps the current effective UID and GID to the
+                                                                  7   Related Work
+superuser inside the new user namespace. Because unshare
+cannot map multiple UID or GID ranges, traversing directo-        Containment and virtualization: There has been a signifi-
+ries owned by another accessible GID can trigger EOVERFLOW;       cant amount of work on full isolation, including in contain-
+try-gidmapper addresses this case, with security implica-         ers [9, 54, 84, 87] and virtual machines [10, 12, 16, 53, 68].
+tions that go beyond try’s current scope.                         These primitives create an isolated environment that is dif-
+   As the number of effects can overwhelm a user, an external     ferent from the host environment they execute in, completely
+try module summarizes effects in a human-friendlier form.         avoiding sharing of any sort. Semisolates instead run a pro-
+This module, called try-summarize, queries an opaque lan-         gram in a simulacrum of the current environment—as if on
+guage model with the output from try and additional in-           the same environment, but with significantly lower risk—and
+structions requesting (1) a non-expert summary of the effects,    allow for further and selective manipulation of its effects.
+starting from the most important ones; (2) information about      Software isolation and confinement: Earlier work on isola-
+whether these effects touch sensitive directories. Both prompts   tion and confinement [4,36,39,69,76,78], focused on control-
+offer functionality try’s users could directly implement, but     ling and, if necessary, protecting against harmful component
+proved useful during recent user interactions with try.           effects. These approaches offer structures at the operating
+Experiences: Colleagues and students using try have shared        system level, often not supporting unmodified Linux envi-
+several notable experiences (see Appendix B for testimonials      ronments. In contrast, try leverages subsystems available in
+unrelated to the try authors). The try subsystem is also          modern operating systems—requiring no modifications.
+used in several research projects. An out-of-order execution         Tools such as bubblewrap [17] similarly rely on Linux ker-
+engine called hS [48] and a bolt-on incrementalization system     nel mechanisms to create isolated execution environments
+called Incr [99] use try to build a dependency graph between      for unmodified programs. However, bubblewrap requires con-
+opaque components during execution and revoke their effects       figuring the environment view available to the wrapped pro-
+when appropriate. They achieve speedups of up to 9.3× and         cess ahead-of-execution, does not support layering, and ei-
+373.3× over vanilla execution, respectively.                      ther blocks effects during execution—potentially leaving the
+   Users often discard effects when the wrapped component         component at an inconsistent state—or reflects effects imme-
+wrote outside the expected filesystem subtree, e.g., creating     diately to the host environment. In contrast, try requires no
+auxiliary files in the home directory, or when its set of ef-     configuration (aside from optional path ignoring), supports
+fects was larger than expected, e.g., chmod +x * affecting        layering unapplied effects across executions, and allows users
+all files in the current directory. In several cases, they dis-   to inspect and selectively apply effects after execution.
+carded the effects of mistyped pip and cpanm invocations. A          Other systems achieve confinement via system call inter-
+colleague, after running a training job under try, inspected      position [14, 43]. For example, MBOX traces and interposes
+the produced checkpoint files and selectively committed only      on system calls to inform the user of unintended or unde-
+the highest-performing one. A teaching assistant used try to      sired effects. Such interposition meets only some of try’s
+shield against unintended effects from student submissions.       requirements; it does not, for example, support stacking or
+Several students have used try to interpose on agentic work-      further manipulation. Semisolates and try take a different
+flows, wrapping their session with try and inspecting all         approach, offering several more features—and compatibility
+produced effects before committing them. Even when the            across several modern environments.
+agent performed non-filesystem accesses (e.g., access to web-     Language-based wrapping and proxying: Semisolates bear
+pages, interactions with email and messaging APIs), which         resemblance to earlier research that attempts to control effects
+often were read-only network effects, try remained useful.        and capabilities using dynamic effect wrapping [5, 21, 51, 55,
+It allowed students to mediate all resulting local filesystem     57, 58]. In contrast to try, these approaches are not language-
+effects, critical when the agent performed an incorrect action    agnostic, as they are tightly integrated into a language and
+based on misleading information it fetched from the web.          its runtime environment [5, 20, 21, 56], and often require de-
+   It is possible for users to arrive at an inconsistent set of   veloper effort through code modifications, or isolation poli-
+updates when selectively applying or reordering effects. For      cies [50, 57, 58, 61, 91]. Semisolates offer language-agnostic
+
+
+
+464   20th USENIX Symposium on Operating Systems Design and Implementation                                 USENIX Association
+effect control on unmodified programs.                             References
+Capabilities and sandboxing: Semisolates inherit ideas from
+early capability and sandboxing work [46,47,59,60,83]. Soft-        [1] eslint-scope vulnerability. https://security.sny
+ware fault isolation [97] rewrites object code to prevent exe-          k.io/vuln/SNYK-JS-ESLINTSCOPE-11120, 2024.
+cution reaching addresses outside a domain. Rather than com-            Accessed: 2024-09-29.
+pletely restricting naming, try dynamically shadows names
+                                                                    [2] Claude code. https://claude.com/product/cla
+defined outside the compartment’s context—a technique iso-
+                                                                        ude-code, 2025. Accessed: 2025-12-10.
+morphic to a combination of capability revocation followed
+by attenuation; but contrary to earlier efforts, try’s shadowing    [3] Codex: Lightweight coding agent that runs in your
+works with completely unmodified binaries.                              terminal. https://github.com/openai/codex,
+Filtering and access prevention: Another class of sandbox-              2025. Accessed: 2025-08-29.
+ing tools is based on software fault isolation [97], including
+NaCl [81], WASM [33], and RLBox [63]. These systems                 [4] Mike Accetta, Robert Baron, William Bolosky, David
+focus on intraprocess memory-level isolation. Instead, try              Golub, Richard Rashid, Avadis Tevanian, and Michael
+supports effect control (not isolation) outside the process—            Young. Mach: A New Kernel Foundation for UNIX
+including effects such as file modifications.                           Development. In USENIX Technical Conference, 1986.
+   Other systems control effects by preventing file ac-
+cesses [77, 98, 100], terminating processes that access files       [5] Pieter Agten, Steven Van Acker, Yoran Brondsema,
+outside an allowed set, or filtering dangerous or unnecessary           Phu H Phung, Lieven Desmet, and Frank Piessens.
+system calls [22, 29, 42, 85]. These approaches prevent effects         JSand: Complete Client-Side Sandboxing of Third-
+completely—possibly breaking the application if it needs to             Party JavaScript without Browser Modifications. In
+perform the effects to complete its execution.                          Annual Computer Security Applications Conference
+                                                                        (ACSAC), pages 1–10, 2012.
+Transactional filesystems: Earlier research on transactional
+filesystems [25, 79, 80, 88] has developed support for atom-        [6] Ali Sajid. How to sort a file in-place? https://stac
+ically committing or reverting changes to multiple files in             koverflow.com/questions/29244351/how-to-s
+a filesystem. In contrast to try, which allows calling pro-             ort-a-file-in-place, 2015. Accessed: 2025-12-
+grams to inspect and apply some of the effects—or further               04.
+manipulate them at will.
+                                                                    [7] Cursor / Anysphere. Cursor: The best way to code
+                                                                        with ai. https://cursor.com/, 2025. Accessed:
+8   Conclusion                                                          2025-09-25.
+
+Software systems consist of many components, written in             [8] Apache Kibble Developers. Apache kibble. https:
+many languages, and interacting with each other and the en-             //github.com/apache/kibble.
+vironment. This paper showcases the need for and feasibility
+of building a new abstraction, the semisolate, for controlling      [9] Sergei Arnautov, Bohdan Trach, Franz Gregor, Thomas
+potentially undesired effects, maintaining full compatibility           Knauth, Andre Martin, Christian Priebe, Joshua Lind,
+with real-world components, and incurring a performance                 Divya Muthukumaran, Dan O’Keeffe, Mark L. Still-
+overhead that is aligned with several practical applications.           well, David Goltzsche, Dave Eyers, Rüdiger Kapitza,
+                                                                        Peter Pietzuch, and Christof Fetzer. SCONE: Secure
+                                                                        Linux containers with Intel SGX. In USENIX Sympo-
+Acknowledgements                                                        sium on Operating Systems Design and Implementa-
+                                                                        tion (OSDI), pages 689–703, Savannah, GA, November
+We thank the anonymous OSDI’26 reviewers and our shep-                  2016. USENIX Association.
+herd for their feedback; the OSDI’26 Artifact Evaluation re-
+viewers for their time; and the Brown CS2952R (Fall’24)            [10] Paul Barham, Boris Dragovic, Keir Fraser, Steven
+participants for their input on several iterations of this pa-          Hand, Tim Harris, Alex Ho, Rolf Neugebauer, Ian Pratt,
+per. This material is based upon research supported by NSF              and Andrew Warfield. Xen and the art of virtualization.
+awards CCF-2525351, CCF-2525352, CCF-2525353, CNS-                      ACM SIGOPS Operating Systems Review, 37(5):164–
+2247687, CNS-2312346, and CNS-2312347, DARPA con-                       177, 2003.
+tract no. HR001124C0486, an Amazon Research Award (Fall
+2024), a Google ML-and-Systems Junior Faculty Award, a             [11] Len Bass, Paul Clements, and Rick Kazman. Software
+seed grant from Brown University’s Data Science Institute,              architecture in practice. Addison-Wesley Professional,
+and a BrownCS Faculty Innovation Award.                                 2021.
+
+
+
+USENIX Association                           20th USENIX Symposium on Operating Systems Design and Implementation         465
+[12] Muli Ben-Yehuda, Michael D. Day, Zvi Dubitzky,                 Server-Side JavaScript. In Annual Computer Secu-
+     Michael Factor, Nadav Har’El, Abel Gordon, Anthony             rity Applications Conference (ACSAC), pages 446–455,
+     Liguori, Orit Wasserman, and Ben-Ami Yassour. The              2014.
+     turtles project: Design and implementation of nested
+                                                               [22] Nicholas DeMarinis, Kent Williams-King, Di Jin, Ro-
+     virtualization. In USENIX Symposium on Operating
+                                                                    drigo Fonseca, and Vasileios P Kemerlis. Sysfilter:
+     Systems Design and Implementation (OSDI), Vancou-
+                                                                    Automated system call filtering for commodity soft-
+     ver, BC, October 2010. USENIX Association.
+                                                                    ware. In International Symposium on Research in At-
+[13] Bentley, Jon and Knuth, Don and McIlroy, Doug.                 tacks, Intrusions and Defenses (RAID), pages 459–474,
+     Programming pearls: a literate program. CACM,                  2020.
+     29(6):471–483, June 1986.
+                                                               [23] Linux Kernel Documentation. mount(2) — Linux man-
+[14] Antonio Bianchi, Yanick Fratantonio, Christopher               ual page, 2024. Available at https://man7.org/lin
+     Kruegel, and Giovanni Vigna. Njas: Sandboxing un-              ux/man-pages/man2/mount.2.html.
+     modified applications in non-rooted devices running       [24] Linux Kernel Documentation. Overlayfs - Linux kernel
+     stock android. In Proceedings of the 5th Annual ACM            documentation, 2024. Available at https://www.ke
+     CCS Workshop on Security and Privacy in Smart-                 rnel.org/doc/html/latest/filesystems/overl
+     phones and Mobile Devices, pages 27–38, 2015.                  ayfs.html.
+[15] Andrea Bittau, Petr Marchenko, Mark Handley, and          [25] Robert Escriva and Emin Gun Sirer. The design and im-
+     Brad Karp. Wedge: Splitting applications into reduced-         plementation of the warp transactional filesystem. In
+     privilege compartments. In Proceedings of the 5th              USENIX Symposium on Networked Systems Design
+     USENIX Symposium on Networked Systems Design                   and Implementation (NSDI), pages 469–483, Santa
+     and Implementation, NSDI’08, pages 309–322, Berke-             Clara, CA, March 2016. USENIX Association.
+     ley, CA, USA, 2008. USENIX Association.
+                                                               [26] fegome90-cmd. Cursor ai executes destructive com-
+[16] Xiaoxin Chen, Tal Garfinkel, E. Christopher Lewis,             mand during development session. https://forum.
+     Pratap Subrahmanyam, Carl A. Waldspurger, Dan                  cursor.com/t/cursor-ai-executes-destructi
+     Boneh, Jeffrey Dwoskin, and Dan R.K. Ports. Over-              ve-command-rm-rf-during-development-sessi
+     shadow: a virtualization-based approach to retrofitting        on/129401, 2025. Accessed: 2025-09-24.
+     protection in commodity operating systems. In Pro-
+     ceedings of the 13th International Conference on Ar-      [27] Free Software Foundation. GNU Stow Manual. ht
+     chitectural Support for Programming Languages and              tps://www.gnu.org/software/stow/manual/.
+     Operating Systems, ASPLOS XIII, page 2–13, New                 Accessed: 2026-06-06.
+     York, NY, USA, 2008. Association for Computing Ma-        [28] Frogmouth Developers. Frogmouth. https://gith
+     chinery.                                                       ub.com/Textualize/frogmouth.
+[17] Bubblewrap Contributors. Bubblewrap. https://             [29] Alexander J Gaidis, Vaggelis Atlidakis, and Vasileios P
+     github.com/containers/bubblewrap. Accessed:                    Kemerlis. SysXCHG: Refining privilege with adaptive
+     2025-09-25.                                                    system call filters. In Proceedings of the 2023 ACM
+                                                                    SIGSAC Conference on Computer and Communica-
+[18] MITRE Corporation. Cve-2022-23812: Vulnerability               tions Security, pages 1964–1978, 2023.
+     details. https://www.cve.org/CVERecord?id=C
+     VE-2022-23812, 2025. Accessed: 2025-01-02.                [30] Holger Gantikow, Steffen Walter, and Christoph Reich.
+                                                                    Rootless containers with podman for hpc. In High
+[19] Charlie Curtsinger and Daniel W. Barowy. Riker:                Performance Computing: ISC High Performance 2020
+     Always-Correct and fast incremental builds from sim-           International Workshops, Frankfurt, Germany, June
+     ple specifications. In USENIX Annual Technical Con-            21–25, 2020, Revised Selected Papers, page 343–354,
+     ference (ATC), pages 885–898, Carlsbad, CA, July               Berlin, Heidelberg, 2020. Springer-Verlag.
+     2022. USENIX Association.
+                                                               [31] Git Project. Git - git-clean Documentation. https:
+[20] Tom Van Cutsem. Membranes in JavaScript. http                  //git-scm.com/docs/git-clean. Accessed: 2026-
+     s://tvcutsem.github.io/js-membranes, 2012.                     06-06.
+     Accessed: 2020-03-16.
+                                                               [32] GNU patch contributors. patch(1) — Linux Manual
+[21] Willem De Groef, Fabio Massacci, and Frank Piessens.           Page. https://man7.org/linux/man-pages/man
+     NodeSentry: Least-privilege Library Integration for            1/patch.1.html. Accessed: 2026-06-06.
+
+
+
+466   20th USENIX Symposium on Operating Systems Design and Implementation                           USENIX Association
+ [33] Andreas Haas, Andreas Rossberg, Derek L Schuff,            [43] Taesoo Kim and Nickolai Zeldovich. Practical and
+      Ben L Titzer, Michael Holman, Dan Gohman, Luke                  effective sandboxing for non-root users. In USENIX
+      Wagner, Alon Zakai, and JF Bastien. Bringing the web            Annual Technical Conference (ATC), pages 139–144,
+      up to speed with WebAssembly. In Proceedings of                 2013.
+      the 38th ACM SIGPLAN Conference on Programming
+      Language Design and Implementation, pages 185–200,         [44] Evangelos Lamprou, Ethan Williams, Georgios
+      2017.                                                           Kaoukis, Zhuoxuan Zhang, Michael Greenberg,
+                                                                      Konstantinos Kallas, Lukas Lazarek, and Nikos
+ [34] Shivam Handa, Konstantinos Kallas, Nikos Vasilakis,             Vasilakis. The Koala benchmarks for the shell:
+      and Martin C. Rinard. An order-aware dataflow model             Characterization and implications. In USENIX Annual
+      for parallel Unix pipelines. Proc. ACM Program. Lang.,          Technical Conference (ATC), pages 449–64, Boston,
+      5(ICFP), August 2021.                                           MA, July 2025. USENIX Association.
+
+ [35] IAspireToBeGladOS. How to compress files larger            [45] Lukas Lazarek, Seong-Heon Jung, Evangelos
+      than a certain size in a directory? https://stackove            Lamprou, Zekai Li, Anirudh Narsipur, Eric Zhao,
+      rflow.com/questions/42097461/how-to-compr                       Michael Greenberg, Konstantinos Kallas, Konstantinos
+      ess-files-larger-than-a-certain-size-in-a                       Mamouras, and Nikos Vasilakis. From ahead-of- to
+     -directory, 2017. Accessed: 2025-12-04.                          just-in-time and back again: Static analysis for unix
+                                                                      shell programs. In 2025 Workshop on Hot Topics
+ [36] Sotiris Ioannidis, Steven M. Bellovin, and Jonathan M.          in Operating Systems, HotOS ’25, page 88–95, New
+      Smith. Sub-operating systems: A new approach to                 York, NY, USA, 2025. Association for Computing
+      application security. In Proceedings of the 10th Work-          Machinery.
+      shop on ACM SIGOPS European Workshop, EW 10,
+      pages 108–115, New York, NY, USA, 2002. ACM.               [46] R. Levin, E. Cohen, W. Corwin, F. Pollack, and
+                                                                      W. Wulf. Policy/mechanism separation in hydra. In
+ [37] john. How can I recursively find all files in current           Proceedings of the Fifth ACM Symposium on Oper-
+      and subfolders based on wildcard matching? https:               ating Systems Principles, SOSP ’75, pages 132–140,
+      //stackoverflow.com/questions/5905054/ho                        New York, NY, USA, 1975. ACM.
+      w-can-i-recursively-find-all-files-in-c
+      urrent-and-subfolders-based-on-wildcard,                   [47] H. M. Levy. Capability Based Computer Systems. Dig-
+      2011. Accessed: 2025-12-04.                                     ital Press, 1984.
+
+ [38] Konstantinos Kallas, Tammam Mustafa, Jan Bielak,           [48] Georgios Liargkovas, Di Jin, Tianyu (Ezri) Zhu, Dan
+      Dimitris Karnikis, Thurston H.Y. Dang, Michael Green-           Liu, A. Bolun Thompson, Anirudh Narsipur, Seong-
+      berg, and Nikos Vasilakis. Practically correct, Just-in-        Heon Jung, Siddhartha Prasad, Diomidis Spinellis,
+      Time shell script parallelization. In USENIX Sympo-             Michael Greenberg, Konstantinos Kallas, and Nikos
+      sium on Operating Systems Design and Implementa-                Vasilakis. hS: Speculative script reordering at subpro-
+      tion (OSDI), pages 769–785, Carlsbad, CA, July 2022.            cess granularity. In USENIX Symposium on Operating
+      USENIX Association.                                             Systems Design and Implementation (OSDI). USENIX
+                                                                      Association, 2026.
+ [39] Poul-Henning Kamp and Robert NM Watson. Jails:
+      Confining the omnipotent root. In Proceedings of the       [49] Xin Lin, Lingguang Lei, Yuewu Wang, Jiwu Jing, Kun
+      2nd International SANE Conference, volume 43, page              Sun, and Quan Zhou. A measurement study on Linux
+      116, 2000.                                                      container security: Attacks and countermeasures. In
+                                                                      Proceedings of the 34th Annual Computer Security
+ [40] KCD. Regex with grep. https://stackoverflo                      Applications Conference, ACSAC ’18, page 418–429,
+      w.com/questions/66579161/regex-with-grep,                       New York, NY, USA, 2018. Association for Computing
+      2021. Accessed: 2025-12-04.                                     Machinery.
+ [41] Kenneth Ward Church. Unix for Poets. https://web.          [50] Sergio Maffeis, John C Mitchell, and Ankur Taly. Ob-
+      stanford.edu/class/cs124/kwc-unix-for-poe                       ject capabilities and isolation of untrusted web appli-
+      ts.pdf, 1994.                                                   cations. In 2010 IEEE Symposium on Security and
+                                                                      Privacy, pages 125–140. IEEE, 2010.
+ [42] The Linux Kernel. Seccomp bpf (secure computing
+      with filters). https://www.kernel.org/doc/html/            [51] Jonas Magazinius, Daniel Hedin, and Andrei Sabelfeld.
+      latest/userspace-api/seccomp_filter.html,                       Architectures for Inlining Security Monitors in Web ap-
+      2023.                                                           plications. In International Symposium on Engineering
+
+
+
+USENIX Association                          20th USENIX Symposium on Operating Systems Design and Implementation        467
+      Secure Software and Systems (ESSoS), pages 141–160,       [62] Antonio SJ Musumeci. mergerfs: a featureful union
+      2014.                                                          filesystem. https://github.com/trapexit/merg
+                                                                     erfs, 2012–2025. Accessed: 2025-01-14.
+[52] Vahid Majdinasab, Michael Joshua Bishop, Shawn
+     Rasheed, Arghavan Moradidakhel, Amjed Tahir, and           [63] Shravan Narayan, Craig Disselkoen, Tal Garfinkel,
+     Foutse Khomh. Assessing the security of github copi-            Nathan Froyd, Eric Rahm, Sorin Lerner, Hovav
+     lot’s generated code - a targeted replication study. In         Shacham, and Deian Stefan. Retrofitting fine grain
+     IEEE International Conference on Software Analysis,             isolation in the Firefox renderer. In 29th USENIX Secu-
+     Evolution and Reengineering (SANER), pages 435–                 rity Symposium (USENIX Security 20), pages 699–716,
+     444, 2024.                                                      2020.
+[53] Jeanna Neefe Matthews, Wenjin Hu, Madhujith Ha-            [64] netgo software GmbH. LinOTP. https://github.c
+     puarachchi, Todd Deshane, Demetrios Dimatos, Gary               om/LinOTP/LinOTP.
+     Hamilton, Michael McCabe, and James Owens. Quan-
+     tifying the performance isolation properties of virtual-   [65] Edmund B. Nightingale, Peter M. Chen, and Jason
+     ization systems. In Proceedings of the 2007 Workshop            Flinn. Speculative execution in a distributed file system.
+     on Experimental Computer Science, ExpCS ’07, page               ACM SIGOPS Operating Systems Review, 39(5):191–
+     6–es, New York, NY, USA, 2007. Association for Com-             205, 2005.
+     puting Machinery.                                          [66] Okteto. Okteto - Develop your applications directly in
+[54] Dirk Merkel. Docker: lightweight linux containers               your Kubernetes Cluster. https://github.com/okt
+     for consistent development and deployment. Linux                eto/okteto, 2025. Accessed: 2025-12-04.
+     Journal, 2014(239):2, 2014.
+                                                                [67] Senthilkumar Palani. How to use -dry-run flag in
+[55] Leo A Meyerovich and Benjamin Livshits. Conscript:              linux commands: Avoid mistakes before they happen.
+     Specifying and enforcing fine-grained security policies         https://ostechnix.com/linux-dry-run-fla
+     for JavaScript in the browser. In 2010 IEEE Symposium           g-guide-beginners/, February 2026. Accessed:
+     on Security and Privacy, pages 481–496. IEEE, 2010.             2026-06-09.
+
+[56] James Mickens. Pivot: Fast, synchronous mashup isola-      [68] Simon Peter, Jialin Li, Irene Zhang, Dan R. K. Ports,
+     tion using generator chains. In 2014 IEEE Symposium             Doug Woos, Arvind Krishnamurthy, Thomas Ander-
+     on Security and Privacy, pages 261–275. IEEE, 2014.             son, and Timothy Roscoe. Arrakis: The operating
+                                                                     system is the control plane. ACM Trans. Comput. Syst.,
+[57] Mark S Miller, Mike Samuel, Ben Laurie, Ihab Awad,              33(4):11:1–11:30, November 2015.
+     and Mike Stay. Caja: Safe active content in sanitized
+     JavaScript. Google white paper, 2009.                      [69] NSA Peter Loscocco. Integrating flexible support for
+                                                                     security policies into the Linux operating system. In
+[58] Mark S Miller, Tom Van Cutsem, and Bill Tulloh. Dis-            Proceedings of the FREENIX Track:... USENIX Annual
+     tributed electronic rights in javascript. In European           Technical Conference, page 29. The Association, 2001.
+     Symposium on Programming, pages 1–20. Springer,
+     2013.                                                      [70] David Quigley, Josef Sipek, Charles P Wright, and Erez
+                                                                     Zadok. Unionfs: User-and community-oriented devel-
+[59] Mark S Miller, Ka-Ping Yee, Jonathan Shapiro, et al.            opment of a unification filesystem. In Proceedings of
+     Capability myths demolished. Technical report, Techni-          the 2006 Linux Symposium, volume 2, pages 349–362,
+     cal Report SRL2003-02, Johns Hopkins University Sys-            2006.
+     tems Research Laboratory, 2003. http://www. erights.
+     org/elib/capability/duals, 2003.                           [71] Raghavan, Deepti and Fouladi, Sadjad and Levis, Philip
+                                                                     and Zaharia, Matei. POSH: a data-aware shell. In Pro-
+[60] Mark Samuel Miller. Robust Composition: Towards                 ceedings of the 2020 USENIX Conference on Usenix
+     a Unified Approach to Access Control and Concur-                Annual Technical Conference, USENIX ATC’20, USA,
+     rency Control. PhD thesis, Baltimore, MD, USA, 2006.            2020. USENIX Association.
+     AAI3245526.
+                                                                [72] RIAEvangelist. node-ipc: Inter-process communica-
+[61] Scott Moore, Christos Dimoulas, Dan King, and                   tion for node.js. https://github.com/RIAEvange
+     Stephen Chong. Shill: a secure shell scripting language.        list/node-ipc, 2025. Accessed: 2025-01-02.
+     In Proceedings of the 11th USENIX Conference on Op-
+     erating Systems Design and Implementation, OSDI’14,        [73] Sam Ritchie. UV Metrics: Metric reporting and exper-
+     page 183–199, USA, 2014. USENIX Association.                    iment management for ml workflows., 2020.
+
+
+
+468   20th USENIX Symposium on Operating Systems Design and Implementation                              USENIX Association
+ [74] RsyncProject. Issue #582: Rsync GitHub Issue. https:            down barriers to improve performance and isolation of
+      //github.com/RsyncProject/rsync/issues/5                        cloud-native containers. In Proceedings of the Twenty-
+      82. Accessed: 2026-05-27.                                       Fourth International Conference on Architectural Sup-
+                                                                      port for Programming Languages and Operating Sys-
+ [75] RsyncProject. rsync(1) Manpage. https://rsync.                  tems, ASPLOS ’19, page 121–135, New York, NY,
+      samba.org/ftp/rsync/rsync.1.html. Accessed:                     USA, 2019. Association for Computing Machinery.
+      2026-06-06.
+                                                                 [85] Dimitrios Skarlatos, Qingrong Chen, Jianyan Chen,
+ [76] J. M. Rushby. Design and verification of secure sys-
+                                                                      Tianyin Xu, and Josep Torrellas. Draco: Architectural
+      tems. In Proceedings of the Eighth ACM Symposium on
+                                                                      and operating system support for system call security.
+      Operating Systems Principles, SOSP ’81, pages 12–21,
+                                                                      In 2020 53rd Annual IEEE/ACM International Sym-
+      New York, NY, USA, 1981. ACM.
+                                                                      posium on Microarchitecture (MICRO), pages 42–57.
+ [77] Mickaël Salaün. Landlock lsm: toward unprivileged               IEEE, 2020.
+      sandboxing. Linux Security Summit, 2017.
+                                                                 [86] Snyk. Snyk vulnerability: Snyk-js-nodeipc-2426370.
+ [78] Jerome H Saltzer. Protection and the control of in-             https://security.snyk.io/vuln/SNYK-JS-NOD
+      formation sharing in multics. Communications of the             EIPC-2426370, 2025. Accessed: 2025-01-02.
+      ACM, 17(7):388–402, 1974.
+                                                                 [87] Stephen Soltesz, Herbert Potzl, Marc E. Fiuczyn-
+ [79] Frank Schmuck and Jim Wylie. Experience with trans-             ski, Andy Bavier, and Larry Peterson. Container-
+      actions in quicksilver. In Proceedings of the thir-             based operating system virtualization: a scalable, high-
+      teenth ACM symposium on Operating systems prin-                 performance alternative to hypervisors. In European
+      ciples, pages 239–253, 1991.                                    Conference on Computer Systems (EuroSys), EuroSys
+                                                                      ’07, page 275–287, New York, NY, USA, 2007. Asso-
+ [80] Russell Sears and Eric Brewer. Stasis: Flexible transac-        ciation for Computing Machinery.
+      tional storage. In Proceedings of the 7th symposium on
+      Operating systems design and implementation, pages         [88] Richard P Spillane, Sachin Gaikwad, Manjunath
+      29–44, 2006.                                                    Chinni, Erez Zadok, and Charles P Wright. Enabling
+                                                                      transactional file access via lightweight kernel exten-
+ [81] David Sehr, Robert Muth, Cliff Biffle, Victor Khi-              sions. In FAST, volume 9, pages 29–42, 2009.
+      menko, Egor Pasko, Karl Schimpf, Bennet Yee, and
+      Brad Chen. Adapting software fault isolation to con-       [89] Patrick Stevens. In praise of -dry-run. https://www.
+      temporary CPU architectures. In 19th USENIX Secu-               gresearch.com/news/in-praise-of-dry-run/,
+      rity Symposium (USENIX Security 10), 2010.                      May 2021. Accessed: 2026-06-09.
+ [82] Natalie Shapira, Chris Wendler, Avery Yen, Gabriele        [90] Teekin. Unix shell script: Update timestamp on all sub-
+      Sarti, Koyena Pal, Olivia Floody, Adam Belfki, Alex             directories and sub-files, including those with spaces.
+      Loftus, Aditya Ratan Jannali, Nikhil Prakash, Jas-              https://stackoverflow.com/questions/371864
+      mine Cui, Giordano Rogers, Jannik Brinkmann, Can                5/unix-shell-script-update-timestamp-on-a
+      Rager, Amir Zur, Michael Ripa, Aruna Sankara-                   ll-sub-directories-and-sub-files-includ,
+      narayanan, David Atkinson, Rohit Gandikota, Jaden               2010. Accessed: 2025-12-04.
+      Fiotto-Kaufman, EunJeong Hwang, Hadas Orgad,
+      P Sam Sahil, Negev Taglicht, Tomer Shabtay, Atai Am-       [91] Jeff Terrace, Stephen R Beard, and Naga Praveen Ku-
+      bus, Nitay Alon, Shiri Oron, Ayelet Gordon-Tapiero,             mar Katta. JavaScript in JavaScript (js. js): sandboxing
+      Yotam Kaplan, Vered Shwartz, Tamar Rott Shaham,                 third-party scripts. In Presented as part of the 3rd
+      Christoph Riedl, Reuth Mirsky, Maarten Sap, David               USENIX Conference on Web Application Development
+      Manheim, Tomer Ullman, and David Bau. Agents of                 (WebApps 12), pages 95–100, 2012.
+      chaos. https://arxiv.org/abs/2602.20021,
+                                                                 [92] The try authors and contributors. Try: Controlling side
+      2026.
+                                                                      effects with semisolates. https://github.com/bin
+ [83] Jonathan S Shapiro, Jonathan M Smith, and David J               pash/try, 2025. Accessed: 2025-09-25.
+      Farber. EROS: a fast capability system, volume 33.
+      ACM, 1999.                                                 [93] Lillian Tsai and Eugene Bagdasarian. Contextual agent
+                                                                      security: A policy for every purpose. In Proceedings
+ [84] Zhiming Shen, Zhen Sun, Gur-Eyal Sela, Eugene Bag-              of the 2025 Workshop on Hot Topics in Operating Sys-
+      dasaryan, Christina Delimitrou, Robbert Van Renesse,            tems, HotOS ’25, page 8–17, New York, NY, USA,
+      and Hakim Weatherspoon. X-containers: Breaking                  2025. Association for Computing Machinery.
+
+
+
+USENIX Association                          20th USENIX Symposium on Operating Systems Design and Implementation         469
+ [94] Tsaliki, Eleftheria and Spinellis, Diomedes. The Real     fresh: Compress Files Larger Than 1 KB
+      Numbers for Athens Buses. https://insidestory.
+      gr/article/noymera-leoforeia-athinas, 2020.
+                                                                P ROMPT
+ [95] Unix Game. The Unix Game - 50 Challenges to Master
+                                                                 Write a Bash script that finds all files larger than 1 KB in
+      the Command Line. https://unixgame.io/unix50,
+                                                                a directory (e.g., ./data) and compresses them using gzip.
+      2024. Accessed: 2025-10-19.
+                                                                Use find with the -size filter and an -exec command. Include
+ [96] util-linux contributors. rename(1) — Linux Manual         comments.
+      Page. https://man7.org/linux/man-pages/man                G ENERATED S CRIPT
+      1/rename.1.html. Accessed: 2026-06-06.
+                                                                1 directory="./data"
+ [97] Robert Wahbe, Steven Lucco, Thomas E Anderson,            2 find "$directory" -type f -size +1k \
+      and Susan L Graham. Efficient software-based fault        3   -exec sh -c 'gzip "{}"' \;
+      isolation. In Proceedings of the fourteenth ACM sympo-
+      sium on Operating systems principles, pages 203–216,
+      1993.
+                                                                archive: Find All .txt Files
+ [98] Chris Wright, Crispin Cowan, James Morris, Stephen
+      Smalley, and Greg Kroah-Hartman. Linux security
+      module framework. In Ottawa Linux Symposium, vol-         P ROMPT
+      ume 8032, pages 6–16, 2002.                                Give me a command to find all .txt files in the current direc-
+                                                                tory and its subdirectories.
+ [99] Yizheng Xie, Evangelos Lamprou, Jerry Xia, and Nikos
+      Vasilakis. Incr: Faster re-execution via bolt-on incre-   G ENERATED S CRIPT
+      mentalization. In USENIX Symposium on Operating
+      Systems Design and Implementation (OSDI). USENIX          1   find . -name "*.txt"
+      Association, 2026.
+
+[100] Wenhui Zhang, Peng Liu, and Trent Jaeger. Analyz-         logs: Extract Error Lines From Log
+      ing the overhead of file protection by Linux security
+      modules. In Proceedings of the 2021 ACM Asia Con-
+      ference on Computer and Communications Security,
+                                                                P ROMPT
+      pages 393–406, 2021.
+                                                                 Give me a command to extract only ERROR, WARNING,
+                                                                or CRITICAL lines from a log file and save them to a new
+A     LLM-Generated Scripts                                     file. Make sure the command doesn’t fail even if nothing is
+                                                                matched.
+This appendix lists the exact prompts used to generate the
+LLM-based benchmarks in §5.1, along with the scripts re-        G ENERATED S CRIPT
+turned by ChatGPT.
+                                                                1   grep -E "ERROR|WARNING|CRITICAL" file.log \
+                                                                2     > filtered_errors.log || true
+crawl: Find & Touch
+
+
+P ROMPT                                                         order: Sort a File
+
+ Write a simple Bash script that searches a directory (for
+example ./data) and runs a command on every file it finds.      P ROMPT
+Use find with -exec and include comments explaining what
+the script does. The command should just touch each file.        Give me a command to sort the contents of book.txt and save
+                                                                the result to another file.
+G ENERATED S CRIPT
+                                                                G ENERATED S CRIPT
+1 directory="./data"
+2 find "$directory" -type f -exec touch "{}" \;                 1   sort book.txt > sortedBook.txt
+
+
+
+470   20th USENIX Symposium on Operating Systems Design and Implementation                               USENIX Association
+B    Testimonials                                                     Scope
+                                                                      The artifact covers the claims made by the paper’s implemen-
+This appendix includes testimonials from users who have
+                                                                      tation and evaluation sections. In particular, it includes: (1)
+tried try and shared their feedback on social media plat-
+                                                                      the try subsystem and the semisolate abstraction described in
+forms. They offer a snapshot of real-world experiences and
+                                                                      §3 and §4; (2) the five use cases and supporting benchmarks
+community reception of the tool. The feedback was primarily
+                                                                      from §2 and §5; and (3) the automation used to reproduce all
+gathered from platforms such as personal blogs and Hacker
+                                                                      key results in §5.
+News.
+
+Looks nifty—basically it’s the “let me try that in a container        Contents
+first” except on your live system with no setup to get it going.
+                                                                      The artifact contains the following components:
+                                 — @mikepurvis, Hacker News
+This is a much needed software.                                        • the try subsystem itself;
+                               — @johnsbullings, Hacker News           • documentation, including a top-level README, a manual
+Very interesting! This feels like something that should have             page, and a short tutorial;
+always existed.
+                                                                       • a regression test suite covering try’s core functionality;
+                      — @Benjamin Oakes, benjaminoakes.com
+This is cool I probably will use this.                                 • the five evaluation workloads and their supporting utilities;
+                                                                         and
+                                — @jagtstronaut, Hacker News
+I love that their demo is to finally give me a dry run com-            • scripts for running the evaluation and generating all key
+mand for pip.                                                            result artifacts.
+                                    — @gdevenyi, Hacker News
+The script is mounting an overlay filesystem for each root            Hosting
+directory on the current system, then looking at what has             The artifact is publicly available both as a GitHub repository
+been added as a new layer. . . Pure genius.                           and as a Zenodo archival snapshot. The GitHub version is
+                           — @MichaelMoser123, Hacker News            hosted at https://github.com/binpash/try/tree/
+I can see this being incredibly useful.                               osdi26-ae, and the archival version is hosted at https:
+                                                 — river, lobste.rs
+                                                                      //zenodo.org/records/19444649.
+
+try is clever.
+                                             — Jim Fowler, x.com
+I look forward to it helping me prevent programs polluting
+my laptop.
+                                             — bfiedlera, lobste.rs
+This tool can bring a level of control that is typically only
+available in databases and VCSs, and make it a commodity.
+                                         — @klabb3, Hacker News
+
+
+C    Software Artifact
+
+Abstract
+The software artifact accompanying this paper consists of
+the try subsystem, its documentation, a test suite, and the
+scripts used to reproduce the evaluation in §5. It supports three
+goals: inspecting the implementation and its accompanying
+materials, exercising the system through its test suite, and
+reproducing the paper’s main evaluation results, including the
+summary across the five use cases and the microbenchmark
+breakdown.
+
+
+
+USENIX Association                              20th USENIX Symposium on Operating Systems Design and Implementation             471
+

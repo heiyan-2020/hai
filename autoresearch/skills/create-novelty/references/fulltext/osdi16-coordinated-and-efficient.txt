@@ -1,0 +1,1258 @@
+Coordinated and Efficient Huge Page Management
+                  with Ingens
+    Youngjin Kwon, Hangchen Yu, and Simon Peter, The University of Texas at Austin;
+ Christopher J. Rossbach, The University of Texas at Austin and VMware; Emmett Witchel,
+                            The University of Texas at Austin
+          https://www.usenix.org/conference/osdi16/technical-sessions/presentation/kwon
+
+
+
+
+           This paper is included in the Proceedings of the
+        12th USENIX Symposium on Operating Systems Design
+                   and Implementation (OSDI ’16).
+                        November 2–4, 2016 • Savannah, GA, USA
+                                     ISBN 978-1-931971-33-1
+
+
+
+                                                Open access to the Proceedings of the
+                                            12th USENIX Symposium on Operating Systems
+                                                    Design and Implementation
+                                                      is sponsored by USENIX.
+          Coordinated and Efficient Huge Page Management with Ingens
+
+    Youngjin Kwon,       Hangchen Yu, Simon Peter, Christopher J. Rossbach1 , Emmett Witchel
+                                     The University of Texas at Austin
+                     1 The University of Texas at Austin and VMware Research Group
+
+
+
+
+Abstract                                                      multi-dimensional page tables amplify worst-case trans-
+Modern computing is hungry for RAM, with today’s enor-        lation costs by 6× [59]. Hardware manufacturers have
+mous capacities eagerly consumed by diverse workloads.        addressed increasing DRAM capacity with better support
+Hardware address translation overheads have grown with        for larger page sizes, or huge pages, which reduce address
+memory capacity, motivating hardware manufacturers to         translation overheads by reducing the frequency of TLB
+provide TLBs with thousands of entries for large page         misses. However, the success of these mechanisms is crit-
+sizes (called huge pages). Operating systems and hypervi-     ically dependent on the ability of the operating systems
+sors support huge pages with a hodge-podge of best-effort     and hypervisors to manage huge pages.
+algorithms and spot fixes that made sense for architectures      While huge pages have been commonly supported in
+with limited huge page support, but the time has come for     hardware since the 90s [75, 76], until recently, processors
+a more fundamental redesign.                                  have had a very small number of TLB entries reserved
+   Ingens is a framework for huge page support that re-       for huge pages, limiting their usability. Newer architec-
+lies on a handful of basic primitives to provide trans-       tures support thousands of huge page entries in dual-level
+parent huge page support in a principled, coordinated         TLBs (e.g., 1,536 in Intel’s Skylake [1]), which is a major
+way. By managing contiguity as a first-class resource and     change: the onus of better huge page support has shifted
+by tracking utilization and access frequency of memory        from the hardware to the system software. There is now
+pages, Ingens is able to eliminate a number of fairness       both an urgent need and an opportunity to modernize
+and performance pathologies that plague current systems.      memory management.
+Experiments with our prototype demonstrate fairness im-          Operating system memory management has generally
+provements, performance improvements (up to 18%), tail-       responded to huge page hardware with best-effort algo-
+latency reduction (up to 41%), and reduction of memory        rithms and spot fixes, choosing to keep their management
+bloat from 69% to less than 1% for important applications     algorithms focused on the 4KB page (which we call a base
+like Web services (e.g., the Cloudstone benchmark) and        page). For example, Linux and KVM (Linux’s in-kernel
+the Redis key-value store.                                    hypervisor) adequately support many large-memory work-
+                                                              loads (i.e., ones with simple, static memory allocation be-
+1     Introduction                                            havior), but a variety of common workloads are exposed
+Modern computing platforms can support terabytes of           to unacceptable performance overheads, wasted memory
+RAM and workloads able to take advantage of such large        capacity, and unfair performance variability when using
+memories are now commonplace [51]. However, in-               huge pages. These problems are common and severe
+creased capacity represents a significant challenge for       enough that administrators generally disable huge pages
+address translation. All modern processors use page ta-       (e.g., MongoDB, Couchbase, Redis, SAP, Splunk, etc.)
+bles for address translation and TLBs to cache virtual-       despite their obvious average-case performance advan-
+to-physical mappings. Because TLB capacities cannot           tages [24, 9, 11, 30, 26, 32, 34, 37]. Other operating
+scale at the same rate as DRAM, TLB misses and address        systems have similar or even more severe problems sup-
+translation can incur crippling performance penalties for     porting huge pages (see §2.2 and §3.4).
+large memory workloads [44, 53] when these workloads             Ingens1 is a memory manager for the operating system
+use traditional page sizes (i.e., 4KB). Hardware-supported    and hypervisor that replaces the best-effort mechanisms
+address virtualization (e.g., AMD’s nested page tables) in-
+creases average-case address translation overhead because       1 Ingens is Latin for huge.
+
+
+
+
+USENIX Association                 12th USENIX Symposium on Operating Systems Design and Implementation             705
+and spot-fixes of the past with a coordinated, unified ap-    recently used page table entries cached in the hardware
+proach to huge pages; one that is better targeted to the      translation lookaside buffer (TLB). Increasing the page
+increased TLB capacity in modern processors. Ingens           size increases TLB reach (the amount of data covered by
+does not interfere with workloads that perform well with      translations cached in the TLB), but larger pages require
+current huge page support: the prototype adds 0.7% over-      larger regions of contiguous physical memory. Large
+head on average (Table 4). Ingens addresses the following     pages can suffer from internal fragmentation (unused por-
+problems endemic to current huge page support, and we         tions within the unit of allocation) and can also increase
+quantify the impact of these problems on real workloads       external fragmentation (reducing the remaining supply
+using our prototype.                                          of contiguous physical memory). Using larger pages re-
+   • Latency. Huge pages expose applications to high          quires more active memory management from the system
+latency variation and increased tail latency (§3.1). Ingens   software to increase available contiguity and avoid frag-
+improves the Cloudstone benchmark [77] by 18% and             mentation.
+reduces 90th percentile tail-latency by 41%.                     Seminal work in huge page management recognized
+   • Bloat. Huge pages can make a process or virtual          the importance of explicitly managing memory contiguity
+machine (VM) occupy a large amount of physical memory         in the OS [68] and formed the basis for huge page support
+while much of that memory remains unusable due to             in FreeBSD. Innovations of Ingens relative to previous
+internal fragmentation (§3.2). For Redis, Linux bloats        work are considered in detail in Section 3.4; here we
+memory use by 69%, while Ingens bloats by just 0.8%.          survey recent hardware trends that make the need for
+   • Unfairness. Simple, greedy allocation of huge            system support of huge pages more urgent.
+pages is unfair, causing large and persistent performance
+variation across identical processes or VMs (§3.5). Ingens    DRAM Growth. Larger DRAM sizes have led to
+makes huge page allocation fair (e.g., Figure 5).             deeper page tables, increasing the number of memory
+   • High-performance memory savings. Services that           references needed to look up a virtual page number. x86
+reduce memory consumption, such as kernel same-page           uses a 4-level page table with a worst case of four page
+merging (KSM), can prevent a VM from using huge pages         table memory references to perform a single address trans-
+(§3.6). On one workload (Figure 11), Linux saves 9.2%         lation.
+of memory but slows down the programs by 6.8–19%.
+Ingens saves 71.3% of the memory that Linux/KVM can
+                                                              Hardware memory virtualization. Extended page ta-
+save with only a 1.5–2.6% slowdown.
+                                                              bles (Intel) or nested page tables (AMD) require addi-
+   Ingens is a memory management redesign that brings
+                                                              tional indirection for each stage of memory address trans-
+performance, memory savings and fairness to memory-
+                                                              lation, making the process of resolving a virtual page
+intensive applications with dynamic memory behavior.
+                                                              number even more complex. With extended page tables,
+It is based on two principles: (1) memory contiguity is
+                                                              both the guest OS and host hypervisor perform virtual to
+an explicit resource to be allocated across processes and
+                                                              physical translations to satisfy a single request. During
+(2) good information about spatial and temporal access
+                                                              translation, guest physical addresses are treated as host
+patterns is essential to managing contiguity; it allows the
+                                                              virtual addresses, which use hardware page-table walkers
+OS to tell/predict when contiguity is/will be profitably
+                                                              to perform the entire translation. Each layer of lookup in
+used. The measured performance of the Ingens prototype
+                                                              the guest can require a multi-level translation in the host,
+on realistic workloads validates the approach.
+                                                              amplifying the maximum cost to 24 lookups [59, 40], and
+2     Background                                              increasing average latencies [67].
+Current trends in memory management hardware are mak-
+                                                              Increased TLB reach. Recently, Intel has moved to
+ing it critical that system software support huge pages ef-
+                                                              a two-level TLB design, and in the past few years has
+ficiently and flexibly. This section considers those trends
+                                                              provided a significant number of second-level TLB entries
+along with the challenges huge page support creates for
+                                                              for huge pages, going from zero for Sandy Bridge and
+the OS and hypervisor. We provide an overview of huge
+                                                              Ivy Bridge to 1,024 for Haswell [2] (2013) and 1,536 for
+page support in modern operating systems and conclude
+                                                              Skylake [1] (2015).
+with experiments that show the performance benefits for
+the state-of-the-art in huge page management.                    Better hardware support for multiple page sizes creates
+                                                              an opportunity for the OS and the hypervisor, but it puts
+2.1   Virtual memory hardware trends
+                                                              stress on the current memory management algorithms.
+Virtual memory decouples the address space used by pro-       In addition to managing the complexity of different page
+grams from that exported by physical memory (RAM).            granularities, system software must generate and maintain
+A page table maps virtual to physical page number, with       significant memory contiguity to use larger page sizes.
+
+
+
+706    12th USENIX Symposium on Operating Systems Design and Implementation                        USENIX Association
+Name            Suite/Application  Description                                                  Issue          OS Hyp
+429.mcf         SPEC CPU 2006 [33] Single-threaded scientific computation             Page fault latency (§3.1) O
+Canneal         PARSEC 3.0 [28]    Parallel scientific computation
+                                                                                      Bloat (§3.2)              O
+SVM [64]        Liblinear [22]     Machine learning, Support vector machine
+Tunkrank [8]    PowerGraph [55]    Large scale in-memory graph analytics              Fragmentation (§3.3)      O O
+Nutch [19]      Hadoop [4]         Web search indexing using MapReduce                Unfair allocation (§3.5) O O
+MovieRecmd [25] Spark/MLlib [5]    Machine learning, Movie recommendation             Memory sharing (§3.6)        O
+Olio            Cloudstone [8]     Social-event Web service (ngnix/php/mysql)
+Redis           Redis [29]         In-memory Key-value store
+                                                                                       Table 2: Summary of issues
+MongoDB         MongoDB [23]       In-memory NoSQL database
+                                                                                       in Linux as the guest OS and
+                                                                                       KVM as the host hypervisor.
+         Table 1: Summary of memory intensive workloads.
+
+2.2   Operating system support for huge pages                  multi-programmed workloads and workloads with more
+                                                               complex memory behavior are common in enterprise and
+Early operating system support for huge pages provided a
+                                                               cloud computing, so Ingens focuses on OS support for
+separate interface for explicit huge page allocation from a
+                                                               these more challenging cases. While transparent huge
+dedicated huge page pool configured by the system admin-
+                                                               page support is far more developer-friendly than explicit
+istrator. Windows and OS X continue to have this level of
+                                                               allocation, it creates memory management challenges in
+support. In Windows, applications must use an explicit
+                                                               the operating system that Ingens addresses.
+memory allocation API for huge page allocation [21] and
+                                                                  Linux running on Intel processors currently has the
+Windows recommends that applications allocate huge
+                                                               best transparent huge page support among commodity
+pages all at once when they begin. OS X applications also
+                                                               OSes so we base our prototype on it and most of our
+must set an explicit flag in the memory allocation API to
+                                                               discussion focuses on Linux. We quantify Linux’s perfor-
+use huge pages [15].
+                                                               mance advantages in Section 3.4. The design of Ingens
+   Initial huge page support in Linux used a similar sep-      focuses on 4 KB (base) and 2 MB (huge) pages because
+arate interface for huge page allocation that a developer      these are most useful to applications with dynamic mem-
+must invoke explicitly (called hugetlbfs). Developers          ory behavior (1 GB are usually too large for user data
+did not like the burden of this alternate API and kernel       structures).
+developers wanted to bring the benefits of huge pages to
+legacy applications and applications with dynamic mem-         Linux is greedy and aggressive. Linux’s huge page
+ory behavior [6, 36]. Hence, the primary way huge pages        management algorithms are greedy: it promotes huge
+are allocated in Linux today is transparently by the kernel.   pages in the page fault handler based on local information.
+                                                               Linux is also aggressive: it will always try to allocate
+Transparent support is vital. Transparent huge page            a huge page. Huge pages require 2 MB of contiguous
+support [80, 68] is the only practical way to bring the        free physical memory but sometimes contiguous phys-
+benefits of huge pages to all applications, which can re-      ical memory is in short supply (e.g., when memory is
+main unchanged while the system provides them with the         fragmented). Linux’s approach to huge page allocation
+often significant performance advantages of huge pages.        works well for simple applications that allocate a large
+With transparent huge page support, the kernel allocates       memory region and use it uniformly, but we demonstrate
+memory to applications using base pages. We say the ker-       many applications that have more complex behavior and
+nel promotes a sequence of 512 properly aligned pages          are penalized by Linux’s greedy and aggressive promo-
+to a huge page (and demotes a huge page into 512 base          tion of huge pages (§3). Ingens recognizes that memory
+pages).                                                        contiguity is a valuable resource and explicitly manages
+   Transparent management of huge pages best supports          it.
+the multi-programmed and dynamic workloads typical
+                                                               2.3   Hypervisor support for huge pages
+of web applications and analytics where memory is con-
+tended and access patterns are often unpredictable. To         Ingens focuses on the case where Linux is used both as
+the contrary, when a single big-memory application is          the guest operating system and as the host hypervisor
+the only important program running, the application can        (i.e., KVM [62]). The Linux/KVM pair is widely used in
+simply map a large region and keep it mapped for the           cloud deployments [27, 16, 3]. In the hypervisor, Ingens
+duration of execution, for example fast network functions      supports host huge pages mapped from guest physical
+using Intel’s Data Plane Development Kit [10]. These           memory. When promoting guest physical memory, In-
+simple programs are well supported by even the rudimen-        gens modifies the extended page table to use huge pages
+tary huge page support in Windows and OS X. However,           because it is acting as a hypervisor, not as an operating
+
+
+
+USENIX Association                  12th USENIX Symposium on Operating Systems Design and Implementation             707
+      Workloads       h Bg H      h Hg B      h Hg H           performance, often significantly (up to 53%). The largest
+      429.mcf           1.18        1.13        1.43           speedup is always attained when both host and guest use
+      Canneal           1.11        1.10        1.32           huge pages.
+      SVM               1.14        1.17        1.53              These results show the value of huge page support
+      Tunkrank          1.11        1.11        1.30           and show that Linux’s memory manager can obtain that
+      Nutch             1.01        1.07        1.12           benefit under simple operating conditions. However, a
+      MovieRecmd        1.03        1.02        1.11           variety of more challenging circumstances expose the
+      Olio              1.43        1.08        1.46           limitations of Linux’s memory management.
+      Redis             1.12        1.04        1.20
+      MongoDB           1.08        1.22        1.37
+                                                               3     Current huge page problems
+                                                               This section quantifies the limitations in performance
+                                                               and fairness for the state-of-the-art in transparent huge
+Table 3: Application speed up for huge page (2 MB)             page management. We examine virtualized systems with
+support relative to host (h) and guest (g) using base (4 KB)   Linux/KVM as the guest OS and hypervisor. The variety
+pages. For example, h B means the host uses base pages         and severity of the limitations motivate our redesign of
+and h H means the host uses both base and huge pages.          page management. All data is collected using the experi-
+                                                               mental setup described in Section 2.4.
+system.                                                        3.1   Page fault latency and synchronous promotion
+   Because operating system and hypervisor memory man-
+agement are unified in Linux, Ingens adopts the unified        When a process faults on an anonymous memory region,
+model. Some of the problems with huge pages that we de-        the page fault handler allocates physical memory to back
+scribe in Section 3 only apply to the OS and some only to      the page. Both base and huge pages share this code path.
+the hypervisor (summarized in Table 2). For example, ad-       Linux is greedy and aggressive in its allocation of huge
+dressing memory sharing vs. performance (§3.6) requires        pages, so if an application faults on a base page, Linux
+only hypervisor modifications and would be as successful       will immediately try to upgrade the request and allocate a
+for a Windows guest as it is for a Linux guest. We leave       huge page if it can.
+for future work determining the most efficient way to             This greedy approach fundamentally increases page
+implement Ingens for operating systems and hypervisors         fault latency for two reasons. First, Linux must zero pages
+that do not share memory management code.                      before returning them to the user. Huge pages are 512×
+                                                               larger than base pages, and thus are much slower to clear.
+2.4   Performance improvement from huge pages                  Second, huge page allocation requires 2 MB of physically
+Table 1 describes a variety of memory-intensive real-          contiguous memory. When memory is fragmented, the
+world applications including web infrastructure such as        OS often must compact memory to generate that much
+key/value stores and databases, as well as scientific ap-      contiguity. Previous work shows that memory quickly
+plications, data analytics and recommendation systems.         fragments in multi-tenant cloud environments [41]. When
+Measurements with hardware performance counters show           memory is fragmented, Linux will often synchronously
+they all spend a significant portion of their execution time   compact memory in the page fault handler, increasing
+doing page walks. For example, when using base pages           average and tail latency.
+for both guest and host, we measure 429.mcf spending              To measure these effects, we compare page fault la-
+47.5% of its execution time doing page walks (24.2% for        tency when huge pages are enabled and disabled, in frag-
+the extended page table and 23.3% for the guest page           mented and non-fragmented settings. We quantify frag-
+table). On the other hand, 429.mcf spends only 4.2% of         mentation using the free memory fragmentation index
+its execution time walking page tables when using huge         (FMFI) [58], a value between 0 (unfragmented) and 1
+pages for both the guest and host.                             (highly fragmented). A microbenchmark maps 10 GB of
+   We execute all workloads in a KVM virtual machine           anonymous virtual memory and reads it sequentially.
+running Linux with default transparent huge page sup-             When memory is unfragmented (FMFI < 0.1), page
+port [80] for both the application (in the guest OS) and       clearing overheads increase average page fault latency
+the virtual machine (in the host OS). The hardware con-        from 3.6 µs for base pages only to 378 µs for huge pages
+figuration is detailed in Section 6.                           (105× slower). When memory is heavily fragmented,
+   Table 3 shows the performance improvements gained           (FMFI = 0.9), the 3.6 µs average latency for base pages
+with transparent huge page support for both the guest          grows to 8.1 µs (2.1× slower) for base and huge pages.
+and the host operating system. The table shows speedup         Average latency is lower in the fragmented case because
+normalized to the case where both host and guest use           98% of the allocations fall back to base pages (e.g. be-
+only base pages. In every case, huge page support helps        cause memory is too fragmented to allocate a huge page).
+
+
+
+708    12th USENIX Symposium on Operating Systems Design and Implementation                         USENIX Association
+                                                                                     1.0
+   SVM                  Synchronous      Asynchronous                                            Redis using huge page
+   Exec. time (sec)      178 (1.30×)      228 (1.02×)                                            Redis not using huge page
+   Huge page                  4.8 GB          468 MB                                 0.8
+
+
+
+
+                                                               Fragmentation index
+   Promotion speed        immediate          1.6 MB/s
+                                                                                     0.6
+Table 4: Comparison of synchronous promotion and asyn-
+chronous promotion when both host and guest use huge
+pages. The parenthesis is speedup compared to not using                              0.4
+huge pages. We use the default asynchronous promotion
+speed of Ubuntu 14.04.
+                                                                                     0.2
+ Workload Using huge pages Not using huge pages
+ Redis    20.7 GB (1.69×)        12.2 GB                                             0.0
+ MongoDB 12.4 GB (1.23×)         10.1 GB                                                0         20         40        60      80   100
+                                                                                                              time (sec)
+Table 5: Physical memory size of Redis and MongoDB.              Figure 1: Fragmentation index in Linux when running a
+                                                                 Redis server, with Linux using (and not using) huge pages.
+Compacting and zeroing memory in the page fault handler          The System has 24 GB memory. Redis uses 13 GB, other
+penalizes applications that are sensitive to average latency     processes use 5 GB, and system has 6 GB free memory.
+and to tail latency, such as Web services.
+   To avoid this additional page fault latency, Linux can        million get requests for 15 million 1 KB objects which
+promote huge pages asynchronously, based on a config-            are initially in persistent storage. MongoDB allocates the
+urable asynchronous promotion speed (in MB/s). Table 4           objects sparsely in a large virtual address space. Linux
+shows performance measurements for asynchronous-only             promotes huge pages including unused memory, and as
+huge page promotion when executing SVM in a virtual              a result, MongoDB uses 23% more memory relative to
+machine. Asynchronous-only promotion turns a 30%                 running without huge page support.
+speedup into a 2% speedup: it does not promote fast
+                                                                    Greedy and aggressive allocation of huge pages makes
+enough. Simply increasing the promotion speed does
+                                                                 it impossible to predict an application’s total memory
+not solve the problem. Earlier implementations of Linux
+                                                                 usage in production because memory usage depends on
+did more aggressive asynchronous promotion, incurring
+                                                                 huge page use, which in turn depends on memory frag-
+unacceptably high CPU utilization for memory scanning
+                                                                 mentation and the allocation pattern of applications. Ta-
+and compaction. The CPU use of aggressive promotion
+                                                                 ble 5 shows if an administrator provisions 18 GB memory
+reduced or in some cases erased the performance benefits
+                                                                 (1.5× over-provisioning relative to using only base pages),
+of huge pages, causing users to disable transparent huge
+                                                                 Redis starts swapping when it uses huge pages, negating
+page support in practice [17, 14, 13, 7].
+                                                                 the benefits of caching objects in memory [31].
+3.2   Increased memory footprint (bloat)                            While these experiments illustrate the potential impact
+Huge pages improve performance, but applications do              of bloat for a handful of workloads, it is important to
+not always fully utilize the huge pages allocated to them.       note that the problem is fundamental to Linux’s current
+Linux greedily allocates huge pages even though under-           design. Memory bloating can happen in any working
+utilized huge pages create internal fragmentation. A huge        set, memory, and TLB size: application-level memory
+page might eliminate TLB misses, but the cost is that a          usage can conspire with aggressive promotion to create
+process using less than a full huge page has to reserve the      internal fragmentation that the OS cannot address. In
+entire region.                                                   such situations, such applications will eventually put the
+   Table 5 shows memory bloat from huge pages when               system under memory pressure regardless of physical
+running Redis and MongoDB, each within their own vir-            memory size.
+tual machine. For Redis, we populate 2 million keys with
+                                                                  3.3                      Huge pages increase fragmentation
+8 KB objects and then delete 70% of the keys randomly.
+Redis frees the memory backing the deleted objects which          One common theme in analyzing page fault latency (§3.1)
+leaves physical memory sparsely allocated. Linux pro-             and memory bloat (§3.2) is Linux’s greedy allocation and
+motes the sparsely allocated memory to huge pages, creat-         promotion of huge pages. We now measure how aggres-
+ing internal fragmentation and causing Redis to use 69%           sive promotion of huge pages quickly consumes available
+more memory compared to not using huge pages. We                  physical memory contiguity, which then increases mem-
+demonstrate the same problem in MongoDB, making 10                ory fragmentation for the remaining physical memory.
+
+
+
+USENIX Association                  12th USENIX Symposium on Operating Systems Design and Implementation                            709
+                                                                                            3000
+             OS       SVM      Canneal     Redis
+          FreeBSD     1.28      1.13       1.02
+                                                                                                                                        VM3
+
+
+
+
+                                                               Huge page consumption (MB)
+          Linux       1.30      1.21       1.15                                             2500
+
+
+Table 6: Performance speedup when using huge page in                                        2000
+different operating systems.
+                                                                                            1500
+
+Increasing fragmentation is the precondition for problems
+                                                                                            1000
+with page fault latency and memory bloat, so greedy pro-                                                                                VM1
+motion creates a vicious cycle. We again rely on the free
+memory fragmentation index, or FMFI to quantify the                                          500
+relationship between huge page allocation and fragmenta-                                                                                VM2
+tion.                                                                                          0
+                                                                                                0   100   200   300      400     500   600    700   800
+   Figure 1 shows the fragmentation index over time when                                                              time (sec)
+running the popular key-value store application Redis in a                                         SVM            VM1         VM2      VM3
+virtual machine. Initially, the system is lightly fragmented                                  Exec. time (sec) 533 (1.12×) 589 (1.24×) 475
+(FMFI = 0.3) by other processes. Through the measure-
+ment period, Redis clients populate the server with 13 GB         Figure 2: Unfair allocation of huge pages in KVM. Three
+of key/value pairs. Redis rapidly consumes contiguous             virtual machines run concurrently, each executing SVM.
+memory as Linux allocates huge pages to it, increasing            The line graph is huge page size (MB) over time and the
+the fragmentation index. When the FMFI is equal to 1,             table shows execution time of SVM for 2 iterations.
+the remaining physical memory is so fragmented, Linux
+starts memory compaction to allocate huge pages.
+                                                                  tions with dense, uniform access memory patterns (e.g.,
+3.4   Comparison with FreeBSD huge page support                   SVM) enjoy similar speedups on Linux and FreeBSD.
+FreeBSD supports transparent huge pages using                     However, FreeBSD does not support asynchronous pro-
+reservation-based huge page allocation [68]. When ap-             motion, so applications which allocate memory gradually
+plications start accessing a 2 MB virtual address region,         (e.g., Canneal) show less benefit. Redis makes frequent
+the page fault handler reserves contiguous memory, but            hash table updates and exhibits many read-only huge page
+does not promote the region to a huge page. It allocates          demotions in FreeBSD. Consequently, Redis also shows
+base pages from the reserved memory for subsequent                limited speedup compared with Linux.
+page faults in the region. FreeBSD monitors page utiliza-
+                                                                   3.5                         Unfair performance
+tion of the region and promotes it to a huge page only
+when all base pages of the reserved memory are allocated.         All of our measurements are on virtual machines where
+FreeBSD is therefore slower to promote huge pages than            Linux is the guest operating system, and KVM (Linux’s
+Linux and promotion requires complete utilization of a            in-kernel hypervisor) is the host hypervisor. Ingens mod-
+2 MB region.                                                      ifies the memory management code of both Linux and
+   FreeBSD supports huge pages for file-cached pages.             KVM. The previous sections focused on problems with
+x86 hardware maintains access/dirty bits for entire huge          operating system memory management, the remaining
+pages—any read or write will set the huge page’s ac-              sections describe problems with KVM memory manage-
+cess/dirty bit. FreeBSD wants to avoid increasing IO              ment.
+traffic when evicting from the page cache or swapping.               Unfair huge page allocation can lead to unfair per-
+Therefore it is conservative about creating writable huge         formance differences when huge pages become scarce.
+pages. When FreeBSD promotes a huge page, it marks                Linux does not fairly redistribute contiguity, which can
+it read-only, with writes demoting the huge page. Only            lead to unfair performance imbalance. To demonstrate
+when all pages in the region are modified will FreeBSD            this problem, we run 4 virtual machines in a setting where
+then promote the region to a writable huge page. The              memory is initially fragmented (FMFI = 0.85). Each VM
+read-only promotion design does not increase IO traffic           uses 8 GB of memory. VM0 starts first and obtains all
+from the page cache because huge pages consist of either          huge pages that are available (3 GB). Later, VM1 starts
+all clean (read-only) or all modified base pages.                 and begins allocating memory, during which VM2 and
+   FreeBSD promotion of huge pages is more conservative           VM3 start. VM0 then terminates, releasing its 3 GB of
+than in Linux, which reduces memory bloating, but yields          huge pages. We measure how Linux redistributes that
+slower performance. Table 6 compares the performance              contiguity to the remaining identical VMs.
+benefits of huge pages in FreeBSD and Linux. Applica-                The graph in Figure 2 shows the amount of huge page
+
+
+
+710   12th USENIX Symposium on Operating Systems Design and Implementation                                                     USENIX Association
+   Policy    Mem saving    Performance slowdown         H/M                                              Util radix tree (per process)
+                                    429.mcf: 278    429.mcf: 99%
+    No
+                  –                    SVM: 191       SVM: 99%              Page fault    Update / Lookup
+  sharing
+                                  Tunkrank: 236    Tunkrank: 99%             handler                                       …
+                            429.mcf: 331 (19.0%)    429.mcf: 66%                                          Util bit vector (512 bit)
+   KVM         1.19 GB
+                               SVM: 204 (6.8%)        SVM: 90%                          Identical
+  (Linux)       (9.2%)                                              Promotion
+                           Tunkrank: 268 (13.5%)   Tunkrank: 69%                      page sharing
+                                                                     request                       Lookup Physical page metadata
+ Huge page     199 MB
+                             429.mcf: 278 (0.0%)    429.mcf: 99%                         service             Huge
+                                SVM: 194 (1.5%)       SVM: 99%
+  sharing       (1.5%)
+                            Tunkrank: 238 (0.8%)   Tunkrank: 99%                Lookup
+                                                                                                               Base
+                                                                                              Update
+                                                                                                                      Access bit vector
+Table 7: Memory saving and performance trade off for a multi-                                                              (8 bit)
+                                                                        Promote-kth                            Huge
+process workload. Each row is an experiment where all work-
+loads run concurrently in separate virtual machines. H/M - huge                          Scan-kth
+page ratio out of total memory used. Parentheses in the Mem
+                                                                                 Code                       Data structures
+saving column expresses the memory saved as a percentage of
+the total memory (13 GB) allocated to all three virtual machines.
+                                                                    Figure 3: Important code and data structures in the Ingens
+                                                                    memory manager.
+
+memory allocated to VM1, VM2, and VM3 (all running
+SVM) over time, starting 10 seconds before the termina-             the virtual machine memory size to the working set size
+tion of VM0. When VM1 allocates memory, Linux com-                  of each workload to avoid spurious sharing of zeroed
+pacts memory for huge page allocation, but compaction               pages. KVM saves 9.2% of memory but the workloads
+begins to fail at 810 MB. VM2 and VM3 start without                 show a slowdown of up to 19.0% because TLB misses
+huge pages. When VM0 terminates 10 seconds into the ex-             are increased by splitting huge pages (the percentage of
+periment, Linux allocates all 3 GB of recently freed huge           huge pages in use (H/M) goes down to 66%). On the
+pages to VM3 through asynchronous promotion. This                   other hand, while huge page sharing preserves good per-
+creates significant and persistent performance inequality           formance, it provides only reduced memory consumption
+among the VMs. The table in Figure 2 shows the variation            by 1.5%. This tradeoff between performance and memory
+in performance (NB: to avoid IO measurement noise, data             savings is avoidable. Identical page sharing services can
+loading time is excluded from the measurement). In a                and should be coordinated with huge page management
+cloud provider scenario, with purchased VM instances of             to obtain both performance and memory saving benefits.
+the same type, users have good reason to expect similar
+performance from identical virtual machine instances, but           4     Design
+VM2 is 24% slower than VM3.
+                                                                    Ingens’s goal is to enable transparent huge page support
+3.6   Memory sharing vs. performance                                that reduces latency, latency variability and bloat while
+                                                                    providing meaningful fairness guarantees and reasonable
+Modern hypervisors detect and share memory pages from
+                                                                    tradeoffs between high performance and memory sav-
+different virtual machines whose contents are identi-
+                                                                    ings. Ingens builds on a handful of basic primitives to
+cal [81, 63]. The ability to share identical memory re-
+                                                                    achieve these goals: utilization tracking, access frequency
+duces the memory consumed by guest VMs, increasing
+                                                                    tracking, and contiguity monitoring.
+VM consolidation ratios. In KVM, identical page sharing
+in the host is done transparently in units of base pages.              While the discussion in this section is mostly expressed
+If the contents of a base page are duplicated in a differ-          in terms of process behavior, Ingens techniques apply
+ent VM, but the duplicated base page is contained within            equally to processes and to virtual machines. Figure 3
+a huge page, KVM will split the huge page into base                 shows the major data structures and code paths of Ingens,
+pages to enable sharing. This policy prioritizes reducing           which we describe in this section.
+memory footprint over preservation of huge pages, so it
+                                                                    4.1    Monitoring space and time
+penalizes performance.
+   Another possible policy, which we call huge page shar-           Ingens unifies and coordinates huge page management
+ing, would not split huge pages. A base page is not al-             by introducing two efficient mechanisms to measure the
+lowed to share pages belonging to a huge page to prevent            utilization of huge-page sized regions (space) and how
+the demotion of the huge page but it can share base pages.          frequently huge-page sized regions are accessed (time).
+In contrast, a huge page is only allowed to share huge              Ingens collects this information efficiently and then lever-
+pages. We implement huge page sharing to compare                    ages it throughout the kernel to make policy decisions,
+with KVM and the result is shown in Table 7. We fit                 using two bitvectors. We describe both.
+
+
+
+USENIX Association                     12th USENIX Symposium on Operating Systems Design and Implementation                        711
+Util bitvector. The util bitvector records which base           accumulates enough allocated base pages (90% in our
+pages are used within each huge-page sized memory re-           prototype), the page fault handler wakes up Promote-kth
+gion (an aligned 2 MB region containing 512 base pages).        to promote the base pages to a huge page.
+Each bit set in the util bitvector indicates that the corre-       Utilization tracking lets Ingens mitigate memory bloat-
+sponding base page is in use. The bitvector is stored in a      ing. Because Ingens allocates contiguous resources only
+radix tree and Ingens uses a huge-page number as the key        for highly utilized virtual address regions, it can control
+to lookup a bitvector. The page fault handler updates the       internal fragmentation. The utilization threshold provides
+util bitvector.                                                 an upper bound on memory bloat. For example, if an
+Access bitvector. The access bitvector records the re-          administrator sets the threshold to 90%, processes can
+cent access history of a process to its pages (base or huge).   use only 10% more memory in the worst case compared
+Scan-kth periodically scans a process’ hardware access          to a system using base pages only. The administrator
+bits in its page table to maintain per-page (base or huge)      can simply provision 10% additional memory to avoid
+access frequency information, stored as an 8-bit vector         unexpected swapping.
+within Linux’ page metadata. Ingens computes the expo-          Utilization-based demotion (performance). Pro-
+nential moving average (EMA) [12] from the bitvector            cesses can free a base page, usually by calling free. If a
+which we define as follows:                                     freed base page is contained within a huge page, Linux
+                                                                demotes the huge page instantly. For example, Redis
+      Ft = α(weight(util bitvector)) + (1 − α)Ft−1       (1)    frees objects when deleting keys which results in a system
+                                                                call to free the memory. Redis uses jemalloc [20], whose
+The weight is the sum of set bits in the bitvector, Ft is
+                                                                free implementation makes an madvise system call
+the access frequency value at time t, and α is a parame-
+                                                                with the MADV_DONTNEED flag to release the memory2 .
+ter. Based on a sensitivity analysis using our workloads,
+                                                                Linux demotes the huge page that contains the freed base
+we set α to 0.4, meaning Ingens considers the page “fre-
+                                                                page3 .
+quently accessed” when Ft ≥ 3 × bitvector size/4 (i.e., 6
+                                                                   Demoting in-use huge pages hurts performance. Con-
+in our case).
+                                                                sequently, Ingens defers the demotion of high utilization
+   We can experimentally verify the accuracy of the fre-
+                                                                huge pages. When a base page is freed within a huge
+quency information by checking whether pages classified
+                                                                page, Ingens clears the bit for the page in the util bitvec-
+as frequently accessed have their access bit set in the
+                                                                tor. When utilization drops below a threshold, Ingens
+next scan interval: in most workloads we find the mis-
+                                                                demotes the huge page and frees the base pages whose
+prediction ratio to be under 3%, although random access
+                                                                bits are clear in the util bitvector.
+patterns (e.g. Redis, MongoDB) can yield higher error
+rates depending on the dynamic request pattern.                 4.4   Proactive batched compaction (reduce fragmen-
+4.2   Fast page faults                                                tation)
+
+To keep the page fault handling path fast, Ingens decou-        Maintaining available free contiguous memory is impor-
+ples promotion decisions (policy) from huge page alloca-        tant to satisfy large size allocation requests required when
+tion (mechanism). The page fault handler decides when           Ingens decides to promote a region to a huge page, or to
+to promote a huge page and signals a background thread          satisfy other system-level contiguity in service of, for ex-
+(called Promote-kth) to do the promotion (and alloca-           ample, device drivers or user-level DMA. To this end, In-
+tion if necessary) asynchronously (Figure 3). Promote-kth       gens monitors the fragmentation state of physical memory
+compacts memory if necessary and promotes the pages             and proactively compacts memory to reduce the latency
+identified by the page fault handler. The Ingens page           of large contiguous allocations.
+fault handler never does a high-latency huge page alloca-          Ingens’s goal is to control memory fragmentation by
+tion. When Promote-kth starts executing, it has a list of       keeping FMFI below a threshold (that defaults to 0.8).
+viable candidates for promotion; after promoting them,          Proactive compaction happens in Promote-kth after per-
+it resumes its scan of virtual memory to find additional        forming periodic scanning. Aggressive proactive com-
+candidates.                                                     paction causes high CPU utilization, interfering with user
+                                                                applications. Ingens limits the maximum amount of com-
+4.3   Utilization-based promotion (mitigate bloat)              pacted memory to 100 MB for each compaction. Com-
+Ingens explicitly and conservatively manages memory             paction moves pages, which necessitates TLB invalida-
+contiguity as a resource, allocating contiguous memory          tions. Ingens does not move frequently accessed pages to
+only when it decides a process (or VM) will use most of            2 TCMalloc [35] also functions this way.
+the allocated region based on utilization. Ingens allocates         3 Kernel version 4.5 introduces a new mechanism to free memory
+only base pages in the page fault handler and tracks base       efficiently, called MADV FREE but it also demotes huge pages instantly
+page allocations in the util bitvector. If a huge page region   and causes the same memory bloating problem as MADV DONTNEED.
+
+
+
+
+712   12th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+reduce the performance impact of compaction.                     hence the lowest priority for obtaining new huge pages.
+                                                                 τ = 1 means M disregards idle memory while τ close
+4.5   Balance page sharing with performance
+                                                                 to 0 means M ’s value is inversely proportional to the
+Ingens uses access frequency information to balance iden-        amount of idle memory.
+tical page sharing with application performance. It de-             A kernel thread (called Scan-kth) periodically pro-
+cides whether or not huge pages should be demoted to             files the idle fraction of huge pages in each process and
+enable sharing of identical base pages contained within          updates the value of M for fair promotion.
+the huge page. In contrast to KVM, which always priori-
+                                                                 4.7   Fair promotion
+tizes memory savings over contiguity, Ingens implements
+a policy that avoids demoting frequently accessed huge           Promote-kth performs fair allocation of contiguity using
+pages. When encountering a matching identical base-page          the promotion metric. When contiguity is contended,
+sized region within a huge page, Ingens denies sharing if        fairness is achieved when all processes have a priority-
+that huge page is frequently accessed, otherwise it allows       proportional share of the available contiguity. Mathe-
+the huge page to be demoted for sharing.                         matically this is achieved by minimizing O, defined as
+   For page sharing, the kernel marks a shared page read-        follows:
+only. When a process writes the page, the kernel stops                              O = ∑(Mi − M¯)2                   (3)
+sharing the page and allocates a new page to the process                                   i
+
+(similar to a copy-on-write mechanism). Ingens checks            The Mi indicates the promotion metric of process/VM i
+the utilization for the huge page region enclosing the new       and M¯ is the mean of all process’ promotion metrics.
+page and if it is highly utilized, it promotes the page          Intuitively, the formula characterizes how much process’
+(while Linux would wait for asychronous promotion).              contiguity allocation (Mi ) deviates from a fair state (M¯):
+                                                                 in a perfectly fair state, all the Mi equal M¯, yielding a
+4.6   Proportional promotion manages contiguity
+                                                                 0-valued O.
+Ingens monitors and distributes memory contiguity fairly            In practice, to optimize O, it suffices to iteratively se-
+among processes and VMs, employing techniques for                lect the process with the biggest Mi , scan its address
+proportional fair sharing of memory with an idleness             space to promote huge pages, and update Mi and O. It-
+penalty [81]. Each process has a share priority for mem-         eration stops when O is close to 0 or when Promote-kth
+ory that begins at an arbitrary but standard value (e.g,         cannot generate any additional huge pages (e.g., all pro-
+10,000). Ingens allocates huge pages in proportion to the        cess are completely backed by huge pages).
+share value. Ingens counts infrequently accessed pages as           An important benefit of this approach is that it does not
+idle memory and imposes a penalty for the idle memory.           require a performance model and it applies equally well
+An application that has received many huge pages but is          to processes and virtual machines.
+not using them actively does not get more.
+   We adapt ESX’s adjusted shares-per-page ratio [81] to
+                                                                 5     Implementation
+express our per-process memory promotion metric mathe-           Ingens is implemented in Linux 4.3.0 and contains new
+matically as follows.                                            mechanisms to support page utilization and access fre-
+                                                                 quency tracking. It also uses Linux infrastructure for huge
+                                  S                              page page table mappings and memory compaction.
+                 M=                                       (2)
+                        H · ( f + τ(1 − f ))
+                                                                 5.1   Huge page promotion
+where S is a process’ (or virtual machine’s or con-              Promote-kth runs as a background kernel thread and
+tainer’s) huge page share priority and H is the number           schedules huge page promotions (replacing Linux’s
+of bytes backed by huge pages allocated to the process.          khugepaged). Promote-kth maintains two priority lists:
+( f + τ(1 − f )) is a penalty factor for idle huge pages. f is   high and normal. The high priority list is a global list
+the fraction of idle huge pages relative to the total number     containing promotion requests from the page fault handler
+of huge pages used by this process (0 ≤ f ≤ 1) and τ, with       and the normal priority list is a per-application list filled
+0 < τ ≤ 1, is a parameter to control the idleness penalty.       in as Promote-kth periodically scans the address space.
+Larger values of M receive higher priority for huge page         The page fault handler or a periodic timer wakes Promote-
+promotion.                                                       kth, which then examines the two lists and promotes in
+    Intuitively, if two processes’ S value are similar and       priority order.
+one process has fewer huge pages (H is smaller), then the           Ingens does not reserve contiguous memory in the page
+kernel prioritizes promotion (or allocation and promotion)       fault handler. When the page fault handler requests a huge
+of huge pages for that process. If S and H values are            page promotion, the physical memory backing the base
+similar among a group of processes, the process with             pages might not be contiguous. In this case, Promote-kth
+the largest fraction of idle pages has the smaller M , and       allocates a new 2 MB contiguous physical memory region,
+
+
+
+USENIX Association                   12th USENIX Symposium on Operating Systems Design and Implementation                713
+copies the data from the discontiguous physical memory,        resets all access bits, the execution time of the workload
+and maps the contiguous physical memory into the pro-          is degraded by 29%. Sampling-based scanning reduces
+cess’ virtual address space. After promotion, Promote-kth      the overhead to 8%. In contrast to this worst-case mi-
+frees the original discontiguous physical memory.              crobenchmark, Section 6 shows that slowdowns of Ingens
+   An application’s virtual address space can grow, shrink,    on real workloads average 1%.
+or be merged with other virtual address regions. These         5.3   Limitations and future work
+changes make new opportunities for huge page promo-
+tion which both Linux and Ingens detect by periodically        Linux supports transparent huge pages only for anony-
+scanning address spaces in the normal priority list (Linux     mous memory because huge page support for page cache
+in khugepaged, Ingens in Promote-kth). For example,            pages can significantly increase I/O traffic, potentially
+a virtual address region that is smaller than the size of a    offsetting the benefits of huge pages. If Linux adds huge
+huge page might merge with another region, allowing it         pages to the page cache, it will make sense to extend In-
+to be part of a huge page.                                     gens to manage them with the goal of improving the read-
+   Promote-kth compares the promotion metric (§4.6) of         only page cache support (implemented in FreeBSD [68]),
+each application and selects the process with the highest      while avoiding significant increases in I/O traffic for write-
+deviation from a fair state (§4.7). It scans 16 MB of pages    back of huge pages which are sparsely modified.
+and sleeps for 10 seconds which is also Linux’s default           Hardware support for finer-grain tracking of access and
+settings (i.e., the 1.6 MB/s in Table 4). After scanning       dirty bits for huge pages would benefit Ingens. Hardware-
+a process’ entire address space, Promote-kth records the       managed access and dirty bits for all base pages within a
+number of promoted huge pages and if an application has        huge page region could avoid wasted I/O on write-back
+too few promotions (zero in the prototype), Promote-kth        of dirty pages, and enable much better informed decisions
+excludes the application from the normal priority list for     about when to demote a huge page or when huge pages
+120 seconds. This mechanism prevents an adversarial            can be reclaimed fairly under memory pressure.
+application that can monopolize Promote-kth. Such an           NUMA considerations. Ingens maintains Linux’s
+application would have a small number of huge pages and        NUMA heuristics, preferring pages from a node’s local
+would appear to be a good candidate to scan to increase        NUMA region, and refusing to allocate a huge page from
+fairness (§4.7)).                                              a different NUMA domain. All of our measurements are
+5.2   Access frequency tracking                                within a single NUMA region.
+                                                                  Previous work has shown that if memory is shared
+In 2015, Linux added an access bit tracking frame-             across NUMA nodes, huge pages may contribute to mem-
+work [70] for version 4.3. The kernel adds an idle flag        ory request imbalance across different memory controllers
+for each physical page and uses hardware access bits to        and reduced locality of accesses, decreasing their perfor-
+track when a page remains unused. If the hardware sets         mance benefit [54]. This happens due to page-level false
+an access bit, the kernel clears the idle bit. The framework   sharing, where unrelated data is accessed on the same
+provides APIs to query the idle flags and clear the access     page, and the hot page effect, which is exacerbated by
+bit. Scan-kth uses this framework to find idle memory          the large page size. The authors propose extensions to
+during a periodic scan of application memory. The default      Linux’ huge page allocation mechanism to balance huge
+period is 2 seconds. Scan-kth clears the access bits at the    pages among NUMA domains and to split huge pages if
+beginning of the profiling period and queries the idle flag    false sharing is detected or if they become too hot. These
+at the end.                                                    extensions integrate nicely with Ingens. Scan-kth can al-
+   In the x86 architecture, clearing the access bit causes     ready measure page access frequencies and Promote-kth
+a TLB invalidation for the corresponding page. Conse-          can check whether huge pages need to be demoted.
+quently, frequent periodic scanning can have a negative
+performance impact. To ameliorate this problem, Ingens         6     Evaluation
+supports frequency-aware profiling and sampling. When          We evaluate Ingens using the applications in Table 1,
+Scan-kth needs to clear the access bit of a page, it checks    comparing against the performance of Linux’s huge page
+whether the page is frequently accessed or not. If it is       support which is state-of-the-art. Experiments are per-
+not frequently accessed, Scan-kth clears the access bit,       formed on two Intel Xeon E5-2640 v3 2.60GHz CPUs
+otherwise it clears it with 20% probability. Ingens uses an    (Haswell) with 64 GB memory and two 256 MB SSDs.
+efficient hardware-based random number generator [18].         We use Linux 4.3 and Ubuntu 14.04 for both the guest
+   To verify that sampling reduces worst case overheads,       and host system. Intel supports multiple hardware page
+we run a synthetic benchmark which reads 10 GB mem-            sizes of 4 KB, 2 MB and 1 GB; our experiments use only
+ory randomly without any computation, and measure the          4 KB and 2 MB huge pages. We set the number of vCPUs
+execution time for one million iterations. When Ingens         equal to the number of application threads.
+
+
+
+714   12th USENIX Symposium on Operating Systems Design and Implementation                            USENIX Association
+                                    Ingens overhead
+           3.0%                                                                          Linux         Ingens
+                                                                                         922.3     1091.9 (1.18×)
+Slowdown
+
+
+           2.0%
+
+           1.0%                                                       (a) Throughput of full operation mix (requests/sec and speedup
+                                                                      normalized to Linux).
+           0.0%
+                            SVM
+                           Redis
+                             Olio
+
+
+                                 h
+
+
+
+
+                             Vips
+                            X264
+                                                               Avg.
+                                cf
+                             rank
+
+
+
+
+                                 p
+                              sim
+
+
+
+
+                              ace
+                                 d
+
+
+
+
+                           goDB
+
+
+                      Body les
+                            track
+                               eal
+
+
+
+                                  t
+
+                            mine
+                               ate
+
+
+
+                      Swap ter
+                            tions
+                           Ferre
+                           Nutc
+
+
+
+
+                          Dedu
+                          Recm
+                         429.m
+
+
+
+
+                                                                                 Event view Homepage visit Tag search
+
+
+
+
+                              s
+                         scho
+
+                        Cann
+
+
+
+
+                         anim
+                        Face
+
+
+
+
+                       Raytr
+                        mclu
+                       Tunk
+
+
+
+
+                       Freq
+                      Mon
+                                                                                Linux Ingens Linux Ingens Linux Ingens
+                   Movie
+
+
+
+
+                   Black
+
+
+
+
+                   Fluid
+
+
+
+                  Strea
+                                                                        Average   478     338  236    207   289    240
+                                                                        90th      605     354  372    226   417    299
+ Figure 4: Performance slowdown of utilization-based pro-               MAX       694     649  379    385   518    507
+ motion relative to Linux when memory is not fragmented.
+                                                                            (b) Latency (millisecond) of read-dominant operations.
+                    Background task      CPU utilization              Table 9: Performance result of Cloudstone WEB 2.0
+                    Proactive compaction           1.3%               Benchmark (Olio) when memory is fragmented.
+                    Access bit tracking           11.4%
+
+Table 8: CPU utilization of background tasks in Ingens.                  Table 8 shows the CPU utilization of background tasks
+For access bit tracking, Scan-kth scans memory of Mon-                in Ingens. We measure the CPU utilization across 1 sec-
+goDB that uses 10.7GB memory.                                         ond intervals and take the average. For proactive com-
+                                                                      paction, we set Ingens to compact 100 MB of memory
+                                                                      every 2 seconds (which is more aggressive than the de-
+   We characterize the overheads of Ingens’s basic mech-              fault of 5 seconds). CPU overhead of access bit tracking
+anisms such as access tracking and utilization-based                  depends on how many pages are scanned, so we measure
+huge page promotion. We evaluate the performance of                   the CPU utilization of Scan-kth while running MongoDB
+utilization-based promotion and demotion and Ingens abil-             using 10.7 GB of memory.
+ity to provide fairness across applications using huge
+                                                                      6.2     Utilization-based promotion
+pages. Finally, we show that Ingens’s access frequency-
+based same page merging achieves good memory savings                  To evaluate Ingens’s utilization-based huge page promo-
+while preserving most of the performance benefit of huge              tion, we compare a mix of operations from the Cloudstone
+pages. We use a single configuration to evaluate Ingens               WEB 2.0 benchmark, which simulates a social event web-
+which is consistent with our examples in Sections 4 and               site. Cloudstone models a LAMP stack, consisting of a
+5: utilization threshold is 90%, Scan-kth period is 10s,              web server (nginx), PHP, and MySQL. We run Cloudstone
+access frequency tracking interval is 2 sec, and sampling             in a KVM virtual machine and use the Rain workload gen-
+ratio is 20%. Proactive batched compaction happens when               erator [45] for load.
+FMFI is below 0.8, with an interval of 5 seconds; the max-               A study of the top million websites showed that in
+imum amount of compacted memory is 100MB; and a                       2015 the average size exceeded 2 MB [50]. In light of
+page is frequently accessed if Ft ≥ 6.                                this, we modify Cloudstone to serve some web pages that
+                                                                      use about 2 MB of memory, enabling the benchmark to
+ 6.1              Ingens overhead
+                                                                      make better use of huge pages. The Cloudstone bench-
+ Figure 4 shows the overheads introduced by Ingens for                mark consists of 7 web pages, and we only modify the
+ memory intensive workloads. To evaluate the perfor-                  homepage and a page that displays social event details to
+ mance of utilization-based huge page promotion in the                use 2 MB memory. The other pages remain unchanged.
+ unfragmented case, we run a number of benchmarks and                    We compare throughput and latency for Cloudstone on
+ compare their run time with Linux. Ingens’s utilization-             Linux and Ingens when memory is fragmented from prior
+ based huge page promotion slows applications down 3.0%               activity (FMFI = 0.9). To cause fragmentation, we run a
+ in the worst case and 0.7% on average. The slowdowns                 program that allocates a large region of memory and then
+ stem primarily from Ingens not promoting huge pages                  partially frees it.
+ as aggressively as Linux, so the workload executes with                 We use Cloudstone’s default operation mix: 85% read
+ slower base pages for a short time until Ingens promotes             (viewing events, visiting homepage, and searching event
+ huge pages. A secondary overhead stems from the com-                 by tag), 10% login, and 5% write (adding new events and
+ putation of huge page utilization.                                   inviting people). Our test database has 7,000 events, 2,000
+    To verify that Ingens does not interfere with the perfor-         people, and 900 tags. Table 9 (a) shows the throughput
+ mance of “normal” workloads, we measure an average                   attained by the benchmark running on Linux and Ingens.
+ performance penalty of 0.8% across the entire PARSEC                 Ingens’s utilization-based promotion achieves a speedup
+ 3.0 benchmark suite.                                                 of 1.18× over Linux. Table 9 (b) shows average and tail
+
+
+
+ USENIX Association                            12th USENIX Symposium on Operating Systems Design and Implementation              715
+                                                                                                                     Ingens huge page promotion
+                                                                                          1000
+
+
+
+
+                                                                Huge page consump. (MB)
+Linux-nohuge Linux Ingens-90% Ingens-70% Ingens-50%                                        900           Canneal-1
+  12.2 GB   20.7 GB 12.3 GB     12.9 GB    17.8 GB                                         800           Canneal-2
+                                                                                           700
+                                                                                           600           Canneal-3
+(a) Redis memory consumption in different configurations. The                              500
+                                                                                           400
+percentage in the label is a utilization threshold.                                        300
+                                                                                           200
+                 Throughput 90th lat. 99th lat. 99.9th lat.                                100
+                                                                                                 0            50        100          150          200      250
+ Linux-nohuge         19.0K        4         5        109                                                            Linux huge page promotion
+                                                                                          1000
+
+
+
+
+                                                                Huge page consump. (MB)
+ Linux                21.7K        3         4           8                                 900           Canneal-1
+ Ingens-90%           20.9K        3         4          64                                 800           Canneal-2
+                                                                                           700
+ Ingens-70%           21.1K        3         4          55                                 600           Canneal-3
+ Ingens-50%           21.6K        3         4          23                                 500
+                                                                                           400
+                                                                                           300
+(b) Redis GET Performance: Throughput (operations/sec) and                                 200
+                                                                                           100
+latency (millisecond).                                                                           0            50        100           150         200      250
+                                                                                                                              time (sec)
+      Table 10: Redis memory use and performance.                                                              Canneal-1       Canneal-2       Canneal-3
+                                                                                                     Linux          181             192             195
+latency of the read operations in the benchmark. Ingens                                              Ingens         186             186             187
+reduces an average latency up to 29.2% over Linux. In
+the tail, the reduction improves further, up to 41.4% at the      Figure 5: Huge page consumption (MB) and execution
+90th percentile.                                                  time (second). 3 instances of canneal (Parsec 3.0 bench-
+   Performance for Ingens improves because it reduces             mark) run concurrently and Promote-kth promotes huge
+the average page-fault latency by not compacting memory           pages. Execution time in the table excludes data loading
+synchronously in the page fault handler. We measure               time.
+461,383 page compactions throughout the run time of the
+benchmark in Linux when memory is fragmented.                   then delete 70% of the key space using a random pattern.
+   When memory is not fragmented, Ingens reduces                We then measure the GET performance using the bench-
+throughput by 13.4% and increases latency up to 18.1%           mark tool shipped with Redis. For Ingens, we evaluate
+compared with Linux. The benchmark contains many                different utilization thresholds for huge page promotion.
+short-lived requests and Linux’s greedy huge page allo-            Table 10 shows that memory use for the 90% and 70%
+cation pays off by drastically reducing the total number        utilization-based configurations is very close to the case
+of page faults. Ingens is less aggressive about huge page       where only base pages are used. Only at 50% utiliza-
+allocation to avoid memory bloat, so it incurs many more        tion does Ingens approach the memory use of Linux’s
+page faults.                                                    aggressive huge page promotion.
+   Ingens copes with this performance problem with an              The throughput and latency of the utilization-based
+adaptive policy. When memory fragmentation is below             approach is very close to using only huge pages. Only
+0.5 Ingens mimics Linux’s aggressive huge page alloca-          in the 99.9th percentile does Ingens deviate from Linux
+tion. This policy restores Ingens’s performance to Linux’s      using huge pages only, while still delivering much better
+levels. However, while bloat (§3.2) is not a problem for        tail latency than Linux using base pages only.
+this workload, the adaptive policy increases risk of bloat
+                                                                  6.4                            Fair huge page promotion
+in the general case. Like any management problem, it
+might not be possible to find a single policy that has every      Ingens guarantees a fair distribution of huge pages. If
+desirable property for a given workload. We verified that         applications have the same share priority (§4.6), Ingens
+this policy performs similarly to the default policy used         provides the same amount of huge pages. To evaluate fair-
+in Table 4, but it is most appropriate for workloads with         ness, we run a set of three identical applications concur-
+many short-lived processes.                                       rently with the same share priority and idleness parameter,
+                                                                  and measure the amount of huge pages each one holds at
+6.3   Memory bloating evalution
+                                                                  any point in time.
+To evaluate Ingens’s ability to minimize memory bloating             Figure 5 shows that Linux does not allocate huge pages
+without impacting performance, we evaluate the memory             fairly, it simply allocates huge pages to the first applica-
+use and throughput of a benchmark using the Redis key-            tion that can use them (Canneal-1). In fact, Linux asyn-
+value store. Redis is known to be susceptible to memory           chronously promotes huge pages by scanning linearly
+bloat, as its memory allocations are often sparse. To create      through each application’s address space, only consid-
+a sparse address space in our benchmark, we first populate        ering the next application when it is finished with the
+Redis with 2 million keys, each with 8 KB objects and             current application. Time 160 is when Linux has pro-
+
+
+
+716    12th USENIX Symposium on Operating Systems Design and Implementation                                                                 USENIX Association
+  Policy Mem saving Performance slowdown         H/M             7   Related work
+                      Tunkrank: 274 (12.7%)  Tunkrank: 66%
+  KVM     1438 MB                                                Virtual memory is an active research area. Our evidence
+                   MovieRecmd: 210 (6.5%) MovieRecmd: 10%
+ (Linux)   (9.6%)
+                          SVM: 232 (20.2%)       SVM: 72%        of performance degradation from address translation over-
+                             Tunkrank: 243   Tunkrank: 99%       heads is well-corroborated [44, 53, 47, 67].
+Huge page 317 MB
+                          MovieRecmd: 197 MovieRecmd: 99%
+ sharing   (2.1%)
+                                  SVM: 193       SVM: 99%        Operating system support. Navarro et al. [68] imple-
+                       Tunkrank: 247 (1.6%)  Tunkrank: 90%       ment OS support for multiple page sizes with contiguity-
+          1026 MB
+  Ingens            MovieRecmd: 200 (1.5%) MovieRecmd: 79%
+           (6.8%)
+                           SVM: 198 (2.5%)       SVM: 94%
+                                                                 awareness and fragmentation reduction as primary con-
+                                                                 cerns. They propose reservation-based allocation, allocat-
+Table 11: Memory saving (MB) and performance (second)            ing contiguous ranges of pages in advance, and deferring
+trade off. H/M - huge page ratio out of total memory used.       promotion. Many of their ideas are widely used [80], and
+Parentheses in the Mem saving column expresses the memory        it forms the basis of FreeBSD’s huge page support. In-
+saved as a percentage of the total memory (15 GB) allocated to   gens’s utilization-based promotion uses a util bitvector
+all three virtual machines.                                      that is similar to the population map [68]. In contrast
+                                                                 to that work, Ingens does not use reservation-based al-
+                                                                 location, decouples huge page allocation from promo-
+moted almost all of Canneal-1’s address space to huge            tion decisions, and redistributes contiguity fairly when it
+pages so only then does it begin to allocate huge pages to       becomes available (e.g., after process termination). In-
+Canneal-2.                                                       gens has higher performance because it promotes more
+   In contrast, Ingens promotes huge pages based on              huge pages; it does not require promoted pages to be
+the fairness objective described in Section 4.7 and thus         read-only or completely modified (§3.4). Features in mod-
+equally distributes the available huge pages to each appli-      ern systems such as memory compaction and same-page
+cation. Fair distribution of huge pages translates to fair       merging [63] pose new challenges not addressed by this
+end-to-end execution time as well. All applications finish       previous work.
+at the same time in Ingens, while Canneal-1 finishes well           Gorman et al. [56] propose a placement policy for an
+before 2 and 3 on Linux.                                         OS’s physical page allocator that mitigates fragmentation
+                                                                 and promotes contiguity by grouping pages according to
+6.5   Trade off of memory saving and performance                 relocatability. Subsequent work [57] proposes a software-
+                                                                 exposed interface for applications to explicitly request
+Finally, we evaluate the memory and performance trade-           huge pages like libhugetlbfs [65]. The foci of In-
+offs of identical page sharing. We run a workload mix of         gens, including trade-offs between memory sharing and
+three different applications, each in its own virtual ma-        performance, and unfair allocation of huge pages are un-
+chine. We measure their memory use and performance               addressed by previous work.
+slowdown under three different OS configurations: (1)            Hardware support. TLB miss overheads can be re-
+KVM with aggressive page sharing, where huge pages               duced by accelerating page table walks [42, 46] or re-
+are demoted if underlying base pages can be shared. (2)          ducing their frequency [52]; by reducing the number of
+KVM where only pages of the same type may be shared              TLB misses (e.g. through prefetching [48, 60, 74], pre-
+and huge pages are never broken up (huge page sharing).          diction [69], or structural change to the TLB [79, 72, 71]
+(3) Ingens, where only infrequently used huge pages are          or TLB hierarchy [47, 66, 78, 39, 38, 61, 44, 53]). Multi-
+demoted for page sharing. To avoid unused memory sav-            page mapping techniques [79, 72, 71] map multiple pages
+ing, we intentionally fit guest physical memory size to          with a single TLB entry, improving TLB reach by a small
+memory usages of the workloads.                                  factor (e.g. to 8 or 16); much greater improvements to
+   Table 11 shows that KVM’s aggressive page sharing             TLB reach are needed to deal with modern memory sizes.
+saves the most memory (9.6%), but also cedes the most            Direct segments [44, 53] extend standard paging with a
+performance (between 6.5% and 20.2% slowdown) when               large segment to map the majority of an address space
+compared to huge page sharing. When sharing only pages           to a contiguous physical memory region, but require ap-
+of the same type, it saves memory only 2.1%. Finally,            plication modifications and are limited to workloads able
+Ingens allows us to save 6.8% of memory, while only              to a single large segment. Redundant memory mappings
+slowing down the application up to 2.5%. The main                (RMM) [61] extend TLB reach by mapping ranges of
+reason for the low performance degradation is that the           virtually and physically contiguous pages in a range TLB.
+ratio of huge pages to total pages remains high in Ingens,       The level of additional architectural support is significant,
+due to its access frequency-based approach to huge page          while Ingens works on current hardware.
+demotion and instant promotion when Ingens stops page               A number of related works propose hardware support
+sharing.                                                         to recover and expose contiguity. GLUE [73] groups
+
+
+
+USENIX Association                   12th USENIX Symposium on Operating Systems Design and Implementation                717
+contiguous, aligned small page translations under a single   References
+speculative huge page translation in the TLB. Speculative     [1] http://www.7-cpu.com/cpu/Skylake.
+translations, (similar to SpecTLB [43]) can be verified           html. [Accessed April, 2016].
+by off-critical-path page-table walks, reducing effective
+page-table walk latency. GTSM [49] provides hardware          [2] http://www.7-cpu.com/cpu/Haswell.
+support to leverage contiguity of physical memory extents         html. [Accessed April, 2016].
+even when pages have been retired due to bit errors. Were
+such features to become available, hardware mechanisms        [3] Apache Cloudstack. https://en.wikipedia.
+for preserving contiguity could reduce overheads induced          org/wiki/Apache_CloudStack. [Accessed
+by proactive compaction in Ingens.                                April, 2016].
+   Architectural assists are ultimately complementary to      [4] Apache Hadoop. http://hadoop.apache.
+our own work. Hardware support can help, but higher-              org/. [Accessed April, 2016].
+level coordination of hardware mechanisms by software
+is a fundamental necessity. Additionally, as none of these    [5] Apache Spark. http://spark.apache.org/
+assists are likely to be realized in imminently available         docs/latest/index.html. [Accessed April,
+hardware, using techniques such as those we propose in            2016].
+Ingens are a de facto necessity.
+                                                              [6] Application-friendly kernel interfaces.   https:
+8     Conclusion                                                  //lwn.net/Articles/227818/.               [March,
+                                                                  2007].
+Hardware vendors are betting on huge pages to make
+address translation overheads acceptable as memory ca-        [7] Cloudera recommends turning off mem-
+pacities continue to grow. Ingens provides principled, co-        ory compaction due to high CPU utiliza-
+ordinated transparent huge page support for the operating         tion.         http://www.cloudera.com/
+system and hypervisor, enabling challenging workloads             documentation/enterprise/latest/
+to achieve the expected benefits of huge pages, without           topics/cdh_admin_performance.html.
+harming workloads that are well served by state-of the art        [Accessed April, 2016].
+huge page support. Ingens reduces tail-latency and bloat,
+while improving fairness and performance.                     [8] Cloudsuite.  http://parsa.epfl.ch/
+                                                                  cloudsuite/graph.html. [Accessed April,
+Acknowledgement                                                   2016].
+For their insights and comments we thank readers Mark
+                                                              [9] CouchBase recommends disabling huge pages.
+Silberstein, Nadav Amit, Reza Taheri, Kathryn S. McKin-
+                                                                  http://blog.couchbase.com/often-
+ley, the anonymous reviewers, and our shepherd Sasha
+                                                                  overlooked-linux-os-tweaks. [March,
+Fedorova. We acknowledge funding from NSF grants
+                                                                  2014].
+CNS-1228843 and CNS-1618563.
+                                                             [10] Data Plane Development Kit. http://www.
+                                                                  dpdk.org/. [Accessed April-2016].
+                                                             [11] DokuDB recommends disabling huge pages.
+                                                                  https://www.percona.com/blog/
+                                                                  2014/07/23/why-tokudb-hates-
+                                                                  transparent-hugepages/. [July, 2014].
+                                                             [12] Exponential moving average. https://en.
+                                                                  wikipedia.org/wiki/Moving_average#
+                                                                  Exponential_moving_average. [Accessed
+                                                                  April, 2016].
+                                                             [13] High CPU utilization in Hadoop due to transparent
+                                                                  huge pages. https://www.ghostar.org/
+                                                                  2015/02/transparent-huge-pages-on-
+                                                                  hadoop-makes-me-sad/. [February, 2015].
+                                                             [14] High CPU utilization in Mysql due to transparent
+                                                                  huge pages. http://developer.okta.com/
+                                                                  blog/2015/05/22/tcmalloc. [May, 2015].
+
+
+
+718    12th USENIX Symposium on Operating Systems Design and Implementation                    USENIX Association
+[15] Huge page support in Mac OS X. https:          [27] OpenStack.                 https://
+     //developer.apple.com/legacy/                       openvirtualizationalliance.org/
+     library/documentation/Darwin/                       what-kvm/openstack.   [Accessed April-
+     Reference/ManPages/man2/mmap.2.                     2016].
+     html. [Accessed April-2016].
+                                                    [28] PARSEC 3.0 benchmark suite. http://parsec.
+[16] IBM cloud with KVM hypervisor. http:                cs.princeton.edu/. [Accessed April, 2016].
+     //www.networkworld.com/article/
+     2230172/opensource-subnet/red-                 [29] Redis. http://redis.io/. [Accessed April,
+     hat-s-kvm-virtualization-proves-                    2016].
+     itself-in-ibm-s-cloud.html. [March,
+     2010].                                         [30] Redis recommends disabling huge pages. http:
+                                                         //redis.io/topics/latency. [Accessed
+[17] IBM recommends turning off huge pages               April, 2016].
+     due to high CPU utilization. http://www-
+     01.ibm.com/support/docview.wss?                [31] Redis SSD swap discussion. http://antirez.
+     uid=swg21677458. [July, 2014].                      com/news/52. [March, 2013].
+
+[18] Intel hardware random number generator.        [32] SAP IQ recommends disabling huge pages. http:
+     https://software.intel.com/en-                      //scn.sap.com/people/markmumy/
+     us/articles/intel-digital-random-                   blog/2014/05/22/sap-iq-and-linux-
+     number-generator-drng-software-                     hugepagestransparent-hugepages.
+     implementation-guide. [May, 2014].                  [May, 2014].
+
+[19] Intel HiBench.    https://github.com/          [33] SPEC CPU 2006. https://www.spec.org/
+     intel-hadoop/HiBench/tree/master/                   cpu2006/. [Accessed April, 2016].
+     workloads. [Accessed April, 2016].
+                                                    [34] Splunk  recommends    disabling huge
+[20] Jemalloc. http://www.canonware.com/                 pages.      http://docs.splunk.com/
+     jemalloc/. [Accessed April-2016].                   Documentation/Splunk/6.1.3/
+                                                         ReleaseNotes/SplunkandTHP. [December,
+[21] Large-page support in Windows. https://             2013].
+     msdn.microsoft.com/en-us/library/
+     windows/desktop/aa366720(v=vs.85)              [35] Thread-caching malloc.    http://goog-
+     .aspx. [Accessed April-2016].                       perftools.sourceforge.net/doc/
+                                                         tcmalloc.html. [Accessed April-2016].
+[22] Liblinear. https://www.csie.ntu.edu.
+     tw/˜cjlin/liblinear/. [Accessed April,         [36] Transparent huge pages in 2.6.38. https://lwn.
+     2016].                                              net/Articles/423584/. [January, 2011].
+
+[23] MongoDB. https://www.mongodb.com/.             [37] VoltDB        recommends   disabling huge
+     [Accessed April, 2016].                             pages.          https://docs.voltdb.com/
+                                                         AdminGuide/adminmemmgt.php. [Accessed
+[24] MongoDB recommends disabling huge pages.            April, 2016].
+     https://docs.mongodb.org/manual/
+     tutorial/transparent-huge-pages/.              [38] Jeongseob Ahn, Seongwook Jin, and Jaehyuk Huh.
+     [Accessed April, 2016].                             Revisiting hardware-assisted page walks for virtual-
+                                                         ized systems. In International Symposium on Com-
+[25] Movie recommendation with Spark.    http:           puter Architecture (ISCA), 2012.
+     //ampcamp.berkeley.edu/big-data-
+     mini-course/movie-recommendation-              [39] Jeongseob Ahn, Seongwook Jin, and Jaehyuk Huh.
+     with-mllib.html. [Accessed April, 2016].            Fast two-level address translation for virtualized sys-
+                                                         tems. In IEEE Transactions on Computers, 2015.
+[26] NuoDB recommends disabling huge pages. http:
+     //www.nuodb.com/techblog/linux-                [40] AMD. AMD-V Nested Paging, 2010. http://
+     transparent-huge-pages-jemalloc-                    developer.amd.com/wordpress/media/
+     and-nuodb. [May, 2014].                             2012/10/NPT-WP-1%201-final-TM.pdf.
+
+
+
+USENIX Association           12th USENIX Symposium on Operating Systems Design and Implementation          719
+[41] Jean Araujo, Rubens Matos, Paulo Maciel, Rivalino            A study of emerging scale-out workloads on modern
+     Matias, and Ibrahim Beicker. Experimental eval-              hardware. In Proceedings of the Seventeenth Inter-
+     uation of software aging effects on the eucalyptus           national Conference on Architectural Support for
+     cloud computing infrastructure. In Middleware In-            Programming Languages and Operating Systems,
+     dustry Track Workshop, 2011.                                 ASPLOS XVII, pages 37–48, New York, NY, USA,
+                                                                  2012. ACM.
+[42] Thomas W. Barr, Alan L. Cox, and Scott Rixner.
+     Translation caching: Skip, don’t walk (the page         [52] Jayneel Gandhi, , Mark D. Hill, and Michael M.
+     table). In International Symposium on Computer               Swift. Exceeding the best of nested and shadow
+     Architecture (ISCA), 2010.                                   paging. In International Symposium on Computer
+                                                                  Architecture (ISCA), 2016.
+[43] Thomas W. Barr, Alan L. Cox, and Scott Rixner.
+     Spectlb: A mechanism for speculative address trans-     [53] Jayneel Gandhi, Arkaprava Basu, Mark D. Hill, and
+     lation. In International Symposium on Computer               Michael M. Swift. Efficient memory virtualization.
+     Architecture (ISCA), 2011.                                   In International Symposium on Microarchitecture,
+                                                                  2014.
+[44] Arkapravu Basu, Jayneel Gandhi, Jichuan Chang,
+     Mark D. Hill, and Michael M. Swift. Efficient vir-      [54] Fabien Gaud, Baptiste Lepers, Jeremie Decouchant,
+     tual memory for big memory servers. In Interna-              Justin Funston, Alexandra Fedorova, and Vivien
+     tional Symposium on Computer Architecture (ISCA),            Quéma. Large pages may be harmful on numa sys-
+     2013.                                                        tems. In Proceedings of the 2014 USENIX Con-
+[45] Aaron Beitch, Brandon Liu, Timothy Yung, Rean                ference on USENIX Annual Technical Conference,
+     Griffith, Armando Fox, and David Patterson. Rain:            USENIX ATC’14, pages 231–242, Berkeley, CA,
+     A workload generation toolkit for cloud computing            USA, 2014. USENIX Association.
+     applications. In U.C. Berkeley Technical Publica-       [55] Joseph E. Gonzalez, Yucheng Low, Haijie Gu,
+     tions (UCB/EECS-2010-14), 2010.                              Danny Bickson, and Carlos Guestrin. Powergraph:
+[46] Abhishek Bhattacharjee. Large-reach memory man-              Distributed graph-parallel computation on natural
+     agement unit caches. In International Symposium              graphs. In Presented as part of the 10th USENIX
+     on Microarchitecture, 2013.                                  Symposium on Operating Systems Design and Im-
+                                                                  plementation (OSDI 12), pages 17–30, Hollywood,
+[47] Abhishek Bhattacharjee, Daniel Lustig, and Mar-              CA, 2012. USENIX.
+     garet Martonosi. Shared last-level TLBs for chip
+     multiprocessors. In IEEE International Sympo-           [56] Mel Gorman and Patrick Healy. Supporting super-
+     sium on High Performance Computer Architecture               page allocation without additional hardware support.
+     (HPCA), 2011.                                                In Proceedings of the 7th International Symposium
+                                                                  on Memory Management, 2008.
+[48] Abhishek Bhattacharjee and Margaret Martonosi.
+     Characterizing the TLB behavior of emerging par-        [57] Mel Gorman and Patrick Healy. Performance charac-
+     allel workloads on chip multiprocessors. In Inter-           teristics of explicit superpage support. In Workshorp
+     national Conference on Parallel Architectures and            on the Interaction between Operating Systems and
+     Compilation Techniques (PACT), 2009.                         Computer Architecture (WIOSCA), 2010.
+
+[49] Yu Du, Miao Zhou, B.R. Childers, D. Mosse,              [58] Mel Gorman and Andy Whitcroft. The what, the
+     and R. Melhem. Supporting superpages in non-                 why and the where to of anti-fragmentation. In Linux
+     contiguous physical memory. In IEEE International            Symposium, 2005.
+     Symposium on High Performance Computer Archi-
+                                                             [59] Intel Corporation. Intel 64 and IA-32 Architectures
+     tecture (HPCA), 2015.
+                                                                  Software Developers Manual, 2016. https://
+[50] Tammy Everts. The average web page is more                   www-ssl.intel.com/content/dam/www/
+     than 2 MB size. https://www.soasta.com/                      public/us/en/documents/manuals/64-
+     blog/page-bloat-average-web-page-                            ia-32-architectures-software-
+     2-mb/. [June, 2015].                                         developer-manual-325462.pdf.
+[51] Michael Ferdman, Almutaz Adileh, Onur Kocberber,        [60] Gokul B. Kandiraju and Anand Sivasubramaniam.
+     Stavros Volos, Mohammad Alisafaee, Djordje Jevd-             Going the distance for TLB prefetching: An
+     jic, Cansu Kaynak, Adrian Daniel Popescu, Anasta-            application-driven study. In International Sympo-
+     sia Ailamaki, and Babak Falsafi. Clearing the clouds:        sium on Computer Architecture (ISCA), 2002.
+
+
+
+720   12th USENIX Symposium on Operating Systems Design and Implementation                       USENIX Association
+[61] Vasileios Karakostas, Jayneel Gandhi, Furkan Ayar,           ternational Symposium on High Performance Com-
+     Adrin Cristal, Mark D. Hill, Kathryn S. McKinley,            puter Architecture (HPCA), 2014.
+     Mario Nemirovsky, Michael M. Swift, and Osman           [72] Binh Pham, Viswanathan Vaidyanathan, Aamer
+     nsal. Redundant memory mappings for fast access              Jaleel, and Abhishek Bhattacharjee. CoLT: Coa-
+     to large memories. In International Symposium on             lesced large-reach TLBs. In International Sympo-
+     Computer Architecture (ISCA), 2015.                          sium on Microarchitecture, 2012.
+
+[62] Avi Kivity, Yaniv Kamay, Dor Laor, Uri Lublin, and      [73] Binh Pham, Jan Vesely, Gabriel Loh, and Abhishek
+     Anthony Liguori. KVM: The linux virtual machine              Bhattacharjee. Large pages and lightweight mem-
+     monitor. In Linux Symposium, 2007.                           ory management in virtualized systems: Can you
+[63] Kernel Same-page Merging.    https://en.                     have it both ways? In International Symposium on
+     wikipedia.org/wiki/Kernel_same-                              Microarchitecture, 2015.
+     page_merging. [Accessed April, 2016].
+                                                             [74] Ashley Saulsbury, Fredrik Dahlgren, and Per Sten-
+[64] Ching-Pei Lee and Chih-Jen Lin. Large-scale linear           ström. Recency-based TLB preloading. In Interna-
+     RankSVM. Neural Comput., 26(4):781–817, April                tional Symposium on Computer Architecture (ISCA),
+     2014.                                                        2000.
+[65] Huge Pages Part 2 (Interfaces). https://lwn.
+                                                             [75] Tom Shanley. Pentium Pro Processor System Archi-
+     net/Articles/375096/. [February, 2010].
+                                                                  tecture. Addison-Wesley Longman Publishing Co.,
+[66] Daniel Lustig, Abhishek Bhattacharjee, and Mar-              Inc., Boston, MA, USA, 1st edition, 1996.
+     garet Martonosi. TLB improvements for chip multi-
+     processors: Inter-core cooperative prefetchers and      [76] Richard L. Sites and Richard T. Witek. ALPHA ar-
+     shared last-level TLBs. ACM Transactions on Ar-              chitecture reference manual. Digital Press, Boston,
+     chitecture and Code Optimization (TACO), 2013.               Oxford, Melbourne, 1998.
+
+[67] Timothy Merrifield and H. Reza Taheri. Perfor-          [77] Will Sobel, Shanti Subramanyam, Akara Suchar-
+     mance implications of extended page tables on vir-           itakul, Jimmy Nguyen, Hubert Wong, Arthur
+     tualized x86 processors. In Proceedings of the12th           Klepchukov, Sheetal Patil, O Fox, and David Patter-
+     ACM SIGPLAN/SIGOPS International Conference                  son. Cloudstone: Multi-platform, multi-language
+     on Virtual Execution Environments, VEE ’16, pages            benchmark and measurement tools for web 2.0,
+     25–35, New York, NY, USA, 2016. ACM.                         2008.
+[68] Juan Navarro, Sitaram Iyer, Peter Druschel, and
+     Alan Cox. Practical, transparent operating system       [78] Shekhar Srikantaiah and Mahmut Kandemir. Syner-
+     support for superpages. In USENIX Symposium                  gistic tlbs for high performance address translation
+     on Operating Systems Design and Implementation               in chip multiprocessors. In International Symposium
+     (OSDI), 2002.                                                on Microarchitecture, 2010.
+
+[69] M.-M. Papadopoulou, Xin Tong, A. Seznec, and            [79] M. Talluri and M. D. Hill. Surpassing the TLB
+     A. Moshovos. Prediction-based superpage-friendly             performance of superpages with less operating sys-
+     TLB designs. In IEEE International Symposium on              tem support. In International Conference on Archi-
+     High Performance Computer Architecture (HPCA),               tectural Support for Programming Languages and
+     2015.                                                        Operating Systems (ASPLOS), 1994.
+[70] Idle Page Tracking.         http://lxr.
+     free-electrons.com/source/                              [80] Transparent Hugepages. https://lwn.net/
+     Documentation/vm/idle_page_                                  Articles/359158/. [October, 2009].
+     tracking.txt. [November, 2015].
+                                                             [81] Carl A. Waldspurger. Memory resource manage-
+[71] Binh Pham, Abhishek Bhattacharjee, Yasuko Eckert,            ment in VMware ESX server. In USENIX Sympo-
+     and Gabriel H. Loh. Increasing TLB reach by ex-              sium on Operating Systems Design and Implemen-
+     ploiting clustering in page translations. In IEEE In-        tation (OSDI), 2002.
+
+
+
+
+USENIX Association                12th USENIX Symposium on Operating Systems Design and Implementation           721
+

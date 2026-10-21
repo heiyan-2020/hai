@@ -1,0 +1,938 @@
+        Using Lightweight Formal Methods to Validate a
+            Key-Value Storage Node in Amazon S3
+                James Bornholt                                          Rajeev Joshi                         Vytautas Astrauskas
+           Amazon Web Services                                     Amazon Web Services                              ETH Zurich
+     & The University of Texas at Austin
+
+                 Brendan Cully                                        Bernhard Kragl                               Seth Markle
+              Amazon Web Services                                  Amazon Web Services                         Amazon Web Services
+
+                    Kyle Sauri                                          Drew Schleit                              Grant Slatton
+              Amazon Web Services                                  Amazon Web Services                         Amazon Web Services
+
+                 Serdar Tasiran                                     Jacob Van Geffen                            Andrew Warfield
+              Amazon Web Services                                University of Washington                      Amazon Web Services
+
+Abstract                                                                          Using Lightweight Formal Methods to Validate a Key-Value Storage
+This paper reports our experience applying lightweight for-                       Node in Amazon S3. In ACM SIGOPS 28th Symposium on Operating
+                                                                                  Systems Principles (SOSP ’21), October 26ś28, 2021, Virtual Event,
+mal methods to validate the correctness of ShardStore, a new
+                                                                                  Germany. ACM, New York, NY, USA, 15 pages. https://doi.org/10.
+key-value storage node implementation for the Amazon S3                           1145/3477132.3483540
+cloud object storage service. By “lightweight formal methodsž
+we mean a pragmatic approach to verifying the correctness
+of a production storage node that is under ongoing feature                        1 Introduction
+development by a full-time engineering team. We do not aim                        Amazon S3 is a cloud object storage service that offers cus-
+to achieve full formal verification, but instead emphasize                        tomers elastic storage with extremely high durability and
+automation, usability, and the ability to continually ensure                      availability. At the core of S3 are storage node servers that
+correctness as both software and its specification evolve over                    persist object data on hard disks. These storage nodes are
+time. Our approach decomposes correctness into indepen-                           key-value stores that hold shards of object data, replicated
+dent properties, each checked by the most appropriate tool,                       by the control plane across multiple nodes for durability. S3
+and develops executable reference models as specifications                        is building a new key-value storage node called ShardStore
+to be checked against the implementation. Our work has                            that is being gradually deployed within our current service.
+prevented 16 issues from reaching production, including sub-                         Production storage systems such as ShardStore are notori-
+tle crash consistency and concurrency problems, and has                           ously difficult to get right [25]. To achieve high performance,
+been extended by non-formal-methods experts to check new                          ShardStore combines a soft-updates crash consistency proto-
+features and properties as ShardStore has evolved.                                col [16], extensive concurrency, append-only IO and garbage
+                                                                                  collection to support diverse storage media, and other com-
+CCS Concepts: · Software and its engineering → Soft-                              plicating factors. Its current implementation reflects that
+ware verification and validation.                                                 complexity, comprising over 40,000 lines of Rust code. The
+Keywords: cloud storage, lightweight formal methods                               implementation is fast moving and frequently changing, and
+                                                                                  even the specification is not set in stone. It is developed and
+ACM Reference Format:                                                             operated by a team of engineers whose changes are continu-
+James Bornholt, Rajeev Joshi, Vytautas Astrauskas, Brendan Cully,                 ously deployed worldwide, and currently stores hundreds of
+Bernhard Kragl, Seth Markle, Kyle Sauri, Drew Schleit, Grant Slat-
+                                                                                  petabytes of customer data as part of a gradual rollout.
+ton, Serdar Tasiran, Jacob Van Geffen, and Andrew Warfield. 2021.
+                                                                                     This paper reports our experiences applying lightweight
+Permission to make digital or hard copies of part or all of this work for         formal methods [24] such as property-based testing and state-
+personal or classroom use is granted without fee provided that copies are         less model checking to validate ShardStore’s correctness. We
+not made or distributed for profit or commercial advantage and that copies        sought lightweight methods that were automated and usable
+bear this notice and the full citation on the first page. Copyrights for third-   by non-formal-methods experts to validate new features
+party components of this work must be honored. For all other uses, contact        on their own; our goal was to mainstream formal methods
+the owner/author(s).
+SOSP ’21, October 26ś28, 2021, Virtual Event, Germany
+                                                                                  into our daily engineering practice. We sought formal meth-
+© 2021 Copyright held by the owner/author(s).                                     ods because we wanted to validate deep properties of the
+ACM ISBN 978-1-4503-8709-5/21/10.                                                 implementationÐfunctional correctness of API-level calls,
+https://doi.org/10.1145/3477132.3483540                                           crash consistency of on-disk data structures, and concurrent
+SOSP ’21, October 26ś28, 2021, Virtual Event, Germany                                                             Bornholt et al.
+
+
+correctness of API calls and background maintenance tasksÐ       checks. Formal methods experts wrote the initial validation
+not just general properties like memory safety. In return        infrastructure for ShardStore, but today 18% of the total ref-
+for being lightweight and easy to apply, we were willing to      erence model and test harness code has been written by the
+accept weaker correctness guarantees than full formal verifi-    engineering team to check new features and properties, and
+cation, which is currently impractical for storage systems at    we expect this percentage to increase as we continue to adopt
+this scale and level of complexity. We were inspired by recent   formal methods across S3. We apply code coverage metrics
+efforts on verified storage systems [8, 18, 49] and hope that    to monitor the quality of checks over time and ensure that
+our experience provides encouragement for future work.           new functionality remains covered.
+   We settled on an approach with three elements. First, we         In summary, this paper makes three main contributions:
+distill specifications of desired behavior using executable          • A lightweight approach to specifying and validating a
+reference models that define the expected semantics of the              production-scale storage system in the face of frequent
+system. A reference model defines the allowed sequential,               changes and new features.
+crash-free behaviors of a component in the system. Reference         • A decomposition of storage system correctness that
+models are written in the same language as the implemen-                allows applying a diverse suite of formal methods tools
+tation and embedded in its code base, allowing them to be               to best check each property.
+written and maintained by the engineering team rather than           • Our experience integrating lightweight formal meth-
+languishing as separate expert-written artifacts. The refer-            ods into the practice of a production engineering team
+ence models developed for ShardStore are small executable               and handing over the validation artifacts to be main-
+specifications (1% of the implementation code) that empha-              tained by them rather than formal methods experts.
+size simplicity; for example, the reference model for a log-
+structured merge tree [41] implementation is a hash map. We      2 ShardStore
+also reuse these reference models as mock implementations
+for ShardStore unit tests, effectively requiring engineers to    ShardStore is a key-value store currently being deployed
+update the reference model specifications themselves when        within the Amazon S3 cloud object storage service. This
+developing new code.                                             section provides background on ShardStore’s design and its
+   Second, we validate that the ShardStore implementation        crash consistency protocol.
+satisfies our desired correctness properties by checking that
+                                                                 Context. The ShardStore key-value store is used by S3 as a
+it refines the reference model. To make the best use of avail-
+                                                                 storage node. Each storage node stores shards of customer
+able lightweight formal methods tools, we decompose these
+                                                                 objects, which are replicated across multiple nodes for dura-
+properties and apply the most appropriate tool for each com-
+                                                                 bility, and so storage nodes need not replicate their stored
+ponent. For functional correctness, we apply property-based
+                                                                 data internally. ShardStore is API-compatible with our exist-
+testing [9] to check that the implementation and model agree
+                                                                 ing storage node software, and so requests can be served by
+on random sequences of API operations. For crash consis-
+                                                                 either ShardStore or our existing key-value stores.
+tency, we augment the reference models to define the specific
+recent mutations that soft updates allow to be lost during
+a crash, and again apply property-based testing to check         2.1 Design Overview
+conformance on histories that include arbitrary crashes. For     ShardStore presents a key-value store interface to the rest of
+concurrency, we apply stateless model checking [5, 35] to        the S3 system, where keys are shard identifiers and values
+show that the implementation is linearizable [19] with re-       are shards of customer object data. Customer requests are
+spect to the reference model. In all three cases the checkers    mapped to shard identifiers by S3’s metadata subsystem [53].
+are highly automated and the infrastructure is compact (the         ShardStore’s key-value store comprises a log-structured
+combined property definitions and test harnesses comprise        merge tree (LSM tree) [41] but with shard data stored out-
+12% of the ShardStore code base). These checks have pre-         side the tree to reduce write amplification, similar to Wisc-
+vented 16 issues from reaching production, including subtle      Key [31]. Figure 1 shows an overview of how this LSM tree
+crash-consistency and concurrency issues that evaded tradi-      stores object data on disk. The LSM tree maps each shard
+tional testing methods, and anecdotally have prevented more      identifier to a list of (pointers to) chunks, each of which is
+issues from even reaching code review. These checks are also     stored within an extent. Extents are contiguous regions of
+“pay-as-you-gož, in the sense that we can run them for longer    physical storage on a disk; a typical disk has tens of thou-
+to increase the chance of finding issues (like fuzzing), and     sands of extents. ShardStore requires that writes within each
+so they can be run both locally on an engineer’s machine         extent are sequential, tracked by a write pointer defining the
+during development and at scale before deployments.              next valid write position, and so data on an extent cannot be
+   Third, we ensure that the results of this validation effort   immediately overwritten. Each extent has a reset operation
+remain relevant as the system evolves by training the en-        to return the write pointer to the beginning of the extent
+gineering team to develop their own reference models and         and allow overwrites.
+Using Lightweight Formal Methods to Validate a Key-Value Storage Node in Amazon S3       SOSP ’21, October 26ś28, 2021, Virtual Event, Germany
+
+    LSM tree
+                                                                          while unreferenced chunks are simply dropped. Once the
+    shardID 0x13
+                                                                          entire extent has been scanned, its write pointer is reset and
+    shardID 0x28
+                …                                                         it is available for reuse. Resetting an extent’s write pointer
+    shardID 0x75                                                          makes all data on that extent unreadable even if not yet
+                                                                          physically overwritten (ShardStore forbids reads beyond an
+                                                                          extent’s write pointer), and so the chunk store must enforce
+    extent 17        extent 18             extent 19   extent 20
+                                                                          a crash-consistent ordering for chunk evacuations, index
+                                                                          updates, and extent resets.
+                                 (a) Initial state                            As noted above, the LSM tree itself is also stored as chunks
+    LSM tree
+
+     shardID 0x1
+                                                                          written to extents. Maintenance operations like LSM com-
+     shardID 0x2
+                                                                          paction can render these chunks unused. The free space
+                …                                                         those chunks occupy is reclaimed in the same way as above,
+    shardID 0x75
+                                                                          except that the reverse lookup is into the LSM tree’s meta-
+                                                                          data structure (stored on disk in a reserved metadata extent)
+                                                                          that records locators of chunks currently in use by the tree.
+    extent 17        extent 18             extent 19   extent 20
+                                                                          RPC interface. ShardStore runs on storage hosts with mul-
+        (b) After reclamation of extent 18 and LSM-tree flush             tiple HDDs. Each disk is an isolated failure domain and runs
+                                                                          an independent key-value store. Clients interact with Shard-
+Figure 1. ShardStore’s on-disk layout. Each extent offers                 Store through a shared RPC interface that steers requests to
+append-only writes. A log-structured merge tree (LSM tree)                target disks based on shard IDs. The RPC interface provides
+maps shards to their data, stored as chunks on the extents.               the usual request-plane calls (put, get, delete) and control-
+The LSM tree itself is also stored as chunks on disk (on                  plane operations for migration and repair.
+extent 17). In (a), extent 18 has an unreferenced chunk left
+by a deleted shard. To make that space available for reuse,               Append-only IO. To support both zoned and conventional
+chunk reclamation evacuates live chunks from extent 18 to                 disks, ShardStore provides its own implementation of the
+elsewhere on disk, resulting in the state in (b).                         extent append operation in terms of the write system call.
+                                                                          It does this by tracking in memory a soft write pointer for
+                                                                          each extent, internally translating extent appends to write
+   Rather than centralizing all shard data in a single shared             system calls accordingly, and persisting the soft write pointer
+log on disk, ShardStore spreads shard data across extents.                for each extent in a superblock flushed on a regular cadence.
+This approach gives us flexibility in placing each shard’s data
+on disk to optimize for expected heat and access patterns                 2.2    Crash Consistency
+(e.g., to minimize seek latency). However, the lack of a single           ShardStore uses a crash consistency approach inspired by
+log makes crash consistency more complex, as ğ2.2 describes.              soft updates [16]. A soft updates implementation orches-
+Chunk storage and chunk reclamation. All persistent                       trates the order in which writes are sent to disk to ensure
+data is stored in chunks, including the backing storage for the           that any crash state of the disk is consistent. Soft updates
+LSM tree itself, as Fig. 1 shows. A chunk store abstraction ar-           avoid the cost of redirecting writes through a write-ahead log
+ranges the mapping of chunks onto extents. The chunk store                and allow flexibility in physical placement of data on disk.
+offers PUT(data) → locator and GET(locator) → data in-                       Correctly implementing soft updates requires global rea-
+terfaces, where locators are opaque chunk identifiers and                 soning about all possible orderings of writebacks to disk. To re-
+used as pointers. A single shard comprises one or more                    duce this complexity, ShardStore’s implementation specifies
+chunks depending on its size.                                             crash-consistent orderings declaratively, using a Dependency
+   Because extents are append-only, deleting a shard cannot               type to construct dependency graphs at run time that dictate
+immediately recover the free space occupied by that shard’s               valid write orderings. ShardStore’s extent append operation,
+chunks. For example, in Fig. 1a, extent 18 has a hole left                which is the only way to write to disk, has the type signature:
+behind by a chunk whose corresponding shard has recently                    fn append(&self, ..., dep: Dependency) -> Dependency
+been deleted. To recover and reuse free space, the chunk store            both taking as input and returning a dependency. The con-
+has a reclamation background task that performs garbage                   tract for the append API is that the append will not be issued
+collection. Reclamation selects an extent and scans it to find            to disk until the input dependency has been persisted. Shard-
+all chunks it stores. For each chunk, reclamation performs a              Store’s IO scheduler ensures that writebacks respect these
+reverse lookup in the index (the LSM tree); chunks that are               dependencies. The dependency returned from append can
+still referenced in the index are evacuated to a new extent               be passed back into subsequent append operations, or first
+and their pointers updated in the index as Fig. 1b shows,                 combined with other dependencies (e.g., dep1.and(dep2))
+SOSP ’21, October 26ś28, 2021, Virtual Event, Germany                                                                                                              Bornholt et al.
+
+
+PUT #1           PUT #2            PUT #3                                                                       enough together in time to participate in the same LSM-tree
+                                                                                                                flush, which writes a new chunk of LSM tree data (on extent
+  LSM-tree
+  metadata
+                            Soft write
+                            pointer for
+                                                                                                                12) and then updates the LSM tree metadata (on chunk 9) to
+             extent 9
+                            extent 9
+                                      extent 0                                                                  point to that new chunk.
+
+  Index entry               Index entry                               Index entry          Soft write           Why be crash consistent? Amazon S3 is designed for eleven
+                                                                                           pointer for
+                                                                                           extent 12
+                                                                                                                nines of data durability, and replicates object data across mul-
+           extent 12                extent 12                                 extent 12             extent 0
+                                                                                                                tiple storage nodes, so single-node crash consistency issues
+  Shard data                Shard data           Soft write           Shard data           Soft write
+                                                                                                                do not cause data loss. We instead see crash consistency as
+  chunk                     chunk                pointer for
+                                                 extent 27
+                                                                      chunk                pointer for
+                                                                                           extent 4
+                                                                                                                reducing the cost and operational impact of storage node
+           extent 27                extent 27              extent 0            extent 4              extent 0
+                                                                                                                failures. Recovering from a crash that loses an entire storage
+                                      (a) Dependency graph                                                      node’s data creates large amounts of repair network traffic
+    LSM tree                                                                                                    and IO load across the storage node fleet. Crash consistency
+     shardID 0x1                                                                                                also ensures that the storage node recovers to a safe state
+     shardID 0x2
+                                                                                                                after a crash, and so does not exhibit unexpected behavior
+     shardID 0x3
+                                                                                                                that may require manual operator intervention.
+
+                 0x40                 0x36                    0x34                  0x44                0x60
+                                                                                                                3 Validating a Storage System
+      4 ↦ 0x36                                      LSM tree            LSM tree
+      9 ↦ 0x34
+     12 ↦ 0x44
+                                                    metadata            data
+                                                                                                                A production storage system combines several difficult-to-
+     27 ↦ 0x60
+                                                                                                                implement complexities [25]: intricate on-disk data struc-
+    extent 0 (superblock)     extent 4             extent 9             extent 12           extent 27
+                                                                                                                tures, concurrent accesses and mutations to them, and the
+                                          (b) On-disk layout                                                    need to maintain consistency across crashes. The scale of a
+                                                                                                                realistic implementation mirrors this complexity: ShardStore
+Figure 2. Dependency graph for three put operations (a)                                                         is over 40,000 lines of code and changes frequently.
+and the corresponding on-disk data (b) after all three puts                                                        Facing these challenges early in ShardStore’s design pro-
+persist successfully. Each put is only durable once both the                                                    cess, we took inspiration from recent successes in storage
+shard data and the index entry that points to it are durable.                                                   system verification [8, 18, 49] and resolved to apply formal
+Writing to each extent also requires updating the soft write                                                    methods to increase our confidence. We chose formal meth-
+pointers stored in the superblock.                                                                              ods because they would allow us to validate deep properties
+                                                                                                                of ShardStore’s implementation that are difficult to test with
+                                                                                                                off-the-shelf tools at S3’s scale and complexityÐfunctional
+to construct more complex dependency graphs. Dependen-                                                          correctness of API-level calls, crash consistency of on-disk
+cies also have an is_persistent operation that clients can                                                      data structures, and correctness of concurrent executions
+use to poll the persistence of an operation.                                                                    including API calls and maintenance tasks like garbage col-
+                                                                                                                lection. Given the complexity of the system and the rapid rate
+Example. Figure 2a shows dependency graphs for three put
+                                                                                                                of change, we needed our results to outlast the involvement
+operations to ShardStore, which after completion result in
+                                                                                                                of formal methods experts, and so we sought a lightweight
+the on-disk state in Fig. 2b. Each put’s graph follows the
+                                                                                                                approach that could be automated and developed by the
+same pattern involving three writes:
+                                                                                                                engineering team itself.
+  (a) the shard data is chunked and written to an extent.                                                          This section gives an overview of our approach to vali-
+  (b) the index entry for the put is flushed in the LSM tree.                                                   dating ShardStore, including the properties we focused on
+  (c) the metadata for the LSM tree is updated to point to                                                      and how we distilled reference model specifications to check
+      the new on-disk index data.                                                                               against the implementation. ğ4ś7 detail how we check that
+In addition to these writes, every time ShardStore appends to                                                   the implementation conforms to these specifications. ğ8 sum-
+an extent it also updates the corresponding soft write pointer                                                  marizes our experiences with this approach, which has pre-
+in the superblock (extent 0).                                                                                   vented subtle issues from reaching production.
+   The dependency graphs for these puts are constructed
+dynamically at run time. The chunk store allocated the shard                                                    3.1   Correctness Properties
+data chunks for puts #1 and #2 to the same extent on disk, so                                                   Correctness for a production storage system is multifaceted:
+their writebacks can be coalesced into one IO by the sched-                                                     it should be durable in the absence of crashes, consistent
+uler, and thus their soft write pointer updates are combined                                                    in the presence of crashes and concurrency, highly avail-
+into the same superblock update. The shard data chunk for                                                       able during normal operation, and meet our performance
+put #3 is allocated to a different extent and so requires a                                                     goals. Our validation effort considers availability and per-
+separate soft write pointer update. All three puts arrive close                                                 formance properties out of scope, as S3 has successfully
+Using Lightweight Formal Methods to Validate a Key-Value Storage Node in Amazon S3       SOSP ’21, October 26ś28, 2021, Virtual Event, Germany
+
+
+established other methods for validating these properties,                shard identifiers to chunk locators, we define a reference
+including integration tests, load testing in pre-production               model that uses a simple hash table to store the mapping,
+environments, and staggered deployments with monitoring                   rather than the persistent LSM-tree described in ğ2.1.
+in production [29]. We chose to focus on durability and con-                 Since the reference models provide the same interface as
+sistency properties, which are hard to establish by traditional           the implementation, ideally they should give identical re-
+testing alone and more difficult to recover from if violated.             sults, so that equivalence would be a simple equality check.
+   In our approach, we ask developers to write an executable              This is true on the happy path, but we found it very difficult
+reference model (ğ3.2) to specify the expected state of the               to enforce strict equality for failures. The reference models
+system after each API call. Our durability property then is               can fail in limited ways (e.g., reads of keys that were never
+that the model and implementation remain in equivalent                    written should fail), but we choose to omit other implemen-
+states after each API call. Since the system is a key-value               tation failures (IO errors, resource exhaustion, etc.) from the
+store, we define equivalence as having the same key-value                 models. This choice simplifies the models at the expense
+mapping. This invariant establishes durability because it                 of making checking slightly more complex and precluding
+ensures that the implementation only loses or changes data                us from reasoning about most availability or performance
+when the specification allows (e.g., by a delete operation).              properties. ğ4.4 discusses failure testing in more detail.
+However, this property is too strong in the face of two types                Implementing the reference model as executable code is
+of non-determinism: crashes may cause data loss that the                  a design choice. We could instead have used a language
+reference model does not allow, and concurrency allows                    intended for modeling (Alloy [23], Promela [22], P [12], etc.),
+operations to overlap, meaning concurrent operations may                  which would have given us better expressiveness and built-in
+be in flight when we check equivalence after each API call.               checking tools. However, we found that by writing reference
+   To address these limitations, we found it useful to de-                models in the same language as the implementation, we
+compose the durability property into three parts and reason               make them easier for engineers to keep up to date. We also
+about each separately:                                                    minimize the cognitive burden of learning a new language
+    1. For sequential crash-free executions, we check for                 and mapping concepts between model and implementation.
+       equivalence directly (ğ4).
+    2. For sequential crashing executions, we extend the ref-
+       erence model to define which data can be lost after a              Mocking. Writing reference models in the implementation
+       crash, and check a corresponding weaker equivalence                language means we can also use them as mocks during unit
+       that establishes both durability and consistency (ğ5).             testing. For example, unit tests at ShardStore’s API layer use
+    3. For concurrent crash-free executions, we write sepa-               the index reference model (a hash map) as a mock of the
+       rate reference models and check linearizability (ğ6).              index component, rather than instantiating the real LSM tree.
+(We do not currently check properties of concurrent crash-                This reuse helps keep the reference models up-to-date over
+ing executions because we have not found an effective auto-               time, as writing unit tests for new features often requires
+mated approach.) This decomposition aids the specification                updating the mock. We have already seen several ShardStore
+effort by allowing us to separate concernsÐthe initial ref-               developers extend the models this way in the course of their
+erence models are simple and easy to audit, and then we                   development work, as ğ8.2 details.
+extend them separately to handle more complex properties.
+Decomposition also helps us scale the validation effort by
+using the most appropriate tools for each type of execution,
+                                                                          Model verification. The reduced complexity of the refer-
+including property-based testing [9] and stateless model
+                                                                          ence model makes it possible in principle to verify desirable
+checking [5, 35].
+                                                                          properties of the model itself to increase confidence in its
+Additional properties. While these properties cover the                   sufficiency (similar to declarative specifications in Hyperk-
+core functionality of ShardStore, we also identified cases                ernel [37]). For example, we could prove that the LSM-tree
+where checking localized properties (about undefined be-                  reference model removes a key-value mapping if and only
+havior, bounds checking, etc) with specialized tools would                if it receives a delete operation for that key. We have ex-
+improve our confidence. ğ7 covers these properties and how                perimented with writing these proofs using the Prusti [2]
+we check them in a lightweight fashion.                                   verifier for Rust. Our early experience with these proofs has
+                                                                          been limited but positive. We have been collaborating with
+3.2   Reference Models                                                    the Prusti maintainers to open-source benchmarks based on
+For each ShardStore component we developed a reference                    our code and to implement the additional features we need
+modelÐan executable specification in Rust that provides the               for these proofs. We are also excited by rapid progress in
+same interface as the component but using a simpler imple-                auto-active [27] Rust verifiers [3, 14, 15, 40, 48] that promise
+mentation. For instance, for the index component that maps                to make this verification effort easier and more scalable.
+SOSP ’21, October 26ś28, 2021, Virtual Event, Germany                                                                     Bornholt et al.
+
+
+4 Conformance Checking                                             1    enum IndexOp<Key, Value> {
+                                                                   2        Get(Key),
+Once we have a reference model specifying the expected             3        Put(Key, Value),
+behavior of the system, we need to check that the imple-           4        ...
+                                                                   5        Reclaim,
+mentation conforms to the reference model according to the         6        Reboot,
+correctness properties above. This section details how we          7    }
+implement this check using property-based testing, and how         8
+                                                                   9    #[proptest]
+we ensure good coverage of the possible behaviors of the          10    fn proptest_index(ops: Vec<IndexOp<u32, u32>>) {
+implementation.                                                   11        let mut reference = ReferenceIndex::new();
+                                                                  12        let mut implementation = PersistentLSMTIndex::new();
+                                                                  13        for op in ops {
+4.1   Property-Based Testing                                      14            match op {
+To check that the implementation satisfies the reference          15                Put(key, value) => {
+                                                                  16                    compare_results!(
+model specification, we use property-based testing [9], which     17                        implementation.put(key, value),
+generates inputs to a test case and checks that a user-provided   18                        reference.put(key, value),
+property holds when that test is run. Property-based test-        19                    );
+                                                                  20                }
+ing can be thought of as an extension of fuzzing with user-       21                Get(key) => { ... }
+provided correctness properties and structured inputs, which      22                ...
+allow it to check richer behaviors than fuzzing alone. When       23            }
+                                                                  24            check_invariants(&reference, &implementation);
+a property-based test fails, the generated inputs allow the       25        }
+failure to be replayed (provided the test is deterministic).      26    }
+   We use property-based testing to check that implementa-             Figure 3. Property-based test harness for the index reference
+tion code refines the reference model: any observable behav-           model.
+ior of the implementation must be allowed by the model. We
+frame this check as a property-based test that takes as input a
+sequence of operations drawn from an alphabet we define. For           by increasing the scale of testingÐwe routinely run tens of
+each operation in the sequence, the test case applies the oper-        millions of random test sequences before every ShardStore
+ation to both reference model and implementation, compares             deploymentÐbut these tests can only ever check system
+the output of each for equivalence, and then checks invari-            states that the test harness is able to reach. The key challenge
+ants that relate the two systems. To ensure determinism and            in using property-based testing for validation is ensuring
+testing performance, the implementation under test uses an             that it can reach interesting states of the system. We do this
+in-memory user-space disk, but all components above the                by introducing domain knowledge into argument selection
+disk layer use their actual implementation code.                       via biasing, and by employing code coverage mechanisms to
+   Fig. 3 shows an example of this property-based test for             monitor test effectiveness.
+the index component. The IndexOp enumeration (lines 1ś7)               Argument bias. We apply biases in the property-based test
+defines an alphabet of allowed operations. It covers both              harnesses when selecting arguments for operations in a test’s
+the component’s API operations (lines 2ś4: Get, Put, etc.)             alphabet. For example, a naive implementation of Fig. 3
+and background operations such as reclamation and clean                would generate random keys for Get and Put operations,
+reboots (lines 5ś6). These background operations are no-ops            which would rarely coincide, and so would almost never test
+in the reference model (they do not change the key-value               the successful Get path. We instead bias the argument to
+mapping of the index) but including them validates that                Get to prefer to choose from keys that were Put earlier. We
+their implementations do not corrupt the index. Each test              also bias argument selection towards corner cases, such as
+run chooses a set of arbitrary sequences from the operation            read/write sizes close to the disk page size, which in our
+alphabet with arbitrarily chosen arguments (e.g., keys and             experience are frequent causes of bugs. These biases are al-
+values), and invokes proptest_index (line 10) with each                ways probabilistic: they only increase the chance of selecting
+sequence. For each operation in a sequence, the test applies           desirable cases, but other cases remain possible. For example,
+it both to the implementation (line 17) and the reference (line        we still want to test Gets that are unsuccessful, so we do
+18) and compare the results as ğ3.2 describes. Finally (line           not require the key to be one we have previously Put, only
+24), after each operation we perform additional invariant              increase the probability that it is.
+checks comparing the implementation and the reference (e.g.,              Argument biasing is important for increasing coverage,
+checking that both store the same key-value mapping).                  but it also has limitations. While elaborate argument selec-
+                                                                       tion strategies can often be easily justified (“our production
+4.2 Coverage                                                           customer traffic follows this distribution so we should mirror
+Property-based testing selects random sequences of oper-               it herež), we have found little benefit to them. For example,
+ations to test, and so can miss bugs. We reduce this risk              we experimented with replicating production object size and
+Using Lightweight Formal Methods to Validate a Key-Value Storage Node in Amazon S3        SOSP ’21, October 26ś28, 2021, Virtual Event, Germany
+
+
+Get/Put ratio distributions with no effect. More generally,               ways; for example, the default hash algorithm for HashMap
+biasing introduces the risk of baking our assumptions into                types in Rust is randomized and so the iteration order of a
+our tests, when our goal in adopting formal methods is to                 map’s contents varies across runs. Second, we design our
+invalidate exactly such assumptions by checking behaviors                 alphabet of operations with minimization heuristics in mind.
+we did not consider. Our methodology has settled on trusting              For example, the property-based testing tool we use [30]
+default randomness wherever possible, and only introducing                minimizes enumeration types by preferring earlier variants
+bias where we have quantitative evidence that it is beneficial            in the definition (i.e., it will prefer Get in the IndexOp enu-
+(as in the page-size example above).                                      meration in Fig. 3), and so we arrange operation alphabets
+                                                                          in increasing order of complexity.
+Coverage metrics. As the code evolves over time, new func-
+tionality may be added that is not reachable by the existing              4.4    Failure Injection
+property-based test harness. At the interface level, a compo-             In addition to checking correctness in ideal conditions, we
+nent may gain new API methods or arguments that need to                   also use property-based testing to check that ShardStore
+be incorporated into the operation alphabet. At the imple-                correctly handles failures in its environment. Hard disks fail
+mentation level, a component may gain new functionality                   at a non-trivial rate [43], and at scale these failures must be
+(e.g., a cache) that affects the set of states reachable by the           handled automatically without operator intervention. We
+existing test harness. Both types of changes risk eroding the             consider three distinct classes of environmental failures:
+coverage of property-based tests and increase the chance
+                                                                              1. Fail-stop crashes (e.g., power outages, kernel panics)
+that testing misses bugs. To mitigate these risks, our test
+                                                                              2. Transient or permanent disk IO failures (e.g., HDD
+harnesses generate code coverage metrics for the implemen-
+                                                                                 failures, timeouts)
+tation code to help us identify blind spots that are not suf-
+                                                                              3. Resource exhaustion (e.g., out of memory or disk space)
+ficiently checked, including newly added functionality that
+the reference model may not know about, and we tune our                   Fail-stop crashes involve the ShardStore software itself crash-
+argument selection strategies to remedy them.                             ing and recovering; ğ5 describes how we test crash consis-
+                                                                          tency in this failure mode.
+4.3 Minimization                                                          Disk IO failures. To test transient or permanent IO failures
+Our property-based tests generate random sequences of op-                 while ShardStore continues running, we extend our property-
+erations as input, and when they find a failing test case, the            based tests to inject IO failures into their in-memory disk. We
+sequence of operations can be used to reproduce the failure               extend the operation alphabet with new failure operations
+as a unit test. Most property-based testing tools automati-               (e.g., FailDiskOnce(ExtentId) causes the next IO to the
+cally minimize the failing input to simplify the debugging                chosen extent to fail) and allow the property-based test to
+experience [20, 32, 44]. Given a failing sequence of opera-               generate those operations like any other.
+tions, the testing tool repeatedly applies reduction heuristics              Failure injection requires us to relax the conformance
+to simplify the sequence until the reduced version no longer              check in Fig. 3 slightly, as implementation operations may
+fails. These reduction heuristics are generally simple trans-             not be atomic with respect to injected failures. For example, if
+formations such as “remove an operation from the sequencež                a single implementation operation performed three IOs, and
+or “shrink an integer argument towards zerož. They usually                one of those IOs suffered an injected failure, the other two IOs
+do not make any guarantees about finding a minimum failing                may have succeeded and so their effects will be visible. This
+input, but are effective in practice, and we have not found               would cause divergence between the reference model and the
+the need to develop custom heuristics. For example, when                  implementationÐthe reference model does not keep enough
+discovering bug #9 in Fig. 5, the first random sequence that              state to tell which effects should be visible after an IO failureÐ
+failed the test had 61 operations, including 9 crashes and                and so the strict compare_results check in Fig. 3 is too
+14 writes totalling 226 KiB of data; the final automatically              strong. One solution would be to track all possible states of
+minimized sequence had 6 operations, including 1 crash and                the reference model after a failure, but this blows up quickly
+2 writes totalling 2 B of data.                                           in the face of multiple failures. We could instead try to de-
+   Although the minimization process is automated, we ap-                 termine the semantic effect of individual IOs and so track
+ply two design techniques to improve its effectiveness. First,            which data a failure is expected to affect, but this would be
+we design ShardStore components to be as deterministic                    fragile and make the reference model expensive to maintain.
+as possible, and where non-determinism is required we en-                    Instead, the harness tracks a simple “has failedž flag that re-
+sure it can be controlled during property-based testing. Non-             laxes equivalence checks between reference and implementa-
+determinism interferes with minimization because the re-                  tion after a failure is injected. The relaxed check allows oper-
+duction process stops as soon as a test execution does not                ations to disagree with the reference model, but only in some
+fail. Determinism as a system design principle is not new,                ways; for example, a Get operation with an injected IO error
+but non-determinism sneaks into modern code in surprising                 is allowed to fail by returning no data, but is never allowed to
+SOSP ’21, October 26ś28, 2021, Virtual Event, Germany                                                                 Bornholt et al.
+
+
+return the wrong dataÐwe expect ShardStore components to           in volatile memory is persisted to disk by the crash; for ex-
+detect and fail operations that involve corruption even in the     ample, it can choose whether to flush the in-memory section
+presence of IO errors (e.g., by validating checksums). To en-      of the LSM-tree, whether to flush the buffer cache, etc.
+sure these relaxations do not cause our testing to miss bugs          After reboot and recovery, the test iterates through the
+unrelated to failures, we separately run our property-based        dependencies returned by each mutating operation on the
+tests with and without failure injection enabled.                  implementation and checks the two properties above. For the
+                                                                   ReferenceIndex example in Fig. 3, the persistence check is:
+Resource exhaustion. We do not currently apply property-           for (key, dependency) in dependency_map {
+based testing for resource exhaustion failures such as run-            assert!(
+                                                                           !dependency.is_persistent()
+ning out of disk space. We have found these scenarios difficult              || reference.get(key) == implementation.get(key)
+to test automatically because we lack a correctness oracle:            );
+resource exhaustion tests need to distinguish real bugs (e.g.,     }
+a space leak) from failures that are expected because the          Here, the check first polls each operation’s Dependency ob-
+test allocates more space than the environment has avail-          ject to determine whether it was persisted before the crash;
+able. However, all storage systems introduce some amount           if so, it then checks that the corresponding data can be read
+of space overhead and amplification (due to metadata, check-       and has the expected value. If the check fails, there is a crash
+sums, block alignment, allocation, etc.). To distinguish real      consistency bug, such as the Dependency graph missing a
+failures requires accounting for these overheads, but they         required ordering (edge) or write operation (vertex) to en-
+are intrinsic to the implementation and difficult to compute       sure consistency. To validate forward progress, the model
+abstractly. We think adopting ideas from the resource analy-       checks the stronger property
+sis literature [21] would be promising future work to address           assert!(dependency.is_persistent());
+this problem.                                                      for each dependency on a clean reboot.
+                                                                   Block-level crash states. This approach generates crash
+5 Checking Crash Consistency                                       states at a coarse granularity: the RebootType parameter
+Crash consistency can be a source of bugs in storage sys-          makes a single choice for each component (e.g., the LSM
+tems [42]. ShardStore uses a crash consistency protocol based      tree) about whether its entire state is flushed to disk. Coarse
+on soft updates (ğ2.2), which introduces implementation com-       flushes can miss bugs compared to existing techniques that
+plexity. For ShardStore, reasoning about crash consistency         exhaustively enumerate all crash states at the block level [42]
+was a primary motivation for introducing formal methods            or use symbolic evaluation to check all crash states within
+during development, and so it was a focus of our efforts.          an SMT solver [4].
+  We validate crash consistency by using the user-space               To increase the chance of finding bugs, the operation alpha-
+dependencies discussed in ğ2.2. Each mutating ShardStore           bet for the crash-consistency tests includes flush operations
+operation returns a Dependency object that can be polled to        for each component that can be interleaved with other oper-
+determine whether it has been persisted. As a specification,       ations. For example, a history like Put(0, 3), IndexFlush,
+we define two crash consistency properties in terms of these       Put(1, 7), DirtyReboot(None) would flush the index en-
+dependencies:                                                      try for key 0 to the on-disk LSM tree, even though the later
+                                                                   DirtyReboot does not specify any components to flush. The
+   1. persistence: if a dependency says an operation has per-      resulting crash state would therefore reflect an index that is
+      sisted before a crash, it should be readable after a crash   only partially flushed.
+      (unless superseded by a later persisted operation)              We have also implemented a variant of DirtyReboot that
+   2. forward progress: after a non-crashing shutdown, every       does enumerate crash states at the block level, similar to
+      operation’s dependency should indicate it is persistent      BOB [42] and CrashMonkey [33]. However, this exhaustive
+                                                                   approach has not found additional bugs and is dramatically
+Forward progress rules out dependencies being so strong that
+                                                                   slower to test, so we do not use it by default.
+they never complete. We do not enforce any finer-grained
+properties about dependency strength, and so a dependency          Example. Issue #10 in Fig. 5 was a crash consistency bug in-
+returned by the implementation could be stronger than strictly     volving a planned change to chunk reclamation that our val-
+necessary to ensure consistency, but the persistence property      idation uncovered. Because our methodology is lightweight
+ensures it is not too weak.                                        and automated, the developer was able to run property-based
+   To check that the implementation satisfies these crash con-     tests locally and discover this issue before even submitting
+sistency properties, we extend the property-based testing ap-      for code review.
+proach in ğ4 to generate and check crash states. We augment           The issue arose from how chunk data is serialized. Chunk
+the operation alphabet to include a DirtyReboot(RebootType)        data is framed on disk with a two-byte magic header (“Mž
+operation. The RebootType parameter controls which data            below) and a random UUID, repeated on both ends to allow
+Using Lightweight Formal Methods to Validate a Key-Value Storage Node in Amazon S3       SOSP ’21, October 26ś28, 2021, Virtual Event, Germany
+
+
+validating the chunk’s length. The issue involved a chunk                 difficult to test and debug as they introduce non-determinism
+whose serialized form spilled the UUID onto a second page                 into the execution.
+on an extent:                                                                To extend our approach to check concurrent properties,
+                                                                          we hand-wrote harnesses for key properties and validated
+    M UUID length    payload   UUID                                       them using stateless model checking [17], which explores con-
+    page 0                        page 1
+                                                                          current interleavings of a program. We use this approach
+At this point, a crash occurs and loses the data on page 1 but            both to check concurrent executions of the storage system
+not the data on page 0, which had been flushed before the                 and to validate some ShardStore-specific concurrency primi-
+crash. This data loss corrupts the chunk, but so far there is             tives. Stateless model checkers can both validate concurrency
+no consistency issue because we never considered the chunk                properties (e.g., consistency) and test for deadlocks (by find-
+persistent (as the Dependency graph for the chunk includes                ing interleavings that end with all threads blocked).
+both page 0 and page 1). After reboot and recovery, a second              Properties and tools. In principle, we would like to check
+chunk is written to the same extent, starting from page 1                 that concurrent executions of ShardStore are linearizable
+(the current write pointer):                                              with respect to the sequential reference models. We check
+                                                                          such fine-grained concurrency properties using the Loom
+    M UUID length    payload   UUID
+                                  M UUID length   payload   UUID
+                                                                          stateless model checker for Rust [28], which implements
+    page 0                        page 1
+                                                                          the CDSChecker [39] algorithm for sound model checking
+This second chunk is then flushed to disk, and so is con-                 in the release/acquire memory model, and uses bounded
+sidered persistent. Next, the scenario runs reclamation on                partial-order reduction [10] to reduce state explosion.
+this extent, which scans all the chunks on the extent. Nor-                  However, sound stateless model checking tools like Loom
+mally this reclamation would see the first chunk is corrupted             are not scalable enough to check linearizability of end-to-end
+because its leading and trailing UUIDs do not match, and                  ShardStore testsÐeven a relatively small test involves tens
+so it would skip to the second chunk, which it can decode                 of thousands of atomic steps whose interleavings must be
+successfully. However, this logic fails if the trailing bytes of          explored, and the largest tests involve over a million steps.
+the first chunk’s UUID (the bytes that spilled onto page 1                For these tests, we developed and open-sourced the stateless
+and were lost in the crash) are the same as the magic bytes.              model checker Shuttle [47], which implements randomized
+In that case, the reclamation will successfully decode that               algorithms such as probabilistic concurrency testing [5]. The
+first chunk, and then skip over the second chunk because                  two tools offer a soundnessśscalability trade-off. We use
+reclamation does not expect overlapping chunks. Once the                  Loom to soundly check all interleavings of small, correctness-
+reclamation finishes, the second chunk becomes inaccessible,              critical code such as custom concurrency primitives, and
+as resetting the extent prevents access to data stored on it.             Shuttle to randomly check interleavings of larger test har-
+This outcome is a consistency violation: the Dependency for               nesses to which Loom does not scale such as end-to-end
+the second chunk was considered persistent once the chunk                 stress tests of the ShardStore stack.
+was flushed to disk, but after a subsequent reclamation, the                 Fig. 4 shows an example of a Loom test harness for Shard-
+chunk was lost.                                                           Store’s LSM-tree-based index (a corresponding Shuttle test
+   This was a subtle issue that involved a particular choice of           harness looks similar). The test mocks out the persistent
+random UUID to collide with the magic bytes, a chunk that                 chunk storage that backs the LSM tree as a conceit to scal-
+was the right size to just barely spill onto a second page, and           ability. The harness first initializes the index’s state with a
+a crash that lost only the second page. Nonetheless, our con-             fixed set of keys and values. It then spawns three concurrent
+formance checks automatically discovered and minimized                    threads: chunk reclamation for a single arbitrarily chosen
+this test case.                                                           extent (line 11), LSM tree compaction for the index (line 14),
+                                                                          and a thread that overwrites some keys in the index and then
+6 Checking Concurrent Executions                                          reads them back (line 17). The test checks read-after-write
+                                                                          consistency for a fixed read/write history: interleavings of
+Our validation approach thus far deals only with sequential
+                                                                          concurrent background threads between the line 20 write and
+correctness, as the conformance checking approach in ğ4
+                                                                          line 21 read should not affect the read-after-write property.
+tests only deterministic single-threaded executions. In prac-
+tice, a production storage system like ShardStore is highly               Example. Issue #14 in Fig. 5 was a race condition in the LSM
+concurrent, with each disk servicing several concurrent re-               tree implementation that was caught by the Loom test har-
+quests and background maintenance tasks (e.g., LSM tree                   ness in Fig. 4 before even reaching code review. The LSM tree
+compaction, buffer cache flushing, etc). Rust’s type system               implementation uses an in-memory metadata object to track
+guarantees data-race freedom within the safe fragment of                  the set of chunks that are currently being used to store LSM
+the language [52], but cannot make guarantees about higher-               tree data on disk. This metadata is mutated by two concur-
+level race conditions (e.g., atomicity violations), which are             rent background tasks: (1) LSM tree compaction flushes the
+     SOSP ’21, October 26ś28, 2021, Virtual Event, Germany                                                               Bornholt et al.
+
+
+ 1    loom::model(|| {                                               the three chunks on that extent. The first two were refer-
+ 2        let chunk_store = MockChunkStore::new();
+ 3        let index = PersistentLSMTIndex::new(chunk_store);         enced by the metadata, and so were evacuated to extent 2.
+ 4                                                                   However, the newly written chunk was not yet referenced
+ 5         // Set up some initial state in the index                 by the metadata (as the compaction thread was preempted
+ 6         for (key, value) in &[...] {
+ 7             index.put(key, value);                                before it could update the metadata), and so the reclamation
+ 8         }                                                         dropped the new chunk and reset the extent:
+ 9
+10         // Spawn concurrent operations
+11         let t1 = thread::spawn(|| {
+12             chunk_store.reclaim();
+13         });
+14         let t2 = thread::spawn(|| {
+15             index.compact();                                             extent 0         extent 1         extent 2
+16         });
+17         let t3 = thread::spawn(|| {                               Now when the compaction thread resumes and updates the
+18             // Overwrite keys and check the new value sticks
+19             for (key, value) in &[...] {                          metadata, it will introduce a dangling pointer to a chunk that
+20                 index.put(key, value);                            was dropped by reclamation, and so the index entries the
+21                 let new_value = index.get(key);                   LSM tree wanted to store on that chunk are lost. The fix was
+22                 assert_eq!(new_value, value);
+23             }                                                     to make compaction lock the extents it writes new chunks
+24         });                                                       into until it can update the metadata to point to them.
+25
+26         t1.join(); t2.join(); t3.join();
+27    })                                                             7 Other Properties
+     Figure 4. Stateless model checking harness for the index.       The validation approach described so far covers the proper-
+     The test validates that the index exhibits read-after-write     ties in ğ3.1. However, while developing ShardStore, we iden-
+     consistency for a set of keys under concurrent background       tified two more localized classes of issues that our existing
+     maintenance tasks (chunk reclamation and LSM tree com-          approach would not detect, and adopted specific reasoning
+     paction). The Loom stateless model checker [28] explores        techniques to check for them.
+     all concurrent interleavings of the closure passed to model.
+     (Some Arc code to please the borrow checker is omitted.)        Undefined behavior. ShardStore is written in Rust, which
+                                                                     ensures type and memory safety for the safe subset of the lan-
+                                                                     guage. However, as a low-level system, ShardStore requires a
+     in-memory section of the index to disk, creating new chunks
+                                                                     small amount of unsafe Rust code, mostly for interacting with
+     to be added to the metadata and removing chunks whose
+                                                                     block devices. Unsafe Rust is exempt from some of Rust’s
+     contents have been compacted; and (2) chunk reclamation
+                                                                     safety guarantees and introduces the risk of undefined behav-
+     scans extents used by the LSM tree to recover free space, and
+                                                                     ior [1]. To rule out this class of bugs, we run ShardStore’s test
+     updates the metadata to point to relocated chunks.
+                                                                     suite under the Miri interpreter [50], a dynamic analysis tool
+        The issue involved a concurrent compaction and reclama-
+                                                                     built into the Rust compiler that can detect certain classes
+     tion on an index where the metadata pointed to three chunks
+                                                                     of undefined behavior. We had to extend Miri to support
+     currently storing the LSM tree:
+                                                                     basic concurrency primitives (threads and locks), and have
+                                                                     upstreamed that work to the Rust compiler.
+
+                                                                     Serialization. ShardStore has a number of serializers and
+                                                                     deserializers that marshal data between in-memory and on-
+             extent 0          extent 1           extent 2
+     From this state, the compaction thread ran and stored the       disk formats. Both bit rot and transient failures can corrupt
+     in-memory section of the LSM tree into a new chunk, which       on-disk data, and so we treat data read from disk as untrusted.
+     was small enough to write into extent 0:                        We want to ensure that deserialization code running on such
+                                                                     untrusted data is robust to corruption. We worked with the
+                                                                     developers of Crux [51], a bounded symbolic evaluation en-
+                                                                     gine, to prove panic-freedom of our deserialization code. We
+                                                                     proved that for any sequence of on-disk bytes (up to a size
+             extent 0          extent 1           extent 2           bound), our deserializers cannot panic (crash the thread) due
+     The compaction thread’s next step is to update the in-memory    to out of bounds accesses or other logic errors. We also fuzz
+     metadata to include a pointer to the new chunk (the dashed      the same deserializer code on larger inputs to work around
+     pointer above). However, before it could do this, it was pre-   the small size bound required to make symbolic evaluation
+     empted by the reclamation thread, which chose to perform        tractable. We also supplied benchmarks based on these prob-
+     a reclamation on extent 0. The reclamation thread scanned       lems to the Crux developers to aid in further development.
+Using Lightweight Formal Methods to Validate a Key-Value Storage Node in Amazon S3       SOSP ’21, October 26ś28, 2021, Virtual Event, Germany
+
+
+8 Experience                                                              each written more than 100 lines of code extending these
+This section reports on our experience validating ShardStore,             tests, including crash consistency conformance checks for
+including the effort to perform validation and the level of               new functionality. Four engineers have written new stateless
+adoption by the engineering team.                                         model checking harnesses for concurrent code they have
+                                                                          added, and the need for such harnesses is now a standard
+8.1   Bugs Prevented                                                      question during code review of new concurrent functionality.
+Figure 5 presents a catalog of issues detected by our valida-             8.3    Limitations
+tion effort, broken down by the top-level property violated.
+                                                                          As discussed in ğ4, our validation checks can miss bugsÐtheir
+Two of these issues were presented in more detail in ğ5
+                                                                          reporting success does not mean the code is correct, only that
+and ğ6. Each of these issues was prevented from reaching
+                                                                          they could not find a bug. We are not currently aware of any
+production, and detected using the mechanisms described
+                                                                          bugs that have reached production after being missed due to
+in ğ4ś6 (property-based testing for functional correctness
+                                                                          this limitation, but of course we cannot rule it out. We have
+and crash consistency issues; stateless model checking for
+                                                                          seen one example of a bug that our validation should have
+concurrency issues). Most issues related to data integrityÐ
+                                                                          caught but did not, and was instead caught during manual
+they could cause data to be lost or stored incorrectlyÐwhile
+                                                                          code review. That issue involved an earlier code change that
+one concurrency issue (#12) was an availability issue caused
+                                                                          had added a new cache to a ShardStore component. Our
+by a deadlock. Each issue was detected automatically by
+                                                                          existing property-based tests had trouble reaching the cache-
+our tools, although diagnosis remains a developer-intensive
+                                                                          miss code path in this change because the cache size was
+manual effort aided by automated test-case minimization for
+                                                                          configured to be very large in all tests. The new bug was in
+property-based testing.
+                                                                          a change to that cache-miss path, and so was not reached
+   The issues in Fig. 5 span most of ShardStore’s components
+                                                                          by the property-based tests; after reducing the cache size,
+and suggest that our approach has been effective at prevent-
+                                                                          the tests automatically found the issue. This missed bug was
+ing bugs in practice. One aspect these results do not measure
+                                                                          one motivation for our work on coverage metrics ğ4.2.
+is effectiveness at detecting bugs early in development, as
+                                                                             A non-trivial amount of ShardStore’s code base is parsing
+they include only issues that reached (and were blocked by)
+                                                                          of S3’s messaging protocol, request routing, and business
+our continuous integration pipeline. Anecdotally, developers
+                                                                          logic, which we are still working on validating. We also do
+have told us of more bugs our checks detected during local
+                                                                          not have a complete reference model (ğ3.2) for some oper-
+development that never made it to to code review.
+                                                                          ations ShardStore exposes to S3’s control plane. As future
+                                                                          work, we plan to model the parts of these control plane inter-
+8.2 Validation Effort                                                     actions that are necessary to establish durability properties.
+Figure 6 shows the size of the ShardStore code base. Ex-
+cluding the reference models and validation test harnesses                8.4    Lessons Learned
+described in this paper, unit and integration tests comprise              Our lightweight formal methods approach was motivated by
+31% of the code base. Figure 6 also tallies the size of the               two goals: to detect bugs as early as possible in development,
+reference models and validation test harnesses for each of                and to ensure that our validation work remains relevant as
+the top-level properties in ğ3.1. From the code base’s per-               the code changes over time. We learned useful lessons in
+spective, the validation tests are just unit tests like any other:        both directions in the course of doing this work.
+they are run using Rust’s built-in testing infrastructure, and
+they are distinguished from other tests only by naming con-               Early detection. We began formal methods work on Shard-
+ventions and module hierarchy. These artifacts combined                   Store early in development, when the design was still being
+are only 13% of the total code base and 20% of the size of                iterated on and code was being delivered incrementally. To
+the implementation code, an overhead that compares favor-                 fit this development process, we focused on delivering mod-
+ably to formal verification approaches that report 3ś10×                  els and tests one component at a time. As soon as we had
+overhead [8, 18, 49].                                                     a reference model for one ShardStore component (chunk
+   Development of the reference models and test harnesses                 storage and reclamation), we integrated that into the code
+was led initially by two formal methods experts working full-             base and began training engineers, while in parallel extend-
+time for nine months and a third expert who joined for three              ing the models to cover more components. This approach
+months. However, since that initial effort, most work on them             both helped detect bugs early and increased interest in the
+has been taken over by the ShardStore engineering team,                   results of our workÐhaving seen the issues detected even
+none of whom have any prior formal methods experience.                    in this one component, engineers encouraged us to make
+As a crude measure of this adoption, 18% of the lines of                  the tests release blockers for continuous delivery, while also
+code in the test harnesses were last edited by a non-formal-              independently starting to develop models and properties for
+methods expert according to git blame. Three engineers have               the components they owned.
+SOSP ’21, October 26ś28, 2021, Virtual Event, Germany                                                                                   Bornholt et al.
+
+
+                      ID    Component          Description
+                      Functional Correctness
+                      #1    Chunk store Off-by-one error in reclamation for chunks of size close to PAGE_SIZE
+                      #2    Buffer cache Cache was not correctly drained after resetting an extent
+                      #3    Index            Metadata was not flushed correctly during shutdown if an extent was reset
+                      #4    API              Shards could be lost if a disk was removed from service and then later returned
+                      #5    Chunk store Reclamation could forget chunks after a transient read IO error
+                      Crash Consistency
+                      #6    Superblock         Superblock Dependency for extent ownership was incorrect after a reboot
+                      #7    Superblock         Mismatch between soft and hard write pointers in a crash after an extent reset
+                      #8    Buffer cache       Writes did not include a dependency on the soft write pointer update
+                      #9    Chunk store        Reference model was not updated correctly after a crash during reclamation
+                      #10 Chunk store          Reclamation could forget chunks after a crash and UUID collision
+                      Concurrency
+                      #11 Chunk store          Chunk locators could become invalid after a race between write and flush
+                      #12 Superblock           Buffer pool exhaustion could cause threads waiting for a superblock update to deadlock
+                      #13 API                  Race between control plane operations for listing and removal of shards
+                      #14 Index                Race between reclamation and LSM compaction could lose recent index entries
+                      #15 Chunk store          Reference model could re-use chunk locators, which other code assumed were unique
+                      #16 API                  Race between control plane bulk operations for creating and removing shards
+
+
+                      Figure 5. ShardStore issues prevented from reaching production by our validation effort.
+
+              Component                                Lines                       Continuous validation. Tightly integrating reference mod-
+              ShardStore                                                           els into the code base has been crucial for ensuring that our
+              Implementation                          44,048                       validation remains effective as the code changes over time.
+              Unit tests & integration tests          19,540                       Developers must update the models whenever code changes
+              Specification                                                        in order to avoid breaking the build; having the models in
+              Reference models (ğ3.2)                    450                       Rust makes the overhead of these updates low enough to be
+              Validation                                                           practical. From the formal methods perspective, this integra-
+              Functional correctness checks (ğ3)       4,860                       tion is a way to convince engineers to write specifications
+              Crash consistency checks (ğ5)            2,661                       themselves. In practice, after the first iteration of the refer-
+              Concurrency checks (ğ6)                    901                       ence models was written by formal methods experts, they
+              Total                                   72,460                       have been updated almost exclusively by the engineering
+                                                                                   team.
+Figure 6. Lines of code for ShardStore implementation and                             We focused heavily on lowering the marginal cost of fu-
+validation artifacts. All lines are Rust code.                                     ture validation: we would not have considered this work
+                                                                                   successful if future code changes by engineers required kick-
+                                                                                   ing off new formal methods engagements. Early in our work,
+                                                                                   we wrote reference models using modeling languages we
+   By focusing on modeling components whose APIs had                               were familiar with (Alloy [23], SPIN [22], and Yggdrasil-style
+become stable, we avoided too much churn in the specifi-                           Python [49]) and imagined developing tooling to check the
+cation and code for the models, which would have made                              Rust code against them. It was only when we discussed
+them much more expensive to maintain. Had we started                               long-term maintenance implications with the team that we
+looking at formal methods later, when design and code were                         realized writing the models themselves in Rust was a much
+more stable, we would have been tempted to write a single                          better choice, and even later when we realized the reference
+reference model for just the public interface to ShardStore.                       models could serve double duty as mocks for unit testing.
+This approach would lower the overhead of writing specifi-
+cations, but we think it would have been the wrong decision                        Future directions. While we’re pleased with the effective-
+and would have caught fewer bugs. We found it much easier                          ness of our validation work for ShardStore, we’re not done.
+to exercise corner case scenarios (especially fault scenarios)                     Our work so far has focused on modeling and checking key
+by writing tests that directly exercise internal component                         correctness properties (such as crash consistency) of Shard-
+APIs, and engineers have found it easier to debug and fix                          Store viewed as a single storage node. But Amazon S3 is a
+failures in their own changes by not having to trace them                          complex distributed system with hundreds of microservices,
+back through the entire implementation stack.                                      several of which interact with ShardStore storage nodes to
+Using Lightweight Formal Methods to Validate a Key-Value Storage Node in Amazon S3          SOSP ’21, October 26ś28, 2021, Virtual Event, Germany
+
+
+replicate customer data and perform control plane opera-                  writes. We take a coarser-grained approach to crash con-
+tions. AWS has been using the P language for asynchronous                 sistency (ğ5) that scales our testing to larger scenarios and
+programs [11ś13] to validate the correctness of new S3 fea-               covers data consistency.
+tures such as strong consistency [36], and using TLA+ to
+validate the designs of a number of systems [38]. We are                  Storage specifications. The POSIX standard for file systems
+exploring ways of combining P with Rust to extend these                   is imprecise prose, and so difficult to build a validation ap-
+results to include reasoning about ShardStore’s role in the               proach around. SibylFS [46] is an effort to build an executable
+S3 system. We also continue to explore ways to strengthen                 formal model in Lem [34] of the POSIX file system interface
+the guarantees provided by our validation work, including                 and test conformance of file system implementations. Kang
+the recent rapid advances in Rust verification tools [45].                and Jackson [26] develop a formal model of a flash file system
+                                                                          in Alloy [23] and check its correctness against an abstract
+                                                                          POSIX specification. In contrast to these approaches, our ref-
+9 Related Work                                                            erence model specifications are written in the same language
+                                                                          as the implementation, making them easier to update by an
+Storage verification. There has been significant recent in-
+                                                                          engineering team as requirements change over time.
+terest in formally verified storage systems. Yggdrasil [49]
+is a “push-buttonž verified file system implementation that
+formalizes a refinement to define allowed states after a crash.           10     Conclusion
+FSCQ [8] is a formally verified filesystem that instead adopts            ShardStore is a new storage backend for Amazon S3 for
+a crash-aware Hoare logic to define the allowed crash behav-              which we decided early in the design process to involve
+iors of each POSIX system call. VeriBetrKV [18] is a more                 formal methods. Our experience with lightweight formal
+recent effort to verify a key-value store with a focus on auto-           methods has been positive, with a number of issues pre-
+mated proofs that delivers stronger guarantees than we do at              vented from reaching production and substantial adoption
+the cost of more overhead (“tediumž in their terms): 7 lines of           by the ShardStore engineering team. We are excited to fur-
+proof for every line of implementation. Our approach does                 ther improve our results by applying stronger verification
+not have the soundness guarantees of these examplesÐwe                    techniques and expanding the scope of our effort to validate
+can miss bugs these systems would have caughtÐbut our                     more of S3.
+lightweight tools dramatically increase the ability for our
+engineering teams to adopt and integrate formal methods                   Acknowledgments
+into their development practice.                                          We thank the anonymous reviewers, Murat Demirbas, Emina
+   We considered dealing with concurrency essential for our               Torlak, Xi Wang, and our shepherd Manos Kapritsos for
+approach to be successful. Recent verification efforts for                their feedback on this paper. We thank Stuart Pernsteiner for
+concurrent storage systems have focused on simple repli-                  his work applying the Crux symbolic execution engine to
+cated disks [6] and journaling file systems [7]. ShardStore               ShardStore. Finally, we thank the entire S3 ShardStore team
+is substantially more complex than these designs, and so                  at AWS for their collaboration and ongoing support of this
+we focused on lightweight stateless model checking and on                 effort.
+providing a good debugging experience for concurrent test
+failures using the Shuttle model checker [47], again at the
+cost of potentially missing bugs.                                         References
+                                                                           [1] Vytautas Astrauskas, Christoph Matheja, Federico Poli, Peter Müller,
+                                                                               and Alexander J. Summers. 2020. How do programmers use unsafe
+Storage testing. Several projects have explored using model                    Rust? Proc. ACM Program. Lang. 4, OOPSLA (2020), 136:1ś136:27.
+                                                                           [2] Vytautas Astrauskas, Peter Müller, Federico Poli, and Alexander J.
+checking or fuzzing techniques to find bugs in storage sys-                    Summers. 2019. Leveraging Rust types for modular specification and
+tem, with a particular focus on crash consistency. EXPLODE [54]                verification. Proc. ACM Program. Lang. 3, OOPSLA (2019), 147:1ś
+uses model checking to validate a file system against a user-                  147:30.
+written test harness. We take a similar approach but with                  [3] Marek Baranowski, Shaobo He, and Zvonimir Rakamaric. 2018. Ver-
+richer specifications and less reliance on user-written harnessesÐ             ifying Rust Programs with SMACK. In Proceedings of the 16th Inter-
+                                                                               national Symposium on Automated Technology for Verification and
+with property-based testing we ask the user to write only an                   Analysis (ATVA). Los Angeles, CA, USA, 528ś535.
+operation alphabet, and the testing harness chooses inputs                 [4] James Bornholt, Antoine Kaufmann, Jialin Li, Arvind Krishnamurthy,
+to run. Ferrite [4] includes an SMT-based model checker for                    Emina Torlak, and Xi Wang. 2016. Specifying and checking file sys-
+detecting file system crash consistency bugs, but reasons                      tem crash-consistency models. In Proceedings of the 21st International
+only about an abstract model of the file system rather than                    Conference on Architectural Support for Programming Languages and
+                                                                               Operating Systems (ASPLOS). Atlanta, GA, USA, 83ś98.
+implementation code. CrashMonkey [33] checks metadata                      [5] Sebastian Burckhardt, Pravesh Kothari, Madanlal Musuvathi, and San-
+crash consistency of an unmodified file system by running                      tosh Nagarakatte. 2010. A randomized scheduler with probabilistic
+small workloads and interposing at the block layer to trace                    guarantees of finding bugs. In Proceedings of the 15th International
+SOSP ’21, October 26ś28, 2021, Virtual Event, Germany                                                                                      Bornholt et al.
+
+
+     Conference on Architectural Support for Programming Languages and         [24] Daniel Jackson and Jeannette Wing. 1996. Lightweight Formal Meth-
+     Operating Systems (ASPLOS). Pittsburgh, PA, USA, 167ś178.                      ods. Computer 29, 4 (1996).
+ [6] Tej Chajed, Joseph Tassarotti, M. Frans Kaashoek, and Nickolai Zel-       [25] Rajeev Joshi and Gerard J. Holzmann. 2007. A Mini Challenge: Build a
+     dovich. 2019. Verifying concurrent, crash-safe systems with Perennial.         Verifiable Filesystem. Formal Aspects of Computing 19, 2 (June 2007),
+     In Proceedings of the 27th ACM Symposium on Operating Systems Prin-            269ś272.
+     ciples (SOSP). Huntsville, ON, Canada, 243ś258.                           [26] Eunsuk Kang and Daniel Jackson. 2008. Formal Modeling and Analysis
+ [7] Tej Chajed, Joseph Tassarotti, Mark Theng, Ralf Jung, M. Frans                 of a Flash Filesystem in Alloy. In Proceedings of the 1st International
+     Kaashoek, and Nickolai Zeldovich. 2021. GoJournal: a verified, concur-         Conference of Abstract State Machines, B, and Z (ABZ). London, UK.
+     rent, crash-safe journaling system. In Proceedings of the 15th Sympo-     [27] K. Rustan M. Leino and Michał Moskal. 2010. Usable Auto-Active
+     sium on Operating Systems Design and Implementation (OSDI). Virtual,           Verification. In Workshop on Usable Verification. Redmond, WA, USA.
+     423ś439.                                                                  [28] Carl Lerche. 2020. Loom. https://github.com/tokio-rs/loom
+ [8] Haogang Chen, Daniel Ziegler, Tej Chajed, Adam Chlipala, M. Frans         [29] Clare Ligouri. 2020. Automating safe, hands-off deployments. Ama-
+     Kaashoek, and Nickolai Zeldovich. 2015. Using Crash Hoare Logic                zon Builders’ Library. https://aws.amazon.com/builders-library/
+     for Certifying the FSCQ File System. In Proceedings of the 25th ACM            automating-safe-hands-off-deployments/
+     Symposium on Operating Systems Principles (SOSP). Monterey, CA,           [30] Jason Lingle. 2020. Proptest. https://github.com/AltSysrq/proptest
+     USA, 18ś37.                                                               [31] Lanyue Lu, Thanumalayan Sankaranarayana Pillai, Andrea C. Arpaci-
+ [9] Koen Claessen and John Hughes. 2000. QuickCheck: a lightweight tool            Dusseau, and Remzi H. Arpaci-Dusseau. 2016. WiscKey: Separating
+     for random testing of Haskell programs. In Proceedings of the 5th ACM          Keys from Values in SSD-conscious Storage. In Proceedings of the 14th
+     SIGPLAN International Conference on Functional Programming (ICFP).             USENIX Conference on File and Storage Technologies (FAST). Santa Clara,
+     Montreal, Canada, 268ś279.                                                     CA, USA, 133ś148.
+[10] Katherine E. Coons, Madan Musuvathi, and Kathryn S. McKinley.             [32] David Maciver and Alastair F. Donaldson. 2020. Test-Case Reduction
+     2013. Bounded partial-order reduction. In Proceedings of the 28th ACM          via Test-Case Generation: Insights from the Hypothesis Reducer. In
+     SIGPLAN International Conference on Object-Oriented Programming,               Proceedings of the 34th European Conference on Object-Oriented Pro-
+     Systems, Languages, and Applications (OOPSLA). Indianapolis, IN, USA,          gramming (ECOOP). Berlin, Germany, 13:1ś13:27.
+     833ś848.                                                                  [33] Jayashree Mohan, Ashlie Martinez, Soujanya Ponnapalli, Pandian Raju,
+[11] Ankush Desai. 2021. P. https://github.com/p-org/p                              and Vijay Chidambaram. 2018. Finding Crash-Consistency Bugs with
+[12] Ankush Desai, Vivek Gupta, Ethan K. Jackson, Shaz Qadeer, Sriram K.            Bounded Black-Box Crash Testing. In Proceedings of the 13th Sympo-
+     Rajamani, and Damien Zufferey. 2013. P: safe asynchronous event-               sium on Operating Systems Design and Implementation (OSDI). Carlsbad,
+     driven programming. In Proceedings of the 34th ACM SIGPLAN Con-                CA, USA, 33ś50.
+     ference on Programming Language Design and Implementation (PLDI).         [34] Dominic P. Mulligan, Scott Owens, Kathryn E. Gray, Tom Ridge, and
+     Seattle, WA, USA, 321ś332.                                                     Peter Sewell. 2014. Lem: reusable engineering of real-world semantics.
+[13] Ankush Desai, Amar Phanishayee, Shaz Qadeer, and Sanjit A. Seshia.             In Proceedings of the 19th ACM SIGPLAN International Conference on
+     2018. Compositional programming and testing of dynamic distributed             Functional Programming (ICFP). Gothenburg, Sweden, 175ś188.
+     systems. Proc. ACM Program. Lang. 2, OOPSLA (2018), 159:1ś159:30.         [35] Madanlal Musuvathi, Shaz Qadeer, Thomas Ball, Gérard Basler, Pi-
+[14] Craig Disselkoen, Sunjay Cauligi, Dean Tullsen, and Deian Stefan.              ramanayagam Arumuga Nainar, and Iulian Neamtiu. 2008. Finding
+     2020. Finding and Eliminating Timing Side-Channels in Crypto Code              and Reproducing Heisenbugs in Concurrent Programs. In Proceedings
+     with Pitchfork. In TECHCON.                                                    of the 8th Symposium on Operating Systems Design and Implementa-
+[15] Facebook. 2021. MIRAI. https://github.com/facebookexperimental/                tion (OSDI). San Diego, CA, USA, 267ś280.
+     MIRAI                                                                     [36] Vishwas Narendra, Serdar Tasiran, and Ankush Desai. 2021. Ama-
+[16] Gregory R. Ganger and Yale N. Patt. 1994. Metadata Update Perfor-              zon S3 Strong Consistency. https://www.youtube.com/watch?v=
+     mance in File Systems. In Proceedings of the 1st Symposium on Operating        B0yXz6EeCaA
+     Systems Design and Implementation (OSDI). Monterey, CA, USA, 49ś60.       [37] Luke Nelson, Helgi Sigurbjarnarson, Kaiyuan Zhang, Dylan Johnson,
+[17] Patrice Godefroid. 1997. Model Checking for Programming Languages              James Bornholt, Emina Torlak, and Xi Wang. 2017. Hyperkernel: Push-
+     using Verisoft. In Proceedings of the 24th ACM SIGPLAN-SIGACT Sym-             Button Verification of an OS Kernel. In Proceedings of the 26th ACM
+     posium on Principles of Programming Languages (POPL). Paris, France,           Symposium on Operating Systems Principles (SOSP). Shanghai, China,
+     174ś186.                                                                       252ś269.
+[18] Travis Hance, Andrea Lattuada, Chris Hawblitzel, Jon Howell, Rob          [38] Chris Newcombe, Tim Rath, Fan Zhang, Bogdan Munteanu, Marc
+     Johnson, and Bryan Parno. 2020. Storage Systems are Distributed                Brooker, and Michael Deardeuff. 2015. How Amazon Web Services
+     Systems (So Verify Them That Way!). In Proceedings of the 14th Sympo-          Uses Formal Methods. Commun. ACM 58, 4 (March 2015), 66ś73.
+     sium on Operating Systems Design and Implementation (OSDI). Virtual       [39] Brian Norris and Brian Demsky. 2013. CDSchecker: checking con-
+     Event, 99ś115.                                                                 current data structures written with C/C++ atomics. In Proceedings
+[19] Maurice Herlihy and Jeannette M. Wing. 1990. Linearizability: A                of the 28th ACM SIGPLAN International Conference on Object-Oriented
+     Correctness Condition for Concurrent Objects. ACM Trans. Program.              Programming, Systems, Languages, and Applications (OOPSLA). Indi-
+     Lang. Syst. 12, 3 (1990), 463ś492.                                             anapolis, IN, USA, 131ś150.
+[20] Ralf Hildebrandt and Andreas Zeller. 2000. Simplifying failure-           [40] Project Oak. 2021. Rust Verification Tools. https://github.com/project-
+     inducing input. In Proceedings of the International Symposium on Soft-         oak/rust-verification-tools/
+     ware Testing and Analysis (ISSTA). Portland, OR, USA, 135ś145.            [41] Patrick O’Neil, Edward Cheng, Dieter Gawlick, and Elizabeth O’Neil.
+[21] Jan Hoffmann, Klaus Aehlig, and Martin Hofmann. 2012. Resource                 1996. The Log-Structured Merge-Tree (LSM-Tree). Acta Informatica
+     Aware ML. In Proceedings of the 24th International Conference on Com-          33, 4 (June 1996), 351ś385.
+     puter Aided Verification (CAV). Berkeley, CA, USA, 781ś786.               [42] Thanumalayan Sankaranarayana Pillai, Vijay Chidambaram, Ram-
+[22] Gerard J. Holzmann. 1997. The Model Checker SPIN. IEEE Trans. Softw.           natthan Alagappan, Samer Al-Kiswany, Andrea C. Arpaci-Dusseau,
+     Eng. 23, 5 (May 1997), 279ś295.                                                and Remzi H. Arpaci-Dusseau. 2014. All File Systems Are Not Created
+[23] Daniel Jackson. 2009. Software Abstractions: logic, language, and anal-        Equal: On the Complexity of Crafting Crash-Consistent Applications.
+     ysis (2nd ed.). MIT Press.                                                     In Proceedings of the 11th Symposium on Operating Systems Design and
+Using Lightweight Formal Methods to Validate a Key-Value Storage Node in Amazon S3              SOSP ’21, October 26ś28, 2021, Virtual Event, Germany
+
+
+     Implementation (OSDI). Broomfield, CO, USA, 433ś448.                      [48] Amazon Web Services. 2021. Rust Model Checker (RMC). https:
+[43] Eduardo Pinheiro, Wolf-Dietrich Weber, and Luiz André Barroso. 2007.           //github.com/model-checking/rmc
+     Failure Trends in a Large Disk Drive Population. In Proceedings of the    [49] Helgi Sigurbjarnarson, James Bornholt, Emina Torlak, and Xi Wang.
+     5th USENIX Conference on File and Storage Technologies (FAST). San             2016. Push-Button Verification of File Systems via Crash Refinement.
+     Jose, CA, USA, 17ś28.                                                          In Proceedings of the 12th Symposium on Operating Systems Design and
+[44] John Regehr, Yang Chen, Pascal Cuoq, Eric Eide, Chucky Ellison, and            Implementation (OSDI). Savannah, GA, USA, 1ś16.
+     Xuejun Yang. 2012. Test-case reduction for C compiler bugs. In Proceed-   [50] Miri team. 2021. Miri. https://github.com/rust-lang/miri
+     ings of the 33rd ACM SIGPLAN Conference on Programming Language           [51] Aaron Tomb. 2020. Crux: Introducing our new open-source tool
+     Design and Implementation (PLDI). Beijing, China, 335ś346.                     for software verification.     https://galois.com/blog/2020/10/crux-
+[45] Alastair Reid and Shaked Flur. 2021. Rust Verification Tools: Retro-           introducing-our-new-open-source-tool-for-software-verification/
+     spective. https://project-oak.github.io/rust-verification-tools/2021/     [52] Aaron Turon. 2015. Fearless Concurrency with Rust. https://blog.rust-
+     09/01/retrospective.html                                                       lang.org/2015/04/10/Fearless-Concurrency.html
+[46] Tom Ridge, David Sheets, Thomas Tuerk, Andrea Giugliano, Anil Mad-        [53] Werner Vogels. 2021. Diving Deep on S3 Consistency. https://www.
+     havapeddy, and Peter Sewell. 2015. SibylFS: formal specification and           allthingsdistributed.com/2021/04/s3-strong-consistency.html
+     oracle-based testing for POSIX and real-world file systems. In Proceed-   [54] Junfeng Yang, Paul Twohey, Dawson Engler, and Madanlal Musuvathi.
+     ings of the 25th ACM Symposium on Operating Systems Principles (SOSP).         2006. eXplode: A Lightweight, General System for Finding Serious
+     Monterey, CA, USA, 38ś53.                                                      Storage System Errors. In Proceedings of the 7th Symposium on Oper-
+[47] Amazon Web Services. 2020. Shuttle. https://github.com/awslabs/                ating Systems Design and Implementation (OSDI). Seattle, WA, USA,
+     shuttle                                                                        131ś146.
+

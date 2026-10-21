@@ -1,0 +1,924 @@
+     Resource Central: Understanding and Predicting
+    Workloads for Improved Resource Management in
+                Large Cloud Platforms∗
+                   Eli Cortez                                        Anand Bonde                             Alexandre Muzio
+                   Microsoft                                       Microsoft Research                             ITA, Brazil
+          eli.cortez@microsoft.com                               abonde@microsoft.com                        alemuzio@aluno.ita.br
+
+           Mark Russinovich                                       Marcus Fontoura                            Ricardo Bianchini
+               Microsoft                                               Microsoft                               Microsoft Research
+    mark.russinovich@microsoft.com                              marcusfo@microsoft.com                      ricardob@microsoft.com
+ABSTRACT                                                                          CCS CONCEPTS
+Cloud research to date has lacked data on the characteris-                        • Computer systems organization → Cloud comput-
+tics of the production virtual machine (VM) workloads of                          ing; • Computing methodologies → Machine learning
+large cloud providers. A thorough understanding of these                          approaches;
+characteristics can inform the providers’ resource manage-
+ment systems, e.g. VM scheduler, power manager, server                            KEYWORDS
+health manager. In this paper, we first introduce an exten-                       Cloud workloads, machine learning, predictive management
+sive characterization of Microsoft Azure’s VM workload,
+including distributions of the VMs’ lifetime, deployment size,                    ACM Reference Format:
+and resource consumption. We then show that certain VM                            Eli Cortez, Anand Bonde, Alexandre Muzio, Mark Russinovich,
+behaviors are fairly consistent over multiple lifetimes, i.e.                     Marcus Fontoura, and Ricardo Bianchini. 2017. Resource Central:
+history is an accurate predictor of future behavior. Based on                     Understanding and Predicting Workloads for Improved Resource
+this observation, we next introduce Resource Central (RC),                        Management in Large Cloud Platforms. In Proceedings of SOSP’17.
+a system that collects VM telemetry, learns these behaviors                       ACM, New York, NY, USA, 15 pages. https://doi.org/10.1145/3132747.
+offline, and provides predictions online to various resource                      3132772
+managers via a general client-side library. As an example of
+RC’s online use, we modify Azure’s VM scheduler to leverage
+predictions in oversubscribing servers (with oversubscrib-
+                                                                                  1    INTRODUCTION
+able VM types), while retaining high VM performance. Using                        Motivation. Cloud computing has been expanding at a fast
+real VM traces, we then show that the prediction-informed                         pace, especially as enterprises continue to move their opera-
+schedules increase utilization and prevent physical resource                      tions to large cloud providers such as Microsoft Azure, Ama-
+exhaustion. We conclude that providers can exploit their                          zon Web Services (AWS), and Google Cloud Platform (GCP).
+workloads’ characteristics and machine learning to improve                        Due to heated marketplace competition, providers have been
+resource management substantially.                                                under pressure to produce attractive features and services,
+                                                                                  while controlling their datacenter costs. These factors com-
+∗ Cortez and Bonde contributed equally. Muzio was an intern at Microsoft.
+                                                                                  bine to expose providers to a wide variety of workloads (from
+                                                                                  both external customers and their own internal services) that
+Permission to make digital or hard copies of all or part of this work for         must share a common datacenter infrastructure. Providing
+personal or classroom use is granted without fee provided that copies are not
+                                                                                  good performance, availability, and reliability under these
+made or distributed for profit or commercial advantage and that copies bear
+this notice and the full citation on the first page. Copyrights for components    conditions can be expensive without sophisticated (but prac-
+of this work owned by others than ACM must be honored. Abstracting with           tical and scalable) resource management.
+credit is permitted. To copy otherwise, or republish, to post on servers or to       Unfortunately, research on cloud resource management
+redistribute to lists, requires prior specific permission and/or a fee. Request   to date has lacked a thorough understanding of the key char-
+permissions from permissions@acm.org.
+                                                                                  acteristics of the workloads of large commercial providers.
+SOSP’17, October 28, 2017, Shanghai, China
+                                                                                  For example, no prior study has explored the lifetime (time
+© 2017 Association for Computing Machinery.
+ACM ISBN 978-1-4503-5085-3/17/10. . . $15.00                                      between creation and termination) or resource consumption
+https://doi.org/10.1145/3132747.3132772                                           distributions of these providers’ production virtual machines
+SOSP’17, October 28, 2017, Shanghai, China            E. Cortez, A. Bonde, A. Muzio, M. Russinovich, M. Fontoura, R. Bianchini
+
+(VMs). Instead, the prior work has mostly used real but non-       observed from the perspective of each cloud customer. This
+VM workloads, synthetic VM workloads, and/or focused on            observation suggests that prior history may be an accurate
+managing resources via general but often impractical tech-         predictor of the future behavior of the customers’ VMs, so
+niques for a large cloud provider. For example, many papers        machine learning algorithms could be used online to produce
+explore (sometimes offline) workload profiling and aggres-         VM behavior predictions.
+sive online resource reallocation, via dynamic monitoring,            Based on this observation, we introduce Resource Central
+scheduling, and/or live VM migration [2, 7, 20, 21, 24, 27]. In    (RC), a system that collects VM telemetry, periodically learns
+practice, offline profiling is infeasible because the workloads’   these behaviors into prediction models offline, and provides
+inputs are often unavailable until VMs run in production.          behavior predictions online to various resource management
+Online profiling is challenging, as it is hard to determine        systems. Unlike other systems, RC serves predictions from a
+when an arbitrary VM has shown representative behavior.            client-side library, which caches prediction results, models,
+Application-level performance (e.g., tail latency) monitoring      and feature data. The library API is simple yet general, so it
+is usually not possible, as it requires help from applications.    can be used with many types of resource managers, learning
+Finally, live migration retains contended resources for a rela-    algorithms, prediction models, and feature data. RC’s models
+tively long time (e.g., it cannot free up memory pages before      and feature data are currently in production, being used
+successfully migrating them) and can cause widespread net-         manually by engineers and data scientists for analysis and
+work traffic bursts. Practical uses of these techniques require    system design. The changes to the systems that will leverage
+extreme care.                                                      RC are still being productized.
+   We argue that resource management can become more ef-              As an example of RC’s online use, we describe our modi-
+fective and practical for large providers with a deeper under-     fications to Azure’s VM scheduler, which selects a physical
+standing of their VM workloads’ key characteristics. More-         server for each new VM. Specifically, we modify the sched-
+over, if these characteristics can be accurately predicted, im-    uler to collect high-percentile utilization predictions to use
+provements could be even greater. For example, accurately          in oversubscribing physical servers with “oversubscribable”
+predicting resource utilization at VM deployment time would        VM types (e.g., first-party VMs that run non-customer-facing
+allow resource-contention-aware VM co-location (mitigat-           workloads), while retaining good VM performance.
+ing the need for VM migration). Similarly, run-time lifetime          Our evaluation starts by quantifying the accuracy of RC’s
+predictions would allow the health management system to            predictions of six metrics, using our VM telemetry. The re-
+estimate when all the VMs running on a misbehaving server          sults show overall prediction accuracies between 79% and
+will likely terminate (facilitating server maintenance with-       90%, depending on the metric. For example, RC predicts the
+out VM migration or downtime). We are unaware of prior             average CPU utilization of a new VM with 81% accuracy.
+work showing that the characteristics of large providers’ pro-     We then quantify the performance of RC’s components, and
+duction VMs can be accurately predicted for better resource        confirm that models and feature data are compact and fast
+management.                                                        enough to be executed on the client-side. To evaluate the
+   Thus, there is a need for software that can produce such        benefit of predictions, we explore our modified VM scheduler
+predictions and enable the providers’ resource management          using real VM traces and simulation. Our results show that
+systems (e.g., the VM scheduler, the server health manager)        prediction-informed VM schedules enable safe oversubscrip-
+to leverage them. Some prediction-serving systems [5, 6, 10]       tion, while keeping VM deployment failures low.
+have been proposed recently, but have not been studied in          Summary and conclusions. Our contributions are:
+the context of prediction-based resource management.               • We present a detailed characterization of several VM work-
+Our work. In this paper, we first introduce a characteri-          load behaviors from Microsoft Azure;
+zation of Azure’s (first- and third-party) VM workload, in-        • We show that these behaviors can be accurately predicted;
+cluding distributions of the VMs’ size, lifetime, resource         • We describe Resource Central, a large-scale system for
+consumption, utilization pattern, and deployment size. Re-         producing, storing, and using such predictions;
+searchers can use these distributions to produce realistic         • We describe modifications to Azure’s VM scheduler that
+cloud workloads for their own work. Alternatively, they            leverage predictions to improve server selection;
+can use the sanitized production traces we have placed at          • We present extensive results evaluating Resource Central
+https://github.com/Azure/AzurePublicDataset. The traces con-       and our modified VM scheduler; and
+tain a subset of our data, but exhibit roughly the same overall    • We make a large VM dataset available to the community.
+trends as the full dataset.                                           We conclude that cloud providers can exploit the charac-
+   Our characterization shows that many types of VM be-            teristics of their workloads and machine learning techniques
+havior are fairly consistent over multiple lifetimes, when         to improve resource management substantially.
+Resource Central: Understanding and Predicting Cloud Workloads                        SOSP’17, October 28, 2017, Shanghai, China
+
+2   RELATED WORK                                                    and power capping [26]). Most importantly, our prediction
+Cloud VM workload characterization. We are unaware                  results derive from a real cloud platform, its workload and
+of other characterizations of the VM workload of real public        machine learning framework.
+cloud providers, except for [15] which focused solely on            Prediction-based scheduling. The literature on task/conta-
+resource demand volatility and pricing. Other works studied         iner/VM scheduling is also vast. Many of these works use
+cloud platform performance [16] and how users implement             online predictions of resource usage or performance interfer-
+their front-end services in the cloud [11].                         ence [3, 7, 20, 27]. Unfortunately, they are often impractical
+   The closest prior works [8, 19, 22] did not address public       for a large provider, relying on (offline or online) workload
+cloud workloads. Rather, they characterized a month-long            profiling, application-level performance monitoring, short-
+trace of 12k bare-metal servers running first-party container-      term load predictions, and/or aggressive resource realloca-
+based (i.e., non-VM) workloads at Google [25]. In contrast, we      tion (e.g., via live migration). Live migration is particularly
+characterize Azure’s entire VM workload over three months,          problematic, as it retains contended server resources and may
+including third-party VMs. In fact, third-party VMs often           produce traffic bursts; it is better to place VMs where they
+exhibit different characteristics than first-party ones, as we      can stay. Thus, as an example of RC’s online use, we propose
+show in Section 3.                                                  changes to Azure’s VM scheduler that leverage predictions
+   More importantly, VM workloads fundamentally differ              of long-term high-percentile resource usage to implement
+from bare-metal container workloads. Mainly for security            oversubscription in a safe and practical manner.
+reasons, public cloud providers must encapsulate their cus-            To guarantee within-server performance isolation across
+tomers’ workloads using VMs. Unfortunately, VMs impose              VMs, we also need mechanisms for interference detection
+higher creation/termination overheads than containers run-          (e.g., hardware counters [20, 27]) and prevention (e.g., fine-
+ning on bare metal, so they are likely to live longer, pro-         grained resource partitioning [17]), but they are orthogonal
+duce lower resource utilization, and be deployed in smaller         to our work. For example, Heracles (fine) and RC (coarse) op-
+numbers. For example, a user who wants to run multiple              erate at different granularities and time-scales. RC is needed
+MapReduce jobs may create a set of VMs sized for the jobs’          in first placing VMs on servers, so Heracles does not have
+maximum resource needs; she would only destroy/shutdown             to overly punish whatever workloads are considered low-
+the VMs when all jobs have completed. In a container-based          priority on the chosen server.
+system, each map and reduce task of each job would likely
+receive a different container, which can be more accurately         3    CHARACTERIZING CLOUD VM
+sized for its task. As another example, services that assign a           WORKLOADS
+VM to each user (e.g., gaming) may pool and reuse VMs, so           We now explore several aspects of Azure’s VM workload.
+that the overhead of VM creation becomes invisible to users.        Understanding them enables many platform optimizations.
+Machine learning and prediction-serving systems. Prior              Context and terminology. Azure hosts both first- and
+works have recently proposed several frameworks, such as            third-party workloads, split into Infrastructure as a Service
+TensorFlow [1], Caffe [13], and MLLib [18], for producing           (IaaS) and Platform as a Service (PaaS) VMs. In Azure’s offer-
+machine learning models. Our work is orthogonal to them,            ing, PaaS defines functional roles for VMs, e.g. Web server
+as RC relies on TLC, a Microsoft-internal state-of-the-art          VM, worker VM.
+framework that implements many learning algorithms.                    The first-party workloads comprise internal VMs (e.g., re-
+   Instead, RC is comparable to recent prediction-serving           search/development, infrastructure management) and first-
+systems [5, 6, 10]. In contrast with these systems, RC caches       party services (e.g., communication, gaming, data manage-
+prediction results, models, and feature data on the client side.    ment) offered to third-party customers. The third-party work-
+This approach enables the system to operate even when the           loads are VMs created by external customers. Other than the
+data store or the connectivity to it is unavailable. In addition,   limited information contained in our dataset (details below),
+it provides higher performance by removing the interconnect         we have no visibility into third-party uses of internal services
+and store from the critical performance path.                       or third-party workloads. The dataset corresponds to many
+Predicting cloud workloads. The literature on predicting            tens of millions of VMs from many tens of thousands of first-
+workload behaviors is extensive. These works predict re-            and third-party users. 1
+source demand, resource utilization, or job/task length for            Regardless of their first- or third-party status, customers
+provisioning or scheduling purposes [4, 9, 12, 14, 23]. In con-     create one or more Azure subscriptions. After creating a
+trast, we predict a broader set of VM behaviors (including VM       subscription, the customer can deploy VMs into a region
+lifetimes, maximum deployment sizes, and workload classes)
+                                                                    1 Due to confidentiality reasons, we omit certain exact numbers, instead
+for a broader set of purposes (including health management
+                                                                    focusing on more relevant workload statistics and trends.
+SOSP’17, October 28, 2017, Shanghai, China           E. Cortez, A. Bonde, A. Muzio, M. Russinovich, M. Fontoura, R. Bianchini
+
+(one or more datacenters) she selects. We refer to a “VM
+                                                                          100
+deployment” as a set of VMs that the customer groups and
+manages together. All VMs in a deployment execute in one                            Average
+“cluster” in the chosen region, i.e. a large aggregation of               75
+servers within which a deployment needs to fit. Each VM
+                                                                          50
+
+
+
+
+                                                                    CDF
+belongs to a “role”, which refers to the type or functionality
+                                                                                                                          P95 Max
+performed by the VM (e.g., IaaS VM, PaaS Web server).
+Dataset. Our dataset contains information about every VM
+                                                                          25                                   Total
+running on Azure from November 16, 2016 to February 16,                                                        1 st Party + Services
+2017. The information includes (1) identification numbers                                                      3 rd Party
+                                                                           0
+for the VM, and the deployment and subscription to which                        0   20         40            60         80             100
+it belongs; (2) the VM role name; (3) the VM size in terms of                                 CPU Utilization (%)
+its maximum core, memory, and disk allocations; and (4) the         Figure 1: Average and P95 of max CPU utilizations.
+minimum, average, and maximum VM resource utilizations
+(reported every 5 minutes). A sanitized subset of these data
+is available at https://github.com/Azure/AzurePublicDataset.      management. For example, a PaaS Web server VM is likely
+Focus. We focus on aspects of real cloud workloads that           to be customer-facing, and may serve as the front-end to
+have an impact on resource management. Thus, we next ex-          an interactive service. The provider must ensure the best
+plore distributions of VM type (IaaS vs PaaS), virtual resource   possible performance for such services. In contrast, IaaS
+(CPU) usage, VM size (CPU cores and memory space), maxi-          VMs reveal no information and must be treated carefully. In
+mum deployment size, VM lifetime, workload class (likely          Section 3.6, we describe an approach to inferring the class of
+interactive vs delay-insensitive), and VM inter-arrival times.    VM workload that works well for both IaaS and PaaS.
+We present both full platform and per-subscription perspec-
+tives. The subscription is a natural unit for us, as it is tied
+to billing, naming, quotas, and access control. Thus, it typi-
+                                                                  3.2       Virtual resource usage
+cally represents users who (sometimes repeatedly) execute         Entire cloud platform perspective. We illustrate the vir-
+logically related workloads (e.g., many load-balanced copies      tual resource usage by quantifying CPU utilization per VM.
+of a Web server, or Web servers and databases for an ecom-        Figure 1 depicts the Cumulative Distribution Function (CDF)
+merce service), and users from the same organization (e.g.,       of the average virtual CPU utilizations for each VM, and the
+the ecommerce company). As such, the subscription embod-          CDF of the 95th -percentile of the maximum virtual CPU uti-
+ies commonalities that enable accurate predictions. At the        lizations (P95 Max). Recall that the utilization measurements
+end of each subsection, we discuss the implications for cloud     correspond to 5-minute intervals. For example, the figure
+resource management. To close the section, we explore cor-        shows that 60% of the VMs (Y-axis) have an average CPU
+relations between metrics.                                        utilization (X-axis) lower than 20%. Similarly, 40% of them
+                                                                  have a 95th -percentile utilization lower than 50%.
+                                                                     We draw two key observations from this figure. First, a
+3.1    VM type                                                    large percentage of VMs exhibit low average CPU utiliza-
+Entire cloud platform perspective. The workload is al-            tions, especially for first-party workloads. However, average
+most exactly split between IaaS (52%) and PaaS (48%) in           utilizations do not reflect the VMs’ full needs, so we must
+terms of VM counts; first-party workloads have slightly more      consider the 95th percentiles. Though more than one third of
+IaaS VMs (53% vs 47%), whereas third-party workloads have         VMs exhibit low CPU utilizations even at the 95th percentile,
+slightly more PaaS VMs (53% vs 47%). However, PaaS actually       a large percentage of them exhibit very high utilizations (>
+dominates the resource consumption with roughly 61% of            80%), especially for third-party workloads.
+the total core hours. Even more interestingly, third-party           Second, the first-party distributions tend to show lower
+IaaS VMs consume significantly more core hours than their         average and 95th -percentile utilizations than the third-party
+PaaS counterparts (85% vs 15%, respectively), whereas the         distributions. At least two factors contribute to this observa-
+opposite is true of first-party workloads (23% vs 77%).           tion: (1) many first-party services require consistently low
+Per-subscription perspective. We find that VMs from the           latency, which can be easily achieved by overprovisioning
+same subscription are almost always of the same type; 96%         VMs; and (2) our dataset includes a non-trivial percentage
+of the subscriptions create VMs of a single type.                 (15%) of first-party VMs used for testing the performance and
+Implications for resource management. Some PaaS VMs               scalability of VM creation (i.e., VMs get created and quickly
+reveal information that the cloud provider can use in resource    killed without doing any actual work).
+Resource Central: Understanding and Predicting Cloud Workloads                                        SOSP’17, October 28, 2017, Shanghai, China
+
+           100                                                                             100
+
+           80                                                                               80
+
+           60                                                                               60
+% of VMs
+
+
+
+
+                                                                                % of VMs
+           40                                                                               40
+
+           20                                                                               20
+
+            0
+                     Total       1 st Party + Services        3 rd Party                    0
+                                                                                                     Total         1 st Party + Services    3 rd Party
+                     1       4             8             20                32                       0.75     2            4        8       16        >=32
+                     2       6             12            24                                         1.75     3.5          7        14      28
+
+           Figure 2: Number of virtual CPU cores per VM.                                   Figure 3: Amount of memory per VM in GBytes.
+
+Per-subscription perspective. We find that VMs from the
+same subscription tend to exhibit similar behaviors with re-                    than 4 GBytes). This reflects a scale-out design pattern where
+spect to utilization. Specifically, the coefficient of variation                one prefers more numerous small VMs over fewer large VMs.
+(CoV = standard deviation divided by average) of the average                       The figures also show that first- and third-party customers
+and 95t h -percentile virtual CPU utilizations for each sub-                    create VMs of comparable sizes, except that the latter users
+scription indicates low variance in these metrics for most                      create a larger percentage of 3.5-GByte and 0.75-GByte VMs,
+subscriptions. For example, 80% of subscriptions exhibit a                      and a smaller percentage of 1.75-GByte VMs.
+CoV of their average CPU utilizations that is smaller than 1.                   Per-subscription perspective. Subscriptions are remark-
+Implications for resource management. Since at high                             ably consistent in terms of their VM sizes; nearly all sub-
+percentiles many VMs require nearly their entire resource                       scriptions show CoVs of cores and memory lower than 1.
+allocation, the provider must be careful when selecting phys-                   Implications for resource management. As small VMs
+ical servers for new VMs. Even when not oversubscribing                         dominate, it is easier to fill holes in the server packing and
+resources, the high resource usage may cause resource con-                      reduce fragmentation. Despite this, packing is complex as it
+tention. In this case, the provider has to resort to (expensive                 must consider multiple resource dimensions and constraints.
+and slow) live VM migration or accept potential workload
+performance loss.                                                               3.4              Maximum deployment size
+   Nevertheless, a large percentage of VMs require many                         Users do not always deploy their VMs to each region (a
+fewer resources than their allocations. Thus, there is a sig-                   cluster in the region) in one shot, so each deployment may
+nificant potential for oversubscribing physical resources, as                   grow (and shrink) over time before it is terminated.
+long as the provider can predict (at VM creation time) with                     Entire platform perspective. Thus, we now consider the
+high confidence which VMs will require most of their alloca-                    deployment sizes across the platform. While studying this
+tions; these VMs can then be scheduled on different servers.                    data, we realized that some users are not using the concept
+   Focusing on individual subscriptions should simplify this                    of deployment in the way it was intended, i.e. to cleanly
+prediction task, as the space of high utilizations is more                      group and manage logically related VMs within a subscrip-
+consistent than across the entire population of VMs.                            tion. In fact, at least one large first-party service creates many
+                                                                                single-VM deployments, instead of extending an existing de-
+3.3              VM size                                                        ployment each time. To approximate the original intent, we
+We now study the distribution of VM sizes. We define the                        redefine a deployment as the set of VMs from each subscrip-
+size of a VM as the amount of CPU and memory that the                           tion that are deployed to a region during a day. Assuming
+VM’s owner requested for it.                                                    this definition, the CDFs of maximum deployment sizes ap-
+Entire platform perspective. We illustrate the VM sizes                         pear in Figure 4. The figure shows that most deployments
+via the number of virtual CPU cores and amount of memory                        are small: roughly 40% of them include a single VM, and 80%
+per VM. Figures 2 and 3 present the corresponding break-                        have at most 5 VMs. Moreover, the figure shows that third-
+downs using stacked bars, one each for first-party, third-                      party users deploy VMs in smaller groups than first-party
+party, and all workloads. The figures show that most VMs                        ones. These observations reflect patterns that favor smaller
+require few virtual cores (almost 80% of VMs require 1-2                        VM groups; when users deploy multiple groups, they prefer
+cores) and relatively little memory (70% of VMs require less                    them to be spread across multiple regions.
+SOSP’17, October 28, 2017, Shanghai, China               E. Cortez, A. Bonde, A. Muzio, M. Russinovich, M. Fontoura, R. Bianchini
+
+
+       100                                                                    100
+
+
+       75                                                                     75
+
+
+       50                                                                     50
+ CDF
+
+
+
+
+                                                                        CDF
+       25                             Total                                   25                                Total
+                                      1 st Party + Services                                                     1 st Party + Services
+                                      3 rd Party                                                                3 rd Party
+        0                                                                      0
+              5       10      15       20        25           30                         50            100          150           200
+                              # VMs                                                              Lifetime (hours)
+ Figure 4: Max number of VMs in each deployment.                                         Figure 5: VM lifetime.
+
+   Looking at deployment sizes in terms of cores or memory            relatively small percentage of long-running VMs actually
+shows the expected trends. We do not depict these data to             account for >95% of the total core hours (not shown).
+keep deployment and VM sizes separate until Section 3.8.              Per-subscription perspective. Many subscriptions show
+Per-subscription perspective. Again, subscriptions show               consistent lifetime behavior. For example, roughly 75% of
+remarkably consistent behavior with respect to their max-             them exhibit lifetime CoVs lower than 1.
+imum deployment sizes; nearly all subscriptions exhibit a             Implications for resource management. The health man-
+CoV for this metric less than 1.                                      agement system can schedule non-urgent server mainte-
+Implications for resource management. The cluster must                nance without producing VM unavailability or requiring live
+have enough capacity to host the maximum size of a deploy-            migration, if it can predict lifetimes accurately. In addition,
+ment, and avoid eventual deployment failures (or long com-            with accurate lifetime predictions at VM creation time, the
+munication delays across VMs of the same deployment). The             provider can schedule VMs that will complete at roughly
+dominance of small deployments suggests that the provider             the same time on the same servers. The per-subscription
+need not reserve large amounts of capacity within each clus-          data shows that considering subscriptions individually may
+ter for deployment growth, as long as it can predict (when            increase lifetime prediction accuracy.
+deployments are first created) with high confidence the few
+deployments that could become large. The per-subscription             3.6       Workload class
+data shows that focusing on individual subscriptions may              In considering tightly packing VMs onto physical servers,
+increase prediction accuracy.                                         the provider might consider the VMs’ resilience to resource
+                                                                      contention and interference; highly interactive, customer-
+3.5      VM lifetime                                                  facing workloads require low tail response times (measured
+Entire platform perspective. Figure 5 presents the CDFs               in milliseconds), so they are typically less resilient than batch
+of VM lifetimes (how long VMs last from creation to ter-              or background (delay-insensitive) workloads. However, this
+mination) in our dataset, including only VMs that started             resilience is difficult to ascertain, because the provider has
+and completed in our observation period. As this group rep-           little or no information about what is running on the VMs,
+resents 94% of the VMs in our dataset, we can confidently             especially in third-party IaaS scenarios. Even if the provider
+make statements about VM lifetimes. (There are 2% of VMs              were to request this information in advance, users may be
+that started before and completed after the period, and 4% of         unwilling or unable to provide it.
+VMs that either started before or completed after the period.)           For these reasons, we perform an analysis of the (average)
+   The figure shows that a large percentage of first-party            CPU utilization time series to infer whether a VM’s work-
+VMs tend to live shorter (less than 15 minutes) than their            load is likely to be interactive. Since interactive workloads
+third-party counterparts. The main reason is the first-party          tend to exhibit diurnal cycles (people are active during the
+VM-creation testing workloads we mention above. The figure            day and sleep at night), our analysis attempts to find peri-
+also shows a broad spectrum of lifetimes, but most lifetimes          odicity in the utilization time series over 3 days, using the
+are relatively short. The curves show a knee around 1 day             Fast Fourier Transform (FFT) algorithm. The FFT is ideal
+(more than 90% of lifetimes are shorter), and then almost             because it can detect periodicity at multiple time scales. Our
+flatten out. This suggests that, if a VM runs for 1 day, it will      algorithm categorizes VMs into two classes: potentially in-
+very likely run much longer. Perhaps most interestingly, the          teractive (those that exhibit periodic behavior at the diurnal
+Resource Central: Understanding and Predicting Cloud Workloads                                               SOSP’17, October 28, 2017, Shanghai, China
+
+                     100
+                                                                                                                                        Total
+                                                                                                                                        1 st Party + Services
+                     80                                                                                                                 3 rd Party
+
+
+
+
+                                                                                VM arrivals per hour
+   % of core hours
+
+
+
+
+                     60
+
+                     40
+
+                     20
+
+                      0
+                            Total        1 st Party + Services   3 rd Party
+                           Interactive       Delay-insensitive        Unknown                          Mon   Tue   Wed    Thu     Fri         Sat       Sun
+Figure 6: Workload classes and their use of core hours.                         Figure 7: Time series of arrivals per hour at one region.
+                                                                                performance constraints. For example, upon a power emer-
+scale) and delay-insensitive (e.g., batch workloads, develop-                   gency, the power capping system [26] can assign full power
+ment and test workloads). Obviously, it is conceivable that                     to VMs running interactive workloads and a reduced bud-
+some background VMs could increase/decrease activity at                         get to delay-insensitive VMs. The VM scheduler can tightly
+periodic intervals and appear periodic. We do not isolate                       pack VMs that run delay-insensitive workloads onto physical
+these cases, because our classification seeks to be conserva-                   servers, while loosely packing VMs that run interactive ones.
+tive (i.e., it is fine to classify a delay-insensitive workload as              Similarly, the provider can use the former classes of VMs to
+interactive, but not vice-versa). Moreover, some critical daily                 oversubscribe physical servers, while avoiding oversubscrip-
+batch jobs have strict deadlines, so classifying them as in-                    tion of servers that run an interactive VM. In all scenarios,
+teractive correctly reflects their performance needs. Finally,                  the provider must be able to predict with high confidence
+note that the algorithm works well even when the dominant                       which VMs will run or are running delay-insensitive work-
+resource is not the CPU, because the CPU is a good proxy                        loads. Even if such high confidence cannot be achieved, the
+for periodicity (e.g., network-bound interactive workloads                      provider may leverage our classification to help users select
+exhibit more CPU activity during the day than at night).                        good VM and deployment sizes based on their workloads’
+   Our periodicity analysis targets the VMs that run long                       characteristics (e.g., tighter sizes for delay-insensitive work-
+enough for us to detect a reliable pattern (at least 3 days).                   loads). Focusing on subscriptions should increase prediction
+We could have used other heuristics to classify VMs that                        accuracy, as they behave consistently over time.
+live shorter. However, since VMs running longer than 3 days
+consume 94% of the core hours, our classification already                       3.7                    VM inter-arrival times
+covers the vast majority of the used resources.                                 We now study the VM inter-arrival times at one of Azure’s
+   We have validated our classification algorithm with cus-                     regions. Figure 7 depicts the arrival time series at hourly gran-
+tomers accounting for more than 50% of the first-party VMs.                     ularity over a random week. We can see that that arrivals
+Entire platform perspective. Figure 6 depicts the percent-                      are very bursty and diurnal with lower load on weekends,
+age of total (left), first-party (middle), and third-party (right)              regardless of the type of workload. This pattern is represen-
+core hours in each class. The “Unknown” class represents the                    tative of other regions as well. The burstiness is due to the
+VMs that do not last 3 consecutive days. The figure shows                       small percentage of large deployments. We verified that the
+that delay-insensitive VMs consume most (roughly 68%) of                        arrival times are heavy-tailed by fitting Weibull distributions
+the core hours, regardless of whether they are first-party or                   (nearly perfectly) to them.
+not. Still, a significant percentage of VMs execute potentially                 Implications for resource management. Diurnal arrivals
+interactive workloads and consume roughly 28% of the core                       suggest that the provider can schedule its internal batch com-
+hours; these VMs must be managed carefully.                                     puting or infrastructure testing workloads for the night with-
+Per-subscription perspective. Inspecting the classifica-                        out risking competition with customer workloads. Heavy-
+tion per subscription again shows that most subscriptions                       tailed arrivals suggest that burstiness can be significant, so
+behave consistently; 76% of subscriptions with long-running                     the VM scheduler must be optimized for high throughput.
+VMs (at least one VM runs for 3 days) create VMs dominated
+by a single (usually delay-insensitive) class.                                  3.8                    Correlations between metrics
+Implications for resource management. Our classifica-                           Finally, we correlate the VM metrics we study using Spear-
+tion enables the provider to apportion resources according to                   man’s method. Figure 8 shows the pair-wise correlations for
+SOSP’17, October 28, 2017, Shanghai, China                                                                                                                                              E. Cortez, A. Bonde, A. Muzio, M. Russinovich, M. Fontoura, R. Bianchini
+
+                                                                  1 R Q  / L Q H D U  & R U U H O D W L R Q                                                                                   
+                                                                                                                                                                                                        can be used for learning/predicting server effects as well,
+           / L I H W L P H                                                                                                                        
+                                                                                                                                                                                                        such as hardware failures. RC is in production, supporting
+              & R U H V                                                                                                                                                  engineers and data scientists. The systems that will use it
+           0 H P R U \                                                                                                                                                    are being productized and qualified within Azure.
+  & 3 8  $ Y H U D J H                                                                                                                                          
+                                                                                                                                                                                                          Next, we discuss some RC use-cases and its design.
+ & 3 8  3    0 D [                                                                                                            
+     ' H S O R \ P H Q W                                                                                                                     
+                                                                                                                                                                                                     4.1    Example RC use-cases
+                  6 L ] H
+                                                                                                                                                                                                        We envision many uses for RC predictions of the metrics
+         : R U N O R D G                                                                                                                   
+                                                                                                                                                                                                     from Section 3. The following is a non-exhaustive list that
+                               / L I H W L P H
+
+                                                     & R U H V
+
+                                                                      0 H P R U \
+
+                                                                                        & 3 8  $ Y H U D J H
+
+                                                                                                                  & 3 8  3    0 D [
+
+                                                                                                                                            ' H S O R \ P H Q W
+
+
+                                                                                                                                                                      : R U N O R D G
+                                                                                                                                                                                                        expands on some examples from Section 3:
+
+                                                                                                                                                  6 L ] H
+                                                                                                                                                                                                        • Smart VM scheduling. Before selecting servers to run
+  Figure 8: Spearman’s correlations between metrics.                                                                                                                                                    a set of new VMs, the VM scheduler can contact RC for
+                                                                                                                                                                                                        predictions of the VMs’ expected resource utilizations. With
+the entire platform as a heat map; we include the workload                                                                                                                                              this information, the scheduler can select servers to balance
+class by numbering the classes 1 (delay-insensitive) and 2                                                                                                                                              the disk IOPS load, or to reduce the likelihood of physical
+(interactive). A correlation factor near 1.0 reflects a positive                                                                                                                                        resource exhaustion in oversubscribed servers.
+relationship (a higher value of one metric means a higher                                                                                                                                               • Smart cluster selection. Before selecting a cluster in
+value for the other), a factor near −1.0 reflects a negative re-                                                                                                                                        which to create a VM deployment, the cluster selection sys-
+lationship, whereas a factor near 0.0 reflects no relationship.                                                                                                                                         tem can query RC for a prediction of maximum deployment
+   Obviously, each metric is strongly positively correlated                                                                                                                                             size. With this information, this system can select a cluster
+with itself. In addition, the two utilization metrics are strongly                                                                                                                                      that will likely have enough resources.
+positively correlated, and so are numbers of cores and amount                                                                                                                                           • Smart power oversubscription and capping. During
+of memory (the latter relationship derives from Azure’s VM                                                                                                                                              a power emergency (when the power draw is about to ex-
+offerings). More interestingly, we see that the utilizations (es-                                                                                                                                       ceed a circuit breaker limit), the power capping system can
+pecially 95t h -percentile) show a lightly positive relationship                                                                                                                                        query RC for predictions of VM workload interactivity, be-
+to lifetime and a slightly negative relationship to cores and                                                                                                                                           fore apportioning the available power budget across servers.
+memory per VM, meaning that VMs with higher utilization                                                                                                                                                 Ideally, VMs executing interactive workloads should receive
+tend to be smaller and live longer. In contrast, lifetime has                                                                                                                                           all the power they may want, in detriment of VMs running
+no relationship with number of cores or amount of memory                                                                                                                                                batch and background tasks. Alternatively, the VM sched-
+per VM, whereas deployment size has a slightly negative                                                                                                                                                 uler can request interactivity predictions before selecting
+relationship with these metrics (larger deployments require                                                                                                                                             servers, so that interactive and delay-insensitive workloads
+fewer resources per VM). Finally, the class shows a lightly                                                                                                                                             are segregated in different sets of servers.
+positive relationship to lifetime, meaning that interactive                                                                                                                                             • Scheduling server maintenance. When a server starts
+VMs tend to live longer. The other metrics show no relation-                                                                                                                                            to misbehave, the health monitoring system can query RC
+ship to workload class.                                                                                                                                                                                 for the expected lifetime of the VMs running on the server. It
+   The correlations are different when considering only third-                                                                                                                                          can thus determine when maintenance can be scheduled, and
+party or only first-party workloads. Most strikingly, the uti-                                                                                                                                          whether VMs need to be live-migrated to enable maintenance
+lization metrics are moderately positively correlated with                                                                                                                                              without unavailability. In addition, the VM scheduler can
+deployment size in third-party workloads, whereas they are                                                                                                                                              use the lifetime predictions to co-locate VMs that are likely
+lightly negatively correlated in first-party ones.                                                                                                                                                      to terminate roughly at the same time. This could facilitate
+                                                                                                                                                                                                        other types of maintenance, such as OS updates.
+4        RESOURCE CENTRAL                                                                                                                                                                               • Recommending VM and deployment sizes. The cloud
+The previous section discussed several VM behaviors and                                                                                                                                                 platform could provide a service to its customers that recom-
+metrics related to resource management, and the potential                                                                                                                                               mends the appropriate VM size and number of VMs at the
+benefits of predicting them accurately.                                                                                                                                                                 time of each deployment. Using RC predictions of workload
+   To produce these predictions, we introduce Resource Cen-                                                                                                                                             class and resource utilization, the service could recommend
+tral (RC), a system for ingesting VM telemetry, learning from                                                                                                                                           deployments where VMs predicted to be delay-insensitive
+past VM behaviors, producing models that can predict these                                                                                                                                              would be more tightly sized than interactive VMs. (Existing
+behaviors, and executing the models (i.e., providing predic-                                                                                                                                            rightsizing services from Azure, AWS, and GCP recommend
+tions) when client systems request them. Though we focus                                                                                                                                                new sizes for currently running VMs after long observation
+on predicting VM behaviors in this paper, RC is general and                                                                                                                                             periods and do not account for the likely workload class.)
+Resource Central: Understanding and Predicting Cloud Workloads                      SOSP’17, October 28, 2017, Shanghai, China
+
+  Offline                                                            passing as input the model name and information about
+     Massive-scale cluster                                           the VM(s) for which it wants predictions. We refer to this
+             Extraction           Training                           information as the client inputs to the models. Examples
+                                                    Feature data
+              Cleanup          Cross-Validation                      of client inputs are subscription id, VM type and size, and
+                                                     generation
+            Aggregation        Model generation
+                                                                     deployment size. Besides the client inputs, the model may
+     Orchestrator
+                                                                     require historical feature data as additional inputs, which
+                                Download and         Publish to      RC fetches from the highly available store. For example, the
+         Trigger workflow
+                                 sanity check        data store      subscription id for a new VM deployment may be one of
+                                                                     the client inputs provided by the VM scheduler to a lifetime
+                                                  Highly available
+            Models & feature     Fetch models &                      model. As an example of feature data, the lifetime model
+                                                     data store
+             data caches           feature data
+                                                                     would also require information on historical lifetimes (e.g.,
+Client
+
+
+
+
+                                                                     percentage of short-lived and long-lived VMs to date) for the
+                    Results        Generate
+                    cache         predictions     Persistent cache   same subscription from the store.
+                                                                     ML modeling approaches. RC is agnostic to the specific
+              Figure 9: RC architecture (pull version).              modeling approach data analysts select; many approaches
+                                                                     fit the framework. In our current implementation, analysts
+   Exploring all these use-cases is beyond the scope of this         can select models from a large ML repository that runs on
+paper. As an example, Section 5 details the use of RC predic-        the data processing cluster. The repository also provides a
+tions for smart VM scheduling with server oversubscription.          library for executing the models at the clients.
+                                                                        The leftmost three columns of Table 1 list the modeling
+4.2         Design and implementation                                approaches we currently use for the metrics of Section 3:
+Principles. Our design for RC follows a few principles:              Random Forests and Extreme Gradient Boosting Trees as
+   (1) For performance and availability, RC should be an             classifiers, and Fast Fourier Transform (FFT) to detect peri-
+        independent and general system that is off the critical      odicity in the utilization timeseries. Each model takes many
+        performance and availability paths of the systems that       features as inputs, deriving from a smaller number of at-
+        use it.                                                      tributes (e.g., VM type, VM size, guest operating system).
+   (2) For maintainability, it should be simple and rely on          Due to the predictive value of these features, RC can make
+        any existing well-supported infrastructures.                 predictions about VMs it has not seen before.
+   (3) For usability, it should require minimal modifications           For classifying numeric metrics, we divide the space of
+        to the systems that use it, and provide an interface that    possible predictions into a small number of buckets. Formu-
+        is general enough for many use-cases.                        lating these models as classifiers with buckets rather than
+Overview. Based on these principles, we designed RC as in            regression algorithms, makes the metrics easier to predict.
+Figure 9. As the figure illustrates, RC has offline and online       For example, it is easier to predict that utilization will be in
+components. The offline workflow consists of several tasks:          the 50% to 75% bucket than predict that it will be exactly 53%.
+data extraction, cleanup, aggregation, feature data genera-          When the prediction must be converted to a number, the
+tion, training, validation, and machine learning (ML) model          client can assume the highest value for the predicted bucket,
+generation. RC performs these phases on a centralized mas-           the middle value, or the lowest value.
+sive data processing cluster that collects all the VM telemetry      Client DLL. It is configurable per client. Given a model
+from the cloud fabric. RC orchestrates these phases, sanity-         name, it finds out how to interpret the client inputs from the
+checks the models and feature data, and publishes them (with         specifications for the model. It caches the prediction results,
+version numbers) to an existing highly available store. The          model, and feature data from the store in memory.
+store is present in each datacenter.                                    Table 2 lists the main DLL API methods. On a prediction
+   In our current design, RC does not automatically select           request (a call to the Predict method), the DLL looks up the
+the appropriate ML modeling approach (e.g., regression tree,         results cache first by hashing the model name and client
+random forest) for each metric, leaving this task for data           inputs. On a hit, it returns the cached result. On a miss, the
+analysts who also (a) provide a “specification” describing the       DLL looks up the other caches, and executes the model using
+inputs to each model and (b) record them in the store.               client inputs and feature data inputs. The DLL caches the
+   The online part of RC uses a single, general, and thread-         result of this execution. Each prediction result is typically a
+safe client dynamically linked library (DLL), within which           predicted value and a score. The score reflects the model’s
+the ML models execute to produce predictions. This DLL               confidence on the predicted value. The client may choose to
+is the only view of RC for all external clients. The client          ignore a prediction when the confidence score is too low.
+(e.g., VM scheduler, health monitoring system) calls the DLL
+SOSP’17, October 28, 2017, Shanghai, China            E. Cortez, A. Bonde, A. Muzio, M. Russinovich, M. Fontoura, R. Bianchini
+
+                    Metrics                           Approach                   #features   Model size    Feature data size
+               Avg CPU utilization                 Random Forest                    127       312 KB           376 MB
+             P95 max CPU utilization               Random Forest                    127       311 KB           376 MB
+            Deployment size in #VMs        Extreme Gradient Boosting Tree           24        305 KB           368 MB
+            Deployment size in #cores      Extreme Gradient Boosting Tree           24        305 KB           368 MB
+                    Lifetime               Extreme Gradient Boosting Tree           127       329 KB           376 MB
+                 Workload class          FFT, Extreme Gradient Boosting Tree        34        152 KB           311 MB
+                   Table 1: Metrics, ML modeling approaches, model and full feature dataset sizes.
+
+                           API method           Parameters         Return      Description
+                             initialize            none           boolean      Initializes client DLL
+                       get_available_models        none             char*      Gets list of available models
+                          predict_single       model_name,         struct      Produces one prediction
+                                              client_inputs*     prediction
+                          predict_many         model_name,         struct      Produces multiple predictions
+                                              client_inputs**    prediction*
+                        force_reload_cache         none             void       Refreshes memory & disk caches
+                            flush_cache            none             void       Flushes memory & disk caches
+                                               Table 2: Main DLL API methods.
+
+   When the DLL cannot produce a prediction, it simply                   Regardless of the configured caching approach, RC also
+returns a no-prediction flag to the client system, which must         stores the content of the model and feature data caches in
+be able to handle this situation.                                     the local file system. It only looks up the local disk cache
+Cache management. Result caching is configurable and                  in either of two cases: (1) there is an in-memory model or
+implements a hash table accessible by hashing the model               feature data cache miss and the store is unavailable; or (2)
+name and the client inputs. Thus, it works well when the              the client crashes and restarts and the store is unavailable.
+client does not provide any rapidly changing inputs in the            In both cases, the DLL ignores the local disk cache, if it has
+prediction calls. Each result cache entry stores only the cor-        expired (the expiration time is also configurable).
+responding prediction value and score.                                Justification. Our DLL-based design follows the principles
+   The DLL caches model and feature data using either a               listed above. First, our caches attain high hit rates and our
+pull (fetch from the store on-demand) or push (update cache           models are light enough to be instantiated/run at the client
+when a change occurs at the store) approach. In one pull              (principle #1). Though high prediction performance is not
+configuration, the DLL returns a no-prediction on any re-             required for some RC use-cases, it can be critical when mod-
+sult cache miss; accesses to the remote store and/or model            els are large or expensive to execute, or when the client
+executions happen in the background. Clients can use this             has a low time budget. Implementing RC as a service with
+configuration when the models or full feature dataset are too         a REST API would have placed the interconnect and the
+large for their memory, and they never want remote accesses           prediction-serving stack on the critical paths of all predic-
+or model executions on the critical path of predictions.              tions. Second, the DLL is simple and is backed by an existing
+   We have not needed pull-based caching however: as the              highly available store, so it does not require provisioning
+two rightmost columns of Table 1 show, all the model sizes            additional servers/VMs for serving predictions (principle #2).
+and feature datasets we have considered so far are small              Finally, the interface the DLL provides makes requesting
+enough to fit entirely in the client’s memory. Thus, we rely          predictions seem like a simple method call (principle #3).
+on push-based caching, where RC periodically produces new
+models and feature data for all subscriptions, and pushes             5    CASE STUDY: RC-INFORMED VM
+them in the background to the caches in the client DLL. In the
+                                                                           SCHEDULING
+push approach, RC returns a no-prediction if it cannot find
+a model or feature data in its caches. For example, this may          In this section, we describe how Azure’s production VM
+occur if the prediction request refers to a recently created          scheduler can leverage the predictions from RC to enable
+subscription; information about this subscription will appear         careful physical CPU oversubscription. Other VM schedulers
+in the feature data cache after a future data push.                   can use the same predictions in a similar way. Recall that a
+                                                                      complete description of the Azure scheduler is beyond the
+                                                                      scope of this paper. Instead, we overview the system and
+Resource Central: Understanding and Predicting Cloud Workloads                         SOSP’17, October 28, 2017, Shanghai, China
+
+describe the changes we propose to it. We are productizing          Algorithm 1 CPU oversubscription rule and bookkeeping.
+our changes and expect to deploy them to production in the           1: Given: VM V to schedule, current set of candidate servers C
+next few months. In production, we will only oversubscribe           2: Client inputs include V .subscription, V .type, V .alloc
+servers running first-party workloads.                               3: function SelectCandidateServers(V , C)
+                                                                     4:     if V .type == PROD then
+VM scheduler. Azure executes one VM scheduler per server
+                                                                     5:         for each non-oversubscribable or empty server c ∈ C do
+cluster. The scheduler selects physical servers on which to          6:              if c.alloc+V .alloc <= SERVER_CAPACITY then
+place each VM assigned to its cluster. This decision is com-         7:                  Mark c eligible
+plex, because it must consider multiple resource dimensions,         8:     else
+as well as several constraints on the VM placements, at the          9:         P r ed = predict_single(VM_P95UTIL, client_inputs_list)
+same time. For example, given a deployment defined by the           10:         if P r ed .score >= .6 then
+                                                                    11:              V .util = Highest_Util_in_Bucket[P r ed .value] * V .alloc
+VMs’ maximum CPU, memory, and disk space requirements,
+                                                                    12:         else
+the scheduler must find servers with enough resources, while        13:              V .util = V .alloc
+spreading the VMs across multiple failure and update do-            14:         for each oversubscribable or empty server c ∈ C do
+mains. The system must also reserve resources for deploy-           15:              if c.alloc+V .alloc <= MAX_OVERSUB and
+ment growth and healing (re-starting) VMs affected by hard-         16:                c.util+V .util <= MAX_UTIL then
+                                                                    17:                  Mark c eligible
+ware failures. Ultimately, the scheduler must maximize the
+                                                                    18:     return List of eligible servers
+number of VMs that can be accepted, while minimizing the
+                                                                    19: function PlaceVM(V , c)
+number of VM scheduling failures.
+                                                                    20:     if c is empty then                        ◃ i.e., if c.alloc == 0 then
+   Clearly, scheduling VMs fast and at scale under these con-       21:         if V .type == PROD then
+ditions is challenging. In fact, computing an optimal solution      22:              Tag c as non-oversubscribable
+for such a bin-packing problem is infeasible, so prior works        23:         else
+have used heuristics [2, 3, 24]. In a similar vein, our scheduler   24:              Tag c as oversubscribable
+sequentially applies a set of rules that progressively narrow       25:     c.alloc += V .alloc
+                                                                    26:     if c is oversubscribable then
+the choice of servers that are candidates for a placement.
+                                                                    27:         c.util += V .util
+Some rules represent hard constraints that cannot be vio-           28: function VMCompleted(V , c)
+lated (e.g., must have enough available resources), whereas         29:     c.alloc -= V .alloc
+others can be violated if they would excessively restrict the       30:     if c is oversubscribable then
+set of candidate servers (e.g., prefer servers that will be more    31:         c.util -= V .util
+tightly packed). Despite its heuristic nature, our multi-year
+                                                                    (2) non-oversubscribable, i.e. those that only host production
+experience with the scheduler shows that it can pack the
+                                                                    workloads. A later rule tries to fill up non-oversubscribable
+VMs’ requested resources tightly, producing little fragmen-
+                                                                    servers before it places VMs in empty servers. For oversub-
+tation and few scheduling failures.
+                                                                    scribable servers, the rule avoids oversubscribing a server
+Leveraging RC predictions for oversubscription. Our
+                                                                    if another server can accommodate the new VM without
+proposed changes seek to increase server utilization via CPU
+                                                                    oversubscribing resources.
+oversubscription, while preventing scenarios where servers
+would actually run out of physical CPUs.                               Our rule uses RC predictions of 95th -percentile virtual
+   Our new code appears in Algorithm 1, which includes a            core utilization (line 9). If RC’s confidence in this prediction
+hard rule (SELECTCANDIDATESERVERS) and two book-                    is low, we conservatively assume that the VM will consume
+keeping functions (PLACEVM and VMCOMPLETED). The                    all its allocated cores (lines 10-13). The rule then marks as
+rule determines the servers where the new VM would “fit”;           candidates any oversubscribable servers for which: the sum
+it passes those eligible servers to the next rule in the chain.     of the VMs’ allocations is less than MAX_OVERSUB, and the
+Though our rule must check that the VM fits with respect            sum of the VMs’ predicted 95th -percentile utilizations is less
+to all resources, for clarity, the algorithm only shows the         than MAX_UTIL (lines 15-17). MAX_OVERSUB is the maxi-
+handling of the CPU resource (other resources are not over-         mum allowed CPU oversubscription (e.g., 15% more virtual
+subscribed). Similarly, we elide the single lock that protects      cores than physical cores), and MAX_UTIL is the maximum
+the VM and server data structures in the three routines.            allowed physical CPU utilization. We can set MAX_UTIL
+   Our rule receives the existing production vs non-producti-       to 100% (or another high value that provides some slack) to
+on annotation associated with first-party subscriptions as an       prevent resource exhaustion.
+input (called VM type in Algorithm 1). We only oversubscribe        Implementation as a soft rule. Implementing the utiliza-
+physical CPUs using non-production VMs. In fact, our code           tion check as part of the (hard) “fit” rule as above gives more
+logically splits the servers into two groups: (1) oversubscrib-     importance to preventing resource exhaustion than reducing
+able, i.e. those that only host non-production workloads; and       scheduling failures. An approach that inverts this tradeoff
+SOSP’17, October 28, 2017, Shanghai, China             E. Cortez, A. Bonde, A. Muzio, M. Russinovich, M. Fontoura, R. Bianchini
+
+                                                                         Metric          Bucket 1        Bucket 2          Bucket 3     Bucket 4
+implements the utilization check as a soft rule after the fit
+                                                                     Avg and P95 util     0-25%           25-50%            50-75%      75-100%
+rule. In this version, the scheduler treats limiting the CPU         Deployment size        1            > 1 & ≤10       > 10 & ≤ 100    > 100
+utilization as best effort, i.e. if enforcing the soft rule would   (#VMs and #cores)
+                                                                        Lifetime         ≤15 mins     > 15 & ≤ 60 mins   > 1 & ≤24 hs   > 24 hs
+cause all servers that have the needed resources to be marked         Workload class      Delay-         Interactive          NA         NA
+ineligible, the rule is simply disregarded.                                             insensitive
+Mispredictions and lack of predictions. A prediction er-                       Table 3: Metrics and their bucket sizes.
+ror for a VM is unlikely to cause problems, unless RC under-
+predicts these values for many co-located VMs. Consistent           bucket. The leftmost column lists the metric we are predict-
+under-predictions would cause the target peak utilization           ing. The second column lists the accuracy of the full set of
+to be exceeded frequently. Utilization mispredictions would         predictions (i.e., the percentage of predictions that were cor-
+be more prone to problems if we decided to limit the com-           rect), assuming the predicted bucket is that with the highest
+bined predicted average utilizations, instead of the combined       confidence score. The next set of columns present the results
+predicted 95t h -percentile utilizations. In case RC does not       per bucket: they list the percentage of VMs that truly fall
+produce a prediction (not shown), it is safest to assume that       in the bucket, the predictions’ precision for the bucket (i.e.,
+the VM will exhibit 100% utilization.                               the percentage of true positives in the set of predictions that
+Justification. As we seek to balance packing tightness and          named this bucket), and the predictions’ recall (i.e., the per-
+the ability to eliminate resource exhaustion in oversubscribed      centage of true positives in the set of predictions that should
+servers, our approach uses 95t h -percentile instead of maxi-       have named this bucket). The final two columns list the pre-
+mum utilization predictions. Thus, resource exhaustion might        cision and recall, respectively, assuming that RC replies with
+occur when higher percentile utilizations for multiple non-         a no-prediction if the highest bucket score is lower than 0.6
+production VMs happen to align in time, even when pre-              (i.e., confidence is low).
+dictions are perfectly accurate. Our results show that these            Table 4 demonstrates RC’s high prediction accuracy, which
+events happen very rarely, so we can limit resource exhaus-         ranges between 79% (lifetime) and 90% (workload class) de-
+tion while achieving tight packing.                                 pending on the metric. The prediction quality is even higher
+   Finally, we do not consider network and disk bandwidth           when we discard predictions with low confidence: preci-
+in VM scheduling, because Azure’s interconnect is overpro-          sion ranges between 85% (lifetime) and 94% (95th -percentile
+visioned and persistent storage is remote to compute servers.       CPU utilization) without substantially hurting recall, which
+                                                                    ranges between 73% (95th -percentile CPU utilization) and
+                                                                    98% (workload class). For all metrics, the most important
+6     EVALUATION                                                    attributes in determining prediction accuracy are the per-
+We now evaluate the quality of RC’s predictions, its perfor-        centage of VMs classified into each bucket to date in the
+mance, and the benefits of RC-informed VM scheduling.               subscription. Other relevant attributes are the service name
+                                                                    (i.e., the name of a top first-party subscription or “unknown”
+                                                                    for the others), deployment time, operating system, and VM
+6.1    RC prediction quality and performance                        size; their relative importance depends on the metric. VM
+Prediction quality. As we suggest in Section 3, the cus-            roles have little predictive value, e.g. all IaaS VMs have role
+tomers’ subscriptions are often a good unit upon which to           “IaaS” but may behave quite differently.
+base predictions, as VMs from the same subscription tend to             RC tends to achieve higher precision and recall for the
+exhibit similar behaviors. For this reason, we produce models       more popular buckets. This is expected since it has more
+using features that exist in all subscriptions, but produce pre-    data to learn from in these cases. An interesting case is
+dictions using feature data from the input VMs’ subscription.       workload class: bucket 1 shows that 99% of the VMs run
+This approach nicely matches the uses of RC for resource            delay-insensitive workloads, and RC achieves 100% precision
+management, as we always know the subscription to which             (every delay-insensitive prediction is for a delay-insensitive
+the VMs we want to predict belong.                                  VM) and 90% recall (90% of the delay-insensitive VMs are
+   To evaluate RC’s prediction quality, we train our models         predicted as such). Bucket 2 shows that RC achieves 7% pre-
+with two months of data and test them on the third month of         cision and 84% recall for the relatively few interactive VMs.
+our dataset (Section 3). To improve quality, we experimented        This low precision reflects our desire to maximize the recall
+with multiple techniques, including feature engineering and         for this class, and means that many interactive predictions
+normalization, feature selection and regularization.                are for delay-insensitive VMs; mistakes in this direction are
+   We divide the space of possible predictions for each metric      acceptable whereas those in the reverse direction (predicting
+into the buckets listed in Table 3. Given these buckets, Ta-        interactive VMs as delay-insensitive) are undesirable.
+ble 4 summarizes our prediction results for every metric and
+Resource Central: Understanding and Predicting Cloud Workloads                                        SOSP’17, October 28, 2017, Shanghai, China
+
+                                                      Bucket 1               Bucket 2            Bucket 3            Bucket 4
+                       Metric           Acc.     %       P     R        %       P     R      %      P     R     %       P     R    Pθ     Rθ
+                Avg CPU utilization     0.81    74%     0.92 0.83      19%     0.73 0.78    6%     0.78 0.74    2%     0.74 0.71   0.87   0.78
+                P95 CPU utilization     0.83    25%     0.83 0.89      15%     0.72 0.74   14%     0.73 0.72   46%     0.91 0.86   0.94   0.73
+                Deploy size (#VMs)      0.83    49%     0.85 0.87      40%     0.79 0.79   10%     0.80 0.74    1%     0.87 0.75   0.88   0.90
+                Deploy size (#cores)    0.86    19%     0.81 0.84      60%     0.88 0.90   19%     0.81 0.76    3%     0.86 0.66   0.90   0.92
+                Lifetime                0.79    29%     0.78 0.81      32%     0.70 0.79   32%     0.71 0.77    7%     0.69 0.80   0.85   0.80
+                Workload class          0.90    99%     1.00 0.90      1%      0.07 0.84   NA      NA NA       NA      NA NA       0.91   0.98
+                               Table 4: RC’s prediction quality. Acc = accuracy; P = precision; R = recall.
+
+      100                                                                            6.2    Case study: RC-informed VM
+                                                                                            scheduling
+      75                                                                             We now evaluate the impact of using 95th -percentile CPU
+                                                                                     utilization predictions in server CPU oversubscription. Our
+      50                                                                             goal is not to fully evaluate the Azure VM scheduler. Rather,
+CDF
+
+
+
+
+                                                       Avg CPU
+                                                                                     we assess the potential benefits of RC’s resource utilization
+                                                       P95 CPU                       predictions, using the Azure scheduler as an example.
+      25                                               Deploy size (#VMs)            Methodology. As our changes to the VM scheduler are not
+                                                       Deploy size (#cores)
+                                                       Lifetime                      yet in production, we rely on simulations of it using real
+                                                       Workload class
+       0                                                                             VM traces. The simulator is faithful to the real scheduler. In
+            0         50       100          150       200       250        300       fact, Azure evaluates all changes to the production scheduler
+                                       Microseconds
+Figure 10: Latency of model execution for our metrics.                               using the simulator. We have extended the simulator to (1)
+                                                                                     associate real first-party utilization traces (from the dataset
+Performance. The key drivers of RC’s online performance                              of Section 3) with the VMs being scheduled, (2) implement
+are the client DLL caches, model execution, and the data                             our changes to the scheduler, (3) consume RC predictions
+store, so our experiments assess: (1) the hit rate and latency                       for the real VMs, and (4) aggregate CPU utilization data
+of result cache accesses; (2) the latency of model execution                         for all simulated servers. We aggregate utilization data in
+on the client; and (3) the latency of model and feature data                         the simulator by adding up the co-located VMs’ maximum
+cache misses when using pull-based caching. For these exper-                         utilizations in each 5-minute period. This is pessimistic as
+iments, we create a dummy client that repeatedly requests                            it assumes that the maximum utilizations last for the entire
+predictions for the VMs in our month-long test set. The client                       period. Given this approach, simulated server utilizations may
+and DLL run on a 2-core VM.                                                          actually exceed 100%. We assume that each VM’s virtual core
+   We find that the RC result cache achieves a high hit rate for                     is pinned to a physical core, so exceeding 100% utilization in
+our dataset. On average, an entry is accessed between 18 and                         a period means that more than one virtual core would have
+68 times, depending on the metric, after the corresponding                           shared a physical core (via timeslicing) for part of the period.
+model execution. Since the result cache is very small (at                               The simulator reports the server CPU utilizations over
+most around 25 MB) for our dataset and could be allowed                              time, and the number of scheduling “failures” (VMs that
+to grow significantly, a longer VM trace would produce an                            could not be scheduled due to lack of resources or fragmen-
+even higher average number of hits per model execution.                              tation). Using these metrics, we compare schedules without
+The 99t h -percentile latency of a hit is only 1.3 µs, essentially                   oversubscription or differentiation between production and
+corresponding to preparing a key and accessing a hash table.                         non-production VMs (Baseline), with RC-informed oversub-
+   Figure 10 shows that latencies are low (and predictable)                          scription as a soft rule (RC-informed-soft), with RC-informed
+even when RC executes models on-the-fly due to result cache                          oversubscription as a hard rule (RC-informed-hard), and with
+misses. Median latencies range from 95 to 147 µs, whereas                            oversubscription but without RC’s predictions (Naive). We
+99t h -percentile latencies range from 139 to 258 µs.                                also compare against schedules in which RC always predicts
+   Finally, we find that accesses to the data store when using                       the correct bucket (RC-soft-right) or always predicts an incor-
+pull-based caching take substantially longer. Specifically, the                      rect random bucket (RC-soft-wrong) for the 95th -percentile
+store we use has median and 99t h -percentile latencies of 2.9                       CPU utilization. By default, we set MAX_OVERSUB and
+and 5.6 ms, respectively, for an 850-byte record (the size of                        MAX_UTIL in Algorithm 1 to 125% and 100% of the servers’
+the feature data for each subscription).                                             CPU capacity, respectively, but we also study the sensitivity
+                                                                                     of the RC results to these parameters. Finally, we simulate
+SOSP’17, October 28, 2017, Shanghai, China          E. Cortez, A. Bonde, A. Muzio, M. Russinovich, M. Fontoura, R. Bianchini
+
+336k VM arrivals to a cluster of 880 servers (each with 16         scheduling failures increases to 903 or 0.27%, i.e. well beyond
+cores and 112 GBytes of RAM) over a period of 1 month. The         the acceptable 0.1% failures. Nevertheless, lower target maxi-
+VMs exhibit the same size and lifetime distributions as in         mum utilizations can be used in more lightly loaded systems.
+Section 3, and their original tags (71% production VMs).           For instance, with 20% less load, an 80% target maximum
+Comparing schedulers. Given our default settings, RC-              utilization leads to no failures.
+informed-soft produces no scheduling failures and only 77          Sensitivity to VM resource utilization. Finally, we study
+individual server utilization readings above 100% over the         the impact of higher virtual core utilization by artificially
+entire month and across all servers. RC-informed-hard pro-         adding 25% to all real utilization values, and adding 1 to all
+duces the same results, as VM utilizations are not high enough     utilization bucket predictions. As expected, higher utiliza-
+to cause deployment failures (our utilization analysis below       tion causes RC-informed-hard to produce more scheduling
+describes cases in which RC-informed-soft and RC-informed-         failures than RC-informed-soft. However, the difference is
+hard behave differently). Naive does not perform as well: it       just 4 failures, since our utilization predictions must be above
+also produces no failures, but shows 6× more server uti-           100% for all servers with enough available resources for the
+lizations higher than 100%. In contrast, the Baseline system       hard rule to cause an extra failure.
+produces no server utilizations higher than 100% (since there
+is no oversubscription) and 0.25% of failures. This percentage     7    CONCLUSION
+of failures is 2.5× higher than what we consider acceptable.
+These results show that RC-informed oversubscription pro-          In this paper, we detailed Azure’s VM workload, and dis-
+duces more capacity from the same hardware, while control-         cussed how the workload’s characteristics can be exploited
+ling resource exhaustion for non-production workloads.             in improving resource management. We then introduced
+   We also find that predicting utilization accurately is impor-   Resource Central, a system for generating, storing, and ef-
+tant. RC-soft-right produces similar behavior to RC-informed-      ficiently using predictions of these characteristics. Finally,
+soft, with some more utilization readings higher than 100%.        we described changes to Azure’s production VM scheduler
+This is not surprising since (1) RC-informed-soft already          that leverage such predictions. Our results show that Re-
+has high prediction accuracy (Table 4), and (2) RC-soft-right      source Central performs well, produces accurate predictions,
+assumes perfect predictions of 95t h -percentile utilization,      and enables safe CPU oversubscription. We conclude that
+whereas the simulator aggregates maximum utilizations. In          providers can exploit the characteristics of their workloads
+contrast, RC-soft-wrong does much worse, producing 3×              in many management tasks, using machine learning and
+more above-100% utilization readings than RC-informed-soft         efficient prediction-serving systems.
+(while still producing no scheduling failures).
+Sensitivity to amount of oversubscription (MAX_OVERSUB).           Acknowledgements
+We now compare RC-informed-soft for allowable oversub-             We would like to thank our shepherd, Mike Dahlin, and
+scriptions of 125% (results above), 120%, and 115% of the          the anonymous reviewers for their extensive comments on
+servers’ CPU capacity. Lowering this value progressively           our work. Christina Delimitrou, Inigo Goiri, Alok Kumbhare,
+increases the number of scheduling failures, as there is less      Knut Risvik, and Yunqi Zhang also provided many comments
+available capacity for non-production workloads. Even at           that helped us improve our paper. Finally, we thank Bertus
+115% oversubscription however, the number of failures in           Greeff and Abhisek Pan for their help with the VM scheduler
+RC-informed is still 65% lower than in Baseline. At the same       and its simulator.
+time, each server receives fewer VMs as oversubscription
+decreases, so the likelihood of multiple concurrent utiliza-
+tion spikes decreases. This leads to even lower numbers of         REFERENCES
+utilization readings above 100%: at 115% allowable oversub-         [1] Abadi, M., Barham, P., Chen, J., Chen, Z., Davis, A., Dean, J., Devin,
+                                                                        M., Ghemawat, S., Irving, G., Isard, M., Kudlur, M., Levenberg, J.,
+scription, RC-informed-soft produces only 22 such readings.
+                                                                        Monga, R., Moore, S., Murray, D. G., Steiner, B., Tucker, P., Vasude-
+Sensitivity to target max server utilization (MAX_UTIL).                van, V., Warden, P., Wicke, M., Yu, Y., and Zheng, X. TensorFlow: A
+Now, we investigate the impact of lowering the target maxi-             System for Large-Scale Machine Learning. In Proceedings of the 12th
+mum server utilization from 100% (results above) to 90% or              USENIX Symposium on Operating System Design and Implementation
+80%, while keeping the amount of allowable oversubscription             (2016).
+                                                                    [2] Beloglazov, A., and Buyya, R. Energy Efficient Resource Manage-
+at 125%. Reducing the target effectively reduces the avail-
+                                                                        ment in Virtualized Cloud Data Centers. In Proceedings of the 10th
+able server capacity for non-production workloads, leading              International Conference on Cluster, Cloud and Grid Computing (2010).
+to a significant increase in scheduling failures for the same       [3] Bobroff, N., Kochut, A., and Beaty, K. Dynamic Placement of
+VM arrivals. For example, for a target of 80%, the number of            Virtual Machines for Managing SLA Violations. In Proceedings of the
+                                                                        International Symposium on Integrated Network Management (2007).
+Resource Central: Understanding and Predicting Cloud Workloads                                     SOSP’17, October 28, 2017, Shanghai, China
+
+ [4] Calheiros, R. N., Masoumi, E., Ranjan, R., and Buyya, R. Workload                on Computer systems (2009).
+     Prediction Using ARIMA Model and its Impact on Cloud Applications’          [22] Reiss, C., Tumanov, A., Ganger, G. R., Katz, R. H., and Kozuch,
+     QoS. IEEE Transactions on Cloud Computing 3, 4 (2015).                           M. A. Heterogeneity and Dynamicity of Clouds at Scale: Google Trace
+ [5] Crankshaw, D., Bailis, P., Gonzalez, J. E., Li, H., Zhang, Z.,                   Analysis. In Proceedings of the 3rd Symposium on Cloud Computing
+     Franklin, M. J., Ghodsi, A., and Jordan, M. I. The Missing Piece in              (2012).
+     Complex Analytics: Low Latency, Scalable Model Management and               [23] Roy, N., Dubey, A., and Gokhale, A. Efficient Autoscaling in the Cloud
+     Serving with Velox. In Proceedings of the 7th Biennial Conference on             Using Predictive Models for Workload Forecasting. In Proceedings of
+     Innovative Data Systems Research (2015).                                         the International Conference on Cloud Computing (2011).
+ [6] Crankshaw, D., Wang, X., Zhou, G., Franklin, M. J., Gonzalez, J. E.,        [24] Verma, A., Ahuja, P., and Neogi, A. pMapper: Power and Migration
+     and Stoica, I. Clipper: A Low-Latency Online Prediction Serving                  Cost Aware Application Placement in Virtualized Systems. In Proceed-
+     System. In Proceedings of the 14th Symposium on Networked Systems                ings of the International Conference on Distributed Systems Platforms
+     Design and Implementation (2017).                                                and Open Distributed Processing (2008).
+ [7] Delimitrou, C., and Kozyrakis, C. Quasar: Resource-Efficient and            [25] Wilkes, J. More Google Cluster Data. Google research blog,
+     QoS-Aware Cluster Management. In Proceedings of the 19th Interna-                Nov. 2011. Posted at http://googleresearch.blogspot.com/2011/11/
+     tional Conference on Architectural Support for Programming Languages             more-google-cluster-data.html.
+     and Operating Systems (2014).                                               [26] Wu, Q., Deng, Q., Ganesh, L., Hsu, C.-H., Jin, Y., Kumar, S., Li, B.,
+ [8] Di, S., Kondo, D., and Cirne, W. Characterization and Comparison of              Meza, J., and Song, Y. J. Dynamo: Facebook’s Data Center-Wide Power
+     Cloud versus Grid Workloads. In Proceedings of the 2012 International            Management System. In Proceedings of the International Symposium
+     Conference on Cluster Computing (2012).                                          on Computer Architecture (2016).
+ [9] Gong, Z., Gu, X., and Wilkes, J. Press: Predictive Elastic Resource Scal-   [27] Yang, H., Breslow, A., Mars, J., and Tang, L. Bubble-flux: Precise
+     ing for Cloud Systems. In Proceedings of the International Conference            Online QoS Management for Increased Utilization in Warehouse Scale
+     on Network and Service Management (2010).                                        Computers. In Proceedings of the 40th Annual International Symposium
+[10] Google. TensorFlow Serving. http://tensorflow.github.io/serving/.                on Computer Architecture (2013).
+[11] He, K., Fisher, A., Wang, L., Gember, A., Akella, A., and Risten-
+     part, T. Next Stop, the Cloud: Understanding Modern Web Service
+     Deployment in EC2 and Azure. In Proceedings of the 2013 Internet
+     Measurement Conference (2013).
+[12] Islam, S., Keung, J., Lee, K., and Liu, A. Empirical Prediction Models
+     for Adaptive Resource Provisioning in the Cloud. Future Generation
+     Computer Systems 28, 1 (2012).
+[13] Jia, Y., Shelhamer, E., Donahue, J., Karayev, S., Long, J., Girshick, R.,
+     Guadarrama, S., and Darrell, T. Caffe: Convolutional Architecture
+     for Fast Feature Embedding. In Proceedings of the 22nd International
+     Conference on Multimedia (2014).
+[14] Khan, A., Yan, X., Tao, S., and Anerousis, N. Workload Characteri-
+     zation and Prediction in the Cloud: A Multiple Time Series Approach.
+     In Proceedings of the International Conference on Network and Service
+     Management (2012).
+[15] Kilcioglu, C., Rao, J., Kannan, A., and McAfee, R. P. Usage Patterns
+     and the Economics of the Public Cloud. In Proceedings of the 26th
+     International World Wide Web Conference (2017).
+[16] Li, A., Yang, X., Kandula, S., and Zhang, M. CloudCmp: Comparing
+     Public Cloud Providers. In Proceedings of the 10th ACM SIGCOMM
+     Conference on Internet Measurement (2010).
+[17] Lo, D., Cheng, L., Govindaraju, R., Ranganathan, P., and
+     Kozyrakis, C. Heracles: Improving Resource Efficiency at Scale. In
+     Proceedings of the 42nd Annual International Symposium on Computer
+     Architecture (2015).
+[18] Meng, X., Bradley, J., Yavuz, B., Sparks, E., Venkataraman, S., Liu,
+     D., Freeman, J., Tsai, D., Amde, M., Owen, S., et al. MLLib: Machine
+     Learning in Apache Spark. Journal of Machine Learning Research 17,
+     34 (2016).
+[19] Mishra, A. K., Hellerstein, J. L., Cirne, W., and Das, C. R. Towards
+     Characterizing Cloud Backend Workloads: Insights from Google Com-
+     pute Clusters. SIGMETRICS Perform. Eval. Rev. 37, 4 (Mar. 2010).
+[20] Novakovic, D., Vasic, N., Novakovic, S., Kostic, D., and Bianchini,
+     R. DeepDive: Transparently Identifying and Managing Performance
+     Interference in Virtualized Environments. In Proceedings of the USENIX
+     Annual Technical Conference (2013).
+[21] Padala, P., Hou, K.-Y., Shin, K. G., Zhu, X., Uysal, M., Wang, Z.,
+     Singhal, S., and Merchant, A. Automated Control of Multiple
+     Virtualized Resources. In Proceedings of the 4th European Conference
+

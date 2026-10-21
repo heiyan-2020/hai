@@ -1,0 +1,994 @@
+       REPT: Reverse Debugging of Failures
+              in Deployed Software
+          Weidong Cui and Xinyang Ge, Microsoft Research Redmond;
+  Baris Kasikci, University of Michigan; Ben Niu, Microsoft Research Redmond;
+Upamanyu Sharma, University of Michigan; Ruoyu Wang, Arizona State University;
+                    Insu Yun, Georgia Institute of Technology
+            https://www.usenix.org/conference/osdi18/presentation/weidong
+
+
+       This paper is included in the Proceedings of the
+    13th USENIX Symposium on Operating Systems Design
+               and Implementation (OSDI ’18).
+                    October 8–10, 2018 • Carlsbad, CA, USA
+                               ISBN 978-1-939133-08-3
+
+
+
+                                          Open access to the Proceedings of the
+                                      13th USENIX Symposium on Operating Systems
+                                              Design and Implementation
+                                                is sponsored by USENIX.
+             REPT: Reverse Debugging of Failures in Deployed Software
+
+     Weidong Cui1 , Xinyang Ge1 , Baris Kasikci2 , Ben Niu1 , Upamanyu Sharma2 , Ruoyu Wang3 , and Insu Yun4
+                                                 1 Microsoft Research
+                                               2 University of Michigan
+                                               3 Arizona State University
+                                           4 Georgia Institute of Technology
+
+
+
+
+Abstract                                                      logging/tracing when most logs or traces would be dis-
+                                                              carded for normal runs. As a result, only a memory dump
+Debugging software failures in deployed systems is im-        is captured upon failures in deployed software to enable
+portant because they impact real users and customers.         post-mortem diagnosis.
+However, debugging such failures is notoriously hard in
+                                                                 Alas, it is challenging for developers to debug memory
+practice because developers have to rely on limited infor-
+                                                              dumps due to limited information. The result is that a
+mation such as memory dumps. The execution history is
+                                                              significant fraction of bugs is left unfixed [32,59]. Those
+usually unavailable because high-fidelity program trac-
+                                                              that get fixed can take weeks in certain cases [32].
+ing is not affordable in deployed systems.
+                                                                 To make matters worse, streamlined software pro-
+   In this paper, we present REPT, a practical system
+                                                              cesses call for short release cycles [53], which limits
+that enables reverse debugging of software failures in
+                                                              the extent of in-house testing prior to software release.
+deployed systems. REPT reconstructs the execution his-
+                                                              Frequent releases increase the dependency on debugging
+tory with high fidelity by combining online lightweight
+                                                              failures reported from deployed software, because these
+hardware tracing of a program’s control flow with of-
+                                                              failure occurrences become the only way to detect cer-
+fline binary analysis that recovers its data flow. It is
+                                                              tain bugs. Frequent releases also increase the demand for
+seemingly impossible to recover data values thousands
+                                                              quickly resolving bugs to meet short release deadlines.
+of instructions before the failure due to information loss
+and concurrent execution. REPT tackles these challenges          There exists a rich literature on debugging failures,
+by constructing a partial execution order based on time-      which can roughly be classified into two categories:
+stamps logged by hardware and iteratively performing             (1) Automatic root cause diagnosis [16, 37–41, 61] at-
+forward and backward execution with error correction.         tempts to automatically determine the culprit statements
+   We design and implement REPT, deploy it on Mi-             that cause a program to fail. Due to various limitations
+crosoft Windows, and integrate it into WinDbg. We eval-       (e.g., requiring code modification [37, 40, 41], inabil-
+uate REPT on 16 real-world bugs and show that it can          ity to handle complex software efficiently [37, 61], or
+recover data values accurately (92% on average) and ef-       being limited to a subset of failures [37, 39]), none of
+ficiently (in less than 20 seconds) for these bugs. We        these systems are deployed in practice. Moreover, even
+also show that it enables effective reverse debugging for     though root cause diagnosis can help a developer deter-
+14 bugs.                                                      mine the reasons behind a failure, developers often re-
+                                                              quire a deeper understanding of the conditions and the
+                                                              state leading to a failure to fix a bug, which these sys-
+1   Introduction                                              tems do not provide.
+                                                                 (2) Failure reproduction for debugging attempts to en-
+Software failures in deployed systems are unavoidable         able developers to examine program inputs and state that
+and debugging such failures is crucial because they im-       lead to failures. Exhaustive testing techniques such as
+pact real users and customers. It is well known that ex-      symbolic execution [22] and model checking [21, 58],
+ecution logs are helpful for debugging [28], but nobody       or state-space exploration [51] can be used to determine
+wants to pay a high performance overhead for always-on        inputs and state that lead to a failure for the purpose
+
+
+
+
+USENIX Association                  13th USENIX Symposium on Operating Systems Design and Implementation              17
+of debugging. Unfortunately, these techniques require             low runtime monitoring overhead and should finish its
+heavyweight runtime monitoring [26]. Another popular              analysis within minutes. To solve this challenge, we in-
+technique for reproducing failures is record/replay sys-          troduce a new binary analysis approach that combines
+tems [46, 48, 50, 52, 56] that record program executions          forward and backward execution to iteratively emulate
+that can later be replayed to debug failures. This is also        instructions and recover data values. REPT uses the fol-
+known as reverse debugging [31, 55] or time-travel de-            lowing two new techniques for its analysis:
+bugging [44]. On the plus side, reverse debugging allows
+a developer to go back and forth in a failed execution to            First, we design an error correction scheme to detect
+examine a program’s state (i.e., control and data flow) to        and correct value conflicts that are introduced by mem-
+truly understand the bug and devise a fix. On the other           ory writes to unknown addresses. When emulating a
+hand, record/replay systems incur prohibitive overhead            memory write instruction, it is too conservative to mark
+(up to 200% for the state-of-the-art system [56]) in mul-         all memory values as unknown if the destination address
+tithreaded programs running on multiple cores, making             is unknown. Instead, REPT leaves memory untouched
+them impractical for use in deployed systems.                     and relies on detecting a conflict later caused by stale val-
+   Due to the limitations of existing techniques, major           ues in the destination memory. Unlike previous solutions
+software vendors including Apple [17], Google [33], and           that use expensive hypothesis tests to decide memory
+Microsoft [30] as well as open-source systems such as             aliases [57], the error correction scheme enables REPT
+Ubuntu [54] operate error reporting services to collect           to run its iterative analysis efficiently.
+data about failures in deployed software and analyze                 Second, we leverage the timing information pro-
+them. To our knowledge, even the most advanced bug                vided by modern hardware to determine the order of
+diagnosis system deployed in production, namely RE-               non-deterministic events such as races across multiple
+Tracer [27], is only able to triage failures caused by ac-        threads. Non-determinism has been a long-standing
+cess violations.                                                  challenge that hinders the ability of existing record/re-
+   To solve the challenge of debugging software failures          play systems to achieve high accuracy with low over-
+in deployed systems, we argue that we need a practical            head. REPT can identify the order of accesses to
+solution that enables reverse debugging of such failures.         the same memory location in most cases by using
+To be practical, the solution must (1) impose a very low          fine-grained timestamps that modern hardware provides.
+runtime performance overhead when running on a de-                When the timing information is not enough, REPT re-
+ployed system, (2) should be able to recover the execu-           stricts the use of memory accesses whose order cannot
+tion history accurately and efficiently, (3) work with un-        be inferred. This stops their values from negatively af-
+modified source code/binary, (4) apply to broad classes           fecting the recovery of other data.
+of bugs (e.g., concurrency bugs).
+   In this paper, we present REPT1 , a practical solution            We implement REPT in two components. The online
+for reverse debugging of software failures in deployed            tracing component is a driver that controls Intel Proces-
+systems. There are two key ideas behind REPT. First,              sor Trace (PT) [36], and has been deployed on hundreds
+REPT leverages hardware tracing to record a program’s             of millions of machines as part of Microsoft Windows.
+control flow with low performance overhead. Second,               The offline binary analysis component is a loadable li-
+REPT uses a novel binary analysis technique to recover            brary that is integrated into WinDbg [45]. We also en-
+data flow information based on the logged control flow            hance Windows Error Reporting (WER) service [30] to
+information and the data values saved in a memory                 control hardware tracing on deployed systems.
+dump. Consequently, REPT enables reverse debugging
+by combining the logged control flow and the recovered               To measure the effectiveness and efficiency of REPT,
+data flow.                                                        we evaluate it on 16 real-world bugs in software such
+   The main challenge faced by REPT is how to accu-               as Chrome, Apache, PHP, and Python. Our experiments
+rately and efficiently recover data values based on the           show that REPT can enable effective reverse debugging
+logged control flow and the data values saved in the              for 14 of them, including 2 concurrency bugs. We evalu-
+memory dump. To be accurate, REPT must be able to                 ate REPT’s data recovery accuracy by comparing its re-
+correctly recover a significant fraction of data values in        covered data values with those logged by Time Travel
+the execution history. To be efficient, REPT must incur           Debugging (TTD) [44], a slow but precise record/replay
+                                                                  tool. Our experiments show that REPT can achieve an
+   1 REPT stands for Reverse Execution with Processor Trace and   average accuracy of 92% and finish its analysis in less
+reads as “repeat.”                                                than 20 seconds for these bugs.
+
+
+
+
+18   13th USENIX Symposium on Operating Systems Design and Implementation                               USENIX Association
+2     Overview                                               concrete ones. As the program executes, symbolic ex-
+                                                             ecution gathers constraints on symbolic values. When-
+2.1    Problem Statement                                     ever an event of interest occurs (e.g., a failure), symbolic
+                                                             execution uses a constraint solver to determine the pro-
+The overarching goal of REPT is to enable reverse de-        gram inputs that would have led to that failure. Con-
+bugging of failures in deployed software with low run-       ceptually, symbolic execution may help with recovering
+time overhead. REPT realizes reverse debugging in two        data values. We could treat operands such as registers
+steps. (1) REPT uses hardware support to log the control     and memory locations referenced by each instruction as
+flow and timing information of a program’s execution.        variables, and generate constraints among these variables
+When a failure occurs, REPT saves an enriched memory         based on the semantics of the instructions. However,
+dump including both the final program state and the ad-      given a long execution trace, the constraints gathered
+ditionally recorded control flow and timing information      on the variables may grow too large (particularly when
+before the failure. (2) REPT uses a new offline binary       memory locations are made symbolic) to solve within a
+analysis technique to recover data values in the execu-      reasonable amount of time for even state-of-the-art con-
+tion history based on the enriched memory dump.              straint solvers. Therefore, we choose to do concrete exe-
+   REPT needs to recover data values because there is        cution instead of symbolic execution. REPT keeps con-
+no existing hardware support for efficiently logging all     crete values for registers and memory locations at each
+data values of a program’s execution. However, there         position in the instruction sequence and analyzes each
+exist hardware features such as Intel PT [36] and ARM        instruction to recover concrete values of its operands.
+Embedded Trace Macrocell [18] that can efficiently log
+the control flow and timing information.
+                                                             2.3     Challenges
+2.2    Design Choices                                        To enable reverse debugging, REPT faces three chal-
+                                                             lenges when recovering register and memory values in
+When designing REPT, we make three design choices.           the execution history.
+    Memory Dump Only vs. Online Data Capture: We
+choose to only rely on the data in a memory dump rather
+                                                             2.3.1   Irreversible Instructions
+than logging more data during execution to minimize the
+performance overhead for deployed systems. Further-          This first challenge for REPT is handling irreversible
+more, to do online data capture, we would need to mod-       instructions. If every instruction is reversible (i.e., the
+ify the operating system or programs because there is no     program state before an instruction’s execution can be
+existing hardware support for that. We choose not to do      fully determined based on the program state after its ex-
+it to minimize intrusiveness.                                ecution), then the design of REPT would be straight-
+    Binary vs. Source: We choose to do the analysis at       forward: invert each instruction’s semantics and recover
+the binary level instead of at the source code level for     data values at each position in the instruction sequence.
+three reasons. First, by performing analysis at the in-      However, many instructions are irreversible (e.g., xor
+struction level, REPT is essentially agnostic to program-    rax,rax) and thus information destroying. We solve
+ming languages and compilers. This allows REPT to            this challenge by using forward execution to recover val-
+support native languages (e.g., C/C++) as well as man-       ues that cannot be recovered in backward execution.
+aged languages (e.g., C#). Second, today’s applications
+often consist of multiple modules/libraries from differ-
+                                                             2.3.2   Missing Memory Writes
+ent vendors, and not all source code may be available
+for analysis [25]. Third, the mapping between the source     The second challenge for REPT is handling memory
+code and binary instructions is not straightforward due      writes to unknown addresses. Most memory addresses
+to compiler optimizations and the use of temporary vari-     cannot be determined statically. Since the analysis may
+ables, thus converting source-level analysis result back     not fully recover data values due to irreversible instruc-
+to the binary-level presents a non-trivial challenge.        tions, REPT may not know the destination of a memory
+    Concrete vs. Symbolic: One popular approach to re-       write during its analysis. When this happens, one op-
+constructing executions is symbolic execution. In sym-       tion is to assume that values at all memory locations be-
+bolic execution, a program is executed with symbolic in-     come unknown. This is too conservative because it may
+puts of unconstrained values (e.g., a Boolean can ini-       cause the analysis to miss many data values that are actu-
+tially take any of the true or false values) as opposed to   ally recoverable. If REPT chooses to ignore the memory
+
+
+
+
+USENIX Association                  13th USENIX Symposium on Operating Systems Design and Implementation              19
+write, the analysis will leave an invalid value at the mem-         • Multiple instruction sequences with irreversible in-
+ory location, which may propagate into other registers or             structions and with memory accesses (Section 3.4).
+memory locations. We solve this challenge by using er-
+ror correction.                                                   3.1    Instruction Reversal
+                                                                  REPT’s first mechanism assumes that the input is a single
+2.3.3     Concurrent Memory Writes                                instruction sequence with only reversible instructions.
+                                                                  Since every instruction is reversible, REPT can reverse
+The third challenge for REPT is correctly identifying the
+                                                                  the effects of each instruction to completely recover the
+order of shared memory accesses. In the presence of
+                                                                  initial program state from the end of the instruction se-
+multiple instruction sequences from different threads, it
+                                                                  quence to the beginning. For instance, if the instruction
+may not be possible to infer the execution order of con-
+                                                                  sequence has a single instruction I1 = add rax,rbx
+current memory accesses despite timestamps provided
+                                                                  and S1 = {rax=3, rbx=1}, then the analysis can recover
+by hardware. REPT needs to properly handle these mem-
+                                                                  S0 = {rax=2, rbx=1}.
+ory accesses, otherwise it may infer wrong values for
+these memory locations. We solve this challenge by re-
+stricting in the analysis the use of data values recovered        3.2    Irreversible Instruction Handling
+from concurrent memory accesses.
+                                                                  REPT’s second mechanism assumes that there is a single
+                                                                  instruction sequence with irreversible instructions, but
+                                                                  the sequence does not include any memory access. In
+3    Design                                                       practice, most instructions are irreversible. For instance,
+                                                                  xor rbx,rbx is irreversible, because rbx’s value be-
+In this section, we describe the design of REPT by focus-
+                                                                  fore the instruction is executed cannot be recovered sim-
+ing on how it solves the three key technical challenges
+                                                                  ply based on this instruction’s semantics and rbx’s value
+discussed in the previous section.
+                                                                  after the instruction is executed. Therefore, the straight-
+   For brevity, we define an instruction sequence as I =          forward backward analysis for reversible instructions is
+{Ii |i = 1, 2, ..., n} where Ii represents the i-th instruction   not applicable in general.
+executed in the sequence. We assume that the memory                  The key idea for recovering a destroyed value is to in-
+dump is available after the n-th instruction’s execution.         fer it in a forward analysis. As long as the destroyed
+We define a program’s state, S, as a collection of all data       value is derived from some other registers and memory
+values in registers and memory locations. We define Si            locations, and their values are available, we can use these
+as the program state after the i-th instruction is executed.      values to recover the destroyed value. Extending this
+Therefore, S0 represents the program state before the first       idea, our basic solution is to iteratively perform back-
+instruction I1 is executed, and Sn represents the program         ward and forward analysis to recover data values until no
+state stored in the memory dump. We define a state Si             new values are recovered.
+as complete if all the register and memory values are                Conceptually, given the instruction sequence I and the
+known. We define an instruction Ii as reversible if, given        final state Sn , we first mark all register values as unknown
+a complete state Si , we can recover Si−1 completely; oth-        in program states from S0 to Sn−1 . Then we do backward
+erwise we say the instruction is irreversible. The design         analysis to recover program states from Sn−1 to S0 . After
+of REPT is not limited to a specific architecture, how-           this step, we perform forward analysis to update program
+ever, in the rest of the paper, we use x86-64 instructions        states from S0 to Sn−1 . We repeat these steps until a fixed
+in our examples.                                                  point is reached: i.e., no state is updated in a backward
+   In the rest of this section, we present the design of          or forward analysis. When we update a program state,
+REPT progressively by describing how it handles in-               we only change a register’s value from unknown to an
+creasingly more complex and realistic scenarios.                  inferred value. Crucially, this analysis will not produce
+    • A single instruction sequence with only reversible          conflicting inferred values because all the initial values
+      instructions (Section 3.1).                                 are correct and no step in the analysis can introduce a
+    • A single instruction sequence with irreversible             wrong value based on correct values. This also guaran-
+      instructions but without memory accesses (Sec-              tees that the iterative analysis will converge.
+      tion 3.2).                                                     We show an example of handling irreversible instruc-
+    • A single instruction sequence with irreversible in-         tions in Figure 1. The instruction sequence has three in-
+      structions and with memory accesses (Section 3.3).          structions, and two of them are irreversible. Since we do
+
+
+
+
+20      13th USENIX Symposium on Operating Systems Design and Implementation                            USENIX Association
+                                              Iteration 1             Iteration 2            Iteration 3
+                                         S0   ↑ {rax=?, rbx=?} →      ↓                      ↑ {rax=2, rbx=?}
+                 I1   mov rbx, 1         S1   ↑ {rax=?, rbx=?}        ↓ {rax=?, rbx=1}       ↑ {rax=2, rbx=1}
+                 I2   add rax, rbx       S2   ↑ {rax=3, rbx=?}        ↓ {rax=3, rbx=1}       ↑ {rax=3, rbx=1}
+                 I3   xor rbx, rbx       S3   ↑ {rax=3, rbx=0}        ↓ {rax=3, rbx=0} →     ↑
+
+Figure 1: This example shows how REPT’s iterative analysis recovers register values in the presence of irreversible
+instructions. We use “?” to represent “unknown”. Key updates during the analysis are marked in bold face.
+
+                                       Iteration 1                  Iteration 2                  Iteration 3
+                                 S0    ↑ {rax=?, rbx=?, [g]=3} →                                 ↑ {rax=?, rbx=?, [g]=2}
+       I1   lea rbx, [g]         S1    ↑ {rax=?, rbx=?, [g]=3}      ↓ {rax=?, rbx=g, [g]=3}      ↑ {rax=?, rbx=g, [g]=2}
+       I2   mov rax, 1           S2    ↑ {rax=?, rbx=?, [g]=3}      ↓ {rax=1, rbx=g, [g]=3}      ↑ {rax=1, rbx=g, [g]=2}
+       I3   add rax, [rbx]       S3    ↑ {rax=3, rbx=?, [g]=3}      ↓ {rax=3, rbx=g, [g]=3}      ↑ {rax=3, rbx=g, [g]=?}
+       I4   mov [rbx], rax       S4    ↑ {rax=3, rbx=?, [g]=3}      ↓ {rax=3, rbx=g, [g]=3}      ↑ {rax=3, rbx=g, [g]=3}
+       I5   xor rbx, rbx         S5    ↑ {rax=3, rbx=0, [g]=3}      ↓ {rax=3, rbx=0, [g]=3} →
+
+Figure 2: This example shows how REPT’s iterative analysis recovers register and memory values when there exist
+irreversible instructions with memory accesses. We use “?” to represent “unknown”, and use “g” to represent the
+memory address of a global variable. Some values are in bold-face because they represent key updates in the analysis.
+We skip the fourth iteration which will recover [g]’s value to be 2 due to the space constraint.
+
+
+not have instructions before the first one, we do not ex-          are three key updates as marked in bold face. In the first
+pect to recover rbx in S0 . There are three points that are        iteration of the backward analysis, since we do not know
+worth noting in this example. First, we recover rbx’s              rbx’s value in S4 , we do not change the value at the ad-
+value in S1 based on the forward analysis in the second            dress g. In the second iteration of the forward analysis,
+iteration. Second, we keep rax’s value of 3 in S2 in the           there is a conflict for rax in S3 . The original value is 3,
+second iteration of forward analysis even though rax’s             but the newly inferred value would be 4 (rax + [g] = 1
+value is unknown in S1 . Third, we recover rax’s value             + 3 = 4). Our analysis keeps the original value of 3 be-
+of 2 in S1 in the last iteration of backward analysis.             cause it was inferred from the final program state which
+                                                                   we assume is correct. In the third iteration of the back-
+                                                                   ward analysis, based on rax’s value before and after the
+3.3    Recovering Memory Writes                                    instruction I3 , we can recover [g]’s value to be 2.
+REPT’s third mechanism assumes that there is a single                 Next, we describe the algorithm that REPT uses to re-
+instruction sequence with irreversible instructions and            cover missing memory writes. We first introduce the data
+with memory accesses. In practice, there are always                inference graph in Section 3.3.1, and then explain how
+instructions that access memory. Unlike registers that             we use the graph to detect and correct errors caused by
+can be statically identified from instructions, the address        missing memory writes in Section 3.3.2.
+of a memory access may not always be known. For a
+memory write instruction whose destination is unknown,             3.3.1    Data Inference Graph
+we cannot correctly update the value for the destination
+memory. A missing update may introduce an obsolete                 When performing the backward and forward analysis,
+value, which would negatively impact subsequent analy-             REPT maintains a data inference graph. The data infer-
+sis. A conservative approach that marks all memory as              ence graph is different from a traditional data flow graph
+unknown upon a missing memory write would lead to an               in the sense that it tracks how a data value is inferred in
+unnecessary and unacceptable information loss.                     either forward or backward directions while a data flow
+   Our key insight for solving the missing memory write            graph tracks the program’s data flow in just one direction.
+problem is to use error correction. The intuition behind              An example data inference graph is shown in Figure 3.
+REPT is to keep using the memory values that are possi-            In this example, we use rcx to recover [rax], and then
+bly valid to infer other values, and to correct the values         use the latter to recover rbx. Here we assume that rax’s
+later if the values turn out to be invalid based on conflicts.     value is not changed between I1 and In .
+Before describing REPT’s error correction algorithm, we               A node in the data inference graph represents a regis-
+first use an example to explain the high-level idea.               ter or a memory location that is accessed in an executed
+   The example in Figure 2 has five instructions. There            instruction. A node is called a use node if its correspond-
+
+
+
+
+USENIX Association                    13th USENIX Symposium on Operating Systems Design and Implementation                  21
+          I1 : mov [rax], rbx                                 a horizontal edge between the nodes as well. It is worth
+                   ...                                        noting that a node may have multiple horizontal incom-
+          In : mov rcx, [rax]                                 ing value edges. For instance, given add rax,rbx,
+                                                              the def node of rax can have two incoming value edges
+          rax@I1          [rax]@I1        rbx@I1              from the use nodes of rax and rbx.
+                                                                 In the second type of value edges, the connected nodes
+                                                              are from different instructions, but they correspond to the
+                                                              same register or memory location. Such value edges are
+          rax@In          [rax]@In        rcx@In              referred to as vertical edges. Intuitively, nodes connected
+             Value edge         Address edge
+                                                              via vertical edges belong to the same def-use chain (i.e.,
+             Use node
+                                                              a single def with all its reaching uses). In the back-
+                                     Def node
+                                                              ward analysis, we recover values from a use node to the
+                                                              preceding use node or the def node along the def-use
+Figure 3: An example data inference graph in REPT.            chain, and add vertical edges in between. Similarly, in
+The graph indicates that REPT uses rcx@In to recover          the forward analysis, we recover values from a def or use
+[rax]@In , which is further used to recover [rax]@I1          node to its subsequent use node along the def-use chain
+and subsequently rbx@I1 .                                     and add corresponding vertical edges as well. In other
+                                                              words, a def node’s value can only be propagated for-
+                                                              wardly while a use node’s value can be propagated on
+ing register or memory location is for read. Similarly, a     both directions.
+node is called a def node if it is for write. For instance,
+                                                                 For every node in the data inference graph, REPT also
+rbx@I1 is a use node, and rcx@In is a def node. If
+                                                              maintains a dereference level to aid in error correction
+a register or memory location is accessed for both read
+                                                              (Section 3.3.2). Specifically, all use nodes of values in
+and write in a single instruction, we create two nodes for
+                                                              the memory dump have a dereference level of 0. For
+it: one use node, and one def node. Finally, REPT treats
+                                                              any other node, REPT determines its dereference level
+data in the memory dump as use nodes because their val-
+                                                              in three steps: (1) for all incoming value edges, find
+ues can be propagated backwards like other use nodes.
+                                                              the maximum dereference level of the source nodes as
+   There are two kinds of directional edges in the data in-   D1 ; (2) for all incoming address edges, find the maxi-
+ference graph: value edges and address edges. A value         mum dereference level of the source nodes as D2 ; (3)
+edge from node A to node B means that REPT uses A’s           pick the larger value between D1 and D2 + 1 as the target
+value to infer B’s value. An address edge from A to B         node’s dereference level. We can see that the dereference
+means that A’s value is used to compute B’s address.          level actually measures the maximum number of address
+For instance, the edge from rcx@In to [rax]@In is             edges from a value stored in the memory dump to the
+a value edge, and the edge from rax@In to [rax]@In            given node. A node’s dereference level reflects the confi-
+is an address edge. To get or set the value of a mem-         dence level for its value since data inference errors come
+ory location, its address must be known. When setting a       from memory due to missing memory writes. A higher
+memory node’s value, besides value edges, REPT adds           dereference level means a lower confidence level.
+address edges from register nodes that are used to com-
+pute the address of the memory node. A memory node
+                                                              3.3.2   Error Correction
+can have multiple incoming address edges (e.g., a base
+register and an index register are used together to specify   During the iterative backward and forward analysis,
+the address).                                                 REPT continuously updates the data inference graph and
+   There are two types of value edges. In the first type      detects and corrects inconsistencies. There are two kinds
+of value edges, the connected nodes are from the same         of inconsistencies: value conflict and edge conflict. A
+instruction and we call them horizontal edges. Specifi-       value conflict happens when an inferred value does not
+cally, in the backward analysis, if a def node’s value is     match the existing value. An edge conflict happens when
+known and can be used to infer the value of a use node in     a newly identified def node of a memory location breaks
+the same instruction, we recover the use node’s value and     the previously assumed def-use relationship between two
+add a horizontal edge between the two nodes. Similarly,       nodes connected through a vertical edge. Consider the
+in the forward analysis, if a use node’s value is known       example in Figure 3. If REPT detects another write to
+and can be used to infer the value of a def node in the       the same memory location specified by rax between I1
+same instruction, we recover the def node’s value and add     and In , this memory write will cause a conflict on the
+
+
+
+
+22   13th USENIX Symposium on Operating Systems Design and Implementation                          USENIX Association
+vertical edge between [rax]@In and [rax]@I1 .                  partial order of instructions executed in different threads.
+   When REPT detects a conflict, it stops the analysis of      Second, we recognize that memory writes are the only
+the current instruction, identifies the invalid node, then     operations whose orders may affect data recovery.
+runs the invalidation process. For both types of conflicts,       With timestamps inserted in an instruction sequence,
+the invalidation process starts with an initial node. In the   we refer to the instructions between two timestamps as
+case of edge conflicts, the initial node is the target node    an instruction subsequence. We refer to the two times-
+of the broken vertical edge as it no longer belongs to the     tamps as the start and end time of the subsequence.
+same def-use chain. In the case of value conflicts, REPT       Given two instruction subsequences from two different
+checks if the dereference level of the node of the newly       instruction sequences, we infer their relative execution
+inferred value is less than or equal to that of the node       order based on their start and end times. If one subse-
+of the existing value (this means a higher or equal con-       quence’s end time is before another subsequence’s start
+fidence for the new value). If so, REPT picks the node         time, we say the first subsequence is executed before the
+of the existing value as the initial node for invalidation.    other subsequence. Otherwise, we say their order can-
+Otherwise, REPT discards the newly inferred value and          not be inferred, and the two subsequences are concur-
+moves on to the next instruction.                              rent. Note that the order of two subsequences in the same
+   If REPT identifies an initial node for invalidation, it     instruction sequence can always be determined based
+first processes each of its outgoing value and address         on their positions in the instruction sequence. We say
+edges. For a value edge, the target node is marked as          two instructions are concurrent if the instruction subse-
+unknown. For an address edge, the target node is deleted       quences they belong to are concurrent. We say two mem-
+from the data inference graph since its address becomes        ory accesses are concurrent if the corresponding memory
+unknown and consequently such a def or use on that             access instructions are concurrent.
+memory location may no longer exist. Then REPT re-                Given multiple instruction sequences executed simul-
+cursively applies the invalidation process to these target     taneously on multiple cores, REPT first divides them into
+nodes. It is worth noting that the data inference graph        subsequences, then merges them into a single conceptual
+is guaranteed not to have cycles, because REPT adds a          instruction sequence based on the inferred orders. For
+node and edges into the graph only when the node’s value       two subsequences whose order cannot be inferred, REPT
+is inferred for the first time.                                arbitrarily inserts one before the other in the newly con-
+   To ensure convergence of the analysis, REPT main-           structed sequence. A natural question is whether the data
+tains a blacklist of invalidated values for each node. Ev-     recovery is affected by this arbitrary choice of ordering
+ery time a node is invalidated, its value is added to its      two concurrent subsequences. Obviously, if we change
+blacklist. Once a value is in a node’s blacklist, the node     the order of two subsequences that have concurrent mem-
+cannot take that value any more. This ensures that the         ory accesses to the same location and one of them is
+iterative analysis process will not enter the conflicting      write, we may get different values for the memory lo-
+state again and consequently guarantees that the algo-         cation. On the other hand, if concurrent subsequences do
+rithm will eventually converge. However, a correct value       not have any concurrent memory write to the same loca-
+can be incorrectly blacklisted for a node if it has a lower    tion, it does not matter in which order REPT places them
+confidence level than another incorrect value. This leads      into the merged instruction sequence.
+to the problem that a value is recoverable but cannot be
+recovered due to the use of the blacklist. We choose to           Since we cannot tell the order of concurrent instruction
+keep the blacklists to prioritize the convergence of the       subsequences, our goal is to eliminate the impact of their
+analysis over the improvement in data recovery.                ambiguous order on data recovery. Specifically, during
+                                                               the iterative analysis, for every memory access (regard-
+                                                               less of read or write), REPT detects if it has a concurrent
+3.4    Handling Concurrency                                    memory write to the same location. If so, REPT takes
+                                                               the following steps to limit the use of the memory ac-
+When we face multiple instruction sequences executed           cess in the data inference graph. First, REPT removes all
+simultaneously on multiple cores, the problem is seem-         vertical edges of the node representing the memory ac-
+ingly intractable because, without a perfect order of the      cess and invalidates the target nodes of outgoing vertical
+executed instructions, there could be a large number of        edges. Then, REPT labels the memory access node so
+ways to order those instructions. We have two insights         that it will not be used in vertical edges. This is because
+for tackling this challenge. First, we leverage the timing     REPT does not know if the memory access happens be-
+information logged by hardware tracing to construct a          fore or after the concurrent memory write to the same
+
+
+
+
+USENIX Association                   13th USENIX Symposium on Operating Systems Design and Implementation               23
+location. However, REPT still allows horizontal value             In addition to the final program state and constants,
+edges to infer this node’s value.                              REPT can leverage control dependencies to recover data.
+   A remaining question is whether picking an arbitrary        For instance, if a conditional branch is executed only if
+order for concurrent instruction subsequences would af-        a register’s value is 0, then REPT can infer the register’s
+fect the detection of concurrent memory writes to the          value once it observes that the branch is taken.
+same location. Our observation is that REPT’s analysis            Programs invoke system calls to request operating sys-
+works as long as there are no two separate concurrent          tem services, and the operating system may modify cer-
+writes such that one affects the inference of another’s        tain register and memory values in the process as a re-
+destination. We acknowledge that this possibility exists       sponse. Upon a system call, REPT will mark all volatile
+and depends on the granularity of timing information.          registers as unknown based on the calling convention.
+Given the timestamp granularity supported by modern            REPT currently does not handle memory writes by the
+hardware, we deem this as a rare case in practice [39].        kernel, but instead treats those in the same way as miss-
+                                                               ing memory writes and relies on the error correction
+                                                               mechanism to detect and resolve conflicts. We acknowl-
+4     Implementation                                           edge that semantic-aware handling of system calls can
+                                                               be done with more engineering effort to help improve
+In this section, we first describe the implementation de-
+                                                               the data recovery, but we leave it to future work.
+tails of REPT’s online hardware tracing and offline bi-
+nary analysis. Then we describe its deployment.
+                                                               4.3    Deployment
+4.1    Online Hardware Tracing                                 We implement REPT in two components and deploy it
+                                                               into the ecosystem of Microsoft Windows for program
+REPT leverages Intel Processor Trace (PT) to log
+                                                               tracing, failure reporting, and debugging.
+control-flow and timing information of a program’s ex-
+                                                                  First, we implement the online hardware tracing com-
+ecution. Intel PT became available when the Broadwell
+                                                               ponent as a driver of 8.5K lines of C code. It is respon-
+architecture was released in 2014. Intel PT supports var-
+                                                               sible for controlling tracing of a target process and cap-
+ious program tracing modes, and REPT currently uses
+                                                               turing the trace in a memory dump when the monitored
+the per-thread circular buffer mode to trace user-space
+                                                               process fails. We also modify the Windows kernel to
+execution of all threads within a process. REPT sup-
+                                                               support per-thread tracing by swapping the trace buffers
+ports configuring the circular buffer size and the gran-
+                                                               upon context switch.
+ularity of timestamps. We do not configure Intel PT to
+                                                                  Second, we implement REPT’s offline binary analysis
+do whole-execution tracing because that would introduce
+                                                               and reverse debugging as a library of 100K lines of C++
+performance overhead due to frequent interrupts (when
+                                                               code, and integrate it into WinDbg [45]. We also im-
+the trace buffer gets full) and I/O workload (when the
+                                                               plement common debugging functionalities such as code
+buffer is written to some persistent storage). When a
+                                                               and data breakpoints to facilitate the debugging process.
+traced process fails, its final state and the recorded Intel
+                                                                  We enhance the Windows Error Reporting (WER) ser-
+PT traces are saved in a single memory dump.
+                                                               vice [30] to support REPT. Specifically, developers can
+                                                               request Intel PT enriched memory dumps on WER. Then
+4.2    Offline Binary Analysis                                 WER selects user machines to trace the targeted pro-
+                                                               gram. When a traced program causes a failure, a mem-
+REPT takes a memory dump with Intel PT trace as in-
+                                                               ory dump with Intel PT trace is captured and sent back to
+put, and outputs the recovered execution history of each
+                                                               WER. Finally, developers can load the enriched memory
+thread. At first, REPT parses the trace to reconstruct the
+                                                               dump in WinDbg to do reverse debugging.
+control flow. Parsing an Intel PT trace requires that the
+binary code in the dump is the same as the code that was
+executed when the trace is collected. Therefore, REPT          5     Evaluation
+supports jitted code as long as the code was not modi-
+fied since its execution was logged in the circular trace      In this section, we evaluate REPT to answer the follow-
+buffer. Next, REPT converts native instructions into an        ing four questions: (1) How accurately can REPT re-
+intermediate representation (IR) that specifies opcodes        cover data values? (2) How efficiently can REPT recover
+and operands, and conducts the forward and backward            data values? (3) How effectively can REPT be used to
+analysis until it converges.                                   debug failures? (4) What is the deployment status? Next,
+
+
+
+
+24    13th USENIX Symposium on Operating Systems Design and Implementation                          USENIX Association
+ Program-BugId        Bug Type                   MP    SS      Program-BugId        # Insts      Cor       Unk       Inc
+ Apache-24483         NULL pointer deref [1]     No    Yes     Apache-24483             49    96.72%     1.64%    1.64%
+ Apache-39722         NULL pointer deref [2]     No    Yes     Apache-39722          1,644    99.30%     0.70%    0.00%
+ Apache-60324         Integer overflow [3]       No    Yes     Apache-60324            672    96.47%     1.83%    1.70%
+ Nasm-2004-1287       Stack buffer overrun [4]   No    No      Nasm-2004-1287       67,726    95.95%     3.70%    0.35%
+ PHP-2007-1001        Integer overflow [5]       No    Yes     PHP-2007-1001        54,475    99.08%     0.90%    0.02%
+ PHP-2012-2386        Integer overflow [6]       No    No      PHP-2012-2386        43,813    71.55%    25.40%    3.05%
+ PHP-74194            Type confusion [7]         No    No      PHP-74194            78,103    90.88%     7.82%    1.30%
+ PHP-76041            NULL pointer deref [8]     No    Yes     PHP-76041               115    94.96%     3.60%    1.44%
+ PuTTY-2016-2563      Stack buffer overrun [9]   No    No      PuTTY-2016-2563         677    99.55%     0.45%    0.00%
+ Python-2007-4965     Integer overflow [10]      No    Yes     Python-2007-4965      1,043    95.04%     4.09%    0.87%
+ Python-28322         Type confusion [11]        No    No      Python-28322          1,062    90.85%     8.60%    0.55%
+ Chrome-784183        Integer overflow [12]      No    No
+ Pbzip2               Use-after-free [29]        Yes   No     Table 2: REPT’s accuracy on a single instruction se-
+ Python-31530         Race [13]                  Yes   No     quence. Cor, Unk and Inc represent the percentage of
+ Chrome-776677        Race [14]                  Yes   No     correct, unknown, and incorrect register uses.
+ LibreOffice-88914    Deadlock [15]              Yes   No
+
+Table 1: Software bugs used in our experiments. MP            tamps generated by Intel PT. Finally, we stress test REPT
+means that the defect and failure threads are different. SS   on a highly concurrent program and report how well the
+means that the defect is on the same stack as the failure.    timestamps provided by Intel PT can order shared mem-
+                                                              ory accesses under extreme cases.
+we present our experimental setup and describe our ex-
+perimental results to answer these questions.                 5.1.1   Single-Thread Accuracy
+   We evaluate REPT on failures caused by 16 real-world
+bugs listed in Table 1. All of these bugs are from open-      In this experiment, we first use TTD to record the exe-
+source software. We focus on open-source software for         cution where each bug is triggered. Then, we replay the
+independent reproducibility. The main constraint that         recorded execution to construct an instruction sequence
+limits us from evaluating REPT on more bugs is that we        without the timing information for the failure thread.
+need to reproduce bugs in open-source software on Mi-         Next, we run REPT on the constructed instruction se-
+crosoft Windows. When reproducing bugs, we try to pick        quence and the final program state provided by the replay
+bugs that are from a diverse set of widely-used real-world    engine. Finally, we compare the recovered data values
+systems (e.g., Apache, Python, Chrome and PHP) and            with the data values returned by the replay engine.
+from a wide spectrum of bug types (e.g., NULL pointer            When we compare the data values, we only check reg-
+dereference, race, type confusion, use-after-free, integer    ister uses (i.e., a register used as a source operand or
+overflow, and buffer overflow).                               the address of a destination memory operand). We do
+   In our experiments, we configure Intel PT to use a         not check defs (i.e., a destination operand) because we
+circular buffer of 256K bytes per thread and turn on          want to avoid double counting. For instance, given mov
+the most fine-grained timestamp logging (i.e., TSCEn=1,       rax,rcx, both rax and rcx will be correct or incor-
+CYCEn=1, CycThresh=0 and MTCFreq=0; see [36] for              rect at the same time. When computing the data recovery
+more details).                                                accuracy, we do not need to count both of them. We do
+                                                              not check memory uses (i.e., a memory used as a source
+                                                              operand) because memory values are usually read into
+5.1    Accuracy
+                                                              registers before they take on any operations. We analyze
+To evaluate the accuracy of REPT’s data recovery, we          the trace of the 16 bugs and find that the destination is
+need to obtain the ground truth. We use Time Travel           a register for 95% of memory reads. Therefore, we can
+Debugging (TTD) [44], a slow but precise record/replay        count the uses of these registers to measure the accuracy.
+tool, to log both control and data flow of a program’s ex-       We present our accuracy measurements in Table 2.
+ecution. With the fully recorded execution, we create in-     Column 2 describes the number of instructions executed
+puts to REPT and check the correctness of its output. To      from the program defect to the program failure. We iden-
+evaluate the accuracy of REPT in handling multiple con-       tify the location of a program defect based on the bug fix.
+current instruction sequences, we modify TTD to gener-        For instance, Apache-24483 is a NULL pointer derefer-
+ate the timing information as an approximation to times-      ence bug, and its defect is where the NULL pointer check
+
+
+
+
+USENIX Association                   13th USENIX Symposium on Operating Systems Design and Implementation             25
+                                                                                                   5.1.2   Multiple-Thread Accuracy
+                           Correct                    Unknown                        Incorrect
+     100                                                                                           To evaluate REPT’s analysis on multiple concurrent ex-
+      80                                                                                           ecutions, we need to emulate the timing information
+                                                                                                   in addition to the control flow from TTD. Currently,
+      60
+                                                                                                   TTD supports record and replay of multithreaded pro-
+      40                                                                                           grams running on multiple cores by logging timestamps
+      20                                                                                           at each system call and synchronization operation (e.g.,
+                                                                                                   cmpxchg). We extend TTD to log timestamps periodi-
+                   86          94            41                63               65            22   cally in a manner similar to Intel PT during recording.
+                -23         41            60               -25              -49            83
+      0    12         H P-7         H P-7              0 16            0 07          o n-2         When constructing an instruction sequence, we insert
+   P-2              P             P               Y- 2           n - 2
+                                                                             Py
+                                                                                 t h
+ PH                                            TT            tho
+                                           Pu             Py                                       TTD’s timestamps into the sequence accordingly. We
+                                                                                                   acknowledge that such an approach may not perfectly
+Figure 4: REPT’s accuracy on different instruction se-                                             reflect a multithreaded program’s actual behavior on a
+quence sizes. For each bug, we limit REPT to analyze                                               bare metal machine.We conduct this experiment and re-
+1M instructions, and depict the accuracy for 10K, 100K                                             port the results as our best estimation of REPT’s accuracy
+and 1M instructions away from failure, from left to right.                                         for multithreaded programs.
+                                                                                                      We evaluate REPT on two race condition bugs, Pbzip2
+                                                                                                   and Python-31530. We do not evaluate Chrome-776677
+                                                                                                   or LibreOffice-88914 because REPT does not work for
+is added in the bug fix. The rest of three columns show                                            them (see Section 5.3). We measure the accuracy on
+the percentage of correct, unknown and incorrect regis-                                            the instructions executed on all threads from the defect
+ter uses recovered by REPT in the instruction sequence                                             to the failure. For Pbzip2, there are 12,496 instruc-
+from the defect to the failure.                                                                    tions, and the correct/unknown/incorrect percentages are
+                                                                                                   95.33%, 4.36%, and 0.31%. For Python-31530, there
+   We can see that REPT achieves a high accuracy. In                                               are 511,289 instructions, and the corresponding percent-
+most cases, the percentage of correct register uses is                                             ages are 75.72%, 24.14%, and 0.14%. We attribute the
+above 90% for tens of thousands of instructions; the per-                                          lower accuracy on Python-31530 to the large number of
+centage is still above 80% within 162,208 instructions for                                         instructions elapsed between the defect and the failure.
+the Python-31530 bug. PHP-2012-2386 is an outlier case                                                Finally, we evaluate how well REPT can use fine-
+with the lowest accuracy. This particular bug involves a                                           grained timestamps from Intel PT to order memory ac-
+large number of memory allocation operations right be-                                             cesses. We use Racey [34], a stress-testing benchmark
+fore the program failure. Unfortunately, memory alloca-                                            that has extremely frequent data races—each thread races
+tion operations are hard to reverse because the metadata                                           with other threads to constantly read/write a shared array
+information (i.e., chunk sizes) may be completely over-                                            for updating a signature. We run Racey with 8 threads for
+written by reallocations, resulting in a large percentage                                          1000 iterations and instrument it to save the addresses of
+of unknowns. We could not obtain the ground truth for                                              memory accesses to the shared array. To minimize the
+Chrome-781483 because TTD does not support Chrome.                                                 instrumentation’s impact on timing, we store the mem-
+   We also evaluate how the data recovery accuracy                                                 ory addresses to a pre-allocated buffer. We measure the
+changes as the trace grows. We use instruction sequence                                            fraction of memory accesses that have concurrent mem-
+sizes of 10K, 100K and 1M, and evaluate 6 bugs, because                                            ory writes to the same location. We find that 5.5% of
+others have short execution histories. The results are                                             accesses to the shared array have concurrent memory
+summarized in Figure 4. Overall, the accuracy decreases                                            writes. Given Racey is an extreme case of concurrent
+as the number of instructions increases, and the rate of                                           programs, we believe that the granularity of timestamps
+decrease depends on the program and the workload. It is                                            provided by Intel PT is sufficient for a majority of real-
+worth noting that the accuracy does not decrease mono-                                             world programs.
+tonically as the number of instructions increases. This
+is expected because REPT’s accuracy depends on a pro-                                              5.2     Efficiency
+gram’s behavior. For instance, PHP-2012-2386 has the
+accuracy drop in the case of 100K instructions because                                             Efficiency of REPT has two prongs, the performance
+these instructions have a large number of memory allo-                                             overhead caused by Intel PT when a program is running,
+cation operations which are hard to reverse.                                                       and REPT’s offline analysis for data recovery. The for-
+
+
+
+
+26    13th USENIX Symposium on Operating Systems Design and Implementation                                                             USENIX Association
+         Program-BugId        # Iters     REPT (s)             of an equal size and spawns multiple child threads to
+         Apache-24483               4         5.8              process them in parallel. The main thread synchronizes
+         Apache-39722               5         3.0              with child threads using a mutex. Unfortunately, there
+         Apache-60324               2         5.5              is a race condition bug where the main thread may free
+         Chrome-784183              6         8.2
+                                                               the mutex before all child threads finish, causing the pro-
+         Nasm-2004-1287            10        18.6
+         Pbzip2                     7         8.2              gram to crash when a child thread dereferences a pointer
+         PHP-2007-1001              5         2.0              field inside the freed mutex. With REPT, a developer can
+         PHP-2012-2386              6         3.8              set a data breakpoint on the pointer field, and locate the
+         PHP-74194                  7         6.3              instruction that overwrites the pointer field in the heap
+         PHP-76041                  6        14.5              free operation on the main thread by going backwards
+         PuTTY-2016-2563            5         5.2              along the execution.
+         Python-2007-4965          12        10.5
+         Python-28322              18        17.5                 Python-31530. This is a race condition bug in
+         Python-31530               6        10.6              Python’s implementation of its file objects. Python
+                                                               preloads the file content as an optimization for its file
+Table 3: The number of iterations and the time of REPT’s       operations. To do so, Python allocates a buffer based on
+offline analysis.                                              the given size bufsize and assigns it to a pointer field
+                                                               f buf in the file object. Then, it reads the file con-
+                                                               tent into the buffer, and finally updates another pointer
+mer is low and has been well studied. For instance, Fig-
+                                                               field f bufend so that it points to the end of the buffer
+ure 8 in [39] shows that the performance overhead with
+                                                               (i.e., f bufend=f buf+bufsize). The race condi-
+circular buffers and the timing information is below 2%
+                                                               tion happens when two threads preload the file content si-
+for a range of applications. Furthermore, the deployment
+                                                               multaneously. Specifically, while a thread is reading file
+of REPT proves that its performance overhead is accept-
+                                                               content into the buffer, another thread starts preloading
+able in practice, particularly when it is selectively turned
+                                                               and overwrites f buf with a smaller buffer. Then, the
+on for a program on a user machine.
+                                                               original thread updates f bufend based on the over-
+   We test REPT’s offline analysis on a machine run-
+                                                               written f buf and the old bufsize, which makes
+ning an x86-64 Windows 10 on an Intel Core i7-7700K
+                                                               f bufend point to a location beyond the actually al-
+4.2GHZ Quad-Core CPU with 16GB RAM. In Table 3,
+                                                               located buffer. This causes Python to crash when it at-
+we show the analysis time for the 14 bugs REPT can an-
+                                                               tempts to read the data outside of the allocated buffer.
+alyze. We can see that REPT finishes its analysis within
+                                                               With REPT, a developer can set data breakpoints on both
+20 seconds for all the 14 bugs.
+                                                               f buf and f bufend. By going backwards along the
+                                                               reconstructed execution, the developer can see how the
+5.3    Effectiveness                                           race condition bug overwrites f buf and leads to an in-
+                                                               consistent f bufend.
+To evaluate the effectiveness of REPT, we check if re-
+verse debugging based on recovered data can be used to            Chrome-784183. This is an integer overflow bug in
+effectively diagnose a bug. To make this check objec-          a validation routine used for image snipping. The val-
+tive, we say REPT is effective if the values of variables      idation routine checks if the snipped area is within the
+that are involved in the bug fix are correctly recovered.      original image. For example, given an image represented
+For all the 16 bugs listed in Table 1, REPT is effective       as a matrix of pixels, one can snip the image by choos-
+for 14 bugs. REPT does not work for Chrome-776677              ing y rows from row x. The validation routine ensures
+because the collected trace contains in-place code update      x+y is not greater than the height of the original image.
+for jitted code, which fails Intel PT trace parsing. REPT      Unfortunately, the routine does not check if x+y over-
+does not work for LibreOffice-88914, because this is a         flows. Thus, the check is incorrectly passed when a large
+deadlock bug that triggers an infinite loop, which easily      y causes an integer overflow. This results in the subse-
+fills up the circular trace buffer and causes the program      quent crash when Chrome attempts to access a pixel in
+execution history before the loop to be lost. Out of those     the snipped area based on y. When the crash happens,
+14 bugs, we select three complicated ones to demonstrate       the validation function has already returned and more
+the effectiveness of REPT.                                     than 500K instructions have been executed afterwards.
+    Pbzip2. This is a use-after-free bug caused by a race      With REPT, a developer can go back to the validation
+condition. Pbzip2 is a parallel file (de)compressor based      routine and single step through it to quickly pinpoint the
+on bzip2. Specifically, it divides an input file into chunks   actual arithmetic operation that overflows.
+
+
+
+
+USENIX Association                      13th USENIX Symposium on Operating Systems Design and Implementation           27
+5.4    Deployment                                               question is how to perform automatic root cause analysis
+                                                                based on the imperfect information provided by REPT.
+We have received anecdotal stories from Microsoft de-              Our evaluation of REPT has been focused on software
+velopers in using REPT to successfully debug failures           running on a single machine. When developers debug
+reported to WER [30]. The very first production bug that        distributed systems, they usually rely on event logging.
+is successfully resolved with the help of REPT had been         It is an interesting research direction to study how pro-
+left unfixed for almost two years because developers can-       gram tracing can be combined with event logging to help
+not reproduce the crash locally. The failure occurs in          developers debug bugs in distributed systems. We have
+Microsoft Edge when an exception is thrown because a            not been able to apply REPT to mobile applications be-
+function returns with an error. The bug is hard to fix be-      cause there is no efficient hardware tracing like Intel PT
+cause there are two possible reasons for the function to        available on mobile devices.
+fail and it is difficult to tell the actual reason by look-
+ing at the memory dump. With the reverse debugging
+enabled by REPT, the developer is able to step through          7   Related Work
+the function based on the reconstructed execution his-
+tory and quickly find out the root cause and fix the bug.       There is a large body of related work dedicated to debug-
+In summary, a two-year-old bug was fixed in just a few          ging failures. More recently, there have been increas-
+minutes thanks to REPT.                                         ing interest in debugging failures in deployed systems.
+                                                                In this section, we discuss some representative examples
+                                                                and describe how REPT differs.
+6     Discussion                                                   Automatic Root Cause Diagnosis Techniques. A
+                                                                large body of automated root cause diagnosis techniques
+In this section, we discuss the limitations of REPT and         rely on statistical techniques such as sampling and out-
+how we plan to address them in future work.                     lier detection to isolate the key reasons behind a fail-
+   When developers use REPT in practice, they currently         ure and thus help debugging. Cooperative bug isola-
+have to deal with two main limitations. First, the control      tion [19, 20, 37, 41], failure sketching [40], and lazy di-
+flow trace may not be long enough to capture the defect         agnosis [39] are state-of-the-art techniques. Unlike these
+(e.g., the free call is not in the trace for a use-after-free   techniques, REPT does not target at a subset of poten-
+bug). Second, data values that are necessary for debug-         tial bugs or rely on statistical methods to isolate failure
+ging the failure are not recovered (e.g., the heap address      causes, but it rather focuses on reconstructing executions.
+passed to the free call is not recovered for a use-after-free   We perceive these techniques as orthogonal and comple-
+bug). We cannot simply use a large circular trace buffer        mentary to REPT.
+to solve this problem because the data recovery accuracy           POMP [57] is an automatic root cause analysis tool
+decreases when the trace size increases.                        based on a control flow trace and a memory dump. It
+   REPT currently does not capture any data during a            handles missing memory writes by running hypothe-
+program’s execution. To fundamentally solve these two           sis tests recursively, which significantly limits its effi-
+limitations, we will need to log more data than just the        ciency, because the number of hypotheses grows expo-
+memory dump. It is an open research question to iden-           nentially with the trace size. In contrast, REPT uses a
+tify a good trade-off between online data logging, run-         new error correction technique to do forward/backward
+time overhead, and offline data recovery. A potential di-       analysis iteratively, which makes its analysis grow lin-
+rection is to leverage the new PTWRITE instruction [36]         early with the trace size. We compare their performance
+to log data that is important for REPT’s data recovery.         on 3 of the 14 bugs (Nasm-2004-1287, PuTTY-2016-
+   The current implementation of REPT only supports             2563, and Python-2007-4965) that are evaluated by both.
+reverse debugging of user-mode executions. While                REPT is 1 to 3 orders of magnitude faster than POMP.
+REPT’s core analysis is on machine instructions and thus        For instance, POMP takes 30 minutes to analyze the
+independent of the privilege mode, we need to properly          PuTTY-2016-2563 bug, but REPT only takes 5.2 sec-
+handle kernel-specific artifacts such as interrupts to sup-     onds. POMP is evaluated only on how well it works for
+port reverse debugging of kernel-mode executions.               root cause analysis. There is no instruction-level accu-
+   In addition to reverse debugging, we believe one can         racy reported in the paper, so we cannot directly com-
+leverage the execution history recovered by REPT to per-        pare its accuracy with REPT. Furthermore, POMP only
+form automatic root cause analysis. The challenge is that       supports a single thread, but REPT handles concurrency.
+the data recovery of REPT is not perfect, so the research          ProRace [62] attempts to recover data values based
+
+
+
+
+28    13th USENIX Symposium on Operating Systems Design and Implementation                           USENIX Association
+on the control flow logged by Intel PT and the register       tems with data races.
+values logged by Intel Processor Event Based Sampling            Ochiai [16] and Tarantula [38] record failing and suc-
+(PEBS) [36]. Unlike REPT, ProRace does not provide            cessful executions and replay them to isolate root causes.
+solutions for the problems of missing memory writes and       REPT does not rely on expensive record/replay tech-
+concurrent memory writes.                                     niques nor does it assume bugs can be reproduced.
+   PRES [51] and HOLMES [24] record execution infor-             H3 [35] uses a control flow trace to reduce the con-
+mation (e.g., path profiles, function call traces, etc.) to   straint complexity for finding a schedule of shared data
+help debug failures. PRES performs state space explo-         accesses that can reproduce a failure. H3 does not re-
+ration using the recorded information to reproduce bugs.      cover data values, and only applies constraint solving to
+HOLMES performs bug diagnosis purely based on con-            a small number of shared variables.
+trol flow traces. REPT relies on the lightweight hard-           State-of-the-Art Techniques in Deployed Systems.
+ware control flow tracing to reconstruct data flows from      Despite extensive prior research, to our knowledge, there
+a memory dump.                                                are few examples of debugging techniques that are ac-
+   “Better Bug Reporting” [23] is a system that performs      tively used in deployed systems. RETracer [27] is a bug
+symbolic execution on a full execution trace to generate      triaging tool that was deployed in Windows Error Re-
+a new input that can lead to the same failure. Report-        porting [30]. RETracer assigns “blame” to a function
+ing the generated input instead of the original input can     for modifying a pointer that ultimately causes an access
+provide better privacy. The main limitation is that it usu-   violation. RETracer performs backward taint analysis
+ally introduces high overhead to record a full execution      based on an approximate execution history recovered by
+trace. Furthermore, by using a full trace, this bug report-   reverse execution. RETracer does not require a control
+ing scheme does not need to handle memory aliasing, but       flow trace but can only recover limited data values.
+this is not the case for REPT.
+   Execution Synthesis (ESD) [60] does not assume there
+is any execution trace. Given a coredump, it relies on        8   Conclusion
+heuristics to explore possible paths to search for inputs
+that may lead to the crash. As recognized in the ESD          We have presented REPT, a practical solution for re-
+paper, due to the limitations of symbolic executions for      verse debugging of software failures in deployed sys-
+solving complex constraints, ESD may not be able to           tems. REPT can accurately and efficiently recover data
+scale to large programs with long executions.                 values based on a control flow trace and a memory dump
+                                                              by performing forward and backward execution itera-
+   Delta debugging [61] iteratively isolates program in-
+                                                              tively with error correction. We implement and deploy
+puts and the control flow of failing executions by repeat-
+                                                              REPT into the ecosystem of Microsoft Windows for pro-
+edly reproducing the failing and successful runs, and al-
+                                                              gram tracing, failure reporting, and debugging. Our ex-
+tering variable values. REPT does not make the assump-
+                                                              periments show that REPT can recover data values with
+tion that failures can be reproduced and operates on a
+                                                              high accuracy in just seconds, and its reverse debugging
+single control flow trace and memory dump.
+                                                              is effective for diagnosing 14 out of 16 bugs. Given
+   PSE [42] is a static analysis tool that performs back-     REPT, we hope one day developers will refuse to debug
+ward slicing and alias analysis on source code to identify    failures without reverse debugging.
+potential sources of a NULL pointer. PSE has false pos-
+itives and is not evaluated on real-world crashes.
+   Record/Replay Techniques. As we discussed earlier,         9   Acknowledgments
+certain techniques rely on full system record/replay [47–
+49,56] to help debug failures. REPT does not rely on full     We thank our shepherd, Xi Wang, and other review-
+system record/replay, which is expensive for deployment       ers for their insightful feedback. We are very grateful
+usage, but rather reconstructs executions by leveraging       for all the help from our colleagues on the Microsoft
+lightweight control flow tracing.                             Windows team. In particular, Alan Auerbach, Peter
+   Castor [43] is a recent record/replay system that relies   Gilson, Khom Kaowthumrong, Graham McIntyre, Tim-
+on commodity hardware support as well as instrumen-           othy Misiak, Jordi Mola, Prashant Ratanchandani, and
+tation to enable low-overhead recording. Castor works         Pedro Teixeira provided tremendous help and valuable
+efficiently for programs without data races. In our expe-     perspectives throughout the project. We also thank Bee-
+rience, many programs have data races in practice, which      man Strong from Intel for answering numerous questions
+actually make debugging very hard. REPT handles sys-          about Intel Processor Trace.
+
+
+
+
+USENIX Association                   13th USENIX Symposium on Operating Systems Design and Implementation            29
+References                                                   [20] J. Arulraj, G. Jin, and S. Lu. Leveraging the short-
+                                                                  term memory of hardware to diagnose production-
+ [1] https://bz.apache.org/bugzilla/show bug.cgi?id=              run software failures. In Intl. Conf. on Architectural
+     24483.                                                       Support for Programming Languages and Operat-
+                                                                  ing Systems, 2014.
+ [2] https://bz.apache.org/bugzilla/show bug.cgi?id=
+     39722.                                                  [21] T. Ball, V. Levin, and S. K. Rajamani. A decade of
+ [3] https://bz.apache.org/bugzilla/show bug.cgi?id=              software model checking with SLAM. Commun.
+     60324.                                                       ACM, 54(7), July 2011.
+
+ [4] https://www.exploit-db.com/exploits/25005/.             [22] C. Cadar, D. Dunbar, and D. Engler. Klee: Unas-
+                                                                  sisted and automatic generation of high-coverage
+ [5] http://ifsec.blogspot.com/2007/04/php-521-                   tests for complex systems programs. In USENIX
+     wbmp-file-handling-integer.html.                             Conference on Operating Systems Design and Im-
+                                                                  plementation, 2008.
+ [6] https://www.exploit-db.com/exploits/17201/.
+
+ [7] https://bugs.php.net/bug.php?id=74194.                  [23] M. Castro, M. Costa, and J.-P. Martin. Better bug
+                                                                  reporting with better privacy. In Intl. Conf. on Ar-
+ [8] https://bugs.php.net/bug.php?id=76041.                       chitectural Support for Programming Languages
+                                                                  and Operating Systems, 2008.
+ [9] https://github.com/tintinweb/pub/tree/master/pocs/
+     cve-2016-2563.                                          [24] T. M. Chilimbi, B. Liblit, K. Mehra, A. V. Nori, and
+[10] https://bugs.python.org/issue1179.                           K. Vaswani. HOLMES: Effective statistical debug-
+                                                                  ging via efficient path profiling. In Intl. Conf. on
+[11] https://bugs.python.org/issue28322.                          Software Engineering, 2009.
+[12] https://bugs.chromium.org/p/chromium/issues/            [25] V. Chipounov and G. Candea. Enabling sophisti-
+     detail?id=784183.                                            cated analyses of x86 binaries with revgen. In Pro-
+                                                                  ceedings of the 7th Workshop on Hot Topics in Sys-
+[13] https://bugs.python.org/issue31530.
+                                                                  tem Dependability, 2011.
+[14] https://bugs.chromium.org/p/chromium/issues/
+     detail?id=776677.                                       [26] L. Ciortea, C. Zamfir, S. Bucur, V. Chipounov, and
+                                                                  G. Candea. Cloud9: A software testing service.
+[15] https://bugs.documentfoundation.org/show bug.                SIGOPS Oper. Syst. Rev., 2010.
+     cgi?id=88914.
+                                                             [27] W. Cui, M. Peinado, S. K. Cha, Y. Fratantonio, and
+[16] R. Abreu, P. Zoeteweij, and A. J. C. v. Gemund.              V. P. Kemerlis. RETracer: Triaging crashes by re-
+     An evaluation of similarity coefficients for software        verse execution from partial memory dumps. In
+     fault localization. In Pacific Rim Intl. Symp. on De-        International Conference on Software Engineering,
+     pendable Computing, 2006.                                    2016.
+[17] Apple Inc.              MacOSX CrashReporter.
+                                                             [28] J. Engblom. A review of reverse debugging. In
+     https://developer.apple.com/library/content/
+                                                                  Proceedings of the 2012 System, Software, SoC and
+     technotes/tn2004/tn2123.html, 2017.
+                                                                  Silicon Debug Conference, Vienna, Austria, 2012.
+[18] Arm Embedded Trace Macrocell (ETM), 2017.
+     http://infocenter.arm.com/help/index.jsp?topic=         [29] J. Gilchrist. Parallel BZIP2. http://compression.ca/
+     /com.arm.doc.ihi0014q/index.html.                            pbzip2, 2017.
+
+[19] J. Arulraj, P.-C. Chang, G. Jin, and S. Lu.             [30] K. Glerum, K. Kinshumann, S. Greenberg, G. Aul,
+     Production-run software failure diagnosis via hard-          V. Orgovan, G. Nichols, D. Grant, G. Loihle, and
+     ware performance counters. In Intl. Conf. on Archi-          G. Hunt. Debugging in the (very) large: Ten years
+     tectural Support for Programming Languages and               of implementation and experience. In ACM Symp.
+     Operating Systems, 2013.                                     on Operating Systems Principles, 2009.
+
+
+
+
+30   13th USENIX Symposium on Operating Systems Design and Implementation                         USENIX Association
+[31] GNU Foundation.        GDB and reverse debug-           [43] A. Mashtizadeh, T. Garfinkel, D. Terei,
+     ging.      https://www.gnu.org/software/gdb/news/            D. Mazier̀es, and M. Rosenblum.           Towards
+     reversible.html, 2018.                                       practical default-on multi-core record/replay. In
+                                                                  Intl. Conf. on Architectural Support for Pro-
+[32] P. Godefroid and N. Nagappan. Concurrency at Mi-             gramming Languages and Operating Systems,
+     crosoft – An exploratory survey. In Intl. Conf. on           2017.
+     Computer Aided Verification, 2008.
+                                                             [44] Microsoft Corporation.      Time travel debug-
+[33] Google Inc. Chrome Error and Crash Report-                   ging. https://docs.microsoft.com/en-us/windows-
+     ing.  https://support.google.com/chrome/answer/              hardware/drivers/debugger/time-travel-debugging-
+     96817?hl=enl, 2017.                                          overview.
+[34] M. D. Hill and M. Xu. Racey: A stress test for          [45] Microsoft Corporation.       Windows Debugger.
+     deterministic execution. http://www.cs.wisc.edu/             https://docs.microsoft.com/en-us/windows-
+     ∼markhill/racey.html.                                        hardware/drivers/debugger/.
+[35] S. Huang, B. Cai, and J. Huang.        Towards          [46] P. Montesinos, L. Ceze, and J. Torrellas. Delorean:
+     production-run heisenbugs reproduction on com-               Recording and deterministically replaying shared-
+     mercial hardware. In Proceedings of the 2017                 memory multiprocessor execution efficiently. In
+     USENIX Annual Technical Conference, Santa                    Intl. Symp. on Computer Architecture, 2008.
+     Clara, CA, 2017. USENIX Association.
+                                                             [47] P. Montesinos, M. Hicks, S. T. King, and J. Torrel-
+[36] Intel Corporation. Intel 64 and IA-32 architectures          las. Capo: A software-hardware interface for prac-
+     software developer’s manual, 2017.                           tical deterministic multiprocessor replay. In Intl.
+                                                                  Conf. on Architectural Support for Programming
+[37] G. Jin, A. Thakur, B. Liblit, and S. Lu. Instrumenta-        Languages and Operating Systems, 2009.
+     tion and sampling strategies for cooperative concur-
+     rency bug isolation. In International Conference on     [48] Mozilla Corporation. Mozilla rr. http://rr-project.
+     Object Oriented Programming Systems Languages                org/, 2017.
+     and Applications, 2010.
+                                                             [49] S. Narayanasamy, G. Pokam, and B. Calder.
+[38] J. A. Jones and M. J. Harrold. Empirical evaluation          Bugnet: Continuously recording program execu-
+     of the tarantula automatic fault-localization tech-          tion for deterministic replay debugging. In Intl.
+     nique. In IEEE/ACM International Conference on               Symp. on Computer Architecture, 2005.
+     Automated Software Engineering, 2005.                   [50] M. Olszewski, J. Ansel, and S. Amarasinghe.
+[39] B. Kasikci, W. Cui, X. Ge, and B. Niu. Lazy diag-            Kendo: efficient deterministic multithreading in
+     nosis of in-production concurrency bugs. In ACM              software. SIGPLAN Not., 2009.
+     Symp. on Operating Systems Principles, Shanghai,        [51] S. Park, W. Xiong, Z. Yin, R. Kaushik, K. H. Lee,
+     China, October 2017.                                         S. Lu, and Y. Zhou. PRES: Probabilistic replay with
+                                                                  execution sketching on multiprocessors. In ACM
+[40] B. Kasikci, B. Schubert, C. Pereira, G. Pokam, and
+                                                                  Symp. on Operating Systems Principles, 2009.
+     G. Candea. Failure sketching: A technique for au-
+     tomated root cause diagnosis of in-production fail-     [52] G. Pokam, C. Pereira, S. Hu, A.-R. Adl-Tabatabai,
+     ures. In ACM Symp. on Operating Systems Princi-              J. Gottschlich, J. Ha, and Y. Wu. Coreracer: A
+     ples, 2015.                                                  practical memory race recorder for multicore x86
+                                                                  tso processors. In IEEE/ACM International Sym-
+[41] B. R. Liblit. Cooperative Bug Isolation. PhD thesis,
+                                                                  posium on Microarchitecture, 2011.
+     University of California, Berkeley, Dec. 2004.
+                                                             [53] C. Rossi. Rapid release at massive scale. https:
+[42] R. Manevich, M. Sridharan, S. Adams, M. Das,                 //code.facebook.com/posts/270314900139291/
+     and Z. Yang. PSE: Explaining program failures                rapid-release-at-massive-scale/, 2015.
+     via postmortem static analysis. In Proceedings of
+     the 12th ACM International Symposium on Foun-           [54] Ubuntu. Ubuntu error. https://wiki.ubuntu.com/
+     dations of Software Engineering, 2004.                       ErrorTracker, 2017.
+
+
+
+
+USENIX Association                  13th USENIX Symposium on Operating Systems Design and Implementation          31
+[55] Undo. UndoDB: The interactive reverse debugger       [59] Z. Yin, D. Yuan, Y. Zhou, S. Pasupathy, and
+     for C/C++ on Linux and Android. https://undo.io/,         L. Bairavasundaram. How do fixes become bugs?
+     2018.                                                     In ACM SIGSOFT European Conference on Foun-
+                                                               dations of Software Engineering, 2011.
+[56] K. Veeraraghavan, D. Lee, B. Wester, J. Ouyang,
+     P. M. Chen, J. Flinn, and S. Narayanasamy. Dou-      [60] C. Zamfir and G. Candea. Execution synthesis: A
+     bleplay: Parallelizing sequential logging and re-         technique for automated debugging. In ACM Euro-
+     play. In Intl. Conf. on Architectural Support for         pean Conf. on Computer Systems, 2010.
+     Programming Languages and Operating Systems,
+     2011.                                                [61] A. Zeller and R. Hildebrandt. Simplifying and iso-
+                                                               lating failure-inducing input. IEEE Transactions on
+[57] J. Xu, D. Mu, X. Xing, P. Liu, P. Chen, and               Software Engineering, 2002.
+     B. Mao.      Postmortem program analysis with
+     hardware-enhanced post-crash artifacts. In Pro-      [62] T. Zhang, C. Jung, and D. Lee. ProRace: Practi-
+     ceedings of the 26th USENIX Security Symposium,           cal data race detection for production use. In Pro-
+     Vancouver, BC, 2017. USENIX Association.                  ceedings of the 22nd International Conference on
+                                                               Architectural Support for Programming Languages
+[58] J. Yang, T. Chen, M. Wu, Z. Xu, X. Liu, H. Lin,
+                                                               and Operating Systems, 2017.
+     M. Yang, F. Long, L. Zhang, and L. Zhou. Modist:
+     Transparent model checking of unmodified dis-
+     tributed systems. In Proceedings of the 6th USENIX
+     Symposium on Networked Systems Design and Im-
+     plementation, 2009.
+
+
+
+
+32   13th USENIX Symposium on Operating Systems Design and Implementation                    USENIX Association
+

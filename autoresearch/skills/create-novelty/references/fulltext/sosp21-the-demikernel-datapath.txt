@@ -1,0 +1,1205 @@
+               The Demikernel Datapath OS Architecture for
+                  Microsecond-scale Datacenter Systems
+            Irene Zhangr , Amanda Raybuck♣ , Pratyush Patel∗ , Kirk Olynykr , Jacob Nelsonr ,
+      Omar S. Navarro Leija★, Ashlie Martinez∗ , Jing Liu♠ , Anna Kornfeld Simpson∗ , Sujay Jayakar∞ ,
+              Pedro Henrique Pennar , Max Demoulin★, Piali Choudhuryr , Anirudh Badamr
+                              r Microsoft Research, ♣ University of Texas at Austin, ∗ University of Washington,
+                              ♠ University of Wisconsin Madison, ★University of Pennsylvania, ∞ Zerowatt, Inc.
+
+
+Abstract                                                                          like Redis [80], can achieve single-digit microsecond laten-
+Datacenter systems and I/O devices now run at single-digit                        cies. To avoid becoming a bottleneck, datapath systems soft-
+microsecond latencies, requiring ns-scale operating systems.                      ware must operate at sub-microsecond – or nanosecond – la-
+Traditional kernel-based operating systems impose an unaf-                        tencies. To minimize latency, widely deployed kernel-bypass
+fordable overhead, so recent kernel-bypass OSes [73] and                          devices [78, 16] move legacy OS kernels to the control path
+libraries [23] eliminate the OS kernel from the I/O datapath.                     and let µs-scale applications directly perform datapath I/O.
+However, none of these systems offer a general-purpose data-                         Kernel-bypass devices fundamentally change the tradi-
+path OS replacement that meet the needs of µs-scale systems.                      tional OS architecture: they eliminate the OS kernel from
+   This paper proposes Demikernel, a flexible datapath OS                         the I/O datapath without a clear replacement. Kernel-bypass
+and architecture designed for heterogenous kernel-bypass de-                      devices offload OS protection (e.g., isolation, address transla-
+vices and µs-scale datacenter systems. We build two prototype                     tion) to safely offer user-level I/O and more capable devices
+Demikernel OSes and show that minimal effort is needed to                         implement some OS management (e.g., networking) to fur-
+port existing µs-scale systems. Once ported, Demikernel lets                      ther reduce CPU usage. Existing kernel-bypass libraries [57,
+applications run across heterogenous kernel-bypass devices                        23, 44] supply some missing OS components; however, none
+with ns-scale overheads and no code changes.                                      are a general-purpose, portable datapath OS.
+                                                                                     Without a standard datapath architecture and general-purpose
+CCS Concepts • Software and its engineering → Operat-                             datapath OS, kernel-bypass is difficult for µs-scale applica-
+ing systems.                                                                      tions to leverage. Programmers do not want to re-architect
+Keywords operating system, kernel bypass, datacenters                             applications for different devices because they may not know
+                                                                                  in advance what will be available. New device features seem-
+ACM Reference Format:                                                             ingly develop every year, and programmers cannot contin-
+Irene Zhang, Amanda Raybuck, Pratyush Patel, Kirk Olynyk, Ja-                     uously re-design their applications to keep pace with these
+cob Nelson, Omar S. Navarro Leija, Ashlie Martinez, Jing Liu,
+                                                                                  changes. Further, since datacenter servers are constantly up-
+Anna Kornfeld Simpson, Sujay Jayakar, Pedro Henrique Penna, Max
+Demoulin, Piali Choudhury, Anirudh Badam. 2021. The Demiker-
+                                                                                  graded, cloud providers (e.g., Microsoft Azure) deploy many
+nel Datapath OS Architecture for Microsecond-scale Datacenter                     generations of hardware concurrently.
+Systems. In ACM SIGOPS 28th Symposium on Operating Systems                           Thus, µs-scale applications require a datapath architecture
+Principles (SOSP ’21), October 26–29, 2021, Virtual Event, Ger-                   with a portable OS that implements common OS manage-
+many. ACM, New York, NY, USA, 17 pages. https://doi.org/10.1145/                  ment: storage and networking stacks, memory management
+3477132.3483569                                                                   and CPU scheduling. Beyond supporting heterogenous de-
+                                                                                  vices with ns-scale latencies, a datapath OS must meet new
+1    Overview                                                                     needs of µs-scale applications. For example, zero-copy I/O is
+                                                                                  important for reducing latency, so µs-scale systems require
+Datacenter I/O devices and systems are increasingly µs-scale:                     an API with clear zero-copy I/O semantics and memory man-
+network round-trips, disk accesses and in-memory systems,                         agement that coordinates shared memory access between the
+                                                                                  application and OS. Likewise, µs-scale applications perform
+Permission to make digital or hard copies of part or all of this work for
+personal or classroom use is granted without fee provided that copies are not
+                                                                                  I/O every few microseconds, so fine-grained CPU multiplex-
+made or distributed for profit or commercial advantage and that copies bear       ing between application work and OS tasks is also critical.
+this notice and the full citation on the first page. Copyrights for third-party      This paper presents Demikernel, a flexible datapath OS and
+components of this work must be honored. For all other uses, contact the          architecture designed for heterogenous kernel-bypass devices
+owner/author(s).                                                                  and µs-scale kernel-bypass datacenter systems. Demikernel
+SOSP ’21, October 26–29, 2021, Virtual Event, Germany
+                                                                                  defines: (1) new datapath OS management features for µs
+© 2021 Copyright held by the owner/author(s).
+ACM ISBN 978-1-4503-8709-5/21/10.
+                                                                                  applications, (2) a new portable datapath API (PDPIX) and (3)
+https://doi.org/10.1145/3477132.3483569                                           a flexible datapath architecture for minimizing latency across
+heterogenous devices. Demikernel datapath OSes run with                            Kernel-Bypass Architectures                    Demikernel
+a legacy controlplane kernel (e.g., Linux or Windows) and                          Control                                     Control
+                                                                                    Path        Ad-hoc Datapaths                Path      Datapath
+consist of interchangeable library OSes with the same API,                            App                                                App
+OS management features and architecture. Each library OS is                                           App                                       libSPDK
+                                                                      User-space          Arrakis    Caladan       App                      libRDMA
+                                                                                                                                         libDPDK
+device-specific: it offloads to the kernel-bypass device when           Software           libOS      library    eRPC Lib.
+
+
+possible and implements remaining OS management in a user-          Kernel-space OS                                             OS              Buf. Mgmt
+                                                                                                                                          Net. Transport
+                                                                                                                                                 User I/O
+space library. These libOSes aim to simplify the development            Software Kernel                          Net. Trans.
+                                                                                                                               Kernel       Buf. Mgmt
+                                                                                                     Buf. Mgmt   Buf. Mgmt                     SPDK
+                                                                                                                                         Buf. User
+                                                                                                                                              MgmtI/O
+                                                                                          User I/O    User I/O    User I/O                User I/O
+of µs-scale datacenter systems across heterogenous kernel-                                                                               RDMA
+                                                                    I/O Hardware NIC - SR-IOV        DPDK        RDMA            NIC - DPDK
+bypass devices with while minimizing OS overheads.
+    Demikernel follows a trend away from kernel-oriented            Figure 1. Example kernel-bypass architectures. Unlike the Demik-
+OSes to library-oriented datapath OSes, motivated by the            ernel architecture (right), Arrakis [73], Caladan [23] and eRPC [8]’s
+CPU bottleneck caused by increasingly efficient I/O devices.        architectures do not flexibly support heterogenous devices.
+It is not designed for systems that benefit from directly access-
+ing kernel-bypass hardware (e.g., HPC [45], software mid-           OS must portably support both. Future NICs may introduce
+dleboxes [90, 72], RDMA storage systems [17, 98, 7, 101])           other trade-offs, so Demikernel’s design must flexibly ac-
+because it imposes a common API that hides more complex             commodate heterogenous kernel-bypass devices with varied
+device features (e.g., one-sided RDMA).                             hardware capabilities and OS offloads.
+    This paper describes two prototype Demikernel datapath
+                                                                    2.2   Coordinate Zero-Copy Memory Access
+OSes for Linux and Windows. Our implementation is largely
+in Rust, leveraging its memory safety benefits within the data-     Zero-copy I/O is critical for minimizing latency; however, it
+path OS stack. We also describe the design of a new zero-copy,      requires coordinating memory access carefully across the I/O
+ns-scale TCP stack and kernel-bypass-aware memory alloca-           device, stack and application. Kernel-bypass zero-copy I/O
+tor. Our evaluation found it easy to build and port Demikernel      requires two types of memory access coordination, which are
+applications with I/O processing latencies of ≈50ns per I/O,        both difficult for programmers to manage and not explicitly
+and a 17-26% peak throughput overhead, compared to directly         managed by existing kernel-bypass OSes.
+using kernel-bypass APIs.                                              First, kernel-bypass requires the I/O device’s IOMMU (or
+                                                                    a user-level device driver) to perform address translation,
+2     Demikernel Datapath OS Requirements                           which requires coordination with the CPU’s IOMMU and
+Modern kernel-bypass devices, OSes and libraries eliminate          TLB. To avoid page faults and ensure address mappings stay
+the OS kernel from the I/O datapath but do not replace all          fixed during ongoing I/O, kernel-bypass devices require des-
+of its functionality, leaving a gap in the kernel-bypass OS         ignated DMA-capable memory, which is pinned in the OS
+architecture. This gap exposes a key question: what is the right    kernel. This designation works differently across devices; for
+datapath OS replacement for µs-scale systems? This section          example, RDMA uses explicit registration of DMA-capable
+details the requirements of µs-scale systems and heterogenous       memory while DPDK and SPDK use a separate pool-based
+kernel-bypass devices that motivate Demikernel’s design.            memory allocator backed with huge pages for DMA-capable
+                                                                    memory. Thus, a programmer must know in advance what
+2.1    Support Heterogenous OS Offloads
+                                                                    memory to use for I/O, which is not always possible and can
+As shown in Figure 1, today’s datapath architectures are ad         be complex to deduce, and use the appropriate designation
+hoc: existing kernel-bypass libraries [34, 73] offer different      for the available device.
+OS features atop specific kernel-bypass devices. Portability           The second form of coordination concerns actual access to
+is challenging because different device offload different OS        the I/O memory buffers. Since the I/O stack and kernel-bypass
+features. For example, DPDK provides a low-level, raw NIC           device work directly with application memory, the program-
+interface, while RDMA implements a network protocol with            mer must not free or modify that memory while in use for
+congestion control and ordered, reliable transmission. Thus,        I/O. This coordination goes beyond simply waiting until the
+systems that work with DPDK implement a full networking             I/O has completed. For example, the TCP stack might send
+stack, which is unnecessary for systems using RDMA.                 the memory to the NIC, but then network loses the packet. If
+   This heterogeneity stems from a fundamental trade-off that       the application modified or freed the memory buffer in the
+hardware designers have long struggled with [50, 66, 10] –          meantime, the TCP stack has no way to retransmit it. As a re-
+offloading more features improves performance but increases         sult, the application must also coordinate with the TCP stack
+device complexity – which only becomes worse as recent              when freeing memory. This coordination becomes increas-
+research proposes increasingly complex offloads [52, 41,            ingly complex, especially in asynchronous or multithreaded
+86].For example, DPDK is more general and widely usable,            distributed systems. Given this complexity, Demikernel’s
+but RDMA achieves the lowest CPU and latency overheads              design must portably manage complex zero-copy I/O coordi-
+for µs-scale systems within the datacenter, so any datapath         nation between applications and OS components.
+2.3    Multiplex and Schedule the CPU at µs-scale                   • Achieve nanosecond-scale latency overheads. Demikernel
+                                                                      datapath OSes have a per-I/O budget of less than 1µs for
+µs-scale datacenter systems commonly perform I/O every few
+                                                                      I/O processing and other OS services.
+microseconds; thus, a datapath OS must be able to multi-
+plex and schedule I/O processing and application work at            3.2   System Model and Assumptions
+similar speeds. Existing kernel-level abstractions, like pro-       Demikernel relies on popular kernel-bypass devices, includ-
+cesses and threads, are too coarse-grained for µs-scale sched-      ing RDMA [61] and DPDK [16] NICs and SPDK disks [88],
+uling because they consume entire cores for hundreds of mi-         but also accommodates future programmable devices [60, 58,
+croseconds. As a result, kernel-bypass systems lack a general-      69]. We assume Demikernel datapath OSes run in the same
+purpose scheduling abstraction.                                     process and thread as the application, so they mutually trust
+   Recent user-level schedulers [9, 75] allocate application        each other and any isolation and protection are offered by the
+workers on a µs-scale per-I/O basis; however, they still use        control path kernel or kernel-bypass device. These assump-
+coarse-grained abstractions for OS work (e.g., whole threads [23]   tions are safe in the datacenter where applications typically
+or cores [30]). Some go a step further and take a microkernel       bring their own libraries and OS, and the datacenter operator
+approach, separating OS services into another process [57] or       enforces isolation using hardware.
+ring [3] for better security.                                          Demikernel makes it possible to send application mem-
+   µs-scale RDMA systems commonly interleave I/O and                ory directly over the network, so applications must carefully
+application request processing. This design makes scheduling        consider the location of sensitive data. If necessary, this ca-
+implicit instead of explicit: a datapath OS has no way to           pability can be turned off. Other techniques, like information
+control the balance of CPU cycles allocated to the application      flow control or verification could also be leveraged to ensure
+versus datapath I/O processing. For example, both FaRM [17]         the safety and security of application memory.
+and Pilaf [64] always immediately perform I/O processing               To minimize datapath latency, Demikernel uses cooperative
+when messages arrive, even given higher priority tasks (e.g.,       scheduling, so applications must run in a tight I/O process-
+allocating new buffer space for incoming packets that might         ing loop (i.e., enter the datapath libOS to perform I/O at
+otherwise be dropped).                                              least once every millisecond). Failing to allocate cycles to
+   None of these systems are ideal because their schedul-           the datapath OS can cause I/O failures (e.g., packets to be
+ing decisions remain distributed, either between the kernel         dropped and acks/retries not sent). Other control path work
+and user-level scheduler (for DPDK systems) or across the           (e.g., background logging) can run on a separate thread or
+code (for RDMA systems). Recent work, like eRPC [34],               core and go through the legacy OS kernel. Our prototypes cur-
+has shown that multiplexing application work and datapath           rently focus on independently scheduling single CPU cores,
+OS tasks on a single thread is required to achieve ns-scale         relying on hardware support for multi-core scheduling [27];
+overheads. Thus, Demikernel’s design requires a µs-scale            however, the architecture can fit more complex scheduling
+scheduling abstraction and scheduler.                               algorithms [23, 71]. A companion paper [15] proposes a new
+                                                                    kernel-bypass request scheduler that leverages Demikernel’s
+3     Demikernel Overview and Approach
+                                                                    understanding of application semantics to provide better tail
+Demikernel is the first datapath OS that meets the require-         latency for µs-scale workloads with widely varying request
+ments of µs-scale applications and kernel-bypass devices. It        execution times.
+has new OS features and a new portable datapath API, which
+                                                                    3.3   Demikernel Approach
+are programmer-visible, and a new OS architecture and de-
+sign, which is not visible to programmers. This section gives       This section summarizes the new features of Demikernel’s de-
+an overview of Demikernel’s approach, the next describes the        sign – both internal and external – to meet the needs detailed
+programmer-visible features and API, while Section 5 details        in the previous section.
+the Demikernel (lib)OS architecture and design.                     A portable datapath API and flexible OS architecture.
+                                                                    Demikernel tackles heterogenous kernel-bypass offloads with
+3.1    Design Goals
+                                                                    a new portable datapath API and flexible OS architecture.
+While meeting the requirements detailed in the previous sec-        Demikernel takes a library OS approach by treating the kernel-
+tion, Demikernel has three high-level design goals:                 bypass hardware the datapath kernel and accommodating het-
+• Simplify µs-scale kernel-bypass system development. Demik-        erogenous kernel-bypass devices with interchangeable library
+   ernel must offer OS management that meets common needs           OSes. As Figure 1 shows, the Demikernel kernel-bypass archi-
+   for µs-scale applications and kernel-bypass devices.             tecture extends the kernel-bypass architecture with a flexible
+• Offer portability across heterogenous devices. Demikernel         datapath architecture. Each Demikernel datapath OS works
+   should let applications run across multiple types of kernel-     with a legacy control path OS kernel and consists of several
+   bypass devices (e.g., RDMA and DPDK) and virtualized             interchangeable datapath library OSes (libOSes) that imple-
+   environments with no code changes.                               ment a new high-level datapath API, called PDPIX.
+   PDPIX extends the standard POSIX API to better accom-             Table 1. Demikernel datapath OS services. We compare Demik-
+modate µs-scale kernel-bypass I/O. Microsecond kernel-bypass         ernel to kernel-based POSIX implementations and kernel-bypass
+systems are I/O-oriented: they spend most time and memory            programming APIs and libraries, including RDMA ib_verbs [78],
+                                                                     DPDK [16] (SPDK [88]), recent networking [30, 20, 70, 42], stor-
+processing I/O. Thus, PDPIX centers around an I/O queue ab-
+                                                                     age [32, 44, 81] and scheduling [71, 33, 75, 23] libraries. = full
+straction that makes I/O explicit: it lets µs-scale applications     support, H
+                                                                              # = partial support, none = no support.
+submit entire I/O requests, eliminating latency issues with
+
+
+
+
+                                                                                                                                                  Stor lib
+                                                                                                                          RDMA
+                                                                                                                  POSIX
+
+
+
+
+                                                                                                                                        Net lib
+                                                                                                                                 DPDK
+
+
+
+
+                                                                                                                                                                     Demik
+                                                                                                                                                             Sched
+POSIX’s pipe-based I/O abstraction.                                                   Demikernel Datapath
+   To minimize latency, Demikernel libOSes offload OS fea-                               OS Services
+tures to the device when possible and implement the remain-
+
+
+
+
+                                                                      I/O Stack
+                                                                                  I1. Portable high-level API             #
+                                                                                                                          H      #
+                                                                                                                                 H      H
+                                                                                                                                        #         H
+                                                                                                                                                  #
+ing features in software. For example, our RDMA libOS relies
+                                                                                  I2. Microsecond Net Stack               H
+                                                                                                                          #                                  #
+                                                                                                                                                             H
+on the RDMA NIC for ordered, reliable delivery, while the
+                                                                                  I3. Microsecond Storage Stack
+DPDK libOS implements it in software. Demikernel libOSes
+
+
+
+
+                                                                      Schedule
+have different implementations, and can even be written in                        C1. Alloc CPU to app and I/O                   #
+                                                                                                                                 H      #
+                                                                                                                                        H         H
+                                                                                                                                                  #
+different languages; however, they share the same OS features,                    C2. Alloc I/O req to app workers H
+                                                                                                                   #
+architecture and core design.                                                     C3. App request scheduling API          H
+                                                                                                                          #                                  H
+                                                                                                                                                             #
+
+
+
+
+                                                                      Memory
+A DMA-capable heap, use-after-free protection. Demik-                             M1. Mem ownership semantics                           #
+                                                                                                                                        H
+ernel provides three new external OS features to simplify                         M2. DMA-capable heap                                  H
+                                                                                                                                        #
+zero-copy memory coordination: a portable API with clear                          M3. Use-after-free protection
+semantics for I/O memory buffer ownership, (2) a zero-copy,
+DMA-capable heap and (3) use-after-free (UAF) protection             specific I/O requests and the datapath OSes explicitly assign
+for zero-copy I/O buffers. Unlike POSIX, PDPIX defines               I/O requests to workers.
+clear zero-copy I/O semantics: applications pass ownership              For µs-scale CPU multiplexing, Demikernel uses corou-
+to the Demikernel datapath OS when invoking I/O and do not           tines to encapsulate both OS and application computation.
+receive ownership back until the I/O completes.                      Coroutines are lightweight, have low-cost context switches
+   The DMA-capable heap eliminates the need for program-             and are well-suited for the state-machine-based asynchro-
+mers to designate I/O memory. Demikernel libOSes replace             nous event handling that I/O stacks commonly require. We
+the application’s memory allocator to back the heap with             chose coroutines over user-level threads (e.g., Caladan’s green
+DMA-capable memory in a device-specific way. For example,            threads [23]), which can perform equally well, because corou-
+the RDMA libOS’s memory allocator registers heap memory              tines encapsulate state for each task, removing the need for
+transparently for RDMA on the first I/O access, while the            global state management. For example, Demikernel’s TCP
+DPDK libOS’s allocator backs the application’s heap with             stack uses one coroutine per TCP connection for retransmis-
+memory from the DPDK memory allocator.                               sions, which keeps the relevant TCP state.
+   Demikernel libOS allocators also provide UAF protection.             Every libOS has a centralized coroutine scheduler, opti-
+It guarantees that shared, in-use zero-copy I/O buffers are not      mized for the kernel-bypass device. Since interrupts are un-
+freed until both the application and datapath OS explicitly          affordable at ns-scale [33, 15], Demikernel coroutines are
+free them. It simplifies zero-copy coordination by preventing        cooperative: they typically yield after a few microseconds
+applications from accidentally freeing memory buffers in             or less. Traditional coroutines typically work by polling: the
+use for I/O processing (e.g., TCP retries). However, UAF             scheduler runs every coroutine to check for progress. How-
+protection does not keep applications from modifying in-use          ever, we found polling to be unaffordable at ns-scale since
+buffers because there is no affordable way to Demikernel             large numbers of coroutines are blocked on infrequent I/O
+datapath OSes to offer write-protection.                             events (e.g., a packet for the TCP connection arrives). Thus,
+   Leveraging the memory allocator lets the datapath OS con-         Demikernel coroutines are also blockable. The scheduler sep-
+trol memory used to back the heap and when objects are freed.        arates runnable and blocked coroutines and moves blocked
+However, it is a trade-off: though the allocator has insight         ones to the runnable queue only after the event occurs.
+into the application (e.g., object sizes), the design requires all   4            Demikernel Datapath OS Features and API
+applications to use the Demikernel allocator.
+                                                                     Demikernel offers new OS features to meet µs-scale applica-
+Coroutines and µs-scale CPU scheduling. Kernel-bypass                tion requirements. This section describes Demikernel from a
+scheduling commonly happens on a per-I/O basis; however,             programmer’s perspective, including PDPIX.
+the POSIX API is poorly suited to this use. epoll and select
+have a well-known “thundering herd” issue [56]: when the             4.1           Demikernel Datapath OS Feature Overview
+socket is shared, it is impossible to deliver events to precisely    Table 1 summarizes and compares Demikernel’s OS fea-
+one worker. Thus, PDPIX introduces a new asynchronous I/O            ture support to existing kernel-bypass APIs [62, 16] and li-
+API, called wait, which lets applications workers wait on            braries [30, 23, 44]. Unlike existing kernel-bypass systems,
+the Demikernel datapath OS offers a portable I/O API for            I/O and must be processed efficiently by the datapath network-
+kernel-bypass devices with high-level abstractions, like sock-      ing stack. Likewise, sockets remain on the datapath because
+ets and files (Table 1:I1). For each device type, it also im-       they create I/O queues associated with network connections
+plements (I2) a µs-scale networking stack with features like        that the datapath OS needs to dispatch incoming packets.
+ordered, reliable messaging, congestion control and flow con-
+trol and (I3) a µs-scale storage stack with disk block allocation   Network and Storage I/O. push and pop are datapath opera-
+and data organization.                                              tions for submitting and receiving I/O operations, respectively.
+   Demikernel provides two types of CPU scheduling: (C1)            To avoid unnecessary buffering and poor tail latencies, these
+allocating CPU cycles between libOS I/O processing and ap-          libcalls take a scatter-gather array of memory pointers. They
+plication workers, and (C2) allocating I/O requests among ap-       are intended to be a complete I/O operation, so the datapath
+plication workers. This paper focuses on C1, as C2 is a well-       OS can take a fast path and immediately issue or return the
+studied topic [23]. Our companion paper, Perséphone [15],           I/O if possible. For example, unlike the POSIX write oper-
+explores how to leverage Demikernel for better I/O request          ation, Demikernel immediately attempts to submit I/O after
+scheduling at microsecond timescales. To better support kernel-     a push. Both push and pop are non-blocking and return a
+bypass schedulers, we replace epoll with a new API (C3)             qtoken indicating their asynchronous result. Applications use
+that explicitly supports I/O request scheduling.                    the qtoken to fetch the completion when the operation has
+   kernel-bypass applications require zero-copy I/O to make         been successfully processed via the wait_* library calls. Nat-
+the best use of limited CPU cycles. To better this task, Demik-     urally, an application can simulate a blocking library call by
+ernel offers (M1) a zero-copy I/O API with clear memory             calling the operation and immediately waiting on the qtoken.
+ownership semantics between the application, the libOS and          Memory. Applications do not allocate buffers for incoming
+the I/O device, and (M2) makes the entire application heap          data; instead, pop and wait_* return scatter-gather arrays
+transparently DMA-capable without explicit, device-specific         with pointers to memory allocated in the application’s DMA-
+registration. Finally, Demikernel gives (M3) use-after-free         capable heap. The application receives memory ownership of
+protection, which, together with its other features, lets ap-       the buffers and frees them when no longer needed.
+plications that do not update in place, like Redis, leverage           PDPIX requires that all I/O must be from the DMA-capable
+zero-copy I/O with no application changes. Combined with            heap (e.g., not on the stack). On push, the application grants
+its zero-copy network and storage stacks and fine-grained           ownership of scatter-gather buffers to the Demikernel data-
+CPU multiplexing, Demikernel supports single-core run-to-           path OS and receives it back on completion. Use-after-free
+completion for a request (e.g., Redis PUT) from the NIC to          protection guarantees that I/O buffers are not be freed until
+the application to disk and back without copies.                    both the application and datapath OS free them.
+                                                                       UAF protection does not offer write-protection; the ap-
+4.2   PDPIX: A Portable Datapath API                                plication must respect push semantics and not modify the
+                                                                    buffer until the qtoken returns. We chose to offer only UAF
+Demikernel extends POSIX with the portable datapath in-
+                                                                    protection as there is no low cost way for Demikernel to
+terface (PDPIX). To minimize changes to existing µs-scale
+                                                                    provide full write-protection. Thus, UAF protection is a com-
+applications, PDPIX limits POSIX changes to ones that mini-
+                                                                    promise: it captures a common programming pattern but does
+mize overheads or better support kernel-bypass I/O. PDPIX
+                                                                    not eliminate all coordination. However, applications that do
+system calls go to the datapath OS and no longer require a
+                                                                    not update in place (i.e., their memory is immutable, like
+kernel crossing (and thus we call them PDPIX library calls
+                                                                    Redis’s keys and values) require no additional code to support
+or libcalls). PDPIX is queue-oriented, not file-oriented; thus,
+                                                                    zero-copy I/O coordination.
+system calls that return a file descriptor in POSIX return a
+queue descriptor in PDPIX.                                          Scheduling. PDPIX replaces epoll with the asynchronous
+                                                                    wait_* call. The basic wait blocks on a single qtoken;
+I/O Queues. To reduce application changes, we chose to              wait_any provides functionality similar to select or epoll,
+leave the socket, pipe and file abstractions in place. For exam-    and wait_all blocks until all operations complete. This ab-
+ple, PDPIX does not modify the POSIX listen/accept in-              straction solves two major issues with POSIX epoll: (1)
+terface for accepting network connections; however, accept          wait directly returns the data from the operation so the appli-
+now returns a queue descriptor, instead of a file descriptor,       cation can begin processing immediately, and (2) assuming
+through which the application can accept incoming connec-           each application worker waits on a separate qtoken, wait
+tions. queue() creates a light-weight in-memory queue, sim-         wakes only one worker on each I/O completion. Despite these
+ilar to a Go channel [25].                                          semantic changes, we found it easy to replace an epoll loop
+   While these library calls seem like control path operations,     with wait_any. However, wait_* is a low-level API, so we
+they interact with I/O and thus are implemented in the datap-       hope to eventually implement libraries, like libevent [54], to
+ath OS. For example, incoming connections arrive as network         reduce application changes.
+ 1     //   Queue    creation         and management                              1      //   I /O processing ,   notifcation   and memory     calls
+ 2    int qd = socket(...);                                                       2      qtoken qt = push(int qd, const sgarray &sga);
+ 3    int err = listen(int qd, ...);                                              3      qtoken qt = pop(int qd, sgarray *sga);
+ 4    int err = bind(int qd, ...);                                                4      int ret = wait(qtoken qt, sgarray *sga);
+ 5    int qd = accept(int qd, ...);                                               5      int ret = wait_any(qtoken *qts,
+ 6    int err = connect(int qd, ...);                                             6                         size_t num_qts,
+ 7    int err = close(int qd);                                                    7                         qevent **qevs,
+ 8    int qd = queue();                                                           8                         size_t *num_qevs,
+ 9    int qd = open(...);                                                         9                         int timeout);
+10    int qd = creat(...);                                                       10      int ret = wait_all(qtoken *qts, size_t num_qts,
+11    int err = lseek(int qd, ...);                                              11                         qevent **qevs, int timeout);
+12    int err = truncate(int qd, ...);                                           12      void *dma_ptr = malloc(size_t size);
+                                                                                 13      free(void *dma_ptr);
+Figure 2. Demikernel PDPIX library call API. PDPIX retains features of the POSIX interface – ... represents unchanged arguments – with
+three key changes. To avoid unnecessary buffering on the I/O datapath, PDPIX is queue-oriented and lets applications submit complete I/O
+operations. To support zero-copy I/O, PDPIX queue operations define clear zero-copy I/O memory ownership semantics. Finally, PDPIX
+replaces epoll with wait_* to let libOSes explicitly assign I/O to workers.
+
+
+5     Demikernel Datapath Library OS Design                                                       Rust ensures memory safety internally within our libOSes.
+                                                                                                  We also appreciated Rust’s improved build system with porta-
+Figure 3 shows the Demikernel datapath OS architecture:
+                                                                                                  bility across platforms, compared to the difficulties that we
+each OS consists of interchangeable library OSes that run on
+                                                                                                  encountered with CMake. Finally, Rust has excellent support
+different kernel-bypass devices with a legacy kernel. While
+                                                                                                  for co-routines, which we are being actively developing, let-
+each library OS supports a different kernel-bypass device on
+                                                                                                  ting us use language features to implement our scheduling
+a different legacy kernel, they share a common architecture
+                                                                                                  abstraction and potentially contribute back to the Rust com-
+and design, described in this section.
+                                                                                                  munity. The primary downside to using Rust is the need for
+5.1     Design Overview                                                                           many cross-language bindings as kernel-bypass interfaces
+                                                                                                  and µs-scale applications are still largely written in C/C++.
+Each Demikernel libOS supports a single kernel-bypass I/O                                            Each libOS has a memory allocator that allocates or regis-
+device type (e.g., DPDK, RDMA, SPDK) and consists of                                              ters DMA-capable memory and performs reference counting
+an I/O processing stack for the I/O device, a libOS-specific                                      for UAF protection. Using the memory allocator for memory
+memory allocator and a centralized coroutine scheduler. To                                        management is a trade-off that provides good insight into
+support both networking and storage, we integrate libOSes                                         application memory but requires that applications use our
+into a single library for both devices (e.g., RDMAxSPDK).                                         memory allocator. Other designs are possible; for example,
+   We implemented the bulk of our library OS code in Rust.                                        having the libOSes perform packet-based refcounting. Our
+We initially prototyped several libOSes in C++; however,                                          prototype Demikernel libOSes use Hoard [4], a popular mem-
+we found that Rust performs competitively with C++ and                                            ory allocator that is easily extensible using C++ templates [5].
+achieves ns-scale latencies while offering additional benefits.                                   We intend to integrate a more modern memory allocator (i.e.,
+First, Rust enforces memory safety through language fea-                                          mimalloc [46]) in the future.
+tures and its compiler. Though our libOSes use unsafe code                                           Demikernel libOSes use Rust’s async/await language fea-
+to bind to C/C++ kernel-bypass libraries and applications,                                        tures [85] to implement asynchronous I/O processing within
+                 Control          Demikernel Datapath Architecture
+                                                                                                  coroutines. Rust leverages support for generators to compile
+                  Path                                                                            imperative code into state machines with a transition function.
+                                                     App
+       User-space                     Demikernel PDPIX Datapath API
+                                                                                                  The Rust compiler does not directly save registers and swap
+         Software          libPOSIX    libRDMA
+                                                     libDPDK     libSPDK     libFuture            stacks; it compiles coroutines down to regular function calls
+                                                                                ???
+                                                                                                  with values “on the stack” stored directly in the state machine
+      Kernel-space      OS
+          Software     Kernel          Net. Trans.
+                                                                                                  [55]. This crucial benefit of using Rust makes a coroutine
+                                       Buf. Mgmt     Buf. Mgmt   Buf. Mgmt
+                                        User I/O      User I/O    User I/O      ???               context switch lightweight and fast (≈12 cycles in our Rust
+      I/O Hardware   I/O Device        RDMA           DPDK       SPDK        Future               prototype) and helps our I/O stacks avoid a real context switch
+                                                                                                  on the critical path. While Rust’s language interface and com-
+Figure 3. Demikernel kernel-bypass architecture. Demikernel ac-                                   piler support for writing coroutines is well-defined, Rust does
+commodates heterogenous kernel-bypass devices, including poten-
+                                                                                                  not currently have a coroutine runtime. Thus, we implement
+tial future hardware, with a flexible library OS-based datapath ar-
+chitecture.We include a libOS that goes through the OS kernel for
+                                                                                                  a simple coroutine runtime and scheduler within each libOS
+development and debugging.
+that optimizes for the amount of I/O processing that each                               App co-routine                                         App co-routine
+kernel-bypass devices requires.                                                       1. fetch first request                                 7. process req
+
+
+                                                                        PDPIX       pop(qd)    qt     wait(qt)                            qt,buf push(qd)        qt
+                                                                                                                      Fast-path
+5.2   I/O Processing                                                                                   3. alloc
+                                                                                                                      co-routine           6. return 8. process
+                                                                                     2.alloc qtoken                            5. process incoming outgoing 9. alloc
+                                                                                                      co-routine
+                                                                                                                       4.        packet      data       data    qtoken
+The primary job of Demikernel libOSes is µs-scale I/O pro-              Scheduler                              yield Polling           yield
+
+cessing. Every libOS has an I/O stack with this process-                DPDK                                       rte_rx_burst               rte_tx_burst
+
+ing flow but different amounts and types of I/O process-
+                                                                    Figure 4. Example Demikernel I/O processing flow for DPDK.
+ing and different background tasks (e.g., sending acks). As
+noted previously, Demikernel I/O stacks minimize latency          connections, the application calls pop on all connections and
+by polling, which is CPU-intensive but critical for microsec-     then wait_any with the returned qtokens.
+ond latency. Each stack uses a fast-path I/O coroutine to poll       We use DPDK as an example; however, the same flow
+a single hardware interface (e.g., RDMA poll_cq, DPDK             works for any asynchronous kernel-bypass I/O API. The fast
+rte_rx_burst), then multiplexes sockets, connections, files,      path coroutine yields after every 𝑛 polls to let other I/O stacks
+etc. across them.                                                 and background work run. For non-common-case scenarios,
+   Taking inspiration from TAS [39], Demikernel I/O stacks        the fast-path coroutine unblocks another coroutine and yields.
+optimize for an error-free fast-path (e.g., packets arrive in
+order, send windows are open), which is the common case in        5.3     Memory Management
+the datacenter [37, 34]. Unlike TAS, Demikernel I/O stacks        Each Demikernel libOS uses a device-specific, modified Hoard
+share application threads and aim for run-to-completion: the      for memory management. Hoard is a pool-based memory al-
+fast-path coroutine processes the incoming data, finds the        locator; Hoard memory pools are called superblocks, which
+blocked qtoken, schedules the application coroutine and pro-      each hold fixed-size memory objects. We use superblocks to
+cesses any outgoing messages before moving on to the next         manage DMA-capable memory and reference counting: the
+I/O. Likewise, Demikernel I/O stacks inline outgoing I/O          superblock header holds reference counts and meta-data for
+processing in push (in the application coroutine) and submit      DMA-capable memory (e.g., RDMA rkeys).
+I/O (to the asynchronous hardware I/O API) in the error-free         As noted in Section 2, different kernel-bypass devices have
+case. Although a coroutine context switch occurs between          different requirements for DMA-capable memory. For ex-
+the fast-path and application coroutines, it does not interrupt   ample, RDMA requires memory registration and a memory
+run-to-completion because Rust compiles coroutine switches        region-specific rkey on every I/O, so Catmint’s memory al-
+to a function call.                                               locator provides a get_rkey interface to retrieve the rkey
+   Figure 4 shows normal case I/O processing for the DPDK         on every I/O. get_rkey(void *) registers an entire su-
+TCP stack, but the same applies to all libOS I/O stacks. To       perblock on the first invokation and stores the rkey in the
+begin, the application: (1) calls pop to ask for incoming data.   superblock header. Likewise, Catnip and Cattree allocate ev-
+If nothing is pending, the libOS (2) allocates and returns a      ery superblock with memory from the DPDK mempool for
+qtoken to the application, which calls wait with the qtoken.      the DMA-capable heap.
+The libOS (3) allocates a blocked coroutine for each qtoken          For UAF protection, all Demikernel allocators provide a
+in wait, then immediately yields to the coroutine scheduler.      simple reference counting interface: inc_ref(void *) and
+We do not allocate the coroutine for each queue token unless      dec_ref(void *). Note that these interfaces are not part of
+the application calls wait to indicate a waiting worker. If       PDPIX but are internal to Demikernel libOSes. The libOS I/O
+the scheduler has no other work, it runs the fast-path corou-     stack calls inc_ref when issuing I/O on a memory buffer
+tine, which (4) polls DPDK’s rte_rx_burst for incoming            and dec_ref when done with the buffer. As noted earlier,
+packets. If the fast-path coroutine finds a packet, then it (5)   Demikernel libOSes may have to hold references for a long
+processes the packet immediately (if error-free), signals a       time; for example, the TCP stack can safely dec_ref only
+blocked coroutine for the TCP connection and yields.              after the receiver has acked the packet.
+   The scheduler runs the unblocked application coroutine,           Hoard keeps free objects in a LIFO linked list with the head
+which (6) returns the incoming request to the application         pointer in the superblock header, which Demikernel amends
+worker, which in turn (7) processes the request and pushes        with a bitmap of per-object reference counts. To minimize
+any response. On the error-free path, the libOS (8) inlines       overhead, we use a single bit per-object, representing one
+the outgoing packet processing and immediately submits the        reference from the application and one from the libOS. If
+I/O to DPDK’s rte_tx_burst, then (9) returns a qtoken to          the libOS has more than one reference to the object (e.g., the
+indicate when the push completes and the application will         object is used for multiple I/Os), it must keep a reference
+regain ownership of the memory buffers. To restart the loop,      table to track when it is safe to dec_ref.
+the application (1) calls pop on the queue to get the next I/O       Zero-copy I/O offers a significant performance improve-
+and then calls wait with the new qtoken. To serve multiple        ment only for buffers over 1 kB in size, so Demikernel OSes
+perform zero-copy I/O only for buffers over that size. Hoard       to the client without copies or thread context switches. Cur-
+superblocks make it easy to limit reference counting and           rent kernel-bypass libraries do not achieve this goal because
+kernel-bypass DMA support to superblocks holding objects           they separate I/O and application processing [30, 39] or do
+larger than 1 kB, minimizing additional meta-data.                 not support applications [43, 28, 96].
+                                                                      To support network and storage devices together, Demik-
+5.4   Coroutine Scheduler                                          ernel integrates its network and storage libOSes. Doing so
+                                                                   is challenging because not all kernel-bypass devices work
+A Demikernel libOS has three coroutine types, reflecting com-
+                                                                   well together. For example, though DPDK and SPDK work
+mon CPU consumers: (1) a fast-path I/O processing coroutine
+                                                                   cooperatively, RDMA and SPDK were not designed to inter-
+for each I/O stack that polls for I/O and performs fast-path
+                                                                   act. SPDK shares the DPDK memory allocator, so initializing
+I/O processing, (2) several background coroutines for other
+                                                                   it creates a DPDK instance, which Catnip×Cattree shares
+I/O stack work (e.g., managing TCP send windows), and (3)
+                                                                   betwen the networking and storage stacks. This automatic
+one application coroutine per blocked qtoken, which runs
+                                                                   initialization creates a problem for RDMA integration be-
+an application worker to process a single request. Generally,
+                                                                   cause the DPDK instance will make the NIC inaccessible for
+each libOS scheduler gives priority to runnable application
+                                                                   RDMA. Thus, Catmint×Cattree must carefully blocklist all
+coroutines, and then to background coroutines and the fast-
+                                                                   NICs for DPDK.
+path coroutine, which is always runnable, in a FIFO manner.
+                                                                      Demikernel memory allocator provides DMA-capable mem-
+Demikernel libOSes are single threaded; thus, each scheduler
+                                                                   ory for DPDK network or SPDK storage I/O. We modify
+runs one coroutine at a time. We expect the coroutine design
+                                                                   Hoard to allocate memory objects from the DPDK memory
+will scale to more cores. However, Demikernel libOSes will
+                                                                   pool for SPDK and register the same memory with RDMA.
+need to be carefully designed to avoid shared state across
+                                                                   We split the fast path coroutine between polling DPDK de-
+cores, so we do not yet know if this will be a major limitation.
+                                                                   vices and SPDK completion queues in a round-robin fashion,
+   Demikernel schedulers offer a yield interface that lets
+                                                                   allocating a fair share of CPU cycles to both given no pending
+coroutines express whether they are blocked and provide
+                                                                   I/O. More complex scheduling of CPU cycles between net-
+a readiness flag for the unblocking event. A coroutine can
+                                                                   work and storage I/O processing is possible in the future. In
+be in one of three states: running, runnable or blocked. To
+                                                                   general, portable integration between networking and storage
+separate runnable and blocked coroutines, Demikernel sched-
+                                                                   datapath libOSes significantly simplifies µs-scale applications
+ulers maintain a readiness bit per coroutine. Following Rust’s
+                                                                   running across network and storage kernel-bypass devices.
+Future trait’s [97] design, coroutines that block on an event
+(e.g., a timer, receiving on a connection), stash a pointer to     6     Demikernel Library OS Implementations
+a readiness flag for the event. Another coroutine triggers the
+                                                                   We prototype two Demikernel datapath OSes: D EMI L IN for
+event (e.g., by receiving a packet on the connection), sees the
+                                                                   Linux and D EMI W IN for Windows. Table 2 lists the library
+pointer, and sets the stashed readiness bit, signaling to the
+                                                                   Oses that make up each datapath OS. The legacy kernels
+scheduler that the blocked coroutine is now runnable.
+                                                                   have little impact on the design of the two datapath OSes;
+   Implementing a ns-scale scheduler is challenging: it may
+                                                                   instead, they primarily accommodate differences in kernel-
+manage hundreds or thousands of coroutines and have only
+                                                                   bypass frameworks on Windows and Linux (e.g., the Linux
+hundreds of cycles to find the next to run. For example, heap
+                                                                   and Windows RDMA interfaces are very different). D EMI L IN
+allocations are unaffordable on the datapath, so the scheduler
+                                                                   supports RDMA, DPDK and SPDK kernel-bypass devices.
+maintains a list of waker blocks that contains the readiness bit
+                                                                   It compiles into 6 shared libraries: Catnap, Catmint, Catnip,
+for 64 different coroutines in a bitset. To make ns-scale sched-
+                                                                   Cattree, Catmint×Cattree and Catnip×Cattree. It uses DPDK
+uling decisions, the scheduler must efficiently iterate over
+                                                                   19.08 [16], SPDK 19.10 [88], and the rdmacm and ibverbs
+all set bits in each waker block to find runnable coroutines.
+                                                                   interface included with the Mellanox OFED driver [61] 5.0.2
+We use Lemire’s algorithm [47], which uses x86’s tzcnt
+                                                                   and Ubuntu 18.04. D EMI W IN currently supports only RDMA
+instruction to efficiently skip over unset bits. A microbench-
+                                                                   kernel-bypass devices with Catpaw and the Catnap POSIX
+mark shows that the scheduler can context switch between an
+                                                                   libOS through WSL. DPDK and SPDK are not well supported
+empty yielding coroutine and find another runnable coroutine
+                                                                   on Windows; however, mainline support for both is currently
+in 12 cycles.
+                                                                   in development. Catpaw is built on NDSPI v2 [63]. This
+5.5   Network and Storage LibOS Integration                        section describes their implementation.
+                                                                   6.1    Catnap POSIX Library OS
+A key Demikernel goal is fine-grained CPU multiplexing of
+networking and storage I/O processing with application pro-        We developed Catnap to test and develop Demikernel applica-
+cessing and integrated zero-copy memory coordination across        tions without kernel-bypass hardware, which is an important
+all three. For example, Demikernel lets Redis receive a PUT        feature for building µs-scale datacenter applications. Demik-
+request from the network, checkpoint it to disk, and respond       ernel’s flexible library OS architecture lets us support such a
+Table 2. Demikernel library operating systems. We implement two     process an incoming TCP packet and dispatch it to the waiting
+prototype Demikernel datapath OSes: D EMI L IN for Linux and        application coroutine in 53ns.
+D EMI W IN for Windows. Each datapath OS consists of a set of          Unlike existing TCP implementations [71, 30], it is able to
+library OSes (e.g., D EMI W IN includes Catpaw and Catnap), which
+                                                                    leverage coroutines for a linear programming flow through
+offer portability across different kernel-bypass devices.
+                                                                    the state machine. Because coroutines efficiently encapsulate
+LibOS Name         Datapath OS         Kernel-bypass     LoC        TCP connection state, they allow asynchronous programming
+                                                                    without managing significant global state.
+Catpaw        D EMI W IN               RDMA            6752 C++
+                                                                       The Catnip TCP stack is deterministic. Every TCP oper-
+Catnap        D EMI L IN, D EMI W IN   N/A             822 C++      ation is parameterized on a time value, and Catnip moves
+Catmint       D EMI L IN               RDMA            1904 Rust    time forward by synchronizing with the system clock. As a
+Catnip        D EMI L IN               DPDK            9201 Rust    result, Catnip is able control all inputs to the TCP stack, in-
+Cattree       D EMI L IN               SPDK            2320 Rust    cluding packets and time, which let us easily debug the stack
+                                                                    by feeding it a trace with packet timings.
+libOS without increasing the overhead or complexity of our             Figure 4 shows Catnip’s I/O loop assuming sufficient send
+other libOSes. Catnap follows the flow shown in Figure 4 but        window space, congestion window space, and that the physi-
+uses POSIX read and write in non-blocking mode instead              cal address is in the ARP cache; otherwise, it spawns a send
+of epoll to minimize latency. Catnap supports storage with          coroutine. Established sockets have four background corou-
+files in a similar fashion. Catnap does not require memory          tines to handle sending outgoing packets, retransmitting lost
+management since POSIX is not zero-copy, and it has no              packets, sending pure acknowledgments, and manage connec-
+background tasks since the Linux kernel handles all I/O.            tion close state transitions. During normal operation, all are
+                                                                    blocked. However, if there is an adverse event (e.g. packet
+6.2   Catmint and Catpaw RDMA Library OSes
+                                                                    loss), the fast-path coroutine unblocks the needed background
+Catmint builds PDPIX queues atop the rdma_cm [79] inter-            coroutine. Additional coroutines handle connection establish-
+faces to manage connections and the ib_verbs interface              ment: sockets in the middle of an active or passive open each
+to efficiently send and receive messages. It uses two-sided         have a background coroutine for driving the TCP handshake.
+RDMA operations to send and receive messages, which sim-               For full zero-copy, Catnip cannot use a buffer to account
+plifies support for the wait_* interface. We use a similar          for TCP windows. Instead, it uses a ring buffer of I/O buffers
+design for Catpaw atop NSDPI.                                       and indices into the ring buffer as the start and end of the TCP
+   We found that using one RDMA queue pair per connection           window. This design increases complexity but eliminates an
+was unaffordable [35], so Catmint uses one queue pair per           unnecessary copy from existing designs. Catnip limits its use
+device and implements connection-based multiplexing for             of unsafe Rust to C/C++ bindings. As a result, it is the first
+PDPIX queues. It processes I/O following the common flow,           zero-copy, ns-scale memory-safe TCP stack.
+using poll_cq to poll for completions and ibv_post_wr to
+submit send requests to other nodes and post receive buffers.       6.4   Cattree SPDK Library OS
+The only slow path operation buffers sends for flow control;        Cattree maps the PDPIX queue abstraction onto an abstract
+Catmint allocates one coroutine per connection to re-send           log for SPDK devices. We map each device as a log file;
+when the receiver updates the send window.                          applications open the file and push writes to the file for per-
+   Catmint implements flow control using a simple message-          sistence. Cattree keeps a read cursor for every storage queue.
+based send window count and a one-sided write to update             pop reads (a specified number of bytes) from the read cur-
+the sender’s window count. It currently only supports mes-          sor and push appends to the log. seek and truncate move
+sages up to a configurable buffer size. Further, it uses a flow-    the read cursor and garbage collect the log. This log-based
+control coroutine per connection to allocate and post receive       storage stack worked well for our echo server and Redis’s
+buffers and remotely update the send window. The fast-path          persistent logging mechanism, but we hope to integrate more
+coroutine checks the remaining receive buffers on each in-          complex storage stacks.
+coming I/O and unblocks the flow-control coroutine if the              Cattree uses its I/O processing fast path coroutine to poll
+remaining buffers fall below a fixed number.                        for completed I/O operations and deliver them to the waiting
+                                                                    application qtoken. Since the SPDK interface is asynchronous,
+6.3   Catnip DPDK Library OS
+                                                                    Cattree submits disk I/O operations inline on the application
+Catnip implements UDP and TCP networking stacks on DPDK             coroutine and then yields until the request is completed. It
+according to RFCs 793 and 7323 [82, 6] with the Cubic               has no background coroutines because all its work is directly
+congestion control algorithm [26]. Existing user-level stacks       related to active I/O processing. Cattree is a minimal storage
+did not meet our needs for ns-scale latencies: mTCP [30],           stack with few storage features. While it works well for our
+Stackmap [102], f-stack [20] and SeaStar [42] all report            logging-based applications, we expect that more complex
+double-digit microsecond latencies. In contrast, Catnip can         storage systems might be layered above it in the future.
+7     Evaluation                                                  Table 3. LoC for µs-scale kernel-bypass systems. POSIX and Demik-
+                                                                  ernel versions of each application. The UDP relay also supports
+Our evaluation found that the prototype Demikernel datapath       io_uring (1782 Loc), and TxnStore has a custom RDMA RPC li-
+OSes simplified µs-scale kernel-bypass applications while         brary (12970 LoC).
+imposing ns-scale overheads. All Demikernel and application
+                                                                     OS/API       Echo Server    UDP Relay     Redis    TxnStore
+code is available at: https://github.com/demikernel/demikernel.
+7.1    Experimental Setup                                         POSIX               328          1731       52954      13430
+                                                                  Demikernel          291          2076       54332      12610
+We use 5 servers with 20-core dual-socket Xeon Silver 4114
+2.2 GHz CPUs connected with Mellanox CX-5 100 Gbps
+                                                                  summary of the lines of code needed for POSIX and Demik-
+NICs and an Arista 7060CX 100 Gbps switch with a min-
+                                                                  ernel versions. In general, we found Demikernel easier to use
+imum 450 ns switching latency. We use Intel Optane 800P
+                                                                  than POSIX-based OSes because its API is better suited to
+NVMe SSDs, backed with 3D XPoint persistent memory.
+                                                                  µs-scale datacenter systems and its OS services better met
+For Windows experiments, we use a separate cluster of 14-
+                                                                  their needs, including portable I/O stacks, a DMA-capable
+core dual-socket Xeon 2690 2.6 GHz CPU servers connected
+                                                                  heap and UAF protection.
+with Mellanox CX-4 56 Gbps NICs and a Mellanox SX6036
+56 Gbps Infiniband switch with a minimum 200 ns latency.          Echo Server and Client. To identify Demikernel’s design
+   On Linux, we allocate 2 GB of 2 MB huge pages, as re-          trade-offs and performance characteristics, we build two echo
+quired by DPDK. We pin processes to cores and use the             systems with servers and clients using POSIX and Demik-
+performance CPU frequency scaling governor. To further re-        ernel. This experiment demonstrates the benefits of Demik-
+duce Linux latency, we raise the process priority using nice      ernel’s API and OS management features for even simple
+and use the real-time scheduler, as recommended by Li [53].       µs-scale, kernel-bypass applications compared to current kernel-
+We run every experiment 5 times and report the average; the       bypass libraries that preserve the POSIX API (e.g., Arrakis [73],
+standard deviations are minimal – zero in some cases – except     mTCP [30], F-stack [20]).
+for § 7.6 where we report them in Figure 12.                         Both echo systems run a single server-side request loop
+   Client and server machines use matching configurations         with closed-loop clients and support synchronous logging to
+since some Demikernel libOSes require both clients and            disk. The Demikernel server calls pop on a set of I/O queue
+servers run the same libOS; except the UDP relay application,     descriptors and uses wait_any to block until a message ar-
+which uses a Linux-based traffic generator. We replicated         rives. It then calls push with the message buffer on the same
+experiments with both Hoard and the built-in Linux libc allo-     queue to send it back to the client and immediately frees the
+cator and found no apparent performance differences.              buffer. Optionally, the server can push the message to on-disk
+                                                                  file for persistence before responding to the client.
+Comparison Systems. We compare Demikernel to 2 kernel-
+                                                                     To avoid heap allocations on the datapath, the POSIX echo
+bypass applications – testpmd [93] and perftest [84] – and
+                                                                  server uses a pre-allocated buffer to hold incoming messages.
+3 recent kernel-bypass libraries – eRPC [34] Shenango [71]
+                                                                  Since the POSIX API is not zero-copy, both read and write
+and Caladan [23]. testpmd and perftest are included with
+                                                                  require a copy, adding overhead. Even if the POSIX API were
+the DPDK and RDMA SDKs, respectively, and used as raw
+                                                                  updated to support zero-copy (and it is unclear what the se-
+performance measurement tools. testpmd is an L2 packet
+                                                                  mantics would be in that case), correctly using it in the echo
+forwarder, so it performs no packet processing, while perftest
+                                                                  server implementation would be non-trivial. Since the POSIX
+measures RDMA NIC send and recv latency by pinging a
+                                                                  server reuses a pre-allocated buffer, the server cannot re-use
+remote server. These applications represent the best “native”
+                                                                  the buffer for new incoming messages until the previous mes-
+performance with the respective kernel-bypass devices.
+                                                                  sage has been successfully sent and acknowledged. Thus, the
+   Shenango [71] and Caladan [23] are recent kernel-bypass
+                                                                  server would need to implement a buffer pool with reference
+schedulers with a basic TCP stack; Shenango runs on DPDK,
+                                                                  counting to ensure correct behavior. This experience has been
+while Caladan directly uses the OFED API [2, 59]. eRPC is a
+                                                                  corroborated by the Shenango [71] authors.
+low-latency kernel-bypass RPC library that supports RDMA,
+                                                                     In contrast, Demikernel’s clear zero-copy API dictates
+DPDK and OFED with a custom network transport. We al-
+                                                                  when the echo server receives ownership of the buffer, and its
+locate two cores to Shenango and Caladan for fairness: one
+                                                                  use-after-free semantics make it safe for the echo server to
+each for the IOKernel and application.
+                                                                  free the buffer immediately after the push. Demikernel’s API
+7.2    Programmability for µs-scale Datacenter Systems            semantics and memory management let Demikernel’s echo
+                                                                  server implementation process messages without allocating
+To evaluate Demikernel’s impact on µs-scale kernel-bypass
+                                                                  or copying memory on the I/O processing path.
+development, we implement four µs-scale kernel-bypass sys-
+tems for Demikernel, including a UDP relay server built by        TURN UDP Relay. Teams and Skype are large video con-
+a non-kernel-bypass, expert programmer. Table 3 presents a        ferencing services that operate peer-to-peer over UDP. To
+support clients behind NATs, Microsoft Azure hosts millions        µs-scale system: TxnStore has double-digit µs latencies, im-
+of TURN relay servers [100, 29]. While end-to-end latency          plements transactions and replication, and uses the Protobuf
+is not concern for these servers, the number of cycles spent       library [76]. TxnStore also has its own implementation of
+on each relayed packet directly translate to the service’s CPU     RPC over RDMA, so this experiment let us compare Demik-
+consumption, which is significant. A Microsoft Teams en-           ernel to custom RDMA code.
+gineer ported the relay server to Demikernel. While he has            TxnStore uses interchangeable RPC transports. The stan-
+10+ years of experience in the Skype and Teams groups, he          dard one uses libevent for I/O processing, which relies on
+was not a kernel-bypass expert. It took him 1 day [38] to          epoll. We implemented our own transport to replace libevent
+port the TURN server to Demikernel and 2 days each for             with a custom event loop based on wait_any. As a result
+io_uring [12] and Seastar [42]. In the end, he could not           of this architecture, the Demikernel port replicates signifi-
+get Seastar working and had issues with io_uring. Com-             cant code for managing connections and RPC, increasing the
+pared to io_uring and Seastar, he reported that Demikernel         LoC but not the complexity of the port. TxnStore’s RDMA
+was the simplest and easiest to use, and that PDPIX was his        transport does not support zero-copy I/O because it would
+favorite part of the system. This experience demonstrated          require serious changes to ensure correctness. Compared to
+that, compared to existing kernel-bypass systems, Demikernel       the custom solution, Demikernel simplifies the coordination
+makes kernel-bypass easier to use for programmers that are         needed to support zero-copy I/O.
+not kernel-bypass experts.                                         7.3                     Echo Application
+Redis. We next evaluate the experience of porting the popular      To evaluate our prototype Demikernel OSes and their over-
+Redis [80] in-memory data structure server to Demikernel.          heads, we measure our echo system. Client and server use
+This port required some architectural changes because Redis        matching OSes and kernel-bypass devices.
+uses its own event processing loop and custom event handler        D EMI L IN Latencies and Overheads. We begin with a study
+mechanism. We implement our own Demikernel-based event             of Demikernel performance for small 64B messages. Figure 5
+loop, which replicated some functionality that already exists      shows unloaded RTTs with a single closed-loop client. We
+in Redis. This additional code increases the total modified        compare the Demikernel echo system to the POSIX version,
+LoC, but much of it was template code.                             with eRPC, Shenango and Caladan. Catnap achieves better
+   Redis’s existing event loop processes incoming and out-         latency than the POSIX echo implementation because it polls
+going packets in a single epoll event loop. We modify this         read instead of using epoll; however, this is a trade-off,
+loop to pop and push to Demikernel I/O queues and block            Catnap consumes 100% of one CPU even with a single client.
+using wait_any. Redis synchronously logs updates to disk,             Catnip is 3.1µs faster than Shenango but 1.7µs slower
+which we replace with a push to a log file without requiring       than Caladan. Shenango has higher latency because packets
+extra buffers or copies.                                           traverse 2 cores for processing, while Caladan has run-to-
+   The Demikernel implementation fixes several well-known          completion on a single core. Caladan has lower latency be-
+inefficiencies in Redis due to epoll. For example, wait_any        cause it uses the lower-level OFED API but sacrifices portabil-
+directly returns the packet, so Redis can immediately begin        ity for non-Mellanox NICs. Similarly, eRPC has 0.2µs lower
+processing without further calls to the (lib)OS. Redis also pro-   latency than Catmint but is carefully tuned for Mellanox CX5
+cesses outgoing replies in an asynchronous manner; it queues       NICs. This experiment demonstrates that, compared to other
+the response, waits on epoll for notification that the socket      kernel-bypass systems, Demikernel can achieve competitive
+is ready and then writes the outgoing packet. This design is       µs latencies without sacrificing portability.
+ineffcient: it requires more than one system call and several
+                                                                                      32
+copies to send a reply. Demikernel fixes this inefficiency
+                                                                   Avg Latency (us)
+
+
+
+
+                                                                                                                                                                         Demikernel
+                                                                                      24                                                                                 Everything else
+by letting the server immediately push the response into the                                          11.720
+                                                                                      16
+outgoing I/O queue.                                                                                                                0.053
+                                                                                       8                           0.949   0.025
+   Demikernel’s DMA-capable heap lets Redis directly place                             0
+                                                                                           30.4        16.9         5.3     6.0     7.1     5.8         7.5      6.6    4.8       3.4
+
+incoming PUTs and serve outgoing GETs to and from its                                      Linu
+                                                                                                  x       na  p          t
+                                                                                                                      min Catnip Catnip    eRP
+                                                                                                                                               C         ng   o     dan Raw     Raw A
+                                                                                                      Cat         Cat          P)     P)           Shena       Cala         K
+in-memory store. For simple keys and values (e.g., not sets                                                                (UD    (TC                                   DPD     RDM
+
+or arrays), Redis does not update in place, so Demikernel’s        Figure 5. Echo latencies on Linux (64B). The upper number reports
+use-after-free protection is sufficient for correct zero-copy      total time spent in Demikernel for 4 I/O operations: client and server
+I/O coordination. As a result, Demikernel lets Redis correctly     send and receive; the lower ones show network and other latency;
+implement zero-copy I/O from its heap with no code changes.        their sum is the total RTT on Demikernel. Demikernel achieves
+                                                                   ns-scale overheads per I/O and has latencies close to those of eRPC,
+TxnStore. TxnStore [103] is a high-performance, in-memory,         Shenango and Caladan, while supporting a greater range of devices
+transactional key-value store that supports TCP, UDP, and          and network protocols. We perform 1 million echos over 5 runs, the
+RDMA. It illustrates Demikernel’s benefits for a feature-rich,     variance between runs was below 1%.
+                                                                                         105
+                                                                                               70.0                                      Sync disk write/push
+                                                                                          90
+
+
+
+
+                                                                      Avg Latency (us)
+                                                                                                                                         Everything else
+                                                                                          75            23.0
+                                                                                          60
+                                                                                          45                55.4
+
+                                                                                          30   31.6
+                                                                                          15                         5.4           7.9               7.9
+                                                                                                                     4.3           6.2               7.9
+                                                                                           0
+
+                                                                                               Linu
+                                                                                                    x         p            t              P)         P)
+                                                                                                        Catna         min
+                                                                                                                   Cat tree           (UD        (TC
+                                                                                                                                  nip        nip
+      (a) D EMI W IN                                                                                                 C a t     Cat attree Cat attree
+                                  (b) D EMI L IN in Azure VM                                                       x             xC          xC
+Figure 6. Echo latencies on Windows and Azure (64B). We demon-        Figure 7. Echo latencies on Linux with synchronous logging to disk
+strate portability by running the Demikernel echo server on Windows   (64B). Demikernel offers lower latency to remote disk than kernel-
+and in a Linux VM with no code changes. We use the same testing       based OSes to remote memory. We use the same testing methodology
+methodology and found minimal deviations.                             and found less than 1% deviation.
+   On average, Catmint imposes 250ns of latency overhead
+per I/O, while Catnip imposes 125ns per UDP packet and
+200ns per TCP packet. Catmint trades off latency on the
+critical path for better throughput, while Catnip uses more
+background co-routines. In both cases, Demikernel achieves
+ns-scale I/O processing overhead.
+
+D EMI W IN and Azure Latencies and Overhead. To fur-
+ther demonstrate portability, we evaluate the echo system
+on Windows and Azure. To our knowledge, Demikernel is
+the only kernel-bypass OS to portably support Windows and
+                                                                      Figure 8. NetPIPE Comparison. We measure the bandwidth achiev-
+virtualized environments.
+                                                                      able with a single client and server sending and receiving messages
+   D EMI W IN supports Catnap through the WSL (the Win-               of varying sizes, replicating NetPIPE [3].
+dows Subsystem for Linux) POSIX interface and Catpaw.
+Figure 6a reports that Catnap again offers a small latency im-        high latency penalty on Linux and Catnap. Catnap’s polling-
+provement by avoiding epoll, while Catpaw reduces latency             based design lowers the overhead, but Catnip and Catmint are
+by 27×. This improvement is extreme; however, WSL is not              much faster. Due to its coroutine scheduler and memory man-
+as optimized as the native Windows API.                               agement, Demikernel can process an incoming packet, pass
+   Azure supports DPDK in general-purpose VMs and of-                 it to the echo server, write it to disk and reply back in a tight
+fers bare metal RDMA VMs with an Infiniband intercon-                 run-to-completion loop without copies. As a result, a client
+nect. Azure does not virtualize RDMA because networking               sees lower access latencies to remote disk with Demikernel
+support for congestion control over virtual networks is com-          than remote memory on Linux. This experiment demonstrates
+plex, demonstrating the pros and cons of heterogenous kernel-         that Demikernel portably achieves ns-scale I/O processing,
+bypass devices in different environments.                             run-to-completion and zero-copy for networking and storage.
+   Figure 6b shows D EMI L IN in an Azure virtual machine.
+Catnap’s polling design shows even lower latency in a VM              D EMI L IN Single Client Throughput Overheads. To study
+because it spins the vCPU, so the hypervisor does not de-             Demikernel’s performance for varying message sizes, we use
+schedule it. Catnip offers a 5× latency improvement over              NetPIPE [68] to compare D EMI L IN with DPDK testpmd and
+the Linux kernel. This is less than the bare metal perfor-            RDMA perftest. Figure 8 shows that testpmd offers 40.3Gbps
+mance improvement because DPDK still goes through the                 for 256kB messages, while perftest achieves 37.7Gbps. testpmd
+Azure virtualization layer in the SmartNIC [21] for vnet trans-       has better performance because it is strictly an L2 forwarder,
+lation. Catmint runs bare metal on Azure over Infiniband;             while perftest uses the RoCE protocol, which requires header
+thus, it offers native performance. This experiment shows             processing and acks to achieve ordered, reliable delivery.
+that Demikernel lets µs-scale applications portably run on               Catmint achieves 31.5Gbps with 256kB messages, which is
+different platforms and kernel-bypass devices.                        a 17% overhead on perftest’s raw RDMA performance. Catnip
+                                                                      has 33.3Gbps for UDP and 29.7Gbps for TCP, imposing a
+D EMI L IN Network and Storage Latencies. To show Demik-              17% and 26% performance penalty, respectively, on testpmd
+ernel’s network and storage support, we run the same exper-           for 256kB messages. Again, note that testpmd performs no
+iment with server-side logging. We use the Linux ext4 file            packet processing, while Catnip has a software networking
+system for the POSIX echo server and Catnap, and we inte-             stack. Compared to native kernel-bypass applications, we
+grate Catnip×Cattree and Catmint×Cattree. Figure 7 shows              found that Demikernel provides OS management services
+that writing every message synchronously to disk imposes a            with reasonable cost for a range of packet sizes.
+                                                                                             30                                Average
+
+
+
+
+                                                                              Latency (us)
+                                                                                                         27.6                  p99
+                                                                                             20   24.9          24.4 25.8
+
+                                                                                             10                             13.9 14.9
+
+                                                                                              0
+                                                                                                    Linux       io_uring     Catnip
+
+                                                                      Figure 10. Average and tail latencies for UDP relay. We send 1
+                                                                      million packets and perform the experiment 5 times. Demikernel has
+                                                                      better performance than io_uring and requires fewer changes.
+
+Figure 9. Latency vs. throughput. We skip RDMA (because perftest
+does not support parallelism) and the kernel-based solutions for
+readability. We use 1 core for Demikernel and eRPC, and 2 cores for
+Shenango and Caladan. Catmint and Catnip (UDP) are optimized for
+latency but not throughput, as we focused our efforts on improving
+Catnip’s software TCP stack.
+                                .
+D EMI L IN Peak Throughput and Latency Overheads. To
+evaluate Demikernel’s throughput impact, we compare to                Figure 11. Redis benchmark throughput in-memory and on-disk. We
+Shenango, Caladan and eRPC. We increase offered load and              use 64B values and 1 million keys. We perform separate runs for
+report both sustained server-side throughput and client-side          each operation with 500,000 accesses repeated 5 times. Demikernel
+                                                                      improves Redis performance and lets it maintain that performance
+latency in Figure 9. Catnip (UDP) achieves 70% of the peak
+                                                                      with synchronous writes to disk.
+throughput of Caladan on DPDK and Catmint has 46% the
+throughput of eRPC on RDMA. However, Catnip outper-
+forms Caladan and is competitive with eRPC due to many                utility. Figure 11 (left) reports the peak throughput for unmod-
+optimizations in the TCP stack. We focused our initial opti-          ified Redis and Demikernel Redis running in-memory. Catnap
+mization efforts on per-I/O datapath latency overheads since          has 75-80% lower peak throughput because its polling-based
+µs-scale datacenter systems prioritize datapath latencies and         design trades off latency for throughput. Catmint gives 2×
+tail latencies; however, future optimizations could improve           throughput, and Catnip offers 20% better throughput.
+throughput, especially single-core throughput (e.g., offloading          We add persistence to Redis by turning on its append-only
+background coroutines to another core). Overall, this experi-         file. We fsync after each SET operation for strong guaran-
+ment shows that Demikernel demonstrates that a high-level             tees and fairness to Cattree, which does not buffer or cache
+API and OS features do not have to come at a significant cost.        in memory. Figure 11 (left) gives the results. In this case,
+                                                                      Catnap’s polling increases throughput because it decreases
+7.4   UDP Relay Server                                                disk access latencies, which block the server from process-
+                                                                      ing more requests. Notably, Catnip and Catmint with Cattree
+To evaluate the performance of a µs-scale system built by a           have throughput within 10% of unmodified Redis without
+non-kernel-bypass expert, we compare the performance of the           persistence. This result shows that Demikernel provides ex-
+UDP relay server on Demikernel to Linux and io_uring. We              isting µs-scale applications portable kernel-bypass network
+use a non0-kernel-bypass Linux-based traffic generator and            and storage access with low overhead.
+measure the latency between sending the generated packet
+and receiving the relayed packet.                                     7.6   TxnStore Distributed Transactional Storage
+   Figure 10 shows the average and p99 latencies for the UDP   To measure the performance of Demikernel for a more fully
+relay server. Since all versions use the same Linux-based      featured µs-scale application, we evaluate TxnStore with
+client, the reduced latency directly translates to fewer CPU   YCSB-t workload F, which performs read-modify-write oper-
+cycles used on the server. While io_uring gives modest         ations using transactions. We use a uniform Zipf distribution,
+improvements, Catnip reduces the server-side latency per       64 B keys, and 700 B values. We use the weakly consistent
+request by 11µs on average and 13.7µs at the p99, demon-       quorum-write protocol: every get accesses a single server,
+strating that Demikernel lets non-kernel-bypass experts reap   while every put replicates to three servers.
+performance benefits for their µs-scale applications.             Figure 12 reports the average and 99th percentile tail trans-
+                                                               action latency. Again, Catnap has 69% lower latency than
+7.5 Redis In-memory Distributed Cache
+                                                               TxnStore’s TCP stack and 27% lower latency than its UDP
+To evaluate a ported µs-scale application, we measure Redis    stack due to polling. As a trade-off, Catnap uses almost 100%
+using GET and SET operations with the built-in redis-benchmark of a single CPU to poll for packets, while TxnStore uses 40%.
+                                                                              Average
+                                                                                              Arrakis [73] and Ix [3] offer alternative kernel-bypass ar-
+YCSB-t Latency
+
+
+
+                 600 us
+                                                                              p99          chitectures but are not portable, especially to virtualized en-
+                 400 us                                                                    vironments, since they leverage SR-IOV for kernel-bypass.
+                 200 us                                                                    Netmap [83] and Stackmap [102] offer user-level interfaces
+                   0 us
+                                                                                           to NICs but no OS management. eRPC [34] and ScaleRPC [8]
+                          Linux (TCP) Linux (UDP)   RDMA   Catnap   Catmint Catnip (TCP)   are user-level RDMA/DPDK stacks, while ReFlex [43], PASTE [28]
+Figure 12. YCSB-t average and tail latencies for TxnStore. Demik-                          and Flashnet [96] provide fast remote access to storage, but
+ernel offers lower latency than TxnStore’s custom RDMA stack                               none portably supports both storage and networking.
+because we are not able to remove copies in the custom RDMA                                   User-level networking [51, 39, 70, 30, 42] and storage
+stack without complex zero-copy memory coordination.                                       stacks [44, 81, 32] replace missing functionality and can
+                                                                                           be used interchangeably if they maintain the POSIX API;
+Both Catnip and Catmint are competitive with TxnStore’s                                    however, they lack features needed by µs-scale kernel-bypass
+RDMA messaging stack. TxnStore uses the rdma_cm [79].                                      systems, as described in Section 2. Likewise, recent user-
+However, it uses one queue pair per connection, requires                                   level schedulers [75, 71, 33, 23, 9] assign I/O requests to
+a copy, and has other inefficiencies [36], so Catmint outper-                              application workers but are not portable and do not implement
+forms TxnStore’s native RDMA stack. This experiment shows                                  storage stacks. As a result, none serve as general-purpose
+that Demikernel improves performance for higher-latency                                    datapath operating systems.
+µs-scale datacenter applications compared to a naive custom
+RDMA implementation.
+                                                                                           9    Conclusion And Future Work
+8                 Related Work                                                             Demikernel is a first step towards datapath OSes for µs-scale
+                                                                                           kernel-bypass applications. While we present an OS and ar-
+Demikernel builds on past work in operating systems, espe-
+                                                                                           chitecture that implement PDPIX, other designs are possible.
+cially library OSes [18, 74, 49] and other flexible, extensible
+                                                                                           Each Demikernel OS feature represents a rich area of fu-
+systems [31, 89, 87], along with recent work on kernel-bypass
+                                                                                           ture work. We have barely scratched the surface of portable,
+OSes [73, 3] and libraries [30, 44]. Library operating systems
+                                                                                           zero-copy TCP stacks and have not explored in depth what
+separate protection and management into the OS kernel and
+                                                                                           semantics a µs-scale storage stack might supply. While there
+user-level library OSes, respectively, to better meet custom
+                                                                                           has been recent work on kernel-bypass scheduling, efficient
+application needs. We observe that kernel-bypass architec-
+                                                                                           µs-scale memory resource management with memory allo-
+tures offload protection into I/O devices, along with some OS
+                                                                                           cators has not been explored in depth. Given the insights
+management, so Demikernel uses library OSes for portability
+                                                                                           of the datapath OS into the memory access patterns of the
+across heterogenous kernel-bypass devices.
+                                                                                           application, improved I/O-aware memory scheduling is cer-
+   OS extensions [99, 19, 22, 24] also let applications cus-
+                                                                                           tainly possible. Likewise, Demikernel does not eliminate all
+tomize parts of the OS for their needs. Recently, Linux intro-
+                                                                                           zero-copy coordination and datapath OSes with more explicit
+duced io_uring [12, 11], which gives applications faster ac-
+                                                                                           features for memory ownership are a promising direction for
+cess to the kernel I/O stack through shared memory. LKL [77,
+                                                                                           more research. Generally, we hope that Demikernel is the first
+94] and F-stack [20] move the Linux and FreeBSD network-
+                                                                                           of many datapath OSes for µs-scale datacenter applications.
+ing stacks to userspace but do not meet the requirements of
+µs-scale systems (e.g., accommodating heterogenous device
+hardware and zero-copy I/O memory management). Device                                      10    Acknowledgements
+drivers, whether in the OS kernel [91, 13] or at user level [48],
+hide differences between hardware interfaces but do not im-                                It took a village to make Demikernel possible. We thank
+plement OS services, like memory management.                                               Emery Berger for help with Hoard integration, Aidan Woolley
+   Previous efforts to offload OS functionality focused on lim-                            and Andrew Moore for Catnip’s Cubic implementation, and
+ited OS features or specialized applications, like TCP [14,                                Liam Arzola and Kevin Zhao for code contributions. We
+65, 67, 39]. DPI [1] proposes an interface similar to the                                  thank Adam Belay, Phil Levis, Josh Fried, Deepti Raghavan,
+Demikernel libcall interface but uses flows instead of queues                              Tom Anderson, Anuj Kalia, Landon Cox, Mothy Roscoe,
+and considers network I/O but not storage. Much recent                                     Antoine Kaufmann, Natacha Crooks, Adriana Szekeres, and
+work on distributed storage systems uses RDMA for low-                                     the entire MSR Systems Group, especially Dan Ports, Andrew
+latency access to remote memory [17], FASST [37], and                                      Baumann, and Jay Lorch, who read many drafts. We thank
+more [98, 64, 35, 92, 7, 40] but does not portably support                                 Sandy Kaplan for repeatedly editing the paper. Finally, we
+other NIC hardware. Likewise, software middleboxes have                                    acknowledge the dedication of the NSDI, OSDI and SOSP
+used DPDK for low-level access to the NIC [95, 90] but do                                  reviewers, many of whom reviewed the paper more than once,
+not consider other types of kernel-bypass NICs or storage.                                 and the tireless efforts of our shepherd Jeff Mogul.
+References                                                                      [21] F IRESTONE , D., P UTNAM , A., M UNDKUR , S., C HIOU , D.,
+                                                                                     DABAGH , A., A NDREWARTHA , M., A NGEPAT, H., B HANU , V.,
+                                                                                     C AULFIELD , A., C HUNG , E., C HANDRAPPA , H. K., C HATUR -
+ [1] A LONSO , G., B INNIG , C., PANDIS , I., S ALEM , K., S KRZYPCZAK ,             MOHTA , S., H UMPHREY, M., L AVIER , J., L AM , N., L IU , F.,
+     J., S TUTSMAN , R., T HOSTRUP, L., WANG , T., WANG , Z., AND                    OVTCHAROV, K., PADHYE , J., P OPURI , G., R AINDEL , S., S APRE ,
+     Z IEGLER , T. DPI: The data processing interface for modern networks.           T., S HAW, M., S ILVA , G., S IVAKUMAR , M., S RIVASTAVA , N.,
+     In 9th Biennial Conference on Innovative Data Systems Research                  V ERMA , A., Z UHAIR , Q., BANSAL , D., B URGER , D., VAID , K.,
+     CIDR (2019).                                                                    M ALTZ , D. A., AND G REENBERG , A. Azure accelerated network-
+ [2] BARAK , D. The OFED package, April 2012. https://www.                           ing: SmartNICs in the public cloud. In 15th USENIX Symposium on
+     rdmamojo.com/2012/04/25/the-ofed-package/.                                      Networked Systems Design and Implementation (NSDI 18) (2018),
+ [3] B ELAY, A., P REKAS , G., K LIMOVIC , A., G ROSSMAN , S.,                       USENIX Association.
+     KOZYRAKIS , C., AND B UGNION , E. IX: A protected dataplane op-            [22] F LEMING , M. A thorough introduction to eBPF. lwn.net, December
+     erating system for high throughput and low latency. In 11th USENIX              2017. https://lwn.net/Articles/740157/.
+     Symposium on Operating Systems Design and Implementation (OSDI             [23] F RIED , J., RUAN , Z., O USTERHOUT, A., AND B ELAY, A. Caladan:
+     14) (2014), USENIX Association.                                                 Mitigating interference at microsecond timescales. In 14th USENIX
+ [4] B ERGER , E. D., M C K INLEY, K. S., B LUMOFE , R. D., AND W IL -               Symposium on Operating Systems Design and Implementation (OSDI
+     SON , P. R. Hoard: A scalable memory allocator for multithreaded
+                                                                                     20) (2020), USENIX Association.
+     applications. SIGARCH Comput. Archit. News 28, 5 (Nov. 2000),
+                                                                                [24] File system in user-space. https://www.kernel.org/doc/html/latest/
+     117–128.                                                                        filesystems/fuse.html.
+ [5] B ERGER , E. D., Z ORN , B. G., AND M C K INLEY, K. S. Composing           [25] A Tour of Go: Channels. https://tour.golang.org/concurrency/2.
+     high-performance memory allocators. SIGPLAN Not. 36, 5 (May                [26] H A , S., R HEE , I., AND X U , L. Cubic: a new tcp-friendly high-speed
+     2001), 114–124.                                                                 tcp variant. ACM SIGOPS Operating Systems Review 42, 5 (2008).
+ [6] B ORMAN , D., B RADEN , R. T., JACOBSON , V., AND S CHEFFENEG -            [27] H ERBERT, T., AND DE B RUIJN , W. Scaling in the Linux Networking
+     GER , R. TCP Extensions for High Performance. RFC 7323, 2014.
+                                                                                     Stack. kernel.org. https://www.kernel.org/doc/Documentation/
+ [7] C HEN , H., C HEN , R., W EI , X., S HI , J., C HEN , Y., WANG , Z.,            networking/scaling.txt.
+     Z ANG , B., AND G UAN , H. Fast in-memory transaction processing           [28] H ONDA , M., L ETTIERI , G., E GGERT, L., AND S ANTRY, D. PASTE:
+     using RDMA and HTM. ACM Trans. Comput. Syst. 35, 1 (July 2017).                 A network programming interface for non-volatile main memory. In
+ [8] C HEN , Y., L U , Y., AND S HU , J. Scalable RDMA RPC on reliable               15th USENIX Symposium on Networked Systems Design and Imple-
+     connection with efficient resource sharing. In Proceedings of the Four-         mentation (NSDI 18) (2018), USENIX Association.
+     teenth EuroSys Conference 2019 (2019), Association for Computing           [29] I NTERNET E NGINEERING TASK F ORCE. Traversal Using Relays
+     Machinery.                                                                      around NAT. https://tools.ietf.org/html/rfc5766.
+ [9] C HO , I., S AEED , A., F RIED , J., PARK , S. J., A LIZADEH , M., AND     [30] J EONG , E., W OOD , S., JAMSHED , M., J EONG , H., I HM , S., H AN ,
+     B ELAY, A. Overload control for µs-scale RPCs with Breakwater. In               D., AND PARK , K. mTCP: a highly scalable user-level TCP stack for
+     14th USENIX Symposium on Operating Systems Design and Imple-                    multicore systems. In 11th USENIX Symposium on Networked Systems
+     mentation (OSDI 20) (2020), USENIX Association.                                 Design and Implementation (NSDI 14) (2014), USENIX Association.
+[10] CORBET. Linux and TCP offload engines. LWN Articles, August 2005.          [31] J IN , Y., T SENG , H.-W., PAPAKONSTANTINOU , Y., AND S WAN -
+     https://lwn.net/Articles/148697/.                                               SON , S. KAML: A flexible, high-performance key-value SSD. In
+[11] C ORBET, J. Ringing in a new asynchronous I/O API. lwn.net, Jan                 2017 IEEE International Symposium on High Performance Computer
+     2019. https://lwn.net/Articles/776703/.                                         Architecture (HPCA) (2017), IEEE.
+[12] C ORBET, J. The rapid growth of io_uring. lwn.net, Jan 2020. https:        [32] K ADEKODI , R., L EE , S. K., K ASHYAP, S., K IM , T., KOLLI , A.,
+     //lwn.net/Articles/810414.                                                      AND C HIDAMBARAM , V. SplitFS: Reducing software overhead in
+[13] C ORBET, J., RUBINI , A., AND K ROAH -H ARTMAN , G. Linux Device                file systems for persistent memory. In Proceedings of the 27th ACM
+     Drivers: Where the Kernel Meets the Hardware. " O’Reilly Media,
+                                                                                     Symposium on Operating Systems Principles (2019), Association for
+     Inc.", 2005.                                                                    Computing Machinery.
+[14] C URRID , A. TCP offload to the rescue: Getting a toehold on TCP           [33] K AFFES , K., C HONG , T., H UMPHRIES , J. T., B ELAY, A., M AZ -
+     offload engines—and why we need them. Queue 2, 3 (May 2004),                    IÈRES , D., AND KOZYRAKIS , C. Shinjuku: Preemptive scheduling for
+     58–65.                                                                          µsecond-scale tail latency. In 16th USENIX Symposium on Networked
+[15] D EMOULIN , M., F RIED , J., P EDISICH , I., KOGIAS , M., L OO , B. T.,         Systems Design and Implementation (NSDI 19) (2019), USENIX As-
+     P HAN , L. T. X., AND Z HANG , I. When idling is ideal: Optimizing tail-        sociation.
+     latency for highly-dispersed datacenter workloads with Persephone. In      [34] K ALIA , A., K AMINSKY, M., AND A NDERSEN , D. Datacenter RPCs
+     Proceedings of the 26th Symposium on Operating Systems Principles               can be general and fast. In 16th USENIX Symposium on Networked
+     (2021), Association for Computing Machinery.                                    Systems Design and Implementation (NSDI 19) (2019), USENIX
+[16] Data plane development kit. https://www.dpdk.org/.                              Association.
+[17] D RAGOJEVI Ć , A., NARAYANAN , D., C ASTRO , M., AND H ODSON ,            [35] K ALIA , A., K AMINSKY, M., AND A NDERSEN , D. G. Using RDMA
+     O. FaRM: Fast remote memory. In 11th USENIX Symposium on                        efficiently for key-value services. SIGCOMM Comput. Commun. Rev.
+     Networked Systems Design and Implementation (NSDI 14) (2014),                   44, 4 (Aug. 2014), 295–306.
+     USENIX Association.
+                                                                                [36] K ALIA , A., K AMINSKY, M., AND A NDERSEN , D. G. Design guide-
+[18] E NGLER , D. R., K AASHOEK , M. F., AND O’T OOLE , J. Exoker-                   lines for high performance RDMA systems. In 2016 USENIX Annual
+     nel: An operating system architecture for application-level resource            Technical Conference (USENIX ATC 16) (2016), USENIX Associa-
+     management. In Proceedings of the Fifteenth ACM Symposium on                    tion.
+     Operating Systems Principles (1995), Association for Computing             [37] K ALIA , A., K AMINSKY, M., AND A NDERSEN , D. G. FaSST: Fast,
+     Machinery.                                                                      scalable and simple distributed transactions with two-sided RDMA
+[19] E VANS , J. A scalable concurrent malloc (3) implementation for                 datagram RPCs. In 12th USENIX Symposium on Operating Systems
+     FreeBSD. In Proceedings of the BSDCan Conference (2006).                        Design and Implementation (OSDI 16) (2016), USENIX Association.
+[20] F-Stack. http://www.f-stack.org/.
+[38] K ALLAS , S. Turn server. Github. https://github.com/seemk/urn.           [56] M AREK.            Epoll       is        fundamentally          broken
+[39] K AUFMANN , A., S TAMLER , T., P ETER , S., S HARMA , N. K., K R -             1/2,         Feb           2017.https://idea.popcount.org/
+     ISHNAMURTHY, A., AND A NDERSON , T. TAS: TCP acceleration as                   2017-02-20-epoll-is-fundamentally-broken-12/.
+     an OS service. In Proceedings of the Fourteenth EuroSys Conference        [57] M ARTY, M., DE K RUIJF, M., A DRIAENS , J., A LFELD , C., BAUER ,
+     2019 (2019), Association for Computing Machinery.                              S., C ONTAVALLI , C., DALTON , M., D UKKIPATI , N., E VANS , W. C.,
+[40] K IM , D., M EMARIPOUR , A., BADAM , A., Z HU , Y., L IU , H. H.,              G RIBBLE , S., K IDD , N., KONONOV, R., K UMAR , G., M AUER , C.,
+     PADHYE , J., R AINDEL , S., S WANSON , S., S EKAR , V., AND S E -              M USICK , E., O LSON , L., RUBOW, E., RYAN , M., S PRINGBORN ,
+     SHAN , S. Hyperloop: Group-based NIC-Offloading to accelerate repli-           K., T URNER , P., VALANCIUS , V., WANG , X., AND VAHDAT, A.
+     cated transactions in multi-tenant storage systems. In Proceedings             Snap: A microkernel approach to host networking. In Proceedings of
+     of the 2018 Conference of the ACM Special Interest Group on Data               the 27th ACM Symposium on Operating Systems Principles (2019),
+     Communication (2018), Association for Computing Machinery.                     Association for Computing Machinery.
+[41] K IM , H.-J., L EE , Y.-S., AND K IM , J.-S. NVMeDirect: A user-space     [58] M ELLANOX. BlueField Smart NIC. http://www.mellanox.com/
+     I/O framework for application-specific optimization on NVMe SSDs.              page/products_dyn?product_family=275&mtag=bluefield_
+     In 8th USENIX Workshop on Hot Topics in Storage and File Systems               smart_nic1.
+     (HotStorage 16) (2016), USENIX Association.                               [59] M ELLANOX.         Mellanox   OFED      for   Linux    User    Manual.
+[42] K IVITY, A. Building efficient I/O intensive applications with Seastar,        https://www.mellanox.com/related-docs/prod_software/
+     2019.      https://github.com/CoreCppIL/CoreCpp2019/blob/                      Mellanox_OFED_Linux_User_Manual_v4.1.pdf.
+     master/Presentations/Avi_Building_efficient_IO_intensive_                 [60] M ELLANOX. An introduction to smart NICs. The Next Plat-
+     applications_with_Seastar.pdf.                                                 form, 3 2019. https://www.nextplatform.com/2019/03/04/
+[43] K LIMOVIC , A., L ITZ , H., AND KOZYRAKIS , C. ReFlex: Remote                  an-introduction-to-smartnics/.
+     flash = local flash. In Proceedings of the Twenty-Second International    [61] M ELLANOX. Mellanox OFED RDMA libraries, April 2019. http:
+     Conference on Architectural Support for Programming Languages and              //www.mellanox.com/page/mlnx_ofed_public_repository.
+     Operating Systems (2017), Association for Computing Machinery.            [62] M ELLANOX. RDMA Aware Networks Programming User Man-
+[44] K WON , Y., F INGLER , H., H UNT, T., P ETER , S., W ITCHEL , E.,              ual, September 2020. https://community.mellanox.com/s/article/
+     AND A NDERSON , T. Strata: A cross media file system. In Proceed-              rdma-aware-networks-programming--160--user-manual.
+     ings of the 26th Symposium on Operating Systems Principles (2017),        [63] M ICROSOFT. Network Direct SPI Reference, v2 ed., July
+     Association for Computing Machinery.                                           2010. https://docs.microsoft.com/en-us/previous-versions/
+[45] L AGUNA , I., M ARSHALL , R., M OHROR , K., RUEFENACHT, M.,                    windows/desktop/cc904391(v%3Dvs.85).
+     S KJELLUM , A., AND S ULTANA , N. A large-scale study of MPI usage        [64] M ITCHELL , C., G ENG , Y., AND L I , J. Using one-sided RDMA
+     in open-source HPC applications. In Proceedings of the International           reads to build a fast, CPU-Efficient key-value store. In 2013 USENIX
+     Conference for High Performance Computing, Networking, Storage                 Annual Technical Conference (USENIX ATC 13) (2013), USENIX
+     and Analysis (2019), Association for Computing Machinery.                      Association.
+[46] L EIJEN , D., Z ORN , B., AND DE M OURA , L. Mimalloc: Free list          [65] M OGUL , J. C. TCP offload is a dumb idea whose time has come. In
+     sharding in action. In Asian Symposium on Programming Languages                9th Workshop on Hot Topics in Operating Systems (HotOS IX) (2003),
+     and Systems (2019).                                                            USENIX Association.
+[47] L EMIRE , D. Iterating over set bits quickly, Feb 2018. https://lemire.   [66] M OON , Y., L EE , S., JAMSHED , M. A., AND PARK , K. AccelTCP:
+     me/blog/2018/02/21/iterating-over-set-bits-quickly/.                           Accelerating network applications with stateful TCP offloading. In
+[48] L ESLIE , B., C HUBB , P., F ITZROY-DALE , N., G ÖTZ , S., G RAY, C.,          17th USENIX Symposium on Networked Systems Design and Imple-
+     M ACPHERSON , L., P OTTS , D., S HEN , Y.-T., E LPHINSTONE , K.,               mentation (NSDI 20) (2020), USENIX Association.
+     AND H EISER , G. User-level device drivers: Achieved performance.         [67] NARAYAN , A., C ANGIALOSI , F., G OYAL , P., NARAYANA , S., A L -
+     Journal of Computer Science and Technology 20, 5 (2005), 654–664.              IZADEH , M., AND BALAKRISHNAN , H. The case for moving con-
+[49] L ESLIE , I., M C AULEY, D., B LACK , R., ROSCOE , T., BARHAM , P.,            gestion control out of the datapath. In Proceedings of the 16th ACM
+     E VERS , D., FAIRBAIRNS , R., AND H YDEN , E. The design and im-               Workshop on Hot Topics in Networks (2017), Association for Comput-
+     plementation of an operating system to support distributed multimedia          ing Machinery.
+     applications. IEEE Journal on Selected Areas in Communications 14,        [68] Network Protocol Independent Performance Evaluator. https://linux.
+     7 (1996), 1280–1297.                                                           die.net/man/1/netpipe.
+[50] L ESOKHIN , I. tls: Add generic NIC offload infrastructure. LWN Arti-     [69] N ETRONOME. Agilio CX SmartNICs. https://www.netronome.
+     cles, September 2017. https://lwn.net/Articles/734030.                         com/products/agilio-cx/.
+[51] L I , B., C UI , T., WANG , Z., BAI , W., AND Z HANG , L. Socksdirect:    [70] O PEN FABRICS I NTERFACES W ORKING G ROUP. RSockets. GitHub.
+     Datacenter sockets can be fast and compatible. In Proceedings of               https://github.com/ofiwg/librdmacm/blob/master/docs/
+     the ACM Special Interest Group on Data Communication (2019),                   rsocket.
+     Association for Computing Machinery.                                      [71] O USTERHOUT, A., F RIED , J., B EHRENS , J., B ELAY, A., AND
+[52] L I , B., RUAN , Z., X IAO , W., L U , Y., X IONG , Y., P UTNAM , A.,          BALAKRISHNAN , H. Shenango: Achieving high CPU efficiency for
+     C HEN , E., AND Z HANG , L. KV-Direct: High-performance in-memory              latency-sensitive datacenter workloads. In 16th USENIX Symposium
+     key-value store with programmable NIC. In Proceedings of the 26th              on Networked Systems Design and Implementation (NSDI 19) (2019),
+     Symposium on Operating Systems Principles (2017), Association for              USENIX Association.
+     Computing Machinery.                                                      [72] PANDA , A., H AN , S., JANG , K., WALLS , M., R ATNASAMY, S., AND
+[53] L I , J., S HARMA , N. K., P ORTS , D. R. K., AND G RIBBLE , S. D.             S HENKER , S. Netbricks: Taking the V out of NFV. In 12th USENIX
+     Tales of the tail: Hardware, OS, and application-level sources of tail         Symposium on Operating Systems Design and Implementation (OSDI
+     latency. In Proceedings of the ACM Symposium on Cloud Computing                16) (2016), USENIX Association.
+     (2014), Association for Computing Machinery.                              [73] P ETER , S., L I , J., Z HANG , I., P ORTS , D. R. K., W OOS , D., K R -
+[54] libevent: an event notification library. http://libevent.org/.                 ISHNAMURTHY, A., A NDERSON , T., AND ROSCOE , T. Arrakis: The
+[55] M ANDRY, T. How Rust optimizes async/await I, Aug 2019. https:                 operating system is the control plane. ACM Trans. Comput. Syst. 33, 4
+     //tmandry.gitlab.io/blog/posts/optimizing-await-1/.                            (Nov. 2015).
+[74] P ORTER , D. E., B OYD -W ICKIZER , S., H OWELL , J., O LINSKY, R.,               SLOs in network function virtualization. In 15th USENIX Symposium
+     AND H UNT, G. C. Rethinking the library OS from the top down. In                  on Networked Systems Design and Implementation (NSDI 18) (2018),
+     Proceedings of the Sixteenth International Conference on Architec-                USENIX Association.
+     tural Support for Programming Languages and Operating Systems                [96] T RIVEDI , A., I OANNOU , N., M ETZLER , B., S TUEDI , P., P FEF -
+     (2011), Association for Computing Machinery.                                      FERLE , J., KOURTIS , K., KOLTSIDAS , I., AND G ROSS , T. R. Flash-
+[75] P REKAS , G., KOGIAS , M., AND B UGNION , E. ZygOS: Achieving                     Net: Flash/network stack co-design. ACM Trans. Storage 14, 4 (Dec.
+     low tail latency for microsecond-scale networked tasks. In Proceed-               2018).
+     ings of the 26th Symposium on Operating Systems Principles (2017),           [97] T URON , A. Designing futures for Rust, Sep 2016. https://aturon.
+     Association for Computing Machinery.                                              github.io/blog/2016/09/07/futures-design/.
+[76] Protocol             buffers.        https://developers.google.com/          [98] W EI , X., D ONG , Z., C HEN , R., AND C HEN , H. Deconstructing
+     protocol-buffers/.                                                                RDMA-enabled distributed transactions: Hybrid is better! In 13th
+[77] P URDILA , O., G RIJINCU , L. A., AND TAPUS , N. LKL: The linux                   USENIX Symposium on Operating Systems Design and Implementa-
+     kernel library. In 9th RoEduNet IEEE International Conference (2010),             tion (OSDI 18) (2018), USENIX Association.
+     IEEE.                                                                        [99] W ELCH , B. B., AND O USTERHOUT, J. K. Pseudo devices: User-level
+[78] RDMA C ONSORTIUM. A RDMA protocol specification, October                          extensions to the Sprite file system. Tech. Rep. UCB/CSD-88-424,
+     2002. http://rdmaconsortium.org/.                                                 EECS Department, University of California, Berkeley, Jun 1988.
+[79] RDMA communication manager. https://linux.die.net/man/7/                    [100] W IKIPEDIA. Traversal Using Relays around NAT, May 2021.
+     rdma_cm.                                                                          https://en.wikipedia.org/wiki/Traversal_Using_Relays_
+[80] Redis: Open source data structure server, 2013. http://redis.io/.                 around_NAT.
+[81] R EN , Y., M IN , C., AND K ANNAN , S. CrossFS: A cross-layered direct-     [101] YANG , J., I ZRAELEVITZ , J., AND S WANSON , S. FileMR: Rethinking
+     access file system. In 14th USENIX Symposium on Operating Systems                 RDMA networking for scalable persistent memory. In 17th USENIX
+     Design and Implementation (OSDI 20) (2020), USENIX Association.                   Symposium on Networked Systems Design and Implementation (NSDI
+[82] Transmission Control Protocol. RFC 793, 1981. https://tools.ietf.                 20) (2020), USENIX Association.
+     org/html/rfc793.                                                            [102] YASUKATA , K., H ONDA , M., S ANTRY, D., AND E GGERT, L.
+[83] R IZZO , L. Netmap: A novel framework for fast packet I/O. In 2012                Stackmap: Low-latency networking with the OS stack and dedicated
+     USENIX Annual Technical Conference (USENIX ATC 12) (2012),                        NICs. In 2016 USENIX Annual Technical Conference (USENIX ATC
+     USENIX Association.                                                               16) (2016), USENIX Association.
+[84] RDMA CM connection and RDMA ping-pong test. http://manpages.                [103] Z HANG , I., S HARMA , N. K., S ZEKERES , A., K RISHNAMURTHY, A.,
+     ubuntu.com/manpages/bionic/man1/rping.1.html.                                     AND P ORTS , D. R. Building consistent transactions with inconsistent
+[85] RUST. The Async Book. https://rust-lang.github.io/async-book/.                    replication. ACM Transactions on Computer Systems 35, 4 (2018), 12.
+[86] S ESHADRI , S., G AHAGAN , M., B HASKARAN , S., B UNKER , T.,
+     D E , A., J IN , Y., L IU , Y., AND S WANSON , S. Willow: A user-
+     programmable SSD. In 11th USENIX Symposium on Operating Sys-
+     tems Design and Implementation (OSDI 14) (2014), USENIX Associ-
+     ation.
+[87] S IEGEL , A., B IRMAN , K., AND M ARZULLO , K. Deceit: A flexi-
+     ble distributed file system. In [1990] Proceedings. Workshop on the
+     Management of Replicated Data (1990), pp. 15–17.
+[88] Storage performance development kit. https://spdk.io/.
+[89] S TRIBLING , J., S OVRAN , Y., Z HANG , I., P RETZER , X., K AASHOEK ,
+     M. F., AND M ORRIS , R. Flexible, wide-area storage for distributed
+     systems with WheelFS. In 6th USENIX Symposium on Networked
+     Systems Design and Implementation (NSDI 09) (2009), USENIX
+     Association.
+[90] S UN , C., B I , J., Z HENG , Z., Y U , H., AND H U , H. NFP: Enabling
+     network function parallelism in NFV. In Proceedings of the Confer-
+     ence of the ACM Special Interest Group on Data Communication
+     (2017), Association for Computing Machinery.
+[91] S WIFT, M. M., M ARTIN , S., L EVY, H. M., AND E GGERS , S. J.
+     Nooks: An architecture for reliable device drivers. In Proceedings
+     of the 10th Workshop on ACM SIGOPS European Workshop (2002),
+     Association for Computing Machinery.
+[92] TARANOV, K., A LONSO , G., AND H OEFLER , T. Fast and strongly-
+     consistent per-item resilience in key-value stores. In Proceedings of
+     the Thirteenth EuroSys Conference (2018), Association for Computing
+     Machinery.
+[93] Testpmd Users Guide. https://doc.dpdk.org/guides/testpmd_app_
+     ug/.
+[94] T HALHEIM , J., U NNIBHAVI , H., P RIEBE , C., B HATOTIA , P., AND
+     P IETZUCH , P. rkt-io: A direct I/O stack for shielded execution. In Pro-
+     ceedings of the Sixteenth European Conference on Computer Systems
+     (2021), Association for Computing Machinery.
+[95] T OOTOONCHIAN , A., PANDA , A., L AN , C., WALLS , M., A RGY-
+     RAKI , K., R ATNASAMY, S., AND S HENKER , S. ResQ: Enabling
+

@@ -1,0 +1,1416 @@
+InfiniGen: Efficient Generative Inference
+of Large Language Models with Dynamic
+         KV Cache Management
+Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong Sim,
+               Seoul National University
+    https://www.usenix.org/conference/osdi24/presentation/lee
+
+
+
+
+This paper is included in the Proceedings of the
+18th USENIX Symposium on Operating Systems
+         Design and Implementation.
+          July 10–12, 2024 • Santa Clara, CA, USA
+                       978-1-939133-40-3
+
+
+                                Open access to the Proceedings of the
+                                18th USENIX Symposium on Operating
+                                 Systems Design and Implementation
+                                          is sponsored by
+         InfiniGen: Efficient Generative Inference of Large Language Models with
+                              Dynamic KV Cache Management
+
+                           Wonbeom Lee†      Jungi Lee†     Junghwan Seo                Jaewoong Sim
+                                               Seoul National University
+
+
+
+                              Abstract                           3 [6] and Gemini 1.5 [53] can even process up to 1 million
+Transformer-based large language models (LLMs) demon-            tokens, significantly expanding the context window by several
+strate impressive performance across various natural language    orders of magnitude.
+processing tasks. Serving LLM inference for generating long         In addition to the well-studied challenge of the model size,
+contents, however, poses a challenge due to the enormous         deploying LLMs now encounters a new challenge due to the
+memory footprint of the transient state, known as the key-       substantial footprint of the transient state, referred to as the
+value (KV) cache, which scales with the sequence length and      key-value (KV) cache, during long context processing and gen-
+batch size. In this paper, we present InfiniGen, a novel KV      eration. For generative LLM inference, the keys and values of
+cache management framework tailored for long-text gener-         all preceding tokens are stored in memory to avoid redundant
+ation, which synergistically works with modern offloading-       and repeated computation. Unlike the model weights, how-
+based inference systems. InfiniGen leverages the key insight     ever, the KV cache scales with the output sequence length,
+that a few important tokens that are essential for comput-       often consuming even more memory capacity than the model
+ing the subsequent attention layer in the Transformer can be     weights. As the demand for longer sequence lengths (along
+speculated by performing a minimal rehearsal with the in-        with larger batch sizes) continues to grow, the issue of the KV
+puts of the current layer and part of the query weight and key   cache size will become more pronounced in the future.
+cache of the subsequent layer. This allows us to prefetch only      Meanwhile, modern LLM serving systems support offload-
+the essential KV cache entries (without fetching them all),      ing data to the CPU memory to efficiently serve LLMs within
+thereby mitigating the fetch overhead from the host memory       the hardware budget [5,57]. These offloading-based inference
+in offloading-based LLM serving systems. Our evaluation on       systems begin to support even offloading the KV cache to
+several representative LLMs shows that InfiniGen improves        the CPU memory, thereby allowing users to generate much
+the overall performance of a modern offloading-based system      longer contexts beyond the GPU memory capacity. However,
+by up to 3.00× compared to prior KV cache management             transferring the massive size of the KV cache from the CPU
+methods while offering substantially better model accuracy.      memory to the GPU becomes a new performance bottleneck
+                                                                 in LLM inference.
+                                                                    In this work, we propose InfiniGen, a KV cache manage-
+1     Introduction                                               ment framework designed to synergistically work with mod-
+                                                                 ern offloading-based inference systems. InfiniGen builds on
+Large language models (LLMs) have opened a new era
+                                                                 two key design principles. First, it speculates and chooses
+across a wide range of real-world applications such as chat-
+                                                                 the KV cache entries that are critical to produce the next
+bots [40, 76], coding assistants [11, 43], language transla-
+                                                                 output token, dropping the non-critical ones, by conducting
+tions [1, 68], and document summarization [64, 74]. The re-
+                                                                 a minimal rehearsal of attention computation for Layer i at
+markable success of LLMs can largely be attributed to the
+                                                                 Layer i − 1. Second, it leverages the CPU memory capacity
+enormous model size, which enables effective processing and
+                                                                 and maintains the KV cache pool on the CPU, rather than on
+generation of long contents. For instance, while the maximum
+                                                                 the GPU, to ensure that the critical KV cache values can be
+sequence length of the first version of GPT was restricted to
+                                                                 identified for all outputs and layers with a large window size
+512 tokens [51], the latest version, GPT-4, can handle up to
+                                                                 while alleviating the concerns about limited GPU memory
+32K tokens, which is equivalent to approximately 50 pages
+                                                                 capacity for long content generation.
+of text [3]. Some recently announced models such as Claude
+                                                                    In particular, InfiniGen manipulates the model weights of-
+    † Equal contribution                                         fline to make the speculation far more efficient and precise, by
+
+
+
+USENIX Association                          18th USENIX Symposium on Operating Systems Design and Implementation            155
+skewing the Transformer architecture query and key matrices          2.1     Large Language Models
+to emphasize certain important columns. During the prefill
+stage, while the prompt and input of an inference request are        Large language models (LLMs) are composed of a stack of
+initially processed, InfiniGen generates partial weights for         Transformer blocks, each of which contains an attention layer
+use in the subsequent decoding (i.e., output generation) stage.      followed by a feed-forward layer [61]. The input tensor (X)
+At Layer i − 1 of the decoding stage, InfiniGen speculates on        of the Transformer block has a dimension of N × D, where N
+the attention pattern of the next layer (Layer i) using the atten-   is the number of query tokens, and D is the model dimension.
+tion input of Layer i − 1, a partial query weight, and a partial     This input tensor (X) is first layer-normalized (LayerNorm),
+key cache of Layer i. Based on the speculated attention pat-         and the layer-normalized tensor (Xa ) is fed into the attention
+tern, InfiniGen prefetches the essential KV cache entries from       layer as input. The attention input (Xa ) is multiplied by three
+the CPU memory for attention computation at Layer i. By              different weight matrices (WQ , WK , WV ) to generate Query
+dynamically adjusting the number of KV entries to prefetch,          (Q), Key (K), and Value (V ) matrices. Each weight matrix has
+InfiniGen brings only the necessary amount of the KV cache           a dimension of D × D. Thus, Query, Key, and Value have a
+to the GPU, thereby greatly reducing the overhead of the             dimension of N × D. These matrices are reshaped to have a
+KV cache transfer. In addition, InfiniGen manages the KV             dimension of H × N × d, where H is the number of attention
+cache pool by dynamically removing the KV cache entries of           heads and d is the head dimension; note that D = H × d.
+infrequently used tokens.                                               Each head individually performs attention computation,
+                                                                     which can be formulated as follows: softmax(QK T )V .1 The
+   We implement InfiniGen on a modern offloading-based
+                                                                     attention output, after a residual add (adding to the input tensor
+inference system [57] and evaluate it on two representative
+                                                                     X) and layer normalization, is fed into the feed-forward layer.
+LLMs with varying model sizes, batch sizes, and sequence
+                                                                     The feed-forward network (FFN) consists of two consecutive
+lengths. Our evaluation shows that InfiniGen achieves up to
+                                                                     linear projections and a non-linear activation operation be-
+a 3.00× speedup over the existing KV cache management
+                                                                     tween them. The output of FFN after a residual add becomes
+methods while offering up to a 32.6 percentage point increase
+                                                                     the output of a Transformer block, which has the same dimen-
+in accuracy. In addition, InfiniGen consistently provides per-
+                                                                     sionality as the input of the Transformer block (i.e., N × D).
+formance improvements with larger models, longer sequence
+                                                                     This allows us to easily scale LLMs by adjusting the number
+lengths, and larger batch sizes, while prior compression-based
+                                                                     of Transformer blocks.
+methods lead to saturating speedups.
+   In summary, this paper makes the following contributions:
+                                                                     2.2     Generative Inference and KV Caching
+    • We present InfiniGen, a dynamic KV cache manage-
+      ment framework that synergistically works with modern          Generative LLM inference normally involves two key stages:
+      offloading-based LLM serving systems by intelligently          the prefill stage and the decoding stage. In the prefill stage,
+      managing the KV cache in the CPU memory.                       LLMs summarize the context of the input sequence (i.e., input
+                                                                     prompt) and produce a new token that serves as the initial
+    • We propose a novel KV cache prefetching technique with         input for the decoding stage. Subsequently, using this new
+      ephemeral pruning, which speculates on the attention           token, LLMs run the decoding stage to generate the next token.
+      pattern of the subsequent attention layer and brings only      The newly generated token is then fed back into the decoding
+      the essential portion of the KV cache to the GPU while         stage as input, creating an autoregressive process for token
+      retaining the rest in the CPU memory.                          generation. In this work, we refer to each token generation in
+                                                                     the decoding stage as an iteration.
+    • We implement InfiniGen on a modern offloading-based               To generate a new token that aligns well with the context,
+      inference system and demonstrate that it greatly out-          LLMs need to compute the relationship between the last token
+      performs the existing KV cache management methods,             and all the previous ones, including the tokens from the input
+      achieving up to 3.00× faster performance while also            sequence, in the attention layer. A naïve approach to this is
+      providing better model accuracy.                               to recompute the keys and values of all the previous tokens
+                                                                     at every iteration. However, this incurs a significant overhead
+                                                                     due to redundant and repeated computation. Furthermore, the
+                                                                     computation overhead linearly grows with the number of the
+2     Background
+                                                                     previous tokens; i.e., the overhead becomes larger for longer
+                                                                     sequences.
+This section briefly explains the operational flow and the
+                                                                        To avoid such overhead, the keys (K) and values (V ) of
+KV caching technique of large language models and intro-
+                                                                     all the previous tokens are typically memoized in memory,
+duces the singular value decomposition (SVD) as a method of
+skewing matrices for a better understanding of our proposed             1 In this work, we refer to the results of QK T and softmax(QK T ) as atten-
+
+framework, which we discuss in Section 4.                            tion scores and attention weights, respectively.
+
+
+
+
+156    18th USENIX Symposium on Operating Systems Design and Implementation                                             USENIX Association
+                                                                                250                                               250
+   (a) Q = 𝐔Σ𝐕 #
+    𝑣!                                                  𝑞"                      200                                               200
+                                𝜎!
+
+
+
+
+                                                                                                                      Size (GB)
+                                                                    Size (GB)
+            𝑣"     Σ                       𝐔      𝑞!                            150                                               150
+
+                                                                                100                                               100
+                                     𝜎"
+                                                                                 50                                                50
+
+                                                                                  0                                                 0
+      % = 𝐔Σ(𝐕 # 𝐴)
+  (b) Q                                                                               256   512 1024 2048 4096 8192                     2   4   8   16   32   64
+
+         𝒆𝟐                                                  /𝟏
+                                                             𝒒                          (a) Sequence Length                                 (b) Batch Size
+                                𝜎!                 /𝟐
+                                                   𝒒
+            𝒆𝟏      Σ                      𝐔
+                                                                    Figure 2: Total size of the KV cache and model weights of OPT-30B
+                                     𝜎"
+                                                                    for different sequence lengths and batch sizes. The batch size of
+                                                                    (a) is 16, and the sequence length of (b) is 2048. The dotted line
+Figure 1: Transformation from matrix VT to matrix Q in terms of     represents the size of the model weights.
+SVD. The orthogonal matrix A maximizes the difference in magni-
+tude between the column vectors of Q.                               where U and V are orthogonal matrices of size m × m and
+                                                                    n × n, respectively.2 Σ is an m × n diagonal matrix, which
+which is known as the KV cache. The KV cache then keeps             has nonzero values (σ1 , σ2 , ..., σk ) on the diagonal, where
+updated with the key and value of the generated token at each       k = min(m, n). In terms of linear transformation, it is well
+iteration. As such, the dimension of the KV cache at the i-         known that a transformation of a vector v ∈ Rn by a real matrix
+th iteration can be expressed as H × (N + i) × d. If batched        B (i.e., the product of B and v) is a rotation and/or reflection
+inference is employed, the size of the KV cache also grows          in Rn if the B matrix is orthogonal. If B is an m × n diagonal
+linearly to the batch size. By employing the KV cache, we can       matrix, each dimension of v is stretched by the corresponding
+avoid repeated computation and produce the key and value            diagonal entry of B and is projected to Rm .
+of only one token at each iteration. Note that in the decoding         For example, Figure 1 shows how the column vectors v1
+stage, the input to the Transformer block (X) has a dimension       and v2 of VT would transform to column vectors q1 and q2
+of 1 × D, and the dimension of the attention score matrix           of Q, when m and n are 2. In Figure 1(a), the orthogonal unit
+becomes H × 1 × (N + i) at the i-th iteration.                      vectors v1 and v2 are first stretched to the points on an ellipse
+                                                                    whose semi-axis lengths correspond to the diagonal entries in
+                                                                    Σ. The vectors are then rotated and/or reflected to q1 and q2
+2.3    Outliers in Large Language Models                            by matrix U. On the other hand, Figure 1(b) shows how or-
+Large language models have outliers in the Transformer block        thogonal matrix A performs rotation to make the resulting q˜1
+input tensors. The outliers refer to the elements with substan-     much larger than q˜2 . Specifically, A rotates vectors v1 and v2
+tially larger magnitudes than the other elements. The outliers      to e1 and e2 , which map to the semi-axes of the ellipse. In this
+in LLMs appear in a few fixed channels (i.e., columns in a          way, the vectors are stretched to the maximum and minimum
+2D matrix) across the layers. Prior work has shown that out-        by the matrix Σ. This process emphasizes the magnitude of
+liers are due to the intrinsic property of the model (e.g., large   q˜1 over q˜2 , which allows us to effectively predict the attention
+magnitudes in a few fixed channels of layer normalization           score using only q˜1 while omitting q˜2 .
+weights) [19, 65].
+                                                                    3            Motivation
+2.4    Singular Value Decomposition
+                                                                    In this section, we first explain that the KV cache size becomes
+We observe that skewing the query and key matrices to make          a critical issue for long-text generation in LLM inference,
+a small number of channels much larger than others and using        and it becomes more problematic when deploying modern
+only those channels to compute the attention score matrix can       offloading-based inference systems (Section 3.1). We then
+effectively predict which tokens are important. In essence, we      discuss why the existing KV cache management methods
+multiply the Q and K matrices with an orthogonal matrix A to        cannot fundamentally address the problem in the offloading-
+make it align with the direction that Q stretches the most, to      based inference system (Section 3.2).
+produce the respective skewed matrices Q̃ and K̃. We explain
+in detail why we use an orthogonal matrix in Section 4.2.
+                                                                    3.1               KV Cache in LLM Inference Systems
+   To find such an orthogonal matrix A, we employ the sin-
+gular value decomposition (SVD), which is a widely used             As discussed in Section 2.2, today’s LLM serving systems ex-
+matrix factorization technique in linear algebra. For a real        ploit KV caching to avoid redundant computation of key and
+matrix Q of size m × n, its SVD factorization can be expressed          2 Note that this V, typeset with a different font, is one of the resulting matri-
+as follows:                                                         ces of SVD and is distinct from the V of the Value matrix in the Transformer
+                          Q = U Σ VT ,                              attention layer.
+
+
+
+
+USENIX Association                             18th USENIX Symposium on Operating Systems Design and Implementation                                           157
+ (a) Full GPU                  Per-block Latency                                                                                    Layer 0                             Layer 12                                        Layer 24                              Layer 30
+                                                                                                              1.2                                                                                             1.2
+            Attention    FFN     Attention   FFN
+                                                                                   time
+
+
+
+
+                                                                                          Cosine Similarity
+
+
+
+
+                                                                                                                                                                                          Cosine Similarity
+                                 Load Cache                                                                   1.0                                                                                             1.0
+ (b) KV cache on CPU
+                                                                                                              0.8                                                                                             0.8
+            Attention    FFN                                     Attention   FFN
+                                                                                   time
+                                         Load Cache                                                           0.6                                                                                             0.6
+
+ (c) Prefetch KV cache
+                                                                                                              0.4                                                                                             0.4
+
+
+
+
+                                                                                                                    0
+                                                                                                                        200
+                                                                                                                              400
+                                                                                                                                    600
+                                                                                                                                          800
+                                                                                                                                                1000
+                                                                                                                                                       1200
+                                                                                                                                                              1400
+                                                                                                                                                                     1600
+                                                                                                                                                                            1800
+                                                                                                                                                                                   2000
+
+
+
+
+                                                                                                                                                                                                                    0
+                                                                                                                                                                                                                        200
+                                                                                                                                                                                                                              400
+                                                                                                                                                                                                                                    600
+                                                                                                                                                                                                                                          800
+                                                                                                                                                                                                                                                1000
+                                                                                                                                                                                                                                                       1200
+                                                                                                                                                                                                                                                              1400
+                                                                                                                                                                                                                                                                     1600
+                                                                                                                                                                                                                                                                            1800
+                                                                                                                                                                                                                                                                                   2000
+            Attention    FFN                   Attention   FFN
+                                                                                   time
+                        Load Cache
+                                                                                                                                          Token ID                                                                                        Token ID
+ (d) Prefetch critical KV                          Maximum Reduction                                                                      (a) H2O                                                                                    (b) Optimal
+            Attention    FFN Attn FFN
+                                                                                   time
+             Load Cache                                                                   Figure 4: Cosine similarity between the attention weights of the base
+                                                                                          model with full cache and (a) H2 O or (b) Optimal. H2 O and Optimal
+Figure 3: Comparison between different execution styles of Trans-                         use 200 tokens for attention computation. We use OPT-6.7B and a
+former blocks.                                                                            random sentence with 2000 tokens from the PG-19 dataset [52].
+
+value projections during the decoding stage. While this is an                             high bandwidth of GPU memory. However, the maximum
+effective solution for short sequence generation with a single                            batch size or sequence length is limited by the GPU memory
+client request, the KV cache quickly becomes a key mem-                                   capacity, which is relatively smaller than the CPU memory.
+ory consumer when we generate long sequences or employ                                       To enable a larger batch size or a longer sequence length,
+modern request batching techniques [57, 71].                                              we can offload the KV cache to CPU memory (KV cache
+   Figure 2 shows the combined size of LLM weights and the                                on CPU), as shown in Figure 3(b). While offloading-based
+KV cache across different sequence lengths and batch sizes.                               inference systems alleviate the limitation on the batch size
+As depicted in the figure, the model size remains constant                                and sequence length, transferring hundreds of gigabytes of the
+regardless of sequence lengths or batch sizes, whereas the KV                             KV cache to the GPU for attention computation significantly
+cache size linearly scales with them. Note that modern LLM                                increases the overall execution time of Transformer blocks
+serving systems, such as NVIDIA Triton Inference Server [45]                              due to the limited PCIe bandwidth.
+and TensorFlow Serving [47], already support batched infer-                                  Even when we apply a conventional prefetching technique
+ence for better compute utilization and higher throughput in                              (Prefetch KV cache), as shown in Figure 3(c), only part of
+serving client requests. When individual requests are batched,                            the load latency can be hidden by the computation of the
+each request retains its own KV cache, thereby increasing                                 preceding Transformer block. Note that although compressing
+the overall KV cache size for the inference. Even for a single                            the KV cache via quantization could potentially reduce the
+client request, beam search [59] and parallel sampling [20]                               data transfer overhead in offloading-based systems [57], it
+are widely used to generate better outputs or to offer clients a                          does not serve as a fundamental solution as quantization does
+selection of candidates [11, 24]. The techniques also increase                            not address the root cause of the KV cache problem, which is
+the size of the KV cache like batched inference as multiple se-                           the linear scaling of KV entries with the sequence length. This
+quences are processed together. Consequently, the KV cache                                necessitates intelligent KV cache management to mitigate the
+size can easily exceed the model size for many real-world use                             performance overhead while preserving its benefits.
+cases, as also observed in prior work [37, 49, 57, 78]. This can
+put substantial pressure on GPU memory capacity, which is
+relatively scarce and expensive.                                                          3.2                       Challenges in KV Cache Management
+LLM Inference Systems with Offloading. Modern LLM                                         The fundamental approach to mitigating the transfer overhead
+serving systems such as DeepSpeed [5] and FlexGen [57] al-                                of the KV cache from the CPU to GPU is to reduce the vol-
+ready support offloading the model weights or the KV cache                                ume of the KV cache to load by identifying the critical keys
+to the CPU memory. When it comes to offloading-based infer-                               and values for computing attention scores, as shown in Fig-
+ence systems, the KV cache size becomes more problematic                                  ure 3(d). It is widely recognized that the keys and values of
+due to the low PCIe bandwidth between the CPU and GPU,                                    certain tokens are more important than others in attention
+which becomes a new and critical bottleneck.                                              computation [9, 10, 14, 33, 63]. As explained in Section 2.1,
+   Figure 3 depicts a high-level timing diagram between dif-                              after computing the attention score, the softmax operation
+ferent execution styles of Transformer blocks. Figure 3(a)                                is applied, which emphasizes a few large values of tokens.
+represents the case when the KV cache entirely resides in                                 Therefore, skipping attention computation for some less criti-
+the GPU memory (Full GPU). In this case, the load latency                                 cal tokens does not significantly degrade the model accuracy,
+of the KV cache (Load Cache) involves a simple read oper-                                 provided the token selection is appropriate.
+ation from the GPU memory, which is negligible due to the                                    In this context, several recent works propose to reduce
+
+
+
+158    18th USENIX Symposium on Operating Systems Design and Implementation                                                                                                                                               USENIX Association
+                                                                                                  1200                                                    20000
+the KV cache size through key/value evictions at runtime
+
+
+
+
+                                                                                                                                         # Query Tokens
+                                                                                 # Query Tokens
+within a constrained KV cache budget [37, 78]. However, all                                        900                                                    15000
+
+the prior works assume the persistence of attention patterns                                       600                                                    10000
+
+across iterations; that is, if a token is deemed unimportant in
+                                                                                                   300                                                    5000
+the current iteration (i.e., having a low attention weight), it
+is likely to remain unimportant in the generation of future                                          0                                                       0
+                                                                                                         16   512   1008   1504   2000                            16   512   1008   1504   2000
+tokens. Under the assumption, they evict the tokens with a                                                     # Key Tokens                                              # Key Tokens
+low attention weight from the KV cache at each iteration                                                        (a) Layer 0                                              (b) Layer 18
+when the KV cache size exceeds its budget. The keys and
+values of the evicted tokens are permanently excluded from                       Figure 5: Histogram that shows the number of key tokens needed
+the subsequent iterations while being removed from the mem-                      to achieve 0.9 out of 1.0 total attention weight for (a) Layer 0 and
+ory. Although the recent works on managing the KV cache                          (b) Layer 18 of the OPT-6.7B model. The bin width is set to 16. We
+can be applied to offloading-based inference systems, we ob-                     observe that the distribution dynamically changes across the layers.
+serve that they do not effectively address the challenges in KV
+cache management below and thus have subpar performance                          token ID increases. This implies that Layer 0 has a broader
+with offloading-based inference systems.                                         attending pattern than other layers; i.e., the attention weights
+C1: Dynamic nature of attention patterns across iterations.                      are relatively similar between key tokens. Thus, the selected
+Figure 4 shows the cosine similarity between the attention                       200 tokens with the large attention weight do not adequately
+weights of the baseline model, which uses the KV cache of all                    represent the attention pattern of the baseline model for this
+prior tokens for computing attention weights (i.e., a maximum                    layer, as they are likely only slightly larger than the others, not
+of 2000 tokens in the experiment), and two different KV cache                    strongly so. In such cases, it becomes necessary to compute
+management methods (H2 O and Optimal) with a KV cache                            the attention weight with a larger number of tokens.
+budget of 200 tokens.3 H2 O [78] is a state-of-the-art technique                    To estimate how many keys/values from the KV cache need
+that retains only a small percentage of important tokens in                      to be retained, we sort the attention weight for each query
+the KV cache to reduce its size. It assesses the importance of                   token in descending order and sum the key tokens until the
+each token in every iteration and removes unimportant ones                       cumulative weight reaches 0.9. Figure 5 presents a histogram
+before the next iteration to keep the KV cache size in check                     of the number of query tokens (y-axis) requiring the number
+(i.e., using a narrow assessment window). In contrast, Optimal                   of key tokens (x-axis) needed to reach a weight of 0.9 (out of
+represents the scenario where we choose the same number                          the total attention weight of 1.0) in two different layers: Layer
+of tokens as H2 O from the KV cache at each iteration but                        0 and Layer 18. Layer 0 shows a broad distribution, indicating
+retain all prior keys and values (i.e., using a wider assessment                 a significant variation in the number of key tokens required
+window). In other words, Optimal selects 200 tokens out of                       to achieve a weight of 0.9 for each query token. In contrast,
+the entire sequence of previous tokens at each iteration.                        Layer 18 exhibits a highly skewed distribution, suggesting
+   The figure indicates that despite H2 O-like approaches as-                    that the majority of the query tokens in this layer require
+suming that the attention pattern does not change across it-                     only a few key tokens to reach a weight of 0.9. This implies
+erations, this is not the case in practice. The tokens deemed                    that we need to dynamically adjust the number of key tokens
+unimportant in the current iteration could become important in                   participating in attention computation across different layers
+subsequent iterations. Consequently, H2 O exhibits high simi-                    to make efficient use of the KV cache budget.
+larity until around 200 iterations (i.e., within the KV cache                    C3: Adjusting the number of KV entries across queries. H2 O
+budget), but as the sequence length extends beyond the KV                        sets the number of key/value tokens to retain as a fixed per-
+cache budget, it starts to struggle with the dynamic nature of                   centage of the input sequence length. The KV cache budget
+the attention pattern, resulting in lower cosine similarity than                 remains constant regardless of how many tokens have been
+the Optimal case. Note that while we only show the scenario                      generated. By analyzing the data from Figure 5 on Layer 18,
+of a KV cache budget of 200 out of a total sequence length                       we observe that this fixed KV cache budget has some limi-
+of 2000 tokens for brevity, this issue would become more                         tations. For instance, with an input sequence length of 200
+pronounced as the sequence length surpasses it.                                  and a 20% KV cache budget, H2 O maintains 40 key/value
+C2: Adjusting the number of KV entries across layers. Fig-                       tokens throughout token generations. However, most of the
+ure 4 also illustrates that the impact of the KV cache eviction                  subsequent query tokens require more than 40 tokens to effec-
+varies across the layers in LLMs. For Layer 0, both H2 O and                     tively represent the attention weight of the baseline model; for
+Optimal show a significant drop in cosine similarity as the                      example, the 500th , 1000th , 1500th , and 2000th tokens need
+   3 The cosine similarity measures how much each row of the attention
+                                                                                 80, 146, 160, and 164 key tokens, respectively, to reach a
+weight is similar to the case of the full KV cache. If they are similar, the
+                                                                                 cumulative attention weight of 0.9. This implies an inade-
+generated tokens will also be similar. Thus, a low cosine similarity indicates   quate amount of the key/value tokens to properly represent
+low accuracy far from the baseline model with the full KV cache.                 the attention weight of the baseline model. Furthermore, the
+
+
+
+USENIX Association                                      18th USENIX Symposium on Operating Systems Design and Implementation                                                               159
+number of key tokens required to reach 0.9 varies even for the         InfiniGen System
+adjacent query tokens; for instance, the 998th , 999th , 1000th ,         GPU
+1001st , and 1002nd tokens need 172, 164, 146, 154, and 140                Memory
+                                                                                                    Partial Weight
+                                                                                                  Index Generation
+                                                                                                                             Launch        PWIGen
+                                                                                                                             Selected
+                                                                                                                                          Controller
+key tokens, respectively. Fixing the KV cache budget without                Modified                                          Indices
+                                                                              QK
+accounting for the variance between query tokens inevitably                 Weights                  KV Selection                          KVSel
+results in ineffective KV cache management. Therefore, we                                      Partial Attn   > (𝑚𝑎𝑥 − 𝛼)   Selected      Controller
+                                                                             Other                                           Tokens
+                                                                            Model
+need to dynamically adjust the amount of the key/value to-                  Weights                 LLM Inference
+                                                                                                                                          Inference
+kens loaded and computed for each query token to efficiently                Partial
+                                                                                               Attention           FFN
+                                                                                                                                          Controller
+                                                                            Weight
+manage the KV cache.                                                         and
+                                                                                                        Skewing
+                                                                            Cache                SVD              MatMul                  Skewing
+Summary. Prior works aiming to reduce the KV cache                                                                                        Controller
+size through token eviction inherently have some challenges.
+                                                                                                                           Selected
+Given the dynamic attention pattern across iterations, perma-             CPU Memory                                       KV Cache
+                                                                                                                                           Pool
+nently excluding evicted tokens from future token generation                              KV Cache Pool
+                                                                                                                                          Manager
+can result in a non-negligible drop in accuracy. Instead, we
+                                                                                           Data Plane                                   Control Plane
+need to dynamically select critical tokens from the KV cache
+while avoiding the outright eviction of less important ones.                           Figure 6: Overview of InfiniGen design.
+Furthermore, the fixed size of the KV cache budget in prior
+works leads to inefficient KV cache management. The number          so, we maintain the KV cache pool in the CPU memory and
+of key/value tokens required for each layer differs, and each       selectively and speculatively load a few of tokens.
+query token demands a varying number of key/value tokens               In detail, we use the attention input of the previous Trans-
+to effectively represent the attention pattern of the baseline      former layer to speculate and prefetch the keys and values of
+model. Failing to account for these variations may result in        the important tokens for the current layer. The speculation is
+ineffective KV cache management. Thus, we need to dynam-            done by performing a minimal rehearsal of attention computa-
+ically adjust the number of key/value tokens to select from         tion of the current layer in the preceding layer. This allows for
+the KV cache while considering the variances between layers         reducing the waste of PCIe bandwidth by only transferring the
+and query tokens.                                                   keys and values critical for attention computation while pre-
+                                                                    serving model accuracy. In addition, although the KV cache is
+                                                                    offloaded to CPU memory, which is much cheaper and larger
+4     InfiniGen Design                                              than GPU memory, we manage the KV cache pool size so as
+                                                                    not to put too much pressure on CPU memory.
+In this section, we present InfiniGen, a KV cache manage-              As shown in Figure 6, there are two major components in
+ment framework for offloading-based inference systems. We           the InfiniGen runtime. The first includes the Partial Weight
+first show the high-level overview of our proposed KV cache         Index Generation Controller, KV Selection Controller, and
+management solution (Section 4.1) and discuss the opportuni-        Inference Controller. These controllers cooperate to specu-
+ties of KV cache prefetching that we observe (Section 4.2).         late and prefetch the critical KV cache entries while serving
+We then explain our prefetching module (Section 4.3), which         LLM inference. Additionally, to aid in prefetching, the Skew-
+builds on the offloading-based inference systems, and dis-          ing Controller performs offline modifications on the model
+cuss how InfiniGen manages the KV cache on CPU memory               weights. We explain each operation in Section 4.3. The sec-
+regarding the memory pressure (Section 4.4).                        ond component is the Pool Manager. It manages the KV cache
+                                                                    pool on CPU memory under CPU memory pressure, which
+                                                                    we discuss in Section 4.4.
+4.1    Overview
+Figure 6 shows an overview of our KV cache management               4.2    Prefetching Opportunities
+framework, InfiniGen, which enables offloading the KV cache
+with low data transfer overhead. The key design principle           In the following, we first explain why using the attention input
+behind InfiniGen is to exploit the abundant CPU memory              of the previous layer for speculation makes sense. We then
+capacity to increase the window size when identifying the           show how we modify the query and key weight matrices to
+important tokens in the KV cache. As such, the majority of the      make our speculation far more effective.
+tokens for the KV cache are kept in the CPU memory as we            Attention Input Similarity. Our prefetching module builds
+generate new tokens, not completely discarding them unlike          on the key observation that the attention inputs of consecutive
+prior works [37, 78]. However, we do not bring the entire           attention layers are highly similar in LLMs. There are two
+KV cache to the GPU for attention computation, but load and         major reasons behind this. The first is the existence of outliers
+compute with only the keys and values of a few important            in LLMs, as discussed in Section 2.3, and the second is due
+tokens, dropping other unimportant ones dynamically. To do          to layer normalization (LayerNorm).
+
+
+
+160    18th USENIX Symposium on Operating Systems Design and Implementation                                                    USENIX Association
+                                                                                 Table 1: Average cosine similarity between the Transformer
+(Normal Dimension)
+
+                                                                           8
+                     : 𝑇𝑏𝑙𝑜𝑐𝑘_𝑖𝑛!
+                     : 𝑇𝑏𝑙𝑜𝑐𝑘_𝑖𝑛!"#
+                                                                                 block input of Layer i (Tblock_ini ) and the other three tensors
+
+
+
+
+                                            # Tokens
+      y-axis
+
+
+
+
+                     : 𝐴𝑡𝑡𝑛_𝑜𝑢𝑡!"#                                               (Tblock_ini−1 , Attn_outi−1 , FFN_outi−1 ) across the layers. We
+                     : 𝐹𝐹𝑁_𝑜𝑢𝑡!"#                                          0
+                                                                                 use a random sentence with 2000 tokens from the PG-19 dataset [52].
+
+                            x-axis
+                                                                           -8        Tensors         OPT-6.7B   OPT-13B   OPT-30B Llama-2-7B   Llama-2-13B
+                     (Outlier Dimension)               Channel Dimension          Tblock_ini−1        0.95       0.96      0.97       0.89        0.91
+                     (a) Input Similarity                  (b) Query              Attn_outi−1         0.29       0.28      0.36       0.31        0.27
+                                                                                   FFN_outi−1         0.34       0.28      0.35       0.37        0.34
+Figure 7: (a) Visualization of input similarity between consecutive
+Transformer blocks. (b) Query matrix of Layer 18 of the OPT-13B
+                                                                                 Transformer block input.
+model. We only show channels from 3000 to 4000 for a clearer view
+                                                                                    Table 1 shows the cosine similarity between Tblock_ini
+of column-wise patterns.
+                                                                                 and the other three tensors (Tblock_ini−1 , Attn_outi−1 ,
+  To begin with, the input to the Transformer block i                            FFN_outi−1 ). As shown in the table, Tblock_ini is highly
+(Tblock_ini ) can be formulated as follows:                                      dependent on the Tblock_ini−1 rather than others. InfiniGen
+                                                                                 leverages this key observation to speculate on the attention
+         Attn_outi−1 = Attn(LN(T block_ini−1 ))                                  pattern of Layer i using the attention input of Layer i − 1.
+    FFN_outi−1 = FFN(LN(T block_ini−1 + Attn_outi−1 ))                     (1)   Note that Tblock_in gradually changes across the layers; the
+            T block_ini = T block_ini−1 + Attn_outi−1 + FFN_outi−1 ,             inputs to distant layers are distinct.
+                                                                                 Skewed Partial Weight. We observe that the attention score
+where Tblock_ini−1 is an input for Layer i − 1, which is                         highly depends on a few columns in the query and key matri-
+first layer-normalized (LN) and is fed into the attention                        ces. Figure 7(b) shows the values in a query matrix of Layer
+layer in the Transformer block. After performing atten-                          18 of the OPT-13B model, where the column-wise patterns
+tion, we obtain the output (Attn_outi−1 ), which is added                        indicate that there exist certain columns with large magni-
+to Tblock_ini−1 because of the residual connection. Then,                        tudes in the matrix; we observe the same patterns in the key
+the sum of Tblock_ini−1 and Attn_outi−1 is again layer-                          and query matrices across different layers and models. The
+normalized and is fed into the FFN layer. Afterward, we ob-                      large magnitude columns have a great impact on the attention
+tain the FFN output (FFN_outi−1 ), which is added to the sum                     pattern because the dot product between the query and key is
+of Tblock_ini−1 and Attn_outi−1 again due to the residual                        highly affected by these few columns. The column-wise pat-
+connection. Finally, the sum of Tblock_ini−1 , FFN_outi−1 ,                      tern in the attention input indicates that there is little variance
+and Attn_outi−1 is used as input to the next Transformer                         between each row in the outlier channels. Thus, the dot prod-
+block (Tblock_ini ).                                                             uct between any row of the attention input and a column of the
+   Now, we show why the attention input of Layer i is similar                    weight matrix could have a similarly large magnitude, which
+to the one of Layer i − 1 with the example in Figure 7(a). In                    induces the outlier channels in the query and key matrices.
+the figure, there are four vectors, each of which corresponds to                    Going one step further, if we make a few columns in the
+a term in Equation 1. The x-axis represents an outlier channel                   query and key matrices have much larger magnitude than oth-
+among the model dimension, while the y-axis represents a                         ers, a much smaller number of columns significantly affects
+normal channel (i.e., other than the outlier channel). In prac-                  the attention pattern. We can do this by multiplying the query
+tice, there exist more normal channels and only a few outlier                    and key weight matrices with the same orthogonal matrix A.
+channels in the input tensors, but we only present one channel                   Since the transpose of the orthogonal matrix is the inverse of
+each for both outlier and normal channels for clarity.                           itself, the proposed operation does not change the final result,
+   Tblock_ini−1 is highly skewed along the outlier chan-                         as shown in Equation 2 (i.e., this is mathematically equivalent
+nel (x-axis) due to a few outlier channels containing signifi-                   to QK T , not an approximation):
+cantly large values compared to those in the normal chan-
+nels. In contrast, Attn_outi−1 and FFN_outi−1 have rela-                                         Q̃ = Xa ×WQ × A,                 K̃ = Xa ×WK × A
+tively small values for both outlier and normal channels (i.e.,                          Q̃ × K̃ = Xa ×WQ × A × (Xa ×WK × A)T
+                                                                                                 T
+
+short vectors). This is because the attention and FFN inputs                                         = Xa ×WQ × A × AT ×WKT × XaT
+are layer-normalized, reducing the magnitude of each value.                                                                                               (2)
+                                                                                                     = Xa ×WQ ×WKT × XaT
+The small magnitude of the attention and FFN inputs nat-
+urally results in their output values being relatively small                                         = Xa ×WQ × (Xa ×WK )T
+compared to Tblock_ini−1 . Consequently, Tblock_ini is                                               = Q × KT ,
+highly influenced by Tblock_ini−1 , rather than Attn_outi−1
+or FFN_outi−1 . Highly similar inputs between consecutive                        where Q̃ and K̃ are skewed query and key matrices, while WQ
+Transformer blocks lead to similar inputs across the attention                   and WK are query and key weight matrices. Xa denotes the at-
+layers, as the attention input is a layer-normalized one of the                  tention input. We set the orthogonal matrix A whose direction
+
+
+
+USENIX Association                                           18th USENIX Symposium on Operating Systems Design and Implementation                        161
+       Offline                                                                                                         Partial Weight Index
+       Skewing                                                                                                              Generation
+                                                                                                                                                                  3 6 7
+
+        Prefill                            Decoding                                                                   1. Column Sum
+       Partial            Layer (𝒊 − 𝟏)                  Layer 𝒊
+     Weight Idx    KV                              KV     Light
+ GPU Generation    Sel.    Attention      FFN      Sel. Attention   FFN   ···                                         2. Top-K
+                                                                                time       Absolute Sum of                                 Selected Idx          Selected
+ CPU                      Prefetching                                                                                                        : 3, 6, 7
+                                           Selected                                     Skewed Query and Key                                                      Partial
+                   Selected                                Prefetching     ···
+                  Token IDs
+                                          Keys/Values                                                                                                            Weights
+
+ Figure 8: Operation flow of the prefetching module of InfiniGen.                            Figure 9: Partial weight generation in the prefill stage.
+
+aligns with the direction that the query matrix stretches the                            KV Selection
+most. Specifically, we first decompose the query matrix using                                                              Attention
+                                                                                         Partial Query Projection                                         KV Selection
+                                                                                                                         Speculation
+SVD and obtain U, Σ, and V. We then set A to orthogonal                                                                Partial Key Cache                                 𝑚𝑎𝑥
+matrix V to align the column vectors with the standard unit                                                                 (Transposed)              𝑎𝑙𝑝ℎ𝑎
+
+vectors as VT A = VT V = I, where I is an identity matrix. We                                    ×         =           ×         ×
+                                                                                                                                 ≈
+                                                                                        Attention           Partial
+formulate the skewed query matrix as follows:                                             Input     Partial  Query     =         =
+                                                                                                                                                            : Selected
+                                                                                                 Query Weight                Speculated
+              Q̃ = Q × A = UΣVT × A = UΣVT × V                                   (3)                                       Attention Score                  : Excluded
+
+
+In this way, we can make a few columns with large mag-                                    Figure 10: Attention score speculation in the decoding stage.
+nitudes in Q̃ without altering the result of computation, as
+discussed in Section 2.4.                                                              is essential to select the same column indices in the query
+                                                                                       weight matrix and the key cache to obtain a proper approxima-
+                                                                                       tion of the attention score. However, the indices of the outlier
+4.3    Efficiently Prefetching KV Cache                                                columns of the skewed query (Q̃) and key (K̃) matrices may
+Prefetching Scheme. Figure 8 shows the operation flow of the                           not align exactly. To obtain partial matrices that capture the
+prefetching module in InfiniGen. In the offline phase, Infini-                         outliers, we first take the element-wise absolute values of the
+Gen modifies the weight matrices to generate skewed query                              skewed query and key matrices, then add these two matrices
+and key matrices. To achieve this, InfiniGen first runs the for-                       together. This helps us calculate the sum of each column and
+ward pass of the model once with a sample input. During this                           perform top-k operation only once while accommodating the
+process, InfiniGen gathers the query matrix from each layer                            outlier columns of both query and key matrices. We then sum
+and performs singular value decomposition (SVD) of each                                the elements in each column and select the top-k columns in
+query matrix. The skewing matrix (Ai ) of each layer is ob-                            the matrix; we choose 30% of the columns in our work. Using
+tained using the decomposed matrices of the query matrix, as                           the sum of column values captures the global trend of each
+shown in Equation 3. This matrix is then multiplied with each                          column while minimizing the effect of variance in each row.
+of the query and key weight matrices in the corresponding                              The selected columns better approximate the attention pattern
+layer. Importantly, after the multiplication, the dimensions of                        because of the use of skewed query and key matrices.
+the weight matrices remain unchanged. Note that the skewing                            Decoding Stage. In the decoding stage, InfiniGen speculates
+is a one-time offline process and does not incur any runtime                           on the attention pattern of the next layer and determines the
+overhead because we modify the weight matrices that are                                critical keys and values to prefetch. Figure 10 shows how
+invariant at runtime. As we exploit the column-wise pattern,                           InfiniGen computes the speculated attention score. At Layer
+which stems from the intrinsic property of the model rather                            i − 1, we use the partial query weight matrix and key cache
+than the input, whenever we compute the query and key for                              of Layer i, which are identified in the prefill stage, along with
+different inputs after the skewing, the values exhibit a high                          the attention input of Layer i − 1. After multiplying the partial
+degree of skewness, thereby improving the effectiveness of                             query and partial key cache, InfiniGen selects tokens with
+our prefetching module. Note that skewing does not alter the                           high attention scores.
+original functionality. Even with the skewing, the attention                              We set the threshold considering the maximum value of
+layer produces identical computation results.                                          the speculated attention score. We select only the tokens with
+Prefill Stage. In the prefill stage, InfiniGen selects several                         an attention score greater than the maximum score subtracted
+important columns from the query weight matrix and the key                             by alpha. It is noted that subtraction from the attention score
+cache to speculate on the attention pattern, and generates par-                        results in division after softmax. For example, assume that
+tial query weight and key cache matrices used in the decoding                          the attention score of the 3rd token is the maximum attention
+stage. Figure 9 shows how InfiniGen creates these partial ma-                          score minus 5. Once we apply softmax to the attention scores,
+trices. Because we multiply each column in the query matrix                            the attention weight of the 3rd token is the maximum attention
+with the corresponding row in the transposed key matrix, it                            weight divided by e5 ≈ 148.4. Even though we do not use this
+
+
+
+162    18th USENIX Symposium on Operating Systems Design and Implementation                                                                   USENIX Association
+token, it does not noticeably hurt the accuracy of the model         and the LRU-based one show comparable model accuracy,
+since it accounts for less than 1% of importance (≈ 1/148.4)         which we discuss in Section 5.2. We opt for a counter-based
+after softmax. Thus, InfiniGen only prefetches the keys and          approach due to its simpler design and to avoid atomic mem-
+values of the tokens with an attention score larger than the         ory updates for better parallelism.
+highest attention score minus alpha. As multiple attention
+heads are computed in parallel, we ensure that each head in the      5     Evaluation
+same layer fetches the same number of tokens by averaging
+the number of tokens between the maximum score and the
+                                                                     5.1    Experimental Setup
+threshold across the heads.
+   By reducing the amount of KV cache to load and compute,           Model and System Configuration. We use Open Pre-trained
+InfiniGen effectively reduces the loading latency (i.e., data        Transformer (OPT) models [77] with 6.7B, 13B, and 30B
+transfer from CPU to GPU) while maintaining an output qual-          parameters for evaluation. The 7B and 13B models of Llama-
+ity similar to that of the original model with a full KV cache.      2 [60] are also used to demonstrate that InfiniGen works
+Moreover, as InfiniGen does not require a fixed number of to-        effectively across different model architectures. We run the
+kens to load from CPU memory, it utilizes only the necessary         experiments on a system equipped with an NVIDIA RTX
+PCI interconnect bandwidth. InfiniGen initiates speculation          A6000 GPU [44] with 48GB of memory and an Intel Xeon
+and prefetching from Layer 1 because the outliers, which are         Gold 6136 processor with 96GB of DDR4-2666 memory.
+essential for exploiting input similarity, emerge during the         PCIe 3.0 ×16 interconnects the CPU and GPU.
+computation in Layer 0.                                              Workload. We evaluate using few-shot downstream tasks and
+                                                                     language modeling datasets. We use five few-shot tasks from
+                                                                     the lm-evaluation-harness benchmark [23]: COPA [54], Open-
+4.4    KV Cache Pool Management                                      BookQA [42], WinoGrande [55], PIQA [8], and RTE [62].
+We manage the KV cache as a pool, offloading to the CPU              The language modeling datasets used are WikiText-2 [41] and
+memory and prefetching only the essential amount to the              Penn Treebank (PTB) [38]. Additionally, randomly sampled
+GPU. While CPU memory is more affordable and larger than             sentences from the PG-19 dataset [52] are used to measure
+GPU memory, it still has limited capacity. Hence, for certain        the speedup with long sequence lengths.
+deployment scenarios, it might be crucial to confine the size of     Baseline. We use two inference environments that support KV
+the KV cache pool and remove less important KV entries that          cache offloading: CUDA Unified Virtual Memory (UVM) [4]
+are infrequently selected by query tokens. We extend the de-         and FlexGen [57]. On UVM, all data movements between the
+sign to incorporate a user-defined memory size limit. During         CPU and GPU are implicitly managed by the UVM device
+runtime, when the size of the CPU memory reaches a user-             driver, thereby enabling offloading without requiring interven-
+defined limit, the KV cache pool manager selects a victim            tion from the programmer. In contrast, FlexGen uses explicit
+KV entry for eviction. Subsequently, the manager overwrites          data transfers between the CPU and GPU. For the FlexGen
+the selected victim with the newly generated key and value,          baseline, unless otherwise specified, we explicitly locate all
+along with updating the corresponding partial key cache re-          the KV cache in the CPU memory. The model parameters
+siding in the GPU. It is noted that the order of KV entries can      are stored in the GPU memory as much as possible, with
+be arbitrary, as long as the key and value of the same token         the remainder in the CPU memory. We compare InfiniGen
+maintain the same relative location in the KV cache pool.            with two different KV cache management methods: H2 O [78]
+   The policy of selecting a victim is important since it directly   and Quantization [57]. H2 O, a recent method in KV cache
+impacts model accuracy. We consider a counter-based policy           management, maintains the KV cache of the important or
+along with two widely used software cache eviction policies:         recent tokens by assessing the importance of each token and
+FIFO [7, 69, 70] and Least-Recently-Used (LRU) [2]. The              discarding others. Quantization-based compression applies
+FIFO-based policy is easy to implement with low overhead             group-wise asymmetric quantization to the KV cache.
+but results in a relatively large accuracy drop since it simply      Key Metric. We evaluate accuracy (%) to assess the impact
+evicts the oldest residing token. The LRU-based policy gener-        of approximation when InfiniGen, H2 O, and Quantization are
+ally exhibits a smaller decrease in accuracy but often entails a     used. For the language modeling tasks with WikiText-2 and
+higher runtime overhead. In general, LRU-based policy uses           PTB, we use perplexity as a metric; lower perplexity means
+a doubly linked list with locks to promote accessed objects to       better accuracy. To present performance improvements, we
+the head, which requires atomic memory updates for accessed          measure the wall clock time during inference with varying
+KV entries. In the case of the counter-based policy, the pool        batch sizes and sequence lengths. The partial weight ratio is
+manager increments a counter for each prefetched KV entry            set to 0.3. We set alpha to 4 for OPT and 5 for Llama-2, result-
+and selects a victim with the smallest count in the KV cache         ing in using less than 10% of the KV cache on average across
+pool. If any counter becomes saturated, all the counter values       the layers. For each layer, we allow sending up to 20% of
+are reduced by half. We observe that the counter-based policy        the total KV cache to the GPU if it contains more candidates.
+
+
+
+USENIX Association                             18th USENIX Symposium on Operating Systems Design and Implementation             163
+                                                                       OPT-6.7B                                        OPT-13B                              OPT-30B                      Llama-2-7B                   Llama-2-13B
+                                                            52                                              52                                   52                            52                           52
+
+
+
+
+                                               OpenBookQA
+                                                            44                                              44                                   44                            44                           44
+
+                                                            36        Full Cache                            36                                   36                            36                           36
+                                                                      Quantization
+                                                            28        H2O
+                                                                      H2O                                   28                                   28                            28                           28
+                                                                      InfiniGen
+                                                            20                                              20                                   20                            20                           20
+                                                                 60   45      30           15           0        60   45   30    15        0          60   45    30   15   0        60   45   30   15   0        60   45   30   15   0
+                                                            85                                              85                                   85                            85                           85
+                                               WinoGrande
+
+
+
+                                                            75                                              75                                   75                            75                           75
+
+                                                            65                                              65                                   65                            65                           65
+
+                                                            55                                              55                                   55                            55                           55
+
+                                                            45                                              45                                   45                            45                           45
+                                                                 60   45      30           15           0        60   45   30    15        0          60   45    30   15   0        60   45   30   15   0        60   45   30   15   0
+                                                            85                                              85                                   85                            85                           85
+                                Accuracy (%)
+
+
+
+
+                                                            75                                              75                                   75                            75                           75
+                                               PIQA
+
+
+
+
+                                                            65                                              65                                   65                            65                           65
+
+                                                            55                                              55                                   55                            55                           55
+
+                                                            45                                              45                                   45                            45                           45
+                                                                 60   45      30           15           0        60   45   30    15        0          60   45    30   15   0        60   45   30   15   0        60   45   30   15   0
+                                                            85                                              85                                   85                            85                           85
+
+                                                            75                                              75                                   75                            75                           75
+                                               RTE
+
+
+
+
+                                                            65                                              65                                   65                            65                           65
+
+                                                            55                                              55                                   55                            55                           55
+
+                                                            45                                              45                                   45                            45                           45
+                                                                 60   45      30           15           0        60   45   30    15        0          60   45    30   15   0        60   45   30   15   0        60   45   30   15   0
+                                                            94                                              94                                   94                            94                           94
+
+                                                            83                                              83                                   83                            83                           83
+                                               COPA
+
+
+
+
+                                                            72                                              72                                   72                            72                           72
+
+                                                            61                                              61                                   61                            61                           61
+
+                                                            50                                              50                                   50                            50                           50
+                                                                 60   45      30           15           0        60   45   30    15        0          60   45    30   15   0        60   45   30   15   0        60   45   30   15   0
+
+                                                                                                                                               Relative KV Cache Size (%)
+
+                                                                                   Figure 11: Accuracy of LLMs on 5-shot tasks in lm-evaluation-harness.
+
+             24                                                                                 9
+                                                                 Full Cache                                                      Full Cache                     used). InfiniGen consistently shows better accuracy across the
+                                                                 H2O
+                                                                 H2 O                                                            H2O
+                                                                                                                                 H2 O
+                                                                 InfiniGen                                                       InfiniGen
+                                                                                                                                                                models and tasks when the relative KV cache size is less than
+             18                                                                                 7
+Perplexity
+
+
+
+
+                                                                                   Perplexity
+
+
+
+
+                                                                                                                                                                10%, whereas the others exhibit a noticeable accuracy drop
+             12                                                                                 5                                                               due to insufficient bit widths (Quantization) or permanent KV
+                                                                                                                                                                cache elimination (H2 O). This implies that our proposed so-
+              6                                                                                 3                                                               lution can effectively reduce the KV cache transfer overhead
+                  1    2    3            4            5          6    7       8                     1        4        7     10        13         16
+                           Decoding Chunk ID                                                                     Decoding Chunk ID                              while preserving model accuracy. For relative KV cache sizes
+                             (a) OPT-13B                                                                         (b) Llama-2-13B                                larger than 10%, the accuracy with InfiniGen closely matches
+                                                                                                                                                                that of the full-cache baseline. In some cases, InfiniGen even
+Figure 12: Perplexity of OPT-13B and Llama-2-13B for WikiText-2                                                                                                 shows slightly better accuracy than the full-cache baseline.
+dataset. Lower is better. Perplexity is computed for each decoding
+                                                                                                                                                                This is likely because reducing the amount of the KV cache
+chunk that contains 256 tokens.
+                                                                                                                                                                participating in the attention computation can help the model
+The partial weight ratio and alpha are determined based on                                                                                                      focus more on critical tokens.
+a sensitivity study for each model to balance accuracy and                                                                                                      Sequence Length. Figure 12 shows the perplexity of two
+inference latency, which we discuss in Section 6.1.                                                                                                             different models with InfiniGen and the baselines, as the se-
+                                                                                                                                                                quence length increases. In this experiment, H2 O is config-
+                                                                                                                                                                ured to use the same amount of KV cache as InfiniGen. The
+5.2                   Language Modeling
+                                                                                                                                                                sequence lengths are 2048 and 4096 for OPT-13B and Llama-
+Accuracy on lm-evaluation-harness. Figure 11 shows the                                                                                                          2-13B, respectively. For a clearer view, we evaluate perplexity
+accuracy of the baselines and InfiniGen across different mod-                                                                                                   with consecutive 256 tokens as a group, which is referred
+els with 5-shot tasks. The relative KV cache size indicates                                                                                                     to as a decoding chunk in the figure. The results show that
+the size of the KV cache involved in the attention computa-                                                                                                     even though the sequence length becomes longer (i.e., the
+tion compared to the full-cache baseline (e.g., a 10% relative                                                                                                  decoding chunk ID increases), the perplexity of InfiniGen
+KV cache size means that 10% of the full KV cache size is                                                                                                       remains consistently comparable to the full-cache baseline,
+
+
+
+164                   18th USENIX Symposium on Operating Systems Design and Implementation                                                                                                                                 USENIX Association
+Table 2: Perplexity on WikiText-2 and PTB with 2048 sequence                                                   2007.4
+                                                                                                         600
+length with or without KV cache memory limits. Lower is better.                                                                                                   Prefill   Decode
+
+
+
+
+                                                                                           Latency (s)
+                                                                                                         400
+                         OPT-6.7B    OPT-13B     OPT-30B      Llama-2-7B Llama-2-13B
+               Scheme
+                         Wiki PTB Wiki PTB Wiki PTB Wiki PTB Wiki                 PTB                    200
+                100%    11.68 13.86 10.55 12.78 10.14 12.31   5.69 22.53    5.25 31.94
+           80-FIFO%     19.64 16.82 30.99 33.84 30.66 35.45 22.26 61.88 21.41 32.34                        0
+                                                                                                               UVM      UVM         FlexGen        FlexGen     FlexGen      InfiniGen
+          80-LRU%       11.68 13.85 10.55 12.78 10.14 12.31   5.69 22.53    5.25 31.94                                  + H2O                       + INT4      + H2O
+    80-Counter% 11.68 13.86 10.55 12.78 10.14 12.31           5.69 22.53    5.25 31.94
+                                                                                         Figure 14: Inference latency on OPT-13B with a sequence length of
+               100                                                                       2048 (1920 input and 128 output tokens) and a batch size of 20.
+                                          Full Cache    w/o Skewing        w/ Skewing
+                80
+Accuracy (%)
+
+
+
+
+                                                                                                                                                      1737.4           2007.4
+                                                                                                         600
+                60                                                                                              UVM                         H2O
+                                                                                                                                    UVM + H2O
+                                                                                                                FlexGen             FlexGen + INT4
+
+
+
+
+                                                                                          Latency (s)
+                40                                                                                       400              H2O
+                                                                                                                FlexGen + H2O       InfiniGen
+                20
+
+                 0                                                                                       200
+                        COPA    OpenBookQA WinoGrande          PIQA            RTE
+                                                                                                          0
+Figure 13: Accuracy on the lm-evaluation-harness benchmark with                                                   4             8             12             16                 20
+or without skewing on OPT-6.7B.                                                                                                         Batch Size
+
+                                                                                         Figure 15: Inference latency for 5 different batch sizes on OPT-13B
+while H2 O shows an increasing divergence from the baseline.
+                                                                                         with a sequence length of 2048 (1920 input and 128 output tokens).
+H2 O suffers from permanent KV cache elimination and may
+not retain a sufficient amount of KV cache in certain layers                             5.3              Performance
+due to its fixed budget. In contrast, InfiniGen dynamically
+computes attention using only the essential amount of KV                                 In this section, we refer to H2 O (with a KV cache budget of
+cache for each layer. The difference is likely to widen as the                           20%) and 4-bit quantization implemented on top of FlexGen
+models become capable of handling much longer sequences.                                 as H2 O and INT4.
+Effect of Skewing. Figure 13 shows the accuracy with or                                  Inference Latency. Figure 14 shows the inference latency
+without key/query skewing on the OPT-6.7B model. For the                                 including the prefill and decoding stages. We use the OPT-
+experiment, we use a fixed KV cache budget of 20%, in-                                   13B model with 1920 input tokens, 128 output tokens, and a
+stead of using a dynamic approach, to clearly show the effect                            batch size of 20. InfiniGen achieves 1.63×-32.93× speedups
+of skewing. We observe that several language models (e.g.,                               over the baselines. The performance benefit mainly comes
+Llama-2) show a small drop in accuracy without skewing. For                              from the significantly reduced amount of KV cache to load
+some models such as OPT-6.7B, however, we see a large ac-                                from the CPU memory due to our dynamic approach.
+curacy drop if we do not apply the skewing method as shown                                  UVM shows an extremely long latency because the work-
+in Figure 13. This indicates that in the case of OPT-6.7B, the                           ing set size (i.e., the size of the model parameters and KV
+partial weight does not adequately represent the original ma-                            cache) is larger than the GPU memory capacity, thereby lead-
+trix without skewing. After applying our skewing method, we                              ing to frequent page faults and data transfers between the CPU
+achieve accuracy similar to the full-cache baseline. Our skew-                           and GPU. The prefill stage of UVM + H2 O also shows a long
+ing method effectively skews key and query matrices such                                 latency due to the page faults and data transfers. However,
+that a few columns can better represent the original matrices.                           because all required data are migrated to the GPU memory
+KV Cache Pool Management. Table 2 shows the perplexity                                   after the prefill stage, UVM + H2 O shows a substantially
+of five different models with or without limiting the memory                             shorter decoding latency. FlexGen loads the full KV cache
+capacity for WikiText-2 and PTB. We compare FIFO-based,                                  with high precision (i.e., FP16) from the CPU memory for
+LRU-based, and Counter-based victim selection policies in                                every attention computation. On the other hand, INT4 and
+Section 4.4 under the 80% memory limit of a full KV cache.                               H2 O load relatively small amounts of the data from the CPU
+We also present the perplexity results with no memory limit                              because of the low-bit data format (INT4) or a smaller size of
+(100%). The FIFO-based approach shows the worst model                                    the KV cache (H2 O). However, they still load larger amounts
+performance because it simply deletes the oldest KV entry                                of data than InfiniGen; even with low precision, INT4 loads
+regardless of its importance. The LRU and Counter-based                                  the KV cache of all the previous tokens; H2 O always loads the
+approaches show perplexity that is almost similar to that with                           same amount of data no matter how many tokens are actually
+no memory limit. We choose a Counter-based victim selection                              important in each layer. As a result, InfiniGen achieves better
+policy instead of an LRU-based approach because the LRU-                                 performance than both of them.
+based approach typically needs to maintain a doubly linked                               Batch Size. Figure 15 shows the inference latency across
+list queue with locks for atomic memory updates.                                         different batch sizes. The results show that InfiniGen achieves
+
+
+
+USENIX Association                                               18th USENIX Symposium on Operating Systems Design and Implementation                                                165
+          6                                                6                                                  70                                 60                                70                                  60
+              INT4     H2O
+                       H2O    InfiniGen                        INT4   H2O
+                                                                      H2O    InfiniGen
+
+
+
+
+                                                                                               Accuracy (%)
+
+
+
+
+                                                                                                                                                                    Accuracy (%)
+                                                                                                                                                      Latency (s)
+
+
+
+
+                                                                                                                                                                                                                            Latency (s)
+                                                                                                              60                                 40                                60                                  40
+Speedup
+
+
+
+
+                                                 Speedup
+          4                                                4
+
+
+          2                                                2                                                  50                                 20                                50                                  20
+
+                                                                                                                        Accuracy   Latency                                                    Accuracy     Latency
+          0                                                0                                                  40                                 0                                 40                                  0
+              512      1024     1536      2048                 6.7B         13B          30B                        1    3     5    7        9                                          0.1    0.3   0.5   0.7   0.9
+                    (a) Sequence Length                               (b) Model Size                                    (a) Alpha Value                                                  (b) Partial Weight Ratio
+
+Figure 16: Speedup over the FlexGen baseline across (a) sequence                               Figure 17: Accuracy and inference latency across (a) alpha values
+lengths and (b) model sizes.                                                                   and (b) partial weight ratios.
+
+lower latency than others across the batch sizes (1.28×-                                       dynamically observing the speculated attention score.
+34.64×). As the batch size increases, the performance gap be-                                  Model Size. Figure 16(b) shows the speedup of INT4, H2 O,
+tween InfiniGen and others becomes larger. UVM and UVM                                         and InfiniGen over FlexGen on three different model sizes.
++ H2 O show increasing latency mainly due to frequent page                                     We use 1920 input tokens and 128 output tokens with a batch
+faults in the prefill stage. For UVM, the latency also rapidly                                 size of 4 for the experiment. The results show that InfiniGen
+increases at a batch size of 16 because the working set size                                   outperforms others across the model sizes. As the model size
+exceeds the GPU memory capacity for both prefill and decod-                                    increases from 6.7B to 13B, the speedup of InfiniGen also
+ing stages. As the batch size keeps increasing, UVM + H2 O                                     increases by 1.17×, while others do not lead to a noticeable
+will face the same problem as well.                                                            increase in speedup. For most of the layers, InfiniGen loads a
+   The latency of FlexGen almost linearly increases with the                                   smaller amount of KV cache than H2 O because a relatively
+batch size because the KV cache transfer occupies the ma-                                      small number of tokens are needed. Thus, InfiniGen performs
+jority of the inference latency. As we increase the batch size                                 better than H2 O as the model size becomes larger due to the
+from 4 to 20, the throughput (tokens per second) of InfiniGen                                  increased number of Transformer blocks. For the 30B model,
+increases from 27.36 to 41.99, while INT4 and H2 O offer a                                     the model parameters do not fit in the GPU memory. As such,
+small increase in throughput (from 12.22 to 14.02 and from                                     we offload 30% of the model parameters to the CPU. In this
+21.31 to 25.70 each). By dynamically adjusting the amount                                      case, the size of the offloaded parameters is 1.7× larger than
+of the KV cache to load, InfiniGen achieves scalable perfor-                                   the KV cache size. Even so, InfiniGen shows a 1.34× speedup
+mance across the batch sizes.                                                                  over FlexGen, while others achieve 1.18× and 1.28× each.
+Sequence Length. Figure 16(a) shows the speedup of INT4,
+H2 O, and InfiniGen over FlexGen on OPT-13B across dif-
+ferent sequence lengths. With a batch size of 8, we use four                                   6                   Analysis and Discussion
+different input/output configurations. Each configuration com-
+prises 128 output tokens and 384, 896, 1408, 1920 input to-                                    6.1                  Sensitivity Study
+kens (i.e., a total number of tokens ranging from 512 to 2048).
+The speedup of InfiniGen continues to increase across the                                      We use the OPT-6.7B model with 1920 input tokens, 128
+sequence lengths (up to 5.28×), whereas INT4 and H2 O show                                     output tokens, and a batch size of 8. The accuracy is evaluated
+saturating speedups (up to 1.92× and 3.40×). This suggests                                     with the WinoGrande task in lm-evaluation-harness.
+that neither INT4 nor H2 O provides a scalable solution for                                    Threshold and Alpha. As discussed in Section 4.3, we load
+KV cache management. INT4 shows a negligible increase                                          the KV cache of the tokens with a speculated attention score
+in speedup due to the inherent growth in the size of the KV                                    greater than the threshold (i.e., the maximum attention score
+cache. Similarly, H2 O lacks scalability due to its fixed ratio of                             minus alpha). Increasing alpha results in fetching more KV
+the KV cache budget; as the sequence length increases, H2 O                                    entries to the GPU, thus increasing inference latency but also
+stores and loads more KV cache.                                                                improving accuracy. Figure 17(a) shows such trade-offs be-
+   Even though the sequence length increases, the number of                                    tween accuracy and inference latency for nine different alpha
+tokens that each token attends to does not increase linearly.                                  values with a partial weight ratio of 0.3. The results show that
+For instance, in the OPT-13B model, we count the number                                        more KV entries are fetched and involved in attention compu-
+of important tokens with attention scores larger than (max −                                   tation as alpha increases, thereby leading to better accuracy.
+4) and identify that, on average, 37, 60, 66, and 73 tokens                                    For the alpha values beyond 4, however, since most important
+are assessed as important for sequence lengths of 512, 1024,                                   tokens are already included, the accuracy does not further
+1536, and 2048, respectively. H2 O, which employs 20% of                                       increase, while the cost for KV transfers and attention com-
+a fixed KV cache budget, loads 409 tokens for the sequence                                     putation keeps increasing. This trend is similarly observed in
+length of 2048, while only 73 tokens are relatively important.                                 other models, and we thus opt for an alpha value of 4 or 5 to
+In contrast, InfiniGen naturally captures this trend (i.e., a                                  strike a balance between inference latency and accuracy.
+non-linear increase in the number of important tokens) by                                      Partial Weight Ratio. Figure 17(b) shows the accuracy and
+
+
+
+166           18th USENIX Symposium on Operating Systems Design and Implementation                                                                                                            USENIX Association
+                                                                                       12                                                  12
+                       28.0                                                                       Full Cache                                       Full Cache
+                15                                                                                                                                 H2O
+                                             Attention       FFN                                  Quantization
+                                                                                                                                                   InfiniGen
+
+
+
+
+                                                                          Perplexity
+
+
+
+
+                                                                                                                              Perplexity
+ Latency (ms)
+
+
+
+                                                                                                  H2O
+                                             Data Transfer   Prediction
+                10                                                                     8          InfiniGen                                8
+
+
+                5
+                                                                                       4                                                   4
+                                                                                            30          20       10       0                 2048    4096        8192   16384   32768
+                0
+                      FlexGen   INT4   H2O
+                                       H2O       InfiniGen        Ideal                      (a) Relative KV Cache Size (%)                         (b) Sequence Length
+
+Figure 18: Latency breakdown of a Transformer block for OPT-13B           Figure 19: Perplexity of Llama-2-7B-32K across (a) relative KV
+with a sequence length of 2048 and a batch size of 8.                     cache sizes with a sequence length of 32768 and (b) sequence lengths
+                                                                          while retaining 64 tokens. Lower is better. Llama-2-7B-32K is a fine-
+inference latency across different partial weight ratios with an          tuned version capable of processing up to 32K tokens using position
+alpha value of 4. As shown in the figure, the amount of partial           interpolation [12]. Quantization is omitted in (b) since the KV cache
+weights has a negligible impact on inference latency because              cannot be compressed below 6.25% (i.e., 1 bit).
+the cost for computing the speculated attention score is rela-
+tively small. Note that the amount of KV cache to transfer is             fetching the partial query from the GPU. Even a naïve method
+not related to the partial weight ratio. However, increasing the          of lowering the partial ratio would likely still provide better
+partial weight ratio results in higher memory consumption for             accuracy compared to other methods while reducing storage
+partial weights and key cache (e.g., doubling the ratio doubles           overhead. In summary, by minimally sacrificing inference
+the memory consumption overhead). The accuracy also does                  performance, we can greatly reduce the storage overhead on
+not noticeably differ beyond a ratio of 0.3. In our work, we              the GPU if necessary.
+opt for a partial weight ratio of 0.3 to achieve better accuracy
+while considering memory consumption overhead.
+                                                                          6.3                    Long Context Window
+
+6.2                  Overhead                                             Figure 19 shows the perplexity of the Llama-2-7B-32K model,
+                                                                          which can process up to 32K tokens, across the relative cache
+Prefetching Overhead. Figure 18 shows the latency break-                  sizes and sequence lengths. We use the WikiText-2 dataset
+down of executing a single Transformer block for the OPT-                 for the experiment. As the context window size increases for
+13B model; FFN is not shown in the figure for schemes other               future LLMs, the relative portion of the KV cache that the
+than Ideal because it is fully overlapped with data transfer              GPU can retain would decrease due to the limited capacity of
+time. Ideal is a scenario where all the computations (i.e., at-           GPU memory.
+tention and FFN) are performed on the GPU without any data                   Figure 19(a) shows that InfiniGen maintains perplexity lev-
+transfer between the CPU and GPU. As shown in the results,                els close to the full-cache baseline even as the relative KV
+the key performance bottleneck of FlexGen and H2 O is the                 cache size decreases, without leading to a noticeable increase
+data transfer overhead, which occupies 96.9% and 91.8% of                 in perplexity even with much smaller cache sizes. In contrast,
+the execution time, respectively. For INT4, due to the quan-              other methods increase perplexity compared to the full-cache
+tization and dequantization overhead, attention computation               baseline and significantly diverge at certain sizes due to in-
+also occupies a large portion of the execution time in addition           sufficient bit widths for preserving adequate information on
+to the data transfer. InfiniGen, on the other hand, considerably          all keys and values (Quantization) or the permanent removal
+improves the inference speed over FlexGen by reducing the                 of KV cache entries (H2 O). As shown in Figure 19(b), the
+amount of data transfer with our dynamic KV cache prefetch-               perplexity gap between InfiniGen and H2 O widens for longer
+ing. Furthermore, InfiniGen is only 1.52× slower than Ideal,              sequence lengths, which is likely to increase further for se-
+while others show 3.90×-18.55× slowdowns.                                 quence lengths beyond 32K. This implies that InfiniGen can
+Memory Consumption. InfiniGen uses the partial query                      scale to longer sequences and better preserve model accuracy
+weight and key cache for speculation. For a ratio of 0.3, the             compared to others.
+sizes of the partial query weight and key cache are only 2.5%                We further speculate on how InfiniGen would benefit in an
+and 15% of the total model parameters and total KV cache,                 era of million-token context windows by analyzing a model
+respectively. While we simply store them in the GPU dur-                  capable of handling 1 million tokens. Figure 20(a) shows that
+ing our experiments, we can manage the storage overhead                   the percentage of query tokens that attend to less than 1% of
+in various optimized ways if needed. For example, we can                  key tokens increases as the sequence length becomes longer.
+store only the column indices of the partial query weight and             InfiniGen can adapt to this changing trend by dynamically
+retrieve the column vectors from the full query weight ma-                adjusting the amount of the KV cache to load, whereas prior
+trix (which already resides in the GPU) as needed for partial             fixed-budget/pruning approaches would not easily adjust the
+query projection. Additionally, we can place the partial key              effective KV cache size. Figure 20(b) further shows that the
+cache in the CPU and perform speculation on the CPU after                 attention weights of key tokens can change across iterations;
+
+
+
+USENIX Association                                  18th USENIX Symposium on Operating Systems Design and Implementation                                                       167
+                 100                                                                    Layer 18, Head 30
+                                                                             0.8                                        ploit quantization or sparsity to make LLMs efficient through
+Percentage (%)
+
+
+
+
+                                                          Attention Weight
+                 80
+                                                                             0.0                                        algorithmic methods [13, 19, 22, 34, 66] or hardware-software
+                 60                                                                     Layer 30, Head 18
+                                                                             0.2                                        co-design [26, 27, 36, 50]. Regarding sparsity, most algorithm-
+                                               Layer 0
+                 40
+                                               Layer 12                      0.0
+                                                                                        Layer 30, Head 30
+                                                                                                                        based works focus on reducing the model size by exploiting
+                 20                            Layer 24                      0.2
+                                               Layer 30                                                                 the sparsity of weights. Alternatively, H2 O and Sparse Trans-
+                  0                                                          0.0
+                       2K      16K      128K         1M                            0   4K        8K         12K   16K   former [13] leverage the row-wise (i.e., token-level) sparsity
+                            (a) Sequence Length                                             (b) Iteration
+                                                                                                                        in the KV cache by permanently removing certain KV entries.
+Figure 20: Analysis of 1 million tokens using Llama-3-8B-1048K.                                                         On the other hand, most hardware-software co-design studies
+(a) Percentage of query tokens that attend to less than 1% of the                                                       focus on relaxing the quadratic computational complexity in
+key tokens across the sequence lengths. (b) Attention weight of                                                         the prefill stage by skipping non-essential key tokens with the
+sampled key tokens from different layers and heads across the last                                                      aid of specialized hardware. However, they often do not re-
+16K iterations out of 1 million tokens.                                                                                 duce memory access as they identify the important key tokens
+                                                                                                                        only after scanning all the elements of the key tensors.
+the sampled key tokens show sudden spikes after thousands
+                                                                                                                           Kernel fusion [18, 32] is another approach to mitigating the
+of iterations with significantly low attention weights (e.g., the
+                                                                                                                        quadratic memory overhead of attention in the prefill stage.
+7425th iteration out of the last 16K iterations in Layer 18,
+                                                                                                                        InfiniGen can be implemented with kernel fusion techniques
+Head 30). We observe that the prior approaches that perma-
+                                                                                                                        to alleviate the overhead of KV cache access in the decoding
+nently eliminate tokens while they are unimportant could lose
+                                                                                                                        stage. To our knowledge, this is the first work to enable effi-
+the critical contexts if they become important again at later
+                                                                                                                        cient LLM inference by prefetching only essential KV entries
+iterations. In contrast, InfiniGen can preserve model perfor-
+                                                                                                                        in offloading-based inference systems.
+mance by keeping the temporarily unimportant KV entries
+for potential future use.
+
+                                                                                                                        8   Conclusion
+7                      Related Work
+DNN Serving Systems. A systematic approach to enabling                                                                  The size of the KV cache poses a scalability issue in high-
+an efficient and fast model serving system is an important                                                              throughput offloading-based inference systems, even surpass-
+topic that has been widely studied by both academia and in-                                                             ing the model parameter size. Existing KV cache eviction
+dustry. Some prior works focus on distributed systems with                                                              policies show a large accuracy drop and do not efficiently
+predictable latency for service-level objectives (SLOs) [15,                                                            use the interconnect bandwidth when they are employed in
+16, 25, 56]. Other works improve parallelism and through-                                                               offloading-based LLM systems. We propose InfiniGen, an
+put of the system through preemption [28, 75], fine-grained                                                             offloading-based dynamic KV cache management framework
+batching [17, 21, 71], or memory optimizations [18, 35, 58].                                                            that efficiently executes inference of large language models.
+   Several other works aim at achieving high throughput exe-                                                            InfiniGen exploits the attention input of the previous layer to
+cution with limited GPU memory by offloading parameters                                                                 speculatively prefetch the KV cache of important tokens. We
+to secondary storage (e.g., CPU memory and disk). Some of                                                               manipulate the query and key weights to make the speculation
+them build on CUDA Unified Memory [46] with prefetch-                                                                   more efficient. InfiniGen shows substantially shortened infer-
+ing [31, 39], while others explicitly move tensors in and out                                                           ence latency while preserving language model performance.
+as needed for computation [29, 30, 48, 72, 73]. FlexGen [57]                                                            It also shows much better scalability regarding the batch size,
+is a recent LLM serving system that enables high-throughput                                                             sequence length, and model size compared to prior solutions.
+inference on a single GPU by offloading weights and KV
+cache to CPU memory and disk. InfiniGen is orthogonal to
+FlexGen and can work in conjunction with it to efficiently                                                              Acknowledgments
+offload and prefetch the KV cache.
+KV Cache Management. vLLM [35] mitigates the KV                                                                         We would like to thank the anonymous reviewers and our
+cache memory waste from fragmentation and duplication.                                                                  shepherd Petros Maniatis for their valuable feedback. This
+StreamingLLM [67] enables LLMs to generate longer se-                                                                   work was supported in part by a research grant from Samsung
+quence lengths than the trained ones. However, since neither                                                            Advanced Institute of Technology (SAIT) and by the artificial
+vLLM nor StreamingLLM reduces the size of the KV cache,                                                                 intelligence semiconductor support program to nurture the
+data transfers still incur a significant overhead in offloading-                                                        best talents (No. RS-2023-00256081) supervised by Institute
+based inference systems. InfiniGen complements the KV                                                                   for Information & Communications Technology Planning &
+cache management to reduce the data transfer overhead, which                                                            Evaluation (IITP). The Institute of Engineering Research at
+is a major bottleneck in offloading-based systems.                                                                      Seoul National University provided research facilities for this
+Efficient LLM Inference. There are lines of research that ex-                                                           work. Jaewoong Sim is the corresponding author.
+
+
+
+168                     18th USENIX Symposium on Operating Systems Design and Implementation                                                                     USENIX Association
+References                                                      [12] Shouyuan Chen, Sherman Wong, Liangjian Chen, and
+                                                                     Yuandong Tian. Extending context window of large
+ [1] DeepL. https://www.deepl.com/translator.                        language models via positional interpolation. arXiv
+ [2] Memcached. https://memcached.org.                               preprint arXiv:2306.15595, 2023.
+
+ [3] Josh Achiam, Steven Adler, Sandhini Agarwal, Lama          [13] Rewon Child, Scott Gray, Alec Radford, and Ilya
+     Ahmad, Ilge Akkaya, Florencia Leoni Aleman, Diogo               Sutskever. Generating long sequences with sparse trans-
+     Almeida, Janko Altenschmidt, Sam Altman, Shyamal                formers. arXiv preprint arXiv:1904.10509, 2019.
+     Anadkat, et al. Gpt-4 technical report. arXiv preprint
+                                                                [14] Krzysztof Marcin Choromanski, Valerii Likhosherstov,
+     arXiv:2303.08774, 2023.
+                                                                     David Dohan, Xingyou Song, Andreea Gane, Tamas
+ [4] Tyler Allen and Rong Ge. In-depth analyses of unified           Sarlos, Peter Hawkins, Jared Quincy Davis, Afroz Mohi-
+     virtual memory system for gpu accelerated computing.            uddin, Lukasz Kaiser, David Benjamin Belanger, Lucy J
+     In International Conference for High Performance Com-           Colwell, and Adrian Weller. Rethinking attention with
+     puting, Networking, Storage and Analysis (SC), 2021.            performers. In Proceedings of the International Confer-
+                                                                     ence on Learning Representations (ICLR), 2021.
+ [5] Reza Yazdani Aminabadi, Samyam Rajbhandari, Am-
+     mar Ahmad Awan, Cheng Li, Du Li, Elton Zheng,              [15] Daniel Crankshaw, Gur-Eyal Sela, Xiangxi Mo, Corey
+     Olatunji Ruwase, Shaden Smith, Minjia Zhang, Jeff               Zumar, Ion Stoica, Joseph Gonzalez, and Alexey Tu-
+     Rasley, et al. Deepspeed-inference: enabling efficient          manov. Inferline: latency-aware provisioning and scal-
+     inference of transformer models at unprecedented scale.         ing for prediction serving pipelines. In Proceedings
+     In International Conference for High Performance Com-           of the ACM Symposium on Cloud Computing (SoCC),
+     puting, Networking, Storage and Analysis (SC), 2022.            2020.
+ [6] Anthropic. The claude 3 model family: Opus, sonnet,        [16] Daniel Crankshaw, Xin Wang, Guilio Zhou, Michael J
+     haiku. 2024. https://www.anthropic.com/claude.                  Franklin, Joseph E Gonzalez, and Ion Stoica. Clipper:
+ [7] Benjamin Berg, Daniel S. Berger, Sara McAllister, Isaac         A low-latency online prediction serving system. In
+     Grosof, Sathya Gunasekar, Jimmy Lu, Michael Uhlar,              Proceedings of the USENIX Symposium on Networked
+     Jim Carrig, Nathan Beckmann, Mor Harchol-Balter, and            Systems Design and Implementation (NSDI), 2017.
+     Gregory R. Ganger. The CacheLib caching engine:            [17] Weihao Cui, Han Zhao, Quan Chen, Hao Wei, Zirui
+     Design and experiences at scale. In Proceedings of the          Li, Deze Zeng, Chao Li, and Minyi Guo. Dvabatch:
+     USENIX Symposium on Operating Systems Design and                Diversity-aware multi-entry multi-exit batching for effi-
+     Implementation (OSDI), 2020.                                    cient processing of dnn services on gpus. In Proceedings
+ [8] Yonatan Bisk, Rowan Zellers, Ronan bras, Jianfeng               of the USENIX Annual Technical Conference (USENIX
+     Gao, and Choi Yejin. Piqa: Reasoning about physical             ATC), 2022.
+     commonsense in natural language. In Proceedings of
+                                                                [18] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and
+     the AAAI Conference on Artificial Intelligence (AAAI),
+                                                                     Christopher Ré. Flashattention: Fast and memory-
+     2020.
+                                                                     efficient exact attention with io-awareness. In Advances
+ [9] Beidi Chen, Tri Dao, Eric Winsor, Zhao Song, Atri               in Neural Information Processing Systems (NeurIPS),
+     Rudra, and Christopher Ré. Scatterbrain: Unifying               2022.
+     sparse and low-rank attention. In Advances in Neural
+     Information Processing Systems (NeurIPS), 2021.            [19] Tim Dettmers, Mike Lewis, Younes Belkada, and Luke
+                                                                     Zettlemoyer. Gpt3.int8(): 8-bit matrix multiplication for
+[10] Beidi Chen, Zichang Liu, Binghui Peng, Zhaozhuo Xu,             transformers at scale. In Advances in Neural Informa-
+     Jonathan Lingjie Li, Tri Dao, Zhao Song, Anshumali              tion Processing Systems (NeurIPS), 2022.
+     Shrivastava, and Christopher Re. Mongoose: A learn-
+     able lsh framework for efficient neural network train-     [20] Angela Fan, Mike Lewis, and Yann Dauphin. Hierarchi-
+     ing. In Proceedings of the International Conference on          cal neural story generation. In Annual Meeting of the
+     Learning Representations (ICLR), 2021.                          Association for Computational Linguistics (ACL), 2018.
+
+[11] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan,          [21] Jiarui Fang, Yang Yu, Chengduo Zhao, and Jie Zhou.
+     Henrique Ponde de Oliveira Pinto, Jared Kaplan, Harri           Turbotransformers: an efficient gpu serving system for
+     Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman,            transformer models. In Proceedings of the Symposium
+     et al. Evaluating large language models trained on code.        on Principles and Practice of Parallel Programming
+     arXiv preprint arXiv:2107.03374, 2021.                          (PPoPP), 2021.
+
+
+
+USENIX Association                         18th USENIX Symposium on Operating Systems Design and Implementation          169
+[22] Elias Frantar and Dan Alistarh. Sparsegpt: Massive             In Proceedings of the International Conference on Ar-
+     language models can be accurately pruned in one-shot.          chitectural Support for Programming Languages and
+     In Proceedings of the International Conference on Ma-          Operating Systems (ASPLOS), 2023.
+     chine Learning (ICML), 2023.
+                                                               [32] Sheng-Chun Kao, Suvinay Subramanian, Gaurav
+[23] Leo Gao, Jonathan Tow, Stella Biderman, Sid Black,             Agrawal, Amir Yazdanbakhsh, and Tushar Krishna.
+     Anthony DiPofi, Charles Foster, Laurence Golding, Jef-         Flat: An optimized dataflow for mitigating attention
+     frey Hsu, Kyle McDonell, Niklas Muennighoff, et al.            bottlenecks. In Proceedings of the International
+     A framework for few-shot language model evaluation,            Conference on Architectural Support for Programming
+     2021.                                                          Languages and Operating Systems (ASPLOS), 2023.
+
+[24] GitHub. Copilot. https://github.com/features/             [33] Nikita Kitaev, Lukasz Kaiser, and Anselm Levskaya. Re-
+     copilot.                                                       former: The efficient transformer. In Proceedings of the
+                                                                    International Conference on Learning Representations
+[25] Arpan Gujarati, Reza Karimi, Safya Alzayat, Wei Hao,           (ICLR), 2020.
+     Antoine Kaufmann, Ymir Vigfusson, and Jonathan
+     Mace. Serving dnns like clockwork: Performance pre-       [34] Woosuk Kwon, Sehoon Kim, Michael W Mahoney,
+     dictability from the bottom up. In Proceedings of the          Joseph Hassoun, Kurt Keutzer, and Amir Gholami. A
+     USENIX Symposium on Operating Systems Design and               fast post-training pruning framework for transformers.
+     Implementation (OSDI), 2020.                                   In Advances in Neural Information Processing Systems
+                                                                    (NeurIPS), 2022.
+[26] Cong Guo, Jiaming Tang, Weiming Hu, Jingwen Leng,
+     Chen Zhang, Fan Yang, Yunxin Liu, Minyi Guo, and          [35] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying
+     Yuhao Zhu. Olive: Accelerating large language models           Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez,
+     via hardware-friendly outlier-victim pair quantization.        Hao Zhang, and Ion Stoica. Efficient memory manage-
+     In Proceedings of the International Symposium on Com-          ment for large language model serving with pagedatten-
+     puter Architecture (ISCA), 2023.                               tion. In Proceedings of the Symposium on Operating
+                                                                    Systems Principles (SOSP), 2023.
+[27] Tae Jun Ham, Yejin Lee, Seong Hoon Seo, Soosung
+     Kim, Hyunji Choi, Sung Jun Jung, and Jae W Lee. Elsa:     [36] Jungi Lee, Wonbeom Lee, and Jaewoong Sim. Tender:
+     Hardware-software co-design for efficient, lightweight         Accelerating large language models via tensor decom-
+     self-attention mechanism in neural networks. In Pro-           position and runtime requantization. In Proceedings of
+     ceedings of the International Symposium on Computer            the International Symposium on Computer Architecture
+     Architecture (ISCA), 2021.                                     (ISCA), 2024.
+
+[28] Mingcong Han, Hanze Zhang, Rong Chen, and Haibo           [37] Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao
+     Chen. Microsecond-scale preemption for concurrent              Wang, Victor Xie, Zhaozhuo Xu, Anastasios Kyrillidis,
+     gpu-accelerated dnn inferences. In Proceedings of the          and Anshumali Shrivastava. Scissorhands: Exploiting
+     USENIX Symposium on Operating Systems Design and               the persistence of importance hypothesis for llm kv
+     Implementation (OSDI), 2022.                                   cache compression at test time. In Advances in Neural
+                                                                    Information Processing Systems (NeurIPS), 2023.
+[29] Mark Hildebrand, Jawad Khan, Sanjeev Trika, Jason
+     Lowe-Power, and Venkatesh Akella. Autotm: Automatic       [38] Mitch Marcus, Grace Kim, Mary Ann Marcinkiewicz,
+     tensor movement in heterogeneous memory systems                Robert MacIntyre, Ann Bies, Mark Ferguson, Karen
+     using integer linear programming. In Proceedings of            Katz, and Britta Schasberger. The penn treebank: Anno-
+     the International Conference on Architectural Support          tating predicate argument structure. In Proceedings of
+     for Programming Languages and Operating Systems                the Workshop on Human Language Technology, 1994.
+     (ASPLOS), 2020.
+                                                               [39] Pak Markthub, Mehmet E. Belviranli, Seyong Lee, Jef-
+[30] Chien-Chin Huang, Gu Jin, and Jinyang Li. Swapadvi-            frey S. Vetter, and Satoshi Matsuoka. Dragon: Breaking
+     sor: Pushing deep learning beyond the gpu memory limit         gpu memory capacity limits with direct nvm access. In
+     via smart swapping. In Proceedings of the International        International Conference for High Performance Com-
+     Conference on Architectural Support for Programming            puting, Networking, Storage and Analysis (SC), 2018.
+     Languages and Operating Systems (ASPLOS), 2020.
+                                                               [40] Pierre-Emmanuel Mazare, Samuel Humeau, Martin Rai-
+[31] Jaehoon Jung, Jinpyo Kim, and Jaejin Lee. Deepum:              son, and Antoine Bordes. Training millions of person-
+     Tensor migration and prefetching in unified memory.            alized dialogue agents. In Conference on Empirical
+
+
+
+170   18th USENIX Symposium on Operating Systems Design and Implementation                            USENIX Association
+     Methods in Natural Language Processing (EMNLP),                 Support for Programming Languages and Operating
+     2018.                                                           Systems (ASPLOS), 2022.
+[41] Stephen Merity, Caiming Xiong, James Bradbury, and         [51] Alec Radford, Karthik Narasimhan, Tim Salimans, Ilya
+     Richard Socher. Pointer sentinel mixture models. In Pro-        Sutskever, et al. Improving language understanding by
+     ceedings of the International Conference on Learning            generative pre-training. 2018.
+     Representations (ICLR), 2017.
+[42] Todor Mihaylov, Peter Clark, Tushar Khot, and Ashish       [52] Jack W Rae, Anna Potapenko, Siddhant M Jayakumar,
+     Sabharwal. Can a suit of armor conduct electricity?             Chloe Hillier, and Timothy P Lillicrap. Compressive
+     a new dataset for open book question answering. In              transformers for long-range sequence modelling. In Pro-
+     Conference on Empirical Methods in Natural Language             ceedings of the International Conference on Learning
+     Processing (EMNLP), 2018.                                       Representations (ICLR), 2020.
+
+[43] Erik Nijkamp, Bo Pang, Hiroaki Hayashi, Lifu Tu,           [53] Machel Reid, Nikolay Savinov, Denis Teplyashin,
+     Huan Wang, Yingbo Zhou, Silvio Savarese, and Caim-              Dmitry Lepikhin, Timothy Lillicrap, Jean-baptiste
+     ing Xiong. Codegen: An open large language model                Alayrac, Radu Soricut, Angeliki Lazaridou, Orhan Fi-
+     for code with multi-turn program synthesis. In Pro-             rat, Julian Schrittwieser, et al. Gemini 1.5: Unlocking
+     ceedings of the International Conference on Learning            multimodal understanding across millions of tokens of
+     Representations (ICLR), 2023.                                   context. arXiv preprint arXiv:2403.05530, 2024.
+
+[44] NVIDIA.      NVIDIA RTX A6000 Graphics                     [54] Melissa Roemmele, Cosmin Bejan, and Andrew Gordon.
+     Card.         https://www.nvidia.com/en-us/                     Choice of plausible alternatives: An evaluation of com-
+     design-visualization/rtx-a6000/.                                monsense causal reasoning. In AAAI Spring Symposium
+                                                                     Series, 2011.
+[45] NVIDIA.            Triton  inference             server.
+     https://developer.nvidia.com/
+                                                                [55] Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhaga-
+     triton-inference-server.
+                                                                     vatula, and Yejin Choi. Winogrande: An adversarial
+[46] Nvidia.          Unified memory     program-                    winograd schema challenge at scale. Communications
+     ming.         https://docs.nvidia.com/cuda/                     of the ACM, 2021.
+     cuda-c-programming-guide/index.html#
+     um-unified-memory-programming-hd.                          [56] Haichen Shen, Lequn Chen, Yuchen Jin, Liangyu Zhao,
+                                                                     Bingyu Kong, Matthai Philipose, Arvind Krishnamurthy,
+[47] Christopher Olston, Noah Fiedel, Kiril Gorovoy,                 and Ravi Sundaram. Nexus: A gpu cluster engine for
+     Jeremiah Harmsen, Li Lao, Fangwei Li, Vinu                      accelerating dnn-based video analysis. In Proceed-
+     Rajashekhar, Sukriti Ramesh, and Jordan Soyke.                  ings of the Symposium on Operating Systems Principles
+     Tensorflow-serving: Flexible, high-performance ml               (SOSP), 2019.
+     serving. In Advances in Neural Information Processing
+     Systems (NeurIPS), 2017.                                   [57] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan
+                                                                     Li, Max Ryabinin, Beidi Chen, Percy Liang, Christo-
+[48] Xuan Peng, Xuanhua Shi, Hulin Dai, Hai Jin, Weiliang            pher Re, Ion Stoica, and Ce Zhang. FlexGen: High-
+     Ma, Qian Xiong, Fan Yang, and Xuehai Qian. Capuchin:            throughput generative inference of large language mod-
+     Tensor-based gpu memory management for deep learn-              els with a single gpu. In Proceedings of International
+     ing. In Proceedings of the International Conference on          Conference on Machine Learning (ICML), 2023.
+     Architectural Support for Programming Languages and
+     Operating Systems (ASPLOS), 2020.                          [58] Yining Shi, Zhi Yang, Jilong Xue, Lingxiao Ma, Yuqing
+[49] Reiner Pope, Sholto Douglas, Aakanksha Chowdhery,               Xia, Ziming Miao, Yuxiao Guo, Fan Yang, and Lidong
+     Jacob Devlin, James Bradbury, Jonathan Heek, Kefan              Zhou. Welder: Scheduling deep learning memory access
+     Xiao, Shivani Agrawal, and Jeff Dean. Efficiently scal-         via tile-graph. In Proceedings of the USENIX Sympo-
+     ing transformer inference. In Proceedings of the Ma-            sium on Operating Systems Design and Implementation
+     chine Learning and Systems (MLSys), 2023.                       (OSDI), 2023.
+
+[50] Zheng Qu, Liu Liu, Fengbin Tu, Zhaodong Chen, Yufei        [59] Ilya Sutskever, Oriol Vinyals, and Quoc V Le. Sequence
+     Ding, and Yuan Xie. Dota: detect and omit weak atten-           to sequence learning with neural networks. In Advances
+     tions for scalable transformer acceleration. In Proceed-        in Neural Information Processing Systems (NeurIPS),
+     ings of the International Conference on Architectural           2014.
+
+
+
+USENIX Association                         18th USENIX Symposium on Operating Systems Design and Implementation        171
+[60] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert,          cache eviction. In Proceedings of the Symposium on
+     Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov,             Operating Systems Principles (SOSP), 2023.
+     Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al.
+     Llama 2: Open foundation and fine-tuned chat models.       [70] Tzu-Wei Yang, Seth Pollen, Mustafa Uysal, Arif Mer-
+     arXiv preprint arXiv:2307.09288, 2023.                          chant, and Homer Wolfmeister. CacheSack: Admission
+                                                                     optimization for google datacenter flash caches. In Pro-
+[61] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob                ceedings of the USENIX Annual Technical Conference
+     Uszkoreit, Llion Jones, Aidan N Gomez, Ł ukasz Kaiser,          (USENIX ATC), 2022.
+     and Illia Polosukhin. Attention is all you need. In
+                                                                [71] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soo-
+     Advances in Neural Information Processing Systems
+                                                                     jeong Kim, and Byung-Gon Chun. Orca: A distributed
+     (NeurIPS), 2017.
+                                                                     serving system for Transformer-Based generative mod-
+[62] Alex Wang, Amanpreet Singh, Julian Michael, Felix               els. In Proceedings of the USENIX Symposium on Op-
+     Hill, Omer Levy, and Samuel Bowman. Glue: A multi-              erating Systems Design and Implementation (OSDI),
+     task benchmark and analysis platform for natural lan-           2022.
+     guage understanding. In EMNLP Workshop Black-              [72] Yuan Yu, Martín Abadi, Paul Barham, Eugene Brevdo,
+     boxNLP, 2018.                                                   Mike Burrows, Andy Davis, Jeff Dean, Sanjay Ghe-
+                                                                     mawat, Tim Harley, Peter Hawkins, et al. Dynamic
+[63] Sinong Wang, Belinda Z. Li, Madian Khabsa, Han Fang,            control flow in large-scale machine learning. In Proceed-
+     and Hao Ma. Linformer: Self-attention with linear com-          ings of the Thirteenth EuroSys Conference (EuroSys),
+     plexity. arXiv preprint arXiv:2006.04768, 2020.                 2018.
+[64] Yiming Wang, Zhuosheng Zhang, and Rui Wang.                [73] Haoyang Zhang, Yirui Eric Zhou, Yu Xue, Yiqi Liu, and
+     Element-aware summarization with large language mod-            Jian Huang. G10: Enabling an efficient unified gpu
+     els: Expert-aligned evaluation and chain-of-thought             memory and storage architecture with smart tensor mi-
+     method. In Annual Meeting of the Association for Com-           grations. In Proceedings of the International Symposium
+     putational Linguistics (ACL), 2023.                             on Microarchitecture (MICRO), 2023.
+[65] Xiuying Wei, Yunchen Zhang, Xiangguo Zhang, Ruihao         [74] Haoyu Zhang, Jingjing Cai, Jianjun Xu, and Ji Wang.
+     Gong, Shanghang Zhang, Qi Zhang, Fengwei Yu, and                Pretraining-based natural language generation for text
+     Xianglong Liu. Outlier suppression: Pushing the limit           summarization. In Conference on Computational Natu-
+     of low-bit transformer language models. In Advances             ral Language Learning (CoNLL), 2019.
+     in Neural Information Processing Systems (NeurIPS),
+                                                                [75] Hong Zhang, Yupeng Tang, Anurag Khandelwal, and
+     2022.
+                                                                     Ion Stoica. Shepherd: Serving dnns in the wild. In
+[66] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu,                 Proceedings of the Symposium on Networked Systems
+     Julien Demouth, and Song Han. Smoothquant: Accu-                Design and Implementation (NSDI), 2023.
+     rate and efficient post-training quantization for large    [76] Saizheng Zhang, Emily Dinan, Jack Urbanek, Arthur
+     language models. In International Conference on Ma-             Szlam, Douwe Kiela, and Jason Weston. Personalizing
+     chine Learning (ICML), 2023.                                    dialogue agents: I have a dog, do you have pets too? In
+                                                                     Annual Meeting of the Association for Computational
+[67] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song
+                                                                     Linguistics (ACL), 2018.
+     Han, and Mike Lewis. Efficient streaming language
+     models with attention sinks. In Proceedings of the In-     [77] Susan Zhang, Stephen Roller, Naman Goyal, Mikel
+     ternational Conference on Learning Representations              Artetxe, Moya Chen, Shuohui Chen, Christopher De-
+     (ICLR), 2024.                                                   wan, Mona Diab, Xian Li, Xi Victoria Lin, et al. Opt:
+                                                                     Open pre-trained transformer language models. arXiv
+[68] Haoran Xu, Young Jin Kim, Amr Sharaf, and Hany Has-             preprint arXiv:2205.01068, 2022.
+     san Awadalla. A paradigm shift in machine transla-
+     tion: Boosting translation performance of large language   [78] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong
+     models. In Proceedings of the International Conference          Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuandong
+     on Learning Representations (ICLR), 2024.                       Tian, Christopher Ré, Clark Barrett, et al. H2 O: Heavy-
+                                                                     hitter oracle for efficient generative inference of large
+[69] Juncheng Yang, Yazhuo Zhang, Ziyue Qiu, Yao Yue,                language models. In Advances in Neural Information
+     and Rashmi Vinayak. Fifo queues are all you need for            Processing Systems (NeurIPS), 2023.
+
+
+
+
+172   18th USENIX Symposium on Operating Systems Design and Implementation                              USENIX Association
+

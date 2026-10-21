@@ -1,0 +1,1696 @@
+MAGE: Nearly Zero-Cost Virtual Memory
+       for Secure Computation
+      Sam Kumar, David E. Culler, and Raluca Ada Popa,
+             University of California, Berkeley
+     https://www.usenix.org/conference/osdi21/presentation/kumar
+
+
+
+
+  This paper is included in the Proceedings of the
+  15th USENIX Symposium on Operating Systems
+           Design and Implementation.
+                         July 14–16, 2021
+                          978-1-939133-22-9
+
+
+                                 Open access to the Proceedings of the
+                                 15th USENIX Symposium on Operating
+                                  Systems Design and Implementation
+                                       is sponsored by USENIX.
+           MAGE: Nearly Zero-Cost Virtual Memory for Secure Computation
+                                 Sam Kumar, David E. Culler, and Raluca Ada Popa
+                                       University of California, Berkeley
+
+                         Abstract                                 protocols [10, 15]. But memory management remains prob-
+Secure Computation (SC) is a family of cryptographic prim-        lematic. Many recent cryptographic systems based on SC re-
+itives for computing on encrypted data in single-party and        port that SC systems quickly run out of memory [66,79,94,95].
+multi-party settings. SC is being increasingly adopted by in-     Once they do, the computation becomes prohibitively slow be-
+dustry for a variety of applications. A significant obstacle to   cause the OS inefficiently swaps the large memory footprint to
+using SC for practical applications is the memory overhead of     secondary storage. For example, the authors of Conclave [79]
+the underlying cryptography. We develop MAGE, an execu-           report that Obliv-C, an SMPC framework, can run a join on
+tion engine for SC that efficiently runs SC computations that     only 30,000 records before running out of memory, and state
+do not fit in memory. We observe that, due to their intended      that SMPC “in practice only scales to a few thousand input
+security guarantees, SC schemes are inherently oblivious—         records.” Similarly, Senate [66], a secure collaborative ana-
+their memory access patterns are independent of the input         lytics engine based on SMPC, can run a 16-party private set
+data. Using this property, MAGE calculates the memory ac-         intersection on only 10,000 integers per party.
+cess pattern ahead of time and uses it to produce a memory           In this context, we address the research question: Can SC
+management plan. This formulation of memory management,           execute efficiently when it does not fit in memory? We
+which we call memory programming, is a generalization of          answer this in the affirmative with our system MAGE.1
+paging that allows MAGE to provide a highly efficient virtual        A natural starting point for MAGE is to specialize the OS
+memory abstraction for SC. MAGE outperforms the OS vir-           page replacement policy to SC workloads. Unsurprisingly,
+tual memory system by up to an order of magnitude, and in         this design suffers from some of the same pitfalls as classic
+many cases, runs SC computations that do not fit in memory        virtual memory systems. Pages may not be fetched until a
+at nearly the same speed as if the underlying machines had        page fault occurs, requiring multiprogramming to keep the
+unbounded physical memory to fit the entire computation.          CPU busy [26]. Furthermore, classic page replacement algo-
+                                                                  rithms perform poorly on some workloads [3], and a policy
+1   Introduction
+                                                                  specialized to SC would likely be no different.
+Secure Computation (SC) refers to cryptographic primitives           To mitigate these issues, we observe that SC is inherently
+that allow computation on encrypted data. An example of SC        oblivious. In particular, many SC protocols have no data-
+is secure multi-party computation, which allows two parties to    dependent memory accesses. This is because an SC proto-
+perform a collaborative computation on private input data. Ad-    col must not leak any information about the data contents
+vances in cryptography over the years have steadily brought       via its memory access pattern. Our key insight in MAGE is
+SC closer to practice. Recently, the use of SC in industry—in     that SC’s inherent obliviousness allows us to calculate the
+particular, homomorphic encryption (HE) and secure multi-         access pattern for any computation in advance and use it
+party computation (SMPC)—has burgeoned. Companies offer           to manage memory in a fundamentally more efficient way
+services based on SC [12,19,27,38,46,75] (from secure collab-     than classic OS paging. Unlike paging, which typically re-
+orative learning to decentralized authentication and custody),    sponds to page faults reactively, MAGE can proactively pro-
+large financial enterprises have added SC-based products [64],    duce a memory management plan based on the program’s
+and cryptocurrencies secure billions of dollars with SC [91].     memory access pattern. To highlight this distinction, we call
+   SC not only has high CPU overhead, but also requires           our approach memory programming and the resulting plan
+high memory usage and, in the case of SMPC, high network          a memory program. MAGE preplans the exact sequence of
+usage. For example, a 64-bit integer, which requires only 8 B     memory-storage transfers to issue at runtime, given a target
+of memory when computing in plaintext, takes up 1 KiB             memory consumption. Enabled by memory programming and
+of memory when using a garbled circuit (a type of SMPC).          the compute-to-memory ratio of SC workloads, MAGE exe-
+Efficiently running SC requires careful attention to not only     cutes certain SC programs that do not fit in memory at nearly
+CPU efficiency, but also memory and network demands.              in-memory speeds, as if memory were unbounded—in effect,
+   CPU overheads can be reduced using hardware accelerators       virtual memory at nearly zero cost.
+(e.g., GPUs, FPGAs) or specialized hardware (e.g., AES-NI).
+                                                                     To understand the power of MAGE’s preplanning based on
+Network bandwidth continues to grow exponentially accord-
+                                                                  SC’s obliviousness, consider Belady’s theoretically optimal
+ing to Nielsen’s Law [62], and recent cryptographic improve-
+ments have relaxed network bandwidth demands for some SC            1 MAGE stands for Memory-Aware Garbling Engine.
+
+
+
+
+USENIX Association                          15th USENIX Symposium on Operating Systems Design and Implementation           367
+paging algorithm (MIN) [3]. MIN, being a clairvoyant algo-          become the bottleneck. Thus, we design MAGE to support
+rithm, is not realizable in the classic formulation of paging;      parallel SC execution across multiple network flows, CPU
+it is typically used as a point of comparison to other realiz-      cores, or machines. To do so, we observe that a distributed
+able heuristics. But in the context of memory programming,          memory programming model allows SC to be parallelized in
+MAGE can use MIN directly, because it knows the access              this way, without requiring MAGE’s planner to reason about
+pattern in advance. Memory programming allows MAGE to               threads executing concurrently in the same address space.
+use an algorithm that is well-grounded in theory, instead of a         Finally, we aim to support a variety of applications and
+heuristic (e.g., LRU or LFU) that sometimes performs poorly.        protocols, including new ones that may emerge in the coming
+    Yet memory programming also raises the bar for possible         years. The challenge is that different SC protocols may be
+memory management strategies. For example, although MIN             very different cryptographically and may support different
+is an optimal paging algorithm, it unfortunately does not pro-      operations efficiently. Fortunately, our memory programming
+duce an optimal memory program. The reason is that MIN,             approach allows us to build MAGE entirely in userspace on
+like other paging algorithms, brings a page into memory only        a Linux system, helping to make MAGE extensible to new
+at the moment it is needed, thereby causing the program to          applications and protocols. We carefully design a layered
+stall while transferring the page. We can overcome this by          architecture for MAGE so that the DSL, bytecode, and inter-
+leveraging SC’s obliviousness once again, to prefetch accord-       preter can be extended for new SC protocols.
+ing to the access pattern (i.e., with no false positives or false      We implemented MAGE in C++ and apply it to two SC
+negatives) so that the program never stalls.                        protocols: (1) garbled circuits, a type of SMPC, and (2) CKKS,
+    At its core, our approach to memory management is quite         a type of HE. We evaluated MAGE using 10 workloads, sized
+simple: MAGE optimizes storage bandwidth by evicting                such that they do not fit in memory. MAGE outperforms the
+pages using MIN, and optimizes latency via prefetching and          operating system’s virtual memory for all 10 workloads, and
+asynchronous eviction. Whereas classic paging algorithms            outperforms it by 4–12× for 7 of them. Additionally, MAGE
+typically rely on heuristics and empirical observations of          executes all 10 workloads at within 60% of in-memory speeds,
+what works well in practice [9], our memory programming             and runs 7 of them at within 15% of in-memory speeds.
+approach is simple, well-grounded, robust, and performant.             Even with our techniques, SC remains orders of magni-
+    While conceptually simple, the above strategy is challeng-      tude slower than plaintext computation due to CPU and net-
+ing to instantiate efficiently. The reason is that MIN requires     work overheads. That said, various applications like federated
+the entire memory access pattern to be materialized at once; it     data analytics [1, 66], coopetitive machine learning [94], and
+cannot be applied in a streaming fashion. Using Intel Pin [54],     privacy-preserving recommendation [63] require SC. Due to
+we found that an SC workload that runs in under an hour can         privacy constraints, running these applications in plaintext is
+issue trillions of memory accesses. Thus, materializing the         not an option. By bringing memory management overhead
+access trace could require terabytes of space.                      for SC to nearly zero, MAGE helps make SC more practical
+    To address this, we leverage the strong precedent for using     and potentially enables more SC-based applications.
+DSLs to specify SC programs [34, 78]. MAGE’s planner rep-
+                                                                    2 Secure Computation Background
+resents the program as a bytecode recording higher-level op-
+erations specified in the DSL program. This is more succinct        2.1 Circuit Representation
+than recording individual memory accesses. For example, con-        As explained earlier, SC is inherently oblivious, meaning
+sider a program that adds two integers using garbled circuits,      that any function f computed using SC cannot have data-
+an SMPC protocol. Garbled circuits support only AND and             dependent memory accesses. Thus, it is natural to describe
+XOR operations on encrypted bits, so the integer addition is        the function f as a circuit C [13, 23, 37, 55]. C is a combina-
+ultimately decomposed into encrypted AND and XOR opera-             tional circuit that accepts the arguments to f as inputs and
+tions, each of which comprises many memory accesses. Yet,           produces the result of f applied to those arguments as its
+MAGE records the entire addition operation as a single entry        output. We write C = (W, G), where W is a set of wires and
+in the bytecode. This works well because most of the addition       G is a set of gates. Each wire represents a datum whose type
+operation’s memory accesses are “uninteresting”—they are            is the unit of computation in the SC scheme (in most cases, it
+accesses to temporary variables (e.g., on the stack) that fit       is the information stored in a single ciphertext). We denote
+easily in memory, or to SC protocol state that should remain        the subset of W storing C’s input as I, and the subset of W
+in memory for the entire program. The only consequential            storing C’s output as O. Each gate represents a computation
+accesses for memory management—reading the two input                supported by the SC scheme. We will typically assume that
+integers and writing the output integer—are captured in the         each gate has exactly one output wire, and that each w 6∈ O is
+single entry MAGE records.                                          the input wire of at least one gate. Thus, |W | = |G| + |I|.
+    Once MAGE allows SC to efficiently expand beyond the               The particular data types represented in the wires and
+physical memory limit, another limited resource (e.g., stor-        the types of supported gates depend on the particular SC
+age/network bandwidth or CPUs) of a single machine could            scheme of interest. For the CKKS homomorphic encryption
+
+
+
+368   15th USENIX Symposium on Operating Systems Design and Implementation                                   USENIX Association
+scheme [16], each wire represents a vector of real numbers           of these techniques were developed for garbled circuits, they
+and each gate represents an element-wise addition or mul-            mostly apply to homomorphic encryption as well.
+tiplication of those vectors. For garbled circuits [88], each        2.4.1 Naïve Baseline
+wire represents a single bit and each gate represents a binary       Early garbled circuit systems, like Fairplay [55], JKS [41],
+AND operation or XOR operation on those bits. Other SC               and PSPW [65], allocate memory for all wires and store the
+schemes can be similarly formulated this way. Below, we              entire garbled circuit in memory. The memory overhead is
+explain CKKS and garbled circuits in greater depth.                  O(|W | + |G|). Because, for a well-formed circuit, |G| + |I| =
+2.2    CKKS Homomorphic Encryption                                   |W |, this is equivalent to O(|W |).
+In the CKKS scheme [16], each ciphertext encodes a vector            2.4.2 Pipelining Garbling and Evaluation
+of real or complex numbers (stored with limited precision).          After the garbler garbles a gate to include in C, e the garbler
+Given ciphertexts c1 = Enc(~   v1 ) and c2 = Enc(~   v2 ), one can   does not use that gate’s garbled data. Similarly, once the eval-
+compute Enc(~  v1 + v~2 ) and Enc(~v1 ◦ v~2 ) (where ◦ is element-   uator evaluates a gate, it never again uses that garbled gate.
+wise multiplication). The dimension of each vector depends           Based on this observation, the HEKM system [37] operates
+on parameters chosen during key generation. Each ciphertext          without keeping the entire garbled circuit in memory, as fol-
+is assigned a level, which is a nonnegative integer. When per-       lows. The garbler and the evaluator first agree on an order
+forming the element-wise multiplication operation, both input        in which to execute the gates in C. Then, the garbler garbles
+ciphertexts must have the same level; the level of the output        each gate and streams the garbled gates to the evaluator, who
+ciphertext is one less than the level of the inputs. Performing      evaluates the gates in the same order. In this way, all gates are
+element-wise addition does not reduce the ciphertext level           garbled and evaluated, without materializing the full set of
+the way element-wise multiplication does. A ciphertext at            garbled gates at any one time. Because space is allocated for
+level 0 cannot be used for element-wise multiplication. The          all wires in the circuit, the memory overhead is still O(|W |).
+maximum level of a ciphertext depends on the parameters
+                                                                     2.4.3 Reclaiming Wire Memory
+chosen during key generation. While one can run a bootstrap-
+ping procedure to increase the level of a ciphertext, it is very     When executing a circuit, one can discard the memory for
+expensive, and therefore not implemented by all libraries.           a wire once all gates it feeds into have been executed. Only
+                                                                     wires whose values have been computed and will be used in
+2.3    Garbled Circuits                                              the future—the live wires—must be kept in memory. The KSS
+Yao’s garbled circuit protocol [88] (referred to simply as gar-      system [49] takes advantage of this by dynamically attaching
+bled circuits) allows two parties, called the garbler and the        a reference count to each wire; PCF [48] statically calculates
+evaluator, to jointly compute a function f over their private        when to reuse wire memory. Using interpretation techniques
+inputs x1 and x2 . The protocol requires f to be represented as      developed in PCF [48] and refined in Frigate [60], not even the
+a boolean circuit C. Unlike CKKS, there are no restrictions on       plaintext circuit is materialized in memory. TinyGarble [73],
+C’s depth. However, both parties have to execute the circuit.        EMP-toolkit [82] (for semi-honest SMPC), and EVA [23]
+   First, the two parties run a protocol called oblivious transfer   also use variants of this technique. With this optimization, the
+to obtain the (encrypted) wire values for their inputs without       memory demand is O(w), where w is the size of the largest
+revealing their inputs. Then the garbler encrypts C in a special     set of live wires when executing the circuit. MAGE builds
+way called garbling to obtain C,  e called a garbled circuit. The    on this line of work by exploring how to efficiently swap to
+process of garbling is analogous to executing the circuit; a         storage when w wires do not fit in memory.
+gate cannot be garbled until the (encrypted) values of both
+input wires are obtained, and garbling a gate produces, as a         3     Memory Overhead of Secure Computation
+side effect, the (encrypted) value of the output wire. Then, the     First, we discuss the memory overhead of SC. Then, we dis-
+garbler sends Ce to the evaluator. The evaluator executes the        cuss the memory overhead for collaborative applications.
+circuit, executing each gate using the gate’s garbled informa-       3.1    Analysis of the Memory Demand
+tion in C.
+         e Finally, the two parties communicate to decipher
+                                                                     The size of the circuit, for a computation, is proportional to
+the plaintext values of the output wires.
+                                                                     the size of the computation. But in many cases, the memory
+   If the parties would like to repeat the computation again
+                                                                     demand is substantially smaller than the circuit size; only w
+with different inputs, they must re-garble C. It is insecure to
+                                                                     wires need to be stored, where w is the size of the largest set
+reuse the same garbled circuit Ce with different sets of inputs.
+                                                                     of live wires when executing the circuit (§2.4.3).
+   More comprehensive explanations of garbled circuits, their
+                                                                        In practice, circuits are often described in a programming
+underlying cryptography, and their state-of-the-art optimiza-
+                                                                     language [34, 78] and gates are executed in the same order as
+tions are available in other resources [6, 69, 86].
+                                                                     the program is interpreted. In this execution order, live wires
+2.4    Efficiently Executing Circuits                                correspond to in-scope variables in the program. Thus, the
+In this section, we give background on existing techniques for       memory usage of running an SC program has the same order
+efficiently executing cryptographic circuits. Although many          of growth as running the same algorithm in plaintext.
+
+
+
+USENIX Association                             15th USENIX Symposium on Operating Systems Design and Implementation              369
+      Program                                   Memory Program      Finally, the memory program is given to MAGE’s interpreter,
+...                                            add 32,64,96
+                        MAGE's Planner                              which executes it using the SC protocol.
+while (...) {                                  issue-swap-in 6,8
+                           (memory
+  a[i]=b[i]+c[i]                               add 108,120,152
+}                        programming)
+                                               finish-swap-in 6
+                                                                       For multi-party protocols, the parties run separate instances
+...
+                                                                    of MAGE’s interpreter. In the case of garbled circuits, garbled
+                                                  (can be reused)
+                                                                    gates are streamed from the garbler to the evaluator, as de-
+ Memory Program
+add 32,64,96                                                        scribed in §2.4.2. Both the garbler and evaluator use MAGE to
+issue-swap-in 6,8
+add 108,120,152
+                                                                    follow a memory program and run with constrained memory.
+                           MAGE's
+finish-swap-in 6
+                          Interpreter                 Output           Our approach of including swap directives in the memory
+                       (engine+protocol)
+                                                                    program relies on the planner knowing how much memory
+        Input                                                       will be available at runtime. An alternative approach is for
+                                                                    memory programs to be agnostic to the amount of available
+Figure 1: Overview of MAGE. It consists of two phases:
+                                                                    memory. This would add runtime overhead, as MAGE’s inter-
+planning (top) and execution (bottom)
+                                                                    preter would need to decide which pages to evict. In contrast,
+   The memory cost of SC lies in the constant factors. When         our approach moves this overhead to the planning phase, keep-
+executing a secure computation protocol, the wire values            ing the execution phase as lightweight as possible.
+are encrypted. Thus, a key parameter is the expansion factor        4.1    Address Translation in MAGE
+of the encryption. In garbled circuits using a 128-bit block        The application programmer should not have to manage pag-
+cipher, including state-of-the-art optimizations (Point-and-        ing, so it is natural to write DSL programs in a virtual address
+Permute [2], Free XOR [47], Half Gates [90], and Fixed-Key          space that is, in effect, infinitely large. Central to designing
+Block Cipher [5, 31]), each wire value is 16 bytes. Each wire       MAGE is deciding at which point in Fig. 1 to translate this
+represents only 1 bit of plaintext, so this is a 128× expansion     address space into a physical address space that fits in RAM.
+factor. For CKKS, ciphertexts at higher levels are larger than         One possibility (which MAGE does not use) is to perform
+ciphertexts at lower levels. For the parameters we used in          address translation at runtime, using standard operating sys-
+our evaluation, each ciphertext is hundreds of kilobytes and        tem mechanisms for prefetching and address translation. At
+encodes a vector of dimension up to 4,096.                          runtime, swap directives in the memory program would ask
+3.2      Scaling Collaborative Applications                         the operating system to page parts of the virtual address space
+SMPC supports collaborative applications over secret data,          out to storage or in to RAM. Unfortunately, the existing way
+such as federated data analytics [1] and cooperative machine        for a Linux process to do this—the madvise system call—is
+learning [59]. A common technique to reduce SMPC’s over-            too limited. As of Linux 5.10, pages brought into RAM using
+head is to use SMPC in a minimal way. For example, some             the MADV_WILLNEED hint are not mapped in the page table,
+approaches aim to use SMPC for only a small part of the over-       so a minor page fault is incurred on the first subsequent ac-
+all computation [1, 43, 53, 79, 94]. Others carefully choose        cess. Similarly, the MADV_PAGEOUT hint merely marks pages
+algorithms that can be executed efficiently in SMPC or use          as inactive; it does not swap out pages immediately.
+approximations that incur less overhead [58, 59, 68]. But even         In contrast, MAGE does not rely on OS address transla-
+with these approaches, the SMPC computation often has high          tion for demand paging. MAGE’s engine moves data between
+memory demands [66]. Thus, it remains important to effi-            memory and storage via explicit I/O operations, so that its
+ciently execute SMPC computations that do not fit in memory.        resident set size never exceeds the available RAM. At the
+                                                                    surface, this is similar to buffer management in a DBMS. But
+4     Overview of MAGE                                              unlike a DBMS, MAGE’s planner can be viewed as solving
+SC workloads are oblivious by nature. Thus, MAGE can work           an address translation problem in advance. The DSL variables
+out the program’s memory access pattern in advance, and             declared by the programmer exist in a MAGE-virtual address
+use this information to produce a memory management plan,           space, and the final memory program output by the planner
+called a memory program, tailored to the particular access          references data (i.e., wire values) in a MAGE-physical address
+pattern. Importantly, obliviousness is not merely an artifact of    space that fits within RAM. MAGE’s planner creates these ad-
+certain existing SC schemes; it is inherent to SC. Otherwise,       dress spaces and performs their translation in software during
+an adversary could potentially infer information about secret       the planning phase. It includes swap directives in the memory
+data based on the memory access pattern.                            program so that the interpreter does not run out of RAM.
+   To support this paradigm, MAGE’s workflow has two                   To avoid confusion, we will refer to the addresses created by
+phases, as shown in Fig. 1. An SC application is written in a       the OS and sent over the memory bus as OS-virtual addresses
+DSL internal to C++. MAGE’s planner unrolls the DSL code            and OS-physical addresses. At runtime, MAGE’s interpreter
+to produce a bytecode, and then performs transformations on         stores the program’s memory in an array, and each MAGE-
+the bytecode to produce a memory program. In MAGE, the              physical address in the memory program is treated as an
+memory program is a bytecode that includes swap directives          index into this array. Thus, MAGE-physical addresses roughly
+describing when to transfer data between storage and memory.        correspond to the OS-virtual addresses of MAGE’s interpreter.
+
+
+
+370     15th USENIX Symposium on Operating Systems Design and Implementation                                 USENIX Association
+                                                                                                         Machine Learning
+   MAGE’s approach to address translation has several ad-              Application
+                                                                                     Analytics (Sort,
+                                                                                                          (Matrix-Vector
+                                                                                       Join, etc.)
+vantages. First, in contrast to an madvise-based approach,                                                 Multiply, etc.)      Features provided by DSL
+                                                                                             Integer          Batched
+MAGE’s planner has nearly complete control over when pages             DSL
+                                                                                               DSL            Real DSL
+                                                                                                                           Instruction formats output by DSL
+are brought into memory and evicted to storage. Second, by
+                                                                       Planner                  MAGE's Planner
+translating addresses in the planner, MAGE avoids address-                                                                 Instruction types output by DSL
+translation-related overheads at runtime. In contrast, relying         Engine
+                                                                                           Integer to
+                                                                                           AND/XOR
+                                                                                                              Integer to
+                                                                                                                Binary
+on OS address translation would mean minor page faults, page                                                                    Ops supported by protocol
+                                                                                        Garbled
+                                                                       Protocol                         WRK        CKKS
+table updates, and TLB invalidations at runtime.                                        Circuits
+
+   MAGE’s approach also has a few drawbacks, however.                  Figure 2: MAGE’s envisioned ecosystem, with planning as
+First, the planning phase takes longer because MAGE’s plan-            the narrow waist
+ner must translate all addresses in software. Second, memory
+programs are considerably larger because they must contain             that expands each instruction into the relevant subcircuit at
+not only swap directives, but also a copy of the program trans-        runtime. MAGE’s planner does not need to materialize the
+lated to operate on MAGE-physical addresses. In particular,            subcircuits because wires internal to the subcircuits are very
+the memory program’s length is proportional to the program’s           short-lived and therefore can be ignored.
+execution time because a variable local to a function or loop
+could be assigned different physical addresses each time the           4.3        MAGE’s Ecosystem and its Extensibility
+function is called or on each iteration of the loop.                   An important consideration in MAGE’s design is to be appli-
+   Overall, we felt that the advantages of this design out-            cable to a range of SC protocols. For example, garbled circuits
+weighed its drawbacks. Longer planning times seemed rea-               and homomorphic encryption (CKKS) have quite different
+sonable because planning can happen offline and the resulting          computation models, yet we show how MAGE captures both.
+memory program can be used repeatedly. The larger memory               MAGE’s envisioned ecosystem can be understood as a set of
+program size was an acceptable tradeoff because MAGE’s                 layers with a narrow waist, as shown in Fig. 2. The narrow
+planner materializes an unrolled form of the program anyway            waist is MAGE’s planner; MAGE’s core planning algorithms
+to run Belady’s algorithm. Meanwhile, MAGE’s planner is                can be used with a variety of applications and interpreters.
+afforded nearly full control of page eviction and replacement             MAGE’s interpreter has two layers. The upper layer, called
+and MAGE’s runtime overheads remain relatively small.                  the engine, decomposes each instruction into a subcircuit of
+4.2    MAGE’s Bytecode Representation                                  gates supported by the target SC protocol (§4.2). The lower
+                                                                       layer, called the protocol driver, evaluates gates with the SC
+Recall that MAGE’s planner expresses the program as an
+                                                                       protocol. For example, when using a protocol that supports
+unrolled (branch-free) bytecode, and performs transforma-
+                                                                       only binary AND and XOR operations (e.g., garbled circuits),
+tions on it to compute the memory program bytecode. What
+                                                                       one must use an engine that decomposes each instruction
+operations should the bytecode instructions support?
+                                                                       into a circuit of AND and XOR gates. In contrast, when
+   One possibility would be for the bytecode to describe low-
+                                                                       using a protocol that supports all types of binary gates (e.g.,
+level operations similar to those supported by a CPU, exclud-
+                                                                       TFHE [17]), one can use an engine that uses all types of gates.
+ing control flow instructions. Unfortunately, such a bytecode
+includes the raw memory trace of the program, which, as                   One must choose compatible implementations at each layer.
+discussed in §1, can be impractically large.                           For example, once one has selected an SC protocol, one should
+                                                                       choose an engine that executes each instruction using oper-
+   One alternative, used by PCF [48] and Frigate [60]2 (but
+                                                                       ations supported by that protocol. Then, one should select a
+not MAGE), is to have each instruction correspond to a gate
+                                                                       DSL that outputs instructions that the chosen engine under-
+in the circuit C being executed. This approach would require a
+                                                                       stands. Finally, one must write the application in that DSL.
+protocol driver in MAGE’s interpreter that executes each gate
+using the SC protocol. To understand why this is inefficient,             MAGE’s planner, however, is universally compatible, al-
+consider garbled circuits, for which gates are binary and wires        lowing it to be the “narrow waist” of the ecosystem. The
+represent bits. The programmer specifies the circuit in terms          first reason is that MAGE’s planner does not have to un-
+of operations on high-level types such as integers, which are          derstand what each instruction does, only what memory it
+then compiled into bit-level operations. Thus, each time the           accesses. Thus, even if a new instruction is introduced into
+program performs a high-level operation (e.g., adding two              a DSL, extending a header file to specify its format (which
+integers), the same subcircuit (e.g., describing integer addition      includes which fields are memory addresses) is enough for
+in terms of binary gates) is repeated in the bytecode.                 the planner to understand that instruction. The second reason
+   To eliminate this repetition, MAGE has each instruction             is that MAGE’s planner does not introduce any new instruc-
+describe a high-level operation directly. This requires not only       tions except for swap directives, which all engines understand.
+a protocol driver, but also an engine in MAGE’s interpreter            Thus, if an engine understands the instruction types output by
+                                                                       MAGE’s DSL, then the engine will also be able to interpret
+  2 Unlike MAGE, these systems also include control flow operations.   the planner’s output (i.e., the memory program).
+
+
+
+USENIX Association                                 15th USENIX Symposium on Operating Systems Design and Implementation                                        371
+   A number of frameworks and DSLs for SC [34, 78] aim
+                                                                                W                                            W
+to make it easier for non-SC-experts to use SC. In contrast,
+MAGE is an efficient SC execution engine; its DSLs are not
+necessarily geared toward non-experts, do not optimize the             W                    W                       W                  W
+resulting circuit, and might expose low-level SC operations.
+We discuss how these frameworks fit into Fig. 2 in §9.
+                                                                                W                                            W
+5     MAGE’s Engine                                                        Party 1's MAGE                               Party 2's MAGE
+MAGE’s execution engine is an interpreter for the final mem-                Computation                                  Computation
+ory program. First, it allocates an array to store the program’s   Figure 3: Example of distributed SMPC with MAGE. Workers
+data. Each MAGE-physical address is an index into this ar-         are denoted as circles with W. Solid lines indicate connections
+ray. To execute an instruction, MAGE reads the instruction’s       managed by MAGE’s engine; dashed lines indicate connec-
+arguments from this array, makes calls to the protocol layer       tions managed by the protocol driver
+to compute the output, and writes the output back to the ar-
+ray. Each instruction in the memory program references its            Using a distributed memory model provides two benefits.
+input and output data directly by MAGE-physical address; the       First, it allows MAGE to be agnostic to whether workers are
+engine sees no MAGE-virtual addresses. Some instructions,          placed on a single machine or across multiple machines. Sec-
+such as those requesting pages to be transferred between stor-     ond, it guarantees that the access pattern for each region of
+age and memory, are handled directly by the engine, without        memory consists of a single well-defined sequence, simplify-
+calling the protocol. We call such instructions directives.        ing planning. To ease the difficulty of explicitly specifying
+                                                                   network transfers, one can build easier-to-use DSL libraries
+5.1    Parallel/Distributed Engine                                 for common communication patterns (e.g., our implementa-
+SC is resource-intensive, so it is natural to scale SC by ex-      tion provides a ShardedArray<T> abstraction).
+ecuting the protocol in a distributed fashion across multiple
+                                                                   5.2       Distributed SMPC
+CPU cores or multiple machines. The multiple-machine case
+is useful to overcome resource constraints associated with a       Some SC protocols, like SMPC, require interaction over the
+single machine such as limited CPU cores, limited storage          network between mutually distrusting parties. For such proto-
+I/O, or, in the case of SMPC, limited network bandwidth. This      cols, each party runs a separate MAGE computation, with its
+is different from having multiple parties in SMPC. Here, we        own set of workers. Whereas the MAGE engine handles intra-
+are parallelizing a single trust domain—for example, a single      party communication between workers in the same party, the
+logical party in SMPC may execute using multiple machines.         protocol implementation handles inter-party communication
+   MAGE’s engine supports distributed execution across mul-        among workers in different parties. The inter-party topology
+tiple workers. Each worker is a thread of computation, run-        is up to the protocol driver; our protocol driver for garbled
+ning MAGE’s engine, operating on its own memory region             circuits uses a one-to-one inter-party topology (Fig. 3).
+(a MAGE-physical address space). Workers differ from OS            6       MAGE’s Planner
+processes as follows: (1) each worker contains exactly one         Our memory programming approach is to calculate the mem-
+thread, (2) workers are not necessarily isolated by hardware       ory access pattern in advance and use it to preplan memory
+such as an MMU—multiple workers in a MAGE computa-                 management. One can potentially preplan the following:
+tion could, in principle, run within the same process, and (3)     • Placement. How should we divide up a circuit into pages?
+memory is statically partitioned among the workers.                • Ordering. In what order should we evaluate the gates in
+   MAGE’s planner does not automatically infer how to par-           the SC circuit to result in the best memory behavior?
+allelize the computation. Rather, the programmer writes DSL        • Scheduling. When should pages that will be used in the
+code in a distributed memory model, explicitly indicating            future be swapped in from storage?
+asynchronous network operations to transfer data among the         • Replacement. How should we choose pages to evict when
+different workers. The resulting memory program bytecode             making room for pages from storage?
+contains network directives that the engine interprets. Simi-      MAGE produces an approximate solution, using a heuristic
+larly, the protocol driver must be written to function properly    for placement and optimizing scheduling and replacement.
+when the computation is distributed over multiple workers.         Note that MAGE does not optimize ordering; it evaluates
+   Programs for MAGE are parameterized by the Worker ID.           gates in the order implicit in the DSL program for the circuit.3
+MAGE’s planner is run once for each worker. To generate the
+memory program for a worker, the planner processes only the        6.1       Organization of MAGE’s Planner
+accesses for that worker—it does not need to consider other        We organize MAGE’s planner into stages (Fig. 4):
+workers’ accesses, because each worker can only access its             3 Optimizing ordering may be NP-hard [76]. A system that does so would
+own memory region. Thus, the workers’ memory programs              be very powerful—for example, it would automatically block a loop join or
+can be generated independently and in parallel.                    tile a matrix multiplication. It is beyond the scope of this work.
+
+
+
+
+372    15th USENIX Symposium on Operating Systems Design and Implementation                                        USENIX Association
+    Program                          Virtual Bytecode            Annotations
+...
+                    Placement
+                                     ...                Reverse ...              void millionaire(const ProgramOptions& args) {
+while (...) {                        add 160,192,224     Pass Page 1 next used
+  a[i]=b[i]+c[i]
+                    Execute DSL      add 256,288,320            at Instr. 12        Integer<32> alice_wealth, bob_wealth;
+}                                    ...                        ...
+...                                                                                 alice_wealth.mark_input(Party::Garbler);
+                                                                                    bob_wealth.mark_input(Party::Evaluator);
+                                      Physical Bytecode                             Bit result = alice_wealth >= bob_wealth;
+ Memory Program                       ...
+add 32,64,96
+                       Scheduling     add 32,64,96           Replacement            result.mark_output();
+issue-swap-in 6,8
+                          Add         add 108,120,152          Belady's
+add 108,120,152        Prefetching    swap-in 6,8              Algorithm
+                                                                                 }
+finish-swap-in 6
+                                      ...
+                                                                                 Figure 5: Example code in an Integer-based DSL internal to
+Figure 4: MAGE’s planner’s workflow, with its three stages
+                                                                                 C++ to solve Yao’s Millionaire’s problem
+1. Placement. This stage accepts a DSL program and orga-
+                                                                                 ule to allocate memory in the MAGE-virtual address space
+    nizes wires into MAGE-virtual pages. It outputs instruc-
+                                                                                 for intermediate results, including those stored in variables.
+    tions referencing wires by MAGE-virtual address.
+                                                                                    For example, see Fig. 5. On the mark_input and >= oper-
+2. Replacement. This stage adds instructions to swap pages
+                                                                                 ations, an allocation request is made to MAGE’s placement
+    to/from storage, deciding which pages to evict. It outputs
+                                                                                 module to obtain a MAGE-virtual address, and an instruction
+    instructions referencing wires by MAGE-physical address.
+                                                                                 is emitted to perform that operation (obtain input or integer
+3. Scheduling. This stage moves swap instructions within
+                                                                                 comparison) and store the result at that MAGE-virtual address.
+    the instruction stream and relocates wires to mask the
+                                                                                 Once an Integer’s destructor is called, or if an Integer is
+    latency of moving data between memory and storage.
+                                                                                 reassigned to a new MAGE-virtual address, a deallocation
+   For a parallel/distributed program, MAGE’s planner is
+                                                                                 request is made to MAGE’s placement module for the MAGE-
+invoked separately for each worker, with separate MAGE-
+                                                                                 virtual address previously held by that Integer.
+virtual and MAGE-physical address spaces. Network direc-
+                                                                                    For a parallel/distributed program, the worker ID and total
+tives in the program transfer data among those address spaces.
+                                                                                 number of workers are provided via the ProgramOptions
+   MAGE’s planner does not benefit from MAGE’s memory
+                                                                                 structure. The C++ code can branch on these variables, to
+programming techniques, so it is important that planning does
+                                                                                 have each worker operate differently and exchange data ap-
+not consume an unreasonable amount of memory. We keep the
+                                                                                 propriately to perform the parallel/distributed computation.
+planner’s memory usage lightweight by (1) writing/reading
+                                                                                    Each Integer object contains only the MAGE-virtual
+the intermediate bytecodes to/from files instead of keeping it
+                                                                                 address of its contents; other attributes, such as width, are
+all in memory, (2) designing the DSLs to be lightweight, and
+                                                                                 template arguments and do not consume memory. Thus,
+(3) keeping track of pages instead of individual bytes.
+                                                                                 Integers and other DSL-provided data types are typically
+6.2     MAGE’s First Stage: Placement                                            smaller than the encrypted data items they represent. For
+MAGE’s placement module is, in effect, a page-aware mem-                         example, a 32-bit integer encrypted for the garbled circuit pro-
+ory allocator for the DSL. It unrolls the DSL, allocating space                  tocol is 1 KiB in size, whereas an Integer<32> object used
+for each variable and intermediate value in the MAGE-virtual                     during planning is just 8 B (a single MAGE-virtual pointer).
+address space. It outputs a bytecode for the program in which                    This helps keep the memory cost of the planning phase small.
+each variable is referenced by its MAGE-virtual address.                         6.2.2 Memory Allocation Strategy
+6.2.1 Unrolling the DSL Code                                                     When MAGE’s placement module allocates memory for a
+MAGE’s DSLs are internal to C++. This means that the DSL                         variable, it ensures that the variable is contained in a single
+is a set of convenient C++ APIs to specify the program’s                         MAGE-virtual page; a variable must never straddle two pages.
+behavior, often involving operator overloading. The program                      The reason is that two adjacent MAGE-virtual pages may not
+is specified as a C++ function that uses these APIs.                             be adjacent in the OS-virtual address space at runtime.
+   Fig. 5 shows a program that solves Yao’s Millionaire’s prob-                     A key issue in designing the placement module’s memory
+lem [87]. Integer<width> describes an Integer datum with                         allocator is internal fragmentation [25, 67]. Some fragmen-
+the specified width in bits. Bit is an alias for Integer<1>.                     tation, which we call classic fragmentation, arises from the
+   MAGE’s planner does not parse the DSL program’s source                        inability to pack variables onto pages (e.g., part of a page’s
+code or manipulate its AST. Instead, it simply calls the C++                     space cannot store any variable). Another type of fragmenta-
+function containing the DSL program. As the DSL code exe-                        tion, which we call effective fragmentation, arises from the
+cutes, it produces a bytecode describing the computation. For                    page’s lifetime exceeding some of the variables it stores; if
+example, the overloaded + operator for Integer emits an Add                      even one wire on a page is alive, the entire page remains alive.
+instruction in the output bytecode; it does not actually add                        To reduce classic fragmentation, MAGE’s placement stage
+integers using secure computation. Each output instruction                       uses techniques from slab allocators [8]. Each page contains
+references its operands by MAGE-virtual address. Thus, the                       only variables of a particular size. When a variable goes out
+DSL (e.g., the Integer class) calls MAGE’s placement mod-                        of scope in the DSL, its “slot” in its page is marked as free.
+
+
+
+USENIX Association                                         15th USENIX Symposium on Operating Systems Design and Implementation             373
+When a space for a variable must be allocated, MAGE’s place-                     6.4    MAGE’s Third Stage: Scheduling
+ment module look for a free slot in a page containing variables                  We introduce a parameter ` called the lookahead. To prefetch
+of that size; if no such pages have free slots, it allocates a new               data, MAGE’s scheduling algorithm attempts to move S WAP -
+page for variables of that size. The slab size is one MAGE-                      I N directives ` instructions earlier in the instruction stream.
+virtual page. This ensures that no variable will straddle a page                 However, this does not work if one of the ` intervening in-
+boundary. Just as in slab allocators, some leftover space at the                 structions uses the page frame into which we are bringing in
+end of a page may be unusable, but this can be controlled by                     data. We solve this by budgeting B extra physical page frames,
+tuning the page size. Unlike slab allocators, MAGE’s place-                      called the prefetch buffer; the replacement stage is now run
+ment module does not preserve object state across allocations.                   with a capacity of T − B frames, not T frames. Data is brought
+   To reduce effective fragmentation, MAGE’s placement                           asynchronously into a free slot in the prefetch buffer. Only
+stage uses the following heuristic when allocating memory                        when it is finally needed is it copied from the prefetch buffer
+for a variable. If multiple pages, for the specified variable                    into its destination physical page frame. Instead of S WAP -I N
+size, have free slots available, then MAGE uses the candidate                    directives, the memory program contains I SSUE -S WAP -I N
+page with the fewest free slots. This allows the number of live                  directives, which initiate the transfer of a page into memory,
+pages to decrease if the number of live variables decreases,                     and F INISH -S WAP -I N directives, which block execution until
+by giving a chance for all variables on a page to die.                           a swap operation has completed. Ideally, swap operations will
+                                                                                 be scheduled such that F INISH -S WAP -I N never blocks, but
+6.3     MAGE’s Second Stage: Replacement                                         it serves as an important fallback to prevent old/corrupt data
+We apply Belady’s MIN algorithm [3]. MIN is theoretically                        from being used if the transfer is unpredictably delayed.
+optimal in the number of S WAP -I N operations, but it does                         We use the prefetch buffer similarly to swap out pages. The
+not minimize the number of swap operations if S WAP -O UT                        page to be swapped out is copied into a free slot in the prefetch
+operations are also considered. The reason is that only dirty                    buffer and then swapped out to storage with an I SSUE -S WAP -
+pages need to be written back to storage (i.e., “swapped out”).                  O UT directive while execution of subsequent instructions con-
+Minimizing the number of swaps when taking this into ac-                         tinues. Unlike S WAP -I N operations, there is no clear deadline
+count is NP-hard [28]. Regardless, MIN produces a solution                       by which the write to storage must complete. Thus, we delay
+with at most 2× as many swaps as the theoretical optimum,4                       issuing a F INISH -S WAP -O UT directive for as long as possible;
+so it is useful in MAGE’s replacement stage.                                     we only issue it when allocating a slot in the prefetch buffer
+   To use MIN, we first make a backward pass over the pro-                       fails. In such a situation, we identify the oldest I SSUE -S WAP -
+gram to determine, each time a page is used, the time (instruc-                  O UT operation, issue the F INISH -S WAP -O UT directive for it,
+tion ID) at which it is used next. Then we make a forward                        and reclaim its page in the prefetch buffer.
+pass over the program, using the annotated next use time to                         One could eliminate the copying of pages to/from the
+determine which page to swap out. This requires us to main-                      prefetch buffer by rewriting future instructions. We did not
+tain a priority queue of resident pages, so that we can quickly                  implement this optimization because it would introduce addi-
+identify which one’s next use is farthest in the future. Each                    tional complexity and MAGE performs well without it.
+instruction, even if its arguments are already resident, requires                   A natural question is how large B must be. SSDs have band-
+us to also perform a decrease_key operation on the priority                      widths less than 10 GB/s and latencies that are usually less
+queue to adjust pages’ next use time. Therefore, if N is the                     than 1 ms. Based on these measurements, Little’s Law gives:
+number of instructions and T is the number of pages that fit                     B = 10 GB/s · 1 ms = 10 MB. For server-class machines, this
+in memory, applying Belady’s MIN algorithm is O(N log T ).                       is < 1% of physical memory. In practice, we use 16–32 MiB
+   This stage outputs an instruction stream that contains swap                   to account for burstiness/queuing, still only a small fraction
+directives and references wires by MAGE-physical address.                        of available memory. Thus, MAGE’s scheduling promises to
+To support this, MAGE’s planner maintains a data structure                       mask storage latency with only a small memory penalty.
+that maps MAGE-virtual page numbers to MAGE-physical
+frame numbers, similar to a page table.                                          7     Implementation
+   When planning a parallel/distributed program, the planner                     We implemented a prototype of MAGE in C++, including
+must be careful to not steal a page that is currently being used                 support for two protocols: garbled circuits and CKKS. Using
+for network I/O. Thus, MAGE’s replacement phase reads                            cloc, we found that our implementation is ≈ 11, 000 lines
+the network directives to infer the outstanding asynchronous                     of code, excluding comments and blank lines, broken down
+network operations. When stealing pages, it issues network                       as follows: ≈ 2, 800 for common libraries used throughout
+barrier directives, as necessary, to ensure that the engine waits                MAGE (e.g., data buffering for I/O, configuration file pars-
+for the relevant network I/Os to complete.                                       ing, etc.); ≈ 1, 300 for MAGE’s planner; ≈ 900 for protocol
+                                                                                 drivers (not including the underlying cryptography); ≈ 1, 000
+   4 This occurs in the worst case where it evicts only dirty pages, but there   for MAGE’s DSLs and libraries for those DSLs (e.g., for
+is an optimal solution that evicts the same number of clean pages.               sharding data); ≈ 1, 100 for MAGE’s engines; ≈ 1, 600 for SC
+
+
+
+374    15th USENIX Symposium on Operating Systems Design and Implementation                                                 USENIX Association
+programs written in MAGE’s DSLs, used for testing and eval-           Batches) and engine (AND-XOR vs. Add-Multiply) for each
+uating MAGE; ≈ 1, 900 for the underlying cryptography for             protocol. This conveniently allows us to showcase MAGE’s
+garbled circuits, much of which is based on EMP-toolkit [82];         ability to support different implementations of each layer.
+and ≈ 400 for in-progress (not yet complete) support for a            That said, it is not uncommon for related SC protocols to
+third protocol. We build MAGE using clang++ version 10.0.0            expose similar interfaces. For example, the WRK proto-
+with the optimization flags -Ofast -march=native. MAGE                col [83, 84] exposes the same interface as garbled circuits
+runs as a Linux process, with no changes to kernel code.              (AND-XOR), so support for WRK, if added, could reuse our
+                                                                      Integer DSL and AND-XOR engine.
+7.1    MAGE’s Interpreter
+Engine. The Engine class implements common functional-                7.3    Garbled Circuit Protocol Driver
+ity for the engine layer, including support for directives. It        For garbled circuits, wires have uniform size, so we allow
+establishes pairwise TCP connections among workers within             MAGE address spaces to be wire-addressed; the DSL is un-
+a single party, to support network directives. Swap directives        aware of the size of wires in bytes. Some subcircuits used
+are implemented using the aio facility provided by the kernel         by the AND-XOR engine are based on those used by Obliv-
+(not to be confused with POSIX aio); the swap file/device             C [89]. Our garbled circuit driver uses cryptographic kernels
+is opened with the O_DIRECT flag. MAGE engines are im-                from EMP-toolkit [82]. We implement oblivious transfer (OT)
+plemented as class templates that extend (inherit from) the           using multiple background threads. Concurrently with our
+Engine class. The protocol driver class is provided to the en-        work, EMP-toolkit was updated to use the MiTCCRH hash
+gine as a template argument, so the engine can make calls to it.      function [31]; our implementation is based on an older version
+We avoided using virtual functions for this, as their overhead        of EMP-toolkit based on fixed-key AES [5]. When we com-
+can be significant (e.g., for free XORs).                             pare MAGE to EMP-toolkit in §8, we use the older version of
+Protocol Driver. The protocol driver exposes the SC pro-              EMP-toolkit so the comparison is fair. This is not a limitation
+tocol’s native operations to the engine as a set of methods.          of MAGE; our driver could be changed to use MiTCCRH.
+When the engine invokes these methods, it provides pointers
+                                                                      7.4    CKKS Protocol Driver
+to data to operate on, stored in a large array representing the
+                                                                      CKKS ciphertexts vary in size depending on their level, so
+MAGE-physical address space. The protocol driver specifies
+                                                                      for CKKS’ DSL and engine, MAGE address spaces are byte-
+the type of entries in the engine’s array, in effect dictating
+                                                                      addressed. The protocol driver provides a plugin to the DSL
+what each MAGE-physical address actually corresponds to
+                                                                      describing the particular wire sizes in bytes. It uses the CKKS
+for its protocol (plaintext bits, ciphertext bytes, etc.), and pro-
+                                                                      implementation in Microsoft SEAL [71]. We chose param-
+vides a plugin to the DSL so it can allocate MAGE-virtual
+                                                                      eters for CKKS that allow a multiplicative depth of 2. A
+memory accordingly. The protocol driver must not store point-
+                                                                      challenge was that SEAL ciphertext objects contain pointers
+ers to dynamically allocated memory in the array. The reason
+                                                                      and dynamically-allocated memory. MAGE cannot swap such
+is that the engine swaps out only the contents of the array,
+                                                                      objects to storage (see §7.1). Thus, TE protocol driver serial-
+not including any dynamically-allocated memory it points to.
+                                                                      izes ciphertexts using SEAL’s built-in serialization methods
+In addition to the SC protocol’s cryptographic routines, the
+                                                                      when they are not in use; each operation (e.g., add, multiply)
+driver manages all protocol-specific operations. This includes
+                                                                      deserializes the arguments, computes the result, and then seri-
+sharing protocol-specific state among workers within a party,
+                                                                      alizes the result. We quantify the cost of serialization in §8.
+obtaining input data, writing output data, and managing intra-
+                                                                      This overhead is not fundamental; CKKS ciphertexts could be
+party communication where necessary (e.g., sending garbled
+                                                                      implemented as flat buffers, or homomorphic operations could
+gates from the garbler to the evaluator).
+                                                                      be implemented to operate directly on serialized ciphertexts.
+7.2    Extending MAGE with New Protocols                                 After a multiplication, CKKS ciphertexts are typically re-
+To extend MAGE with a new protocol, one must, at minimum,             linearized and rescaled before the next multiplication. But
+write a protocol driver to support it. If the operations exposed      if two products are added (e.g., ab + cd), one can perform
+by the new protocol driver are identical to those exposed by          relinearization once for the overall result instead of for each
+an existing protocol driver, then one can use the same engine         multiplication separately (e.g., ab and cd). MAGE’s DSL
+that works with the existing protocol. Otherwise, one must            supports this optimization, which is crucial to achieve good
+implement a new engine or modify an existing engine. This             performance on rstats and the linear algebra workloads.
+involves deciding which instruction types the new engine
+will be compatible with. If the supported instruction types
+                                                                      8 Evaluation
+differ from what existing DSLs produce, then one may have             8.1 Workloads
+to implement a new DSL or modify an existing DSL.                     We now establish a set of SC workloads for our evaluation.
+   We implemented protocol drivers for garbled circuits and           Garbled circuits and CKKS support different operations—
+CKKS. Garbled circuits and CKKS support different op-                 bitwise operations for garbled circuits, and add-multiply cir-
+erations, so we implemented a separate DSL (Integers vs.              cuits of low multiplicative depth for CKKS—so we design
+
+
+
+USENIX Association                             15th USENIX Symposium on Operating Systems Design and Implementation             375
+separate workloads for each protocol. These workloads are          part of a larger computation whose intermediate results are
+data-intensive “kernels” that may be used as part of larger SC     held in memory. Thus, each workload operates in three non-
+applications. We discuss larger SC applications in §8.8.           overlapping phases: (1) the inputs are read into memory, (2)
+8.1.1 SMPC Collaborative Applications                              the computation is performed, materializing the output in
+One application of SMPC is federated data analytics [66, 79].      memory, and (3) the output is written to a file.
+Aggregations (GROUP BY operations) and joins are particu-            For the parameters we chose, the CKKS scheme encrypts
+larly memory-intensive. A federated data analytics system          vectors of dimension 4096. Thus, each of our workloads for
+may express equi-joins as set intersections (SI) and aggrega-      CKKS could be applied to 4096 instances of the problem in a
+tions as set unions (SU), both of which can be implemented         SIMD fashion with no additional overhead. There are ways to
+by merging sorted lists [66]. This inspires our first benchmark,   use the 4096 slots in the vector to speed up a single problem,
+merge: merging sorted lists of records. In some cases, the         for example, by vectorizing matrix multiplication [42]. Our
+input lists may not be already sorted. This inspires our second    workloads, for simplicity, do not apply such techniques, but
+benchmark, sort: sorting a list of records. For joins other than   MAGE is not incompatible with them.
+equi-joins, the system must fall back to a classic loop join.      8.2    Empirical Methodology
+This is our third benchmark, ljoin: loop join. For concrete-
+                                                                   We compare MAGE’s performance to an upper bound and a
+ness, we assume that each record is 128 bits long, and that
+                                                                   lower bound. The upper bound, OS Swapping, is the speed
+the first 32 bits are the key used for sorting or joining; the
+                                                                   when relying on the operating system’s paging. The lower
+problem size n is the number of records per party.
+                                                                   bound, Unbounded, is the speed when the entire computation
+   Privacy-preserving machine learning applications inspire
+                                                                   fits in memory. We measure these three scenarios as follows:
+our fourth benchmark, mvmul: matrix-vector multiply with
+                                                                   1. Unbounded. MAGE’s planner is run assuming enough mem-
+8-bit integers. A recent proposal for secure neural network
+                                                                   ory to fit the program. Thus, MAGE’s planner does not insert
+inference, X ONN [68], suggests binarizing the neural net-
+                                                                   swap directives in the memory program. Finally, MAGE’s
+work. This inspires our fifth benchmark, binfclayer: binary
+                                                                   engine executes the memory program outside of any cgroup.
+fully-connected layer. It consists of a series of XNOR and
+                                                                   2. OS Swapping. A memory program is generated in the same
+PopCount operations similar to multiplying a binary matrix
+                                                                   way as for the Unbounded solution. However, it is executed
+by a binary vector, followed by a binary activation function.
+                                                                   in a cgroup that limits physical memory to a fixed amount.
+For simplicity, we do not include batch normalization.
+                                                                   3. MAGE. MAGE’s planner is run assuming a fixed physical
+8.1.2 CKKS Homomorphic Encryption
+                                                                   memory capacity, minus the prefetch buffer and the inter-
+We restrict ourselves to workloads for which CKKS is
+                                                                   preter’s overhead. The resulting plan is run within a cgroup
+efficient—workloads that can be expressed as arithmetic cir-
+                                                                   that limits physical memory to 1 GiB or 16 GiB, to ensure
+cuits of low multiplicative depth. The sixth workload is rsum:
+                                                                   that the memory overhead fits in the limit.
+sum of a list of real numbers, which requires no multiplica-
+                                                                      Except where stated otherwise, we used D16d_v4 instances
+tions. The seventh workload is rstats: computing the mean
+                                                                   on Microsoft Azure [57]. We chose this instance type for a
+and variance of real numbers, which requires a multiplicative
+                                                                   few reasons. First, it has enough memory to fit the entire com-
+depth of 2. These represent simple data analytics workloads;
+                                                                   putation for most experiments, necessary for the Unbounded
+the problem size n is the number of elements.
+                                                                   scenario. Second, it contains a local “temporary” SSD. We
+   Our remaining workloads are inspired by machine learn-
+                                                                   use it for swap space (one of its recommended uses [20]) and
+ing and linear algebra. The eighth workload is rmvmul:
+                                                                   for the file containing the memory program. Third, it provides
+matrix-vector multiply with real numbers. Finally, we consider
+                                                                   enough network bandwidth so as not to be a bottleneck for
+two variants of matrix multiplication. The ninth workload is
+                                                                   garbled circuits (we explore the WAN setting in §8.7).
+n_rmatmul: matrix-matrix multiply with a naïve nested for
+                                                                      We set MAGE’s parameters as follows. For garbled circuits,
+loop. The tenth workload is t_rmatmul: tiled matrix-matrix
+                                                                   we used a page size of 64 KiB, lookahead ` of 10,000 instruc-
+multiply. The problem size n is the length of one side of the
+                                                                   tions, and prefetch buffer size B of 256 pages. For CKKS, we
+matrix (also for mvmul and binfclayer).
+                                                                   used a page size of 2 MiB, lookahead ` of 100 instructions,
+8.1.3 Implementation of Workloads                                  and a prefetch buffer size B of 16 pages. Because CKKS ci-
+For simplicity, our implementations of some of these work-         phertexts are large, we used a larger page size (slab size) than
+loads only support power-of-two sizes and power-of-two             for garbled circuits to reduce external fragmentation. Addi-
+number of workers, but this is not a fundamental limitation        tionally, we left an additional 32–64 MiB of memory unused,
+of MAGE. Some workloads can, in principle, be optimized            to accommodate the memory used by MAGE’s interpreter.
+through streaming. For example, rsum could read each in-
+put one at a time, add the result to an accumulator, and then      8.3    Comparison to Existing Frameworks
+output the accumulator, instead of holding the entire input        We compare MAGE’s garbled circuits performance to that
+dataset in memory. We deliberately avoided such “optimiza-         of EMP-toolkit. Our goal is to demonstrate that MAGE’s
+tions,” as they would not be possible if the workload were         techniques do not limit the performance of garbled circuits
+
+
+
+376   15th USENIX Symposium on Operating Systems Design and Implementation                                  USENIX Association
+            200                                                     1000                                           on different Azure instances (8 different pairs of instances,
+                            Unbounded                                                Unbounded
+                                                                        800
+            150             OS 1 GiB                                                 OS 1 GiB                      for garbled circuits) and plot the median; error bars are the
+
+
+
+
+                                                         Time (s)
+ Time (s)
+
+
+
+
+                            MAGE 1 GiB                                  600          MAGE 1 GiB
+            100             EMP 1 GiB                                                EMP 1 GiB                     quartiles. We additionally ran experiments using a 16 GiB
+                                                                        400
+                50
+                                                                                                                   memory limit. We increased the problem sizes so that their
+                                                                        200
+
+                0                                                        0
+                                                                                                                   memory use exceeded 16 GiB (necessary for the OS scenario)
+                     0        200000      400000                              0           500000         1000000   but fit within the 64 GiB available on the virtual machines
+                      Problem Size (Records Per Party)                         Problem Size (Records Per Party)
+                                                                                                                   (necessary for the Unbounded scenario). Our methodology is
+                 Figure 6: Comparison of MAGE and EMP-toolkit                                                      the same as for the 1 GiB memory limit. We do not include
+                10                                                      250
+
+                 8                                                      200
+                                                                                     OS 1 GiB                      sort in our results for the 16 GiB memory limit, because
+                                                                                     Unbounded
+                                                                                                                   the intermediate bytecodes produced while planning were
+                                                             Time (s)
+     Time (s)
+
+
+
+
+                 6                                                      150          MAGE 1 GiB
+                                         Unbounded
+                                                                                     SEAL 1 GiB
+                 4                       OS 1 GiB                       100                                        too large for the local SSD. The results are shown in Fig. 9.
+                                         MAGE 1 GiB
+                 2
+                                         SEAL 1 GiB
+                                                                         50                                        MAGE outperforms OS swapping by at least 4× on 7 of the
+                 0
+                     0     1000    2000   3000    4000
+                                                                          0
+                                                                              0       5000     10000     15000
+                                                                                                                   workloads, with improvements of ≈ 12× for ljoin and ≈ 10×
+                     Problem Size (Number of Elements)                        Problem Size (Number of Elements)    for rsum. Its performance is within 15% of Unbounded for 7
+                        Figure 7: Comparison of MAGE and SEAL                                                      of the workloads (including sort from Fig. 8).
+                                                                                                                      MAGE’s improvement compared to OS is higher for binf-
+compared to an existing system. We use merge for the com-                                                          clayer and rmvmul than for mvmul; although all three have
+parison. We implemented merge in EMP-toolkit’s DSL, and                                                            similar access patterns, mvmul has lower memory intensity
+used EMP-toolkit’s library for merging sorted arrays.                                                              because multiplying integers in a garbled circuit has high
+    We discovered that EMP-toolkit is an order of magnitude                                                        overhead. For complex access patterns, like merge and sort,
+slower than MAGE. This was because EMP-toolkit performs                                                            MAGE’s improvement is not markedly higher than for simple
+a separate invocation of OT extension, which involves a net-                                                       scans like ljoin, rsum, and rstats (note that both input tables
+work round-trip, each time an Integer input is read for the                                                        for ljoin fit in memory; it is the output, populated in order,
+evaluator. Our garbled circuits implementation for MAGE                                                            that does not fit). MAGE is less affected by high memory
+does not have this problem because it performs OTs in larger                                                       intensity than OS, allowing it to perform well.
+batches using background threads, regardless of the units by
+                                                                                                                   8.5    Overhead of Planning
+which the program reads the input. To eliminate this effect,
+                                                                                                                   The time and peak memory use for planning each workload
+we exclude the time to read the input, for both EMP-toolkit
+                                                                                                                   for the MAGE scenario in Fig. 8 and Fig. 9 is shown in Table
+and MAGE, for this experiment only; we measured the time
+                                                                                                                   1. Note that MAGE’s planning is outside of the critical path:
+to merge the two arrays once they are materialized in memory.
+                                                                                                                   for a given circuit, MAGE’s planner can be run before the
+    We also compare MAGE’s CKKS performance on rstats to
+                                                                                                                   parties’ inputs are known. For garbled circuits, although the
+a C++ program that uses SEAL directly. The main source of
+                                                                                                                   garbled circuit Ce cannot be reused if the computation is re-run,
+overhead in MAGE is the need to deserialize the input cipher-
+                                                                                                                   MAGE’s memory program can be safely reused.
+texts and serialize the output ciphertext, for each instruction.
+                                                                                                                      The planning time and final memory program size are linear
+    The results are shown in Fig. 6 and Fig. 7. The graphs on
+                                                                                                                   in the size of the computation (size of C), not in the size of
+the left are zoomed in to smaller problem sizes to show the
+                                                                                                                   the memory demand. Nevertheless, the planning times are
+point where memory demand exceeds available physical mem-
+                                                                                                                   generally less than the time to perform the execution and the
+ory. “OS” refers to scenario 2 in §8.2; “EMP” and “SEAL”
+                                                                                                                   planner’s memory consumption is significantly smaller than
+refer to those systems similarly running in a cgroup. EMP
+                                                                                                                   the available memory at runtime for all experiments.
+performs about 3× worse than OS when the problem fits in
+                                                                                                                      Generating memory programs for CKKS is more efficient
+memory; when it does not, the relative overhead is small (≈
+                                                                                                                   than for garbled circuits. This is because each instruction for
+33%). We found that EMP performs worse than OS primarily
+                                                                                                                   CKKS operates on more memory than for garbled circuits,
+due to (1) the overhead of its “real-time circuit optimization”
+                                                                                                                   which means that the problem sizes that fill a given physical
+feature, (2) inefficient data buffering when using the network,
+                                                                                                                   memory size tend to require smaller bytecodes for CKKS than
+and (3) virtual function overhead when executing the circuit.
+                                                                                                                   for garbled circuits. For example, an instruction operating on
+OS uses MAGE’s runtime, so it does not have these issues.
+                                                                                                                   integers in a garbled circuit program may operate on a few
+SEAL is faster than OS when the problem fits in memory,
+                                                                                                                   kilobytes of memory (each bit of each integer is 16 bytes),
+but only slightly (less than 20%), indicating that the serializa-
+                                                                                                                   but for CKKS, each instruction operates on a vector of real
+tion overhead is not large. When the problem size does not
+                                                                                                                   numbers, whose encrypted size is hundreds of kilobytes.
+fit in memory, SEAL improves further compared to OS, but
+                                                                                                                      For CKKS, the final memory programs were < 100 MiB
+remains less than 2× faster than OS.
+                                                                                                                   for Fig. 8 and < 1 GiB for Fig. 9. For garbled circuits other
+8.4                   Overhead of Swapping Pages                                                                   than sort, they were < 5 GiB for Fig. 8 and < 65 GiB for Fig.
+We ran the three scenarios on all 10 workloads, using a 1 GiB                                                      9. For sort, it was less than < 25 GiB for Fig. 8. MAGE’s
+memory limit. The results are shown in Fig. 8. We ran 8 trials                                                     planner requires about 4–5× times more storage space than
+
+
+
+USENIX Association                                                                       15th USENIX Symposium on Operating Systems Design and Implementation                  377
+                   15
+
+
+
+
+                                                                                                                                                                                                        224.3
+                                                                                                                                                                                                                                                                                                                                  Unbounded
+Time (Normalized
+
+
+
+
+                                                                                                435.4
+ by Unbounded)
+
+
+
+                                                                                                                                                                                                                                                                                                                                  MAGE 1 GiB
+                   10
+
+
+
+
+                                                                                                                                                                                                                                                                                 593.3
+                                                                                                                                                                                                                                                                                                                                  OS 1 GiB
+
+
+
+
+                                                                                                                                                                      134.0
+
+
+
+
+                                                                                                                                                                                                                                               189.8
+
+
+
+
+                                                                                                                                                                                                                                                                                                                 7148
+                                            698.1
+                   5
+
+
+
+
+                                                                                                                                 429.4
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                       2413
+                                                                   2142
+
+
+
+
+                                                                                                                                                                                                                                                                         105.6
+                                    174.5
+
+
+
+
+                                                                                                                        313.9
+                            163.7
+
+
+
+
+                                                                                                                310.9
+
+
+
+
+                                                                                                                                                                                                                                                                                                          1580
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                1544
+                                                           1360
+                                                    1350
+
+
+
+
+                                                                                                                                                                                                                                                                                                 1496
+
+
+
+
+                                                                                                                                                                                                                                                                                                                         1510
+                                                                                                                                                                                                 31.7
+                                                                                                                                                               33.7
+                                                                                        58.3
+
+
+
+
+                                                                                                                                                                                                                                        42.1
+                                                                                 50.4
+
+
+
+
+                                                                                                                                                        27.1
+
+
+
+
+                                                                                                                                                                                          22.7
+
+
+
+
+                                                                                                                                                                                                                                38.8
+
+
+
+
+                                                                                                                                                                                                                                                                 98.4
+                   0
+                              merge                     sort                        ljoin                          mvmul                                binfclayer                           rsum                                 rstats                               rmvmul                    n_rmatmul                t_rmatmul
+                           n = 1048576              n = 1048576                   n = 2048                        n = 8192                              n = 16384                         n = 65536                             n = 16384                              n = 256                    n = 128                  n = 128
+
+Figure 8: Performance of Unbounded, OS Swapping, and MAGE, normalized by the time for Unbounded; absolute times, in
+seconds, are printed at the upper left corner of each bar
+                   25
+                                                                                                                                                                                                                                                                                                                                Unbounded
+Time (Normalized
+
+
+
+
+                                                                                                                                                                                        2187
+                                                                          1889
+ by Unbounded)
+
+
+
+
+                   20
+                                                                                                                                                                                                                                                                                                                                MAGE 16 GiB
+                   15                                                                                                                                                                                                                                                                                                           OS 16 GiB
+
+
+
+
+                                                                                                                                                                                                                                                                        2590
+                                                                                                                                                                                                                                 2402
+                                                                                                                                                 1854
+
+
+
+
+                                                                                                                                                                                                                                                                                                           52583
+                                             6645
+
+
+
+
+                   10
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                       13955
+                                                                                                                                                                                                                                                                                                  11733
+                                                                                                                                                                                                                                                                                         11584
+                                                                                                                                                                                220.2
+                                                                                                         3265
+
+
+
+
+                                                                                                                                         355.6
+                                                                  160.0
+
+
+
+
+                                                                                                                                                                                                                        377.1
+
+
+
+
+                                                                                                                                                                                                                                                               328.8
+                                                       126.7
+
+
+
+
+                                                                                                                                272.2
+
+
+
+
+                                                                                                                                                                        138.6
+
+
+
+
+                                                                                                                                                                                                                334.8
+
+
+
+
+                                                                                                                                                                                                                                                       309.0
+                                                                                                  1558
+                                     1261
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                7912
+                            1189
+
+
+
+
+                                                                                         1447
+
+
+
+
+                                                                                                                                                                                                                                                                                                                        7834
+                   5
+
+                   0
+                               merge                         ljoin                          mvmul                                binfclayer                                rsum                                    rstats                                  rmvmul                         n_rmatmul                      t_rmatmul
+                            n = 8388608                    n = 3840                       n = 20480                              n = 57344                              n = 458752                              n = 147456                                 n = 448                         n = 256                        n = 224
+
+                         Figure 9: Repeat of Fig. 8, with larger problem sizes and a 16 GiB memory limit (note the larger y-axis scale)
+
+   Problem      Time (8) Mem. (8) Time (9) Mem. (9)                                                                                                                                 That OS Swapping performs worse for these workloads, but
+    merge         38.0        42.6      291.6     299.4                                                                                                                             MAGE does not, suggests that the OS virtual memory system
+      sort       367.3        42.7       N/A       N/A                                                                                                                              might be introducing jitter, which interacts poorly with the
+     ljoin         6.7       121.0      23.6      411.4                                                                                                                             communication phase and induces stragglers.
+    mvmul         56.0       527.5      298.2      3268                                                                                                                             8.7                  SMPC in Wide-Area Networks
+ binfclayer       77.2        19.1      1041      165.7
+                                                                                                                                                                                    SC does not always require significant data transfer over the
+     rsum         0.04         9.6      0.29       30.2
+                                                                                                                                                                                    wide area. In HE, computation is done by a single logical party.
+    rstats        0.04        10.9      0.34       48.5
+                                                                                                                                                                                    Even in SMPC, there may be ways for multiple parties to co-
+   rmvmul         0.09        16.4      0.24       36.9                                                                                                                             locate for an SMPC computation while remaining physically
+ n_rmatmul         2.2       246.1      18.6       1927                                                                                                                             and logically distinct. But in some cases, it is desirable to run
+ t_rmatmul         2.3       246.5      12.9       1246                                                                                                                             SMPC over a wide-area network. We explore this below.
+Table 1: Planning times (s) and peak memory use of the plan-                                                                                                                           We measure performance of garbled circuits with the two
+ner (MiB) for workloads in Fig. 8 and Fig. 9                                                                                                                                        parties hosted on different cloud providers. The garbler was
+                                                                                                                                                                                    always on Azure in the US West 2 region (Oregon). The eval-
+the final memory program due to the need to materialize inter-
+                                                                                                                                                                                    uator was on Google Cloud (n2-highcpu-2 [30]). We com-
+mediate bytecodes of similar size, but this could be optimized
+                                                                                                                                                                                    pare two setups: one where the evaluator was in us-west1
+by pipelining stages of MAGE’s planner where it is possible
+                                                                                                                                                                                    (Oregon) and one where it was in us-central1 (Iowa).
+to do so (e.g., replacement and scheduling in Fig. 4).
+                                                                                                                                                                                       Initially, higher latencies and limited single-flow bandwidth
+8.6                     Impact of Parallelism                                                                                                                                       limited performance. For example, the round-trip time in the
+We now explore how the relative performance of Unbounded,                                                                                                                           Oregon setup was ≈11 ms, which made OTs a bottleneck.
+OS, and MAGE are affected by parallelizing the computation.                                                                                                                            First, we tuned the local TCP stack, increasing the maxi-
+We did experiments parallelizing the computation across four                                                                                                                        mum window size to 32 MiB. Then, we increased the number
+workers (per party, for garbled circuits). We place each worker                                                                                                                     of OT rounds performed concurrently, pipelining multiple OT
+on a separate VM instance, each with a separate SSD.                                                                                                                                rounds over a single connection, which significantly improved
+   We ran each experiment three times, using the same cluster                                                                                                                       performance (Fig. 11a). Additionally, we explore paralleliz-
+of machines for all trials, and report the median in Fig. 10.                                                                                                                       ing the computation, assigning multiple workers to the same
+Most experiments follow a similar pattern as Fig. 8, indicat-                                                                                                                       machine, so that multiple TCP flows are used. The results
+ing that MAGE’s performance gains persist when we paral-                                                                                                                            are in Fig. 11b. The dashed line at the bottom is the time
+lelize the computation. For two experiments, merge and sort,                                                                                                                        to run the experiment with both the garbler and evaluator on
+MAGE’s improvement over OS Swapping visibly increases.                                                                                                                              Azure (taken from Fig. 8). For the Oregon setup, we can come
+Whereas the other workloads are parallelized by splitting                                                                                                                           close to the Local performance using two flows. The Iowa
+the input among the workers in a communication phase at                                                                                                                             setup is more challenging because less bandwidth is available
+the beginning and then computing independently thereafter,                                                                                                                          per flow. Using multiple parallel flows helps, but the perfor-
+merge and sort have a communication phase in the middle                                                                                                                             mance improvement in the Iowa setup is limited by variation
+of the computation (several such phases in the case of sort).                                                                                                                       in wide-area flow performance, which induces stragglers.
+
+
+
+378                 15th USENIX Symposium on Operating Systems Design and Implementation                                                                                                                                                                                                                         USENIX Association
+                              15
+
+
+
+
+                                                                                                                                                                                                            223.5
+                                                                                                                                                                                                                                                                                                    Unbounded
+ Time (Normalized
+
+
+
+
+                                                                                                                   489.2
+  by Unbounded)
+
+
+
+                                                                                                                                                                                                                                                                                                    MAGE 1 GiB
+
+
+
+
+                                                         1442
+                              10
+
+
+
+
+                                                                                                                                                                                                                                                              584.1
+                                                                                                                                                                                                                                                                                                    OS 1 GiB
+
+
+
+
+                                                                                                                                                                     135.5
+
+
+
+
+                                                                                                                                                                                                                                       191.0
+
+
+
+
+                                                                                                                                                                                                                                                                                    14337
+                                                                                  5175
+
+
+
+
+                                                                                                                                               458.3
+                               5
+
+
+
+
+                                                                                                                                                                                                                                                                                                          4736
+                                                 224.7
+
+
+
+
+                                                                                                                                                                                                                                                      106.7
+                                                                                                                                       314.3
+                                         205.3
+
+
+
+
+                                                                                                                               311.7
+                                                                           2075
+
+
+
+
+                                                                                                                                                                                                                                                                                                   3104
+                                                                                                                                                                                                                                                                             3362
+                                                                    1687
+
+
+
+
+                                                                                                                                                                                                                                                                      3307
+
+
+
+
+                                                                                                                                                                                                                                                                                            3055
+                                                                                                                                                                                                     31.9
+                                                                                                                                                              36.5
+                                                                                                            58.5
+
+
+
+
+                                                                                                                                                                                                                                42.7
+                                                                                                     50.5
+
+
+
+
+                                                                                                                                                       29.7
+
+
+
+
+                                                                                                                                                                                            23.0
+
+
+
+
+                                                                                                                                                                                                                         39.6
+
+
+
+
+                                                                                                                                                                                                                                               99.9
+                               0
+                                            merge                      sort                             ljoin                     mvmul                binfclayer                           rsum                           rstats                rmvmul               n_rmatmul             t_rmatmul
+                                         n = 4194304               n = 4194304                        n = 4096                  n = 16384              n = 32768                         n = 262144                      n = 65536               n = 512               n = 256               n = 256
+
+                Figure 10: Normalized performance of Unbounded, OS Swapping, and MAGE, parallelized over p = 4 workers (per party)
+                                                                                                                                                                                                    80
+
+
+
+
+                                                                                                                                                                             Exec. Time (minutes)
+                                                                  us-west1                                                        Local (US West 2)                                                                 MAGE with all available RAM
+                                                                                                    1000
+                         1500                                                                                                     us-west1                                                          60              OS with all available RAM
+Time (s)
+
+
+
+
+                                                                                         Time (s)
+
+
+
+                                                                                                    750                           us-central1
+                                                                                                                                                                                                    40
+                         1000                                                                       500
+                                                                                                                                                                                                    20
+                             500                                                                    250
+
+                                                                                                        0                                                                                           0
+                                                                                                                                                                                                         0.0                     0.5             1.0             1.5              2.0
+                                     0      100        200                                                     1              2        3                 4
+                                                                                                                                                                                                                                  Number of Batches (4096 Real Numbers Per Batch)                                1e6
+                                          OT Concurrency                                                                   Number of workers
+
+(a) Time to run merge vs. number (b) Time to run merge vs. number                                                                                                                                        Figure 13: Scaling computational PIR with MAGE
+of concurrent OTs                of workers
+Figure 11: Wide-area garbled circuit performance in MAGE                                                                                                                     we use four D16d_v4 instances on Azure for the garbler party,
+                                                                                                                                                                             and four n2-highmem-4 instances on Google Cloud [30] for
+Execution Time (hours)
+
+
+
+
+                         8                                                                                             MAGE with all available RAM
+                                                                                                                       OS with all available RAM
+                                                                                                                                                                             the evaluator party. As explored in §8.7, we use two workers
+                         6
+                                                                                                                                                                             per instance (total of eight workers per party) to efficiently use
+                         4
+                                                                                                                                                                             wide-area network bandwidth. The results are shown in Fig.
+                         2
+
+                         0
+                                                                                                                                                                             12. For a given time budget, MAGE increases the number of
+                               0.0         0.2                  0.4        0.6        0.8         1.0                                          1.2      1.4                  user-password records by ≈ 3×. This improvement may have
+                                                                Number of Users/Passwords Per Party                                                    1e8
+                                                                                                                                                                             been larger had we been able to obtain Ddv4-series instances
+             Figure 12: Scaling password reuse detection with MAGE                                                                                                           with a greater swap-space-to-RAM ratio.
+   In both cases, the performance overhead of operating in the                                                                                                               8.8.2 Private Information Retrieval
+wide area is less than the performance overhead of swapping                                                                                                                  Private Information Retrieval (PIR) is a family of protocols
+(Fig. 8), indicating that MAGE’s techniques confer substantial                                                                                                               that allow a user to retrieve a data item at a particular index
+benefit even in wide-area settings.                                                                                                                                          from a database without the database learning which item
+                                                                                                                                                                             was accessed. PIR can be used to support public queries on
+8.8                                Applications                                                                                                                              private data [80]. We evaluate MAGE by using CKKS to
+For these experiments, we did not use cgroups to limit RAM.
+                                                                                                                                                                             instantiate the classic Kushilevitz-Ostrovsky single-server
+The OS and MAGE setups ran using all of the available RAM.
+                                                                                                                                                                             computational PIR scheme [50, §3]. PIR’s access pattern is
+8.8.1 Detecting Password Reuse                                                                                                                                               particularly simple—a linear scan over the database—so ad-
+When users reuse a password across multiple websites, they                                                                                                                   hoc approaches to prefetching, or multi-threading to improve
+become prone to “credential stuffing” attacks, in which an                                                                                                                   swap performance, may be quite effective. Our focus is on
+attacker uses a user’s password leaked by one site to com-                                                                                                                   what MAGE optimizes automatically, so we do not include
+promise that user’s account on other sites. To address this                                                                                                                  such ad-hoc optimizations in the OS baseline. We use a single
+problem, sites may wish to identify which of their users reuse                                                                                                               worker (thread) to compute the PIR. The database consisted
+their passwords on other sites [81]. Senate [66, Query 2 in §2]                                                                                                              of plaintext data pre-encoded into batches to use with CKKS.
+proposes a protocol for this. First, the sites arrange to assign                                                                                                             We wrote a DSL program that populates the database (with
+user IDs and hash passwords such that they will match across                                                                                                                 hardcoded elements) and then performs a PIR query on it;
+sites. Then, they use SMPC to detect which user IDs are                                                                                                                      the reported measurements are the time to perform the PIR
+shared between the sites and have the same password hash.                                                                                                                    query, not including the time to populate the database. The
+Note that user IDs and password hashes cannot be shared                                                                                                                      results are in Fig. 13. For a given time budget, MAGE allows
+directly, since they are sensitive (the hashes can be reversed).                                                                                                             for ≈ 5× as many database elements to be processed.
+   We write a two-party version of the password reuse pro-
+gram in MAGE’s DSL for garbled circuits, based on Senate’s                                                                                                                   9                           Related Work
+password reuse program. Senate uses a different SMPC pro-                                                                                                                    Much existing work has looked at high-performance algo-
+tocol, so its results are not directly comparable to ours.                                                                                                                   rithms for SMPC [21, 22, 44, 45, 84] and HE [17, 29]. These
+   We use MAGE to scale the password reuse program to 227                                                                                                                    works focus on the cryptography, not how to manage a com-
+users per party, which requires 1.125 TiB on each party. A sin-                                                                                                              puter’s resources to perform large computations efficiently.
+gle D16d_v4 instance does not have enough swap space. Thus,                                                                                                                     A complementary line of work explores tailoring SMPC
+
+
+
+USENIX Association                                                                                                          15th USENIX Symposium on Operating Systems Design and Implementation                                                                                                                 379
+computations to a specific application [15,43,68,94]. The goal     imate Belady’s algorithm (MIN) [72]. SC’s obliviousness and
+of MAGE is to perform the same computation more efficiently,       our memory programming approach allow MAGE to compute
+so its techniques generalize across different applications. For    the memory access pattern without first running the program,
+an application, one may first simplify the computation us-         and then apply these techniques using the access pattern itself.
+ing application-specific observations, and then execute the           The recent DEMAND-MIN [39] algorithm combines MIN
+resulting computation as efficiently as possible.                  with prefetching. DEMAND-MIN tells which item to evict
+   Research works including Fairplay [55], HEKM [37],              given an access pattern sequence and prefetch sequence fixed
+KSS [49], MLB [61], PCF [48], and TinyGarble [73] are              in advance. It is not directly applicable to MAGE because
+frameworks for garbled circuit execution. We described many        MAGE’s prefetch sequence is not fixed in advance.
+of them in §2.4. One work [11] explores parallelizing execu-          At a technical level, MAGE’s planning is similar to register
+tion of a garbled circuit, using programming language tools        allocation in compiler theory [14, 18, 74, 85]—variables, reg-
+to automatically extract parallelism. None of them explore         isters, and memory in register allocation correspond to wire
+how to efficiently swap memory to storage, as MAGE does.           values, slots in memory, and storage swap space in the context
+   There already exist many DSLs and compilers for                 of MAGE. The key difference is that register allocators must
+SMPC [34, 36, 51, 60, 82, 89, 93] and HE [13, 23, 78]. These       deal with conditional branches whose outcomes cannot be
+tools often aim to make SC more accessible to non-expert           predicted at compile time. From the perspective of register
+developers, by automatically optimizing the SC program.            allocation, the entire circuit that MAGE operates on would
+MAGE addresses the complementary problem of executing              be viewed as a single basic block. We discussed a result from
+the resulting SC circuit more efficiently. To use an existing      register allocation theory for a single basic block in §6.3. An-
+tool with MAGE (as in Fig. 2), one could modify it to out-         other result is that, for a fixed number of registers, there is a
+put its optimized circuits in one of MAGE’s DSLs, and then         linear-time algorithm that can reorder instructions within a
+run MAGE’s planner on that DSL code. Alternatively, one            structured program to optimize its register allocation [7, §3.2]
+could modify the tool to output a bytecode directly usable by      (though the time is exponential in the number of registers).
+MAGE’s planner (e.g., the “Virtual Bytecode” in Fig. 4).           10    Conclusion
+   AIFM [70] uses similar C++ language features as MAGE’s
+                                                                   This paper explores how to efficiently execute SC computa-
+DSLs. AIFM uses them at runtime for fine-grained memory
+                                                                   tions that do not fit in memory. Our key observation is that SC
+management. In contrast, MAGE (1) executes DSL programs
+                                                                   is inherently oblivious. This enables memory programming,
+only to extract the memory access pattern during the planning
+                                                                   in which one computes the access pattern of an SC program
+phase and (2) manages memory at the granularity of pages.
+                                                                   in advance and uses it to produce a memory management plan.
+   There is an extensive literature concerning memory man-
+                                                                   By using memory programming to preplan data transfers be-
+agement in traditional operating systems [3, 4, 24–26]. A re-
+                                                                   tween memory and storage, MAGE runs SC up to an order of
+lated line of work looks at how operating systems can give
+                                                                   magnitude faster than the OS virtual memory system and can
+memory-intensive applications, such as scientific simulations,
+                                                                   execute some SC programs at nearly in-memory speeds.
+more control over paging [32]. While these works focus pri-
+                                                                      Some non-SC programs, like plaintext neural network infer-
+marily on paging in the classic sense, our work explores
+                                                                   ence and programs designed for hardware enclaves like Intel
+memory programming. Additionally, our work, unlike sci-
+                                                                   SGX, are also oblivious. Applying memory programming to
+entific simulations, is capable of general computations within
+                                                                   such workloads is an interesting direction for future work.
+SC. Scheduling page movement according to real-time con-
+straints imposed by computation also draws from the real-time      Acknowledgments
+scheduling literature [52]. These techniques do not manage         We thank the anonymous reviewers and our shepherd, Na-
+memory directly and are complementary to ours.                     dav Amit, for their helpful feedback. We would also like to
+   Some systems in other domains, like neural network train-       thank Katerina Sotiraki and other students/postdocs from the
+ing, formulate memory management problems as an integer            RISELab Security Group for their feedback on early drafts.
+linear program and use an exponential-time solver [40]. This          This work is supported by NSF CISE Expeditions Award
+approach exploits the high-level structure of the application to   CCF-1730628, NSF CAREER 1943347, and gifts from the
+coarsen the dataflow graph. For MAGE, the dataflow graph is        Sloan Foundation, Bakar Fellows Program, Alibaba, Amazon
+much larger because general SC computations do not conform         Web Services, Ant Group, Ericsson, Facebook, Futurewei,
+to any particular high-level structure. By operating on a pro-     Google, Intel, Microsoft, Nvidia, Scotiabank, Splunk, and
+gram representation of the circuit (§4.2), MAGE does coarsen       VMware. This research is also supported in part by the Na-
+the graph, but it nevertheless remains enormous. Thus, we          tional Science Foundation Graduate Research Fellowship Pro-
+use our staged approach (§6) to find a good approximation.         gram under Grant No. DGE-1752814. Any opinions, findings,
+   Some systems use observations of past memory accesses or        and conclusions or recommendations expressed in this mate-
+past working sets (e.g., from prior invocations of a program)      rial are those of the authors and do not necessarily reflect the
+to perform targeted prefetching [33,35,56,77,92] and approx-       views of the National Science Foundation.
+
+
+
+380   15th USENIX Symposium on Operating Systems Design and Implementation                                   USENIX Association
+References                                                         [16] J. H. Cheon, A. Kim, M. Kim, and Y. Song. Homomor-
+ [1] J. Bater, G. Elliott, V. Eggen, S. Goel, A. Kho, and               phic encryption for arithmetic of approximate numbers.
+     J. Rogers. SMCQL: Secure querying for federated                    In ASIACRYPT. Springer, Cham, 2017.
+     databases. VLDB, 10(6), 2017.
+                                                                   [17] I. Chillotti, N. Gama, M. Georgieva, and M. Izabachène.
+ [2] D. Beaver, S. Micali, and P. Rogaway. The round com-               Faster fully homomorphic encryption: Bootstrapping in
+     plexity of secure protocols. In STOC. ACM, 1990.                   less than 0.1 seconds. In ASIACRYPT. Springer, Berlin,
+                                                                        Heidelberg, 2016.
+ [3] L. A. Belady. A study of replacement algorithms for
+     virtual storage computers. IBM Syst. J., 5(2), 1966.          [18] K. D. Cooper and L. T. Simpson. Live range splitting
+ [4] L. A. Belady, R. A. Nelson, and G. S. Shedler. An                  in a graph coloring register allocator. In CC. Springer,
+     anomaly in space-time characteristics of certain pro-              Berlin, Heidelberg, 1998.
+     grams running in a paging machine. CACM, 12(6),
+                                                                   [19] Curv. Curv | digital asset security infrastructure. https:
+     1969.
+                                                                        //www.curv.co/.
+ [5] M. Bellare, V. T. Hoang, S. Keelveedhi, and P. Rogaway.
+     Efficient garbling from a fixed-key blockcipher. In S&P.      [20] D. McDaniel.    Virtual machines best practices:
+     IEEE, 2013.                                                        Single VMs, temporary storage and uploaded disks.
+                                                                        https://azure.microsoft.com/en-us/blog/
+ [6] O. Biçer. Efficiency optimizations on Yao’s garbled                virtual-machines-best-practices-single-
+     circuits and their practical applications. Master’s thesis,        vms-temporary-storage-and-uploaded-disks/,
+     Istanbul Şehir University, 2017. Chapters 3 and 4.                2014.
+ [7] H. Bodlaender, J. Gustedt, and J. A. Telle. Linear-time       [21] I. Damgård, M. Keller, E. Larraia, V. Pastro, P. Scholl,
+     register allocation for a fixed number of registers. In            and N. P. Smart. Practical covertly secure MPC for
+     SODA. SIAM, 1998.                                                  dishonest majority – or: breaking the SPDZ limits. In
+ [8] J. Bonwick. The slab allocator: An object-caching                  ESORICS. Springer, Berlin, Heidelberg, 2013.
+     kernel. In USENIX Summer Technical Conference.
+     USENIX Association, 1994.                                     [22] I. Damgård, V. Pastro, N. Smart, and S. Zakarias. Mul-
+                                                                        tiparty computation from somewhat homomorphic en-
+ [9] D. P. Bovet and M. Cesati. Page frame reclaiming. In               cryption. Cryptology ePrint Archive, Report 2011/535,
+     Understanding the Linux Kernel, chapter 17, page 679.              2011. https://eprint.iacr.org/2011/535.
+     O’Reilly Media, 2006.
+                                                                   [23] R. Dathathri, B. Kostova, O. Saarikivi, W. Dai, K. Laine,
+[10] E. Boyle, G. Couteau, N. Gilboa, Y. Ishai, L. Kohl,                and M. Musuvathi. EVA: An encrypted vector arith-
+     and P. Scholl. Efficient pseudorandom correlation                  metic language and compiler for efficient homomorphic
+     generators: Silent OT extension and more. Cryptol-                 computation. ACM, 2020.
+     ogy ePrint Archive, Report 2019/448, 2019. https:
+     //eprint.iacr.org/2019/448.                                   [24] P. J. Denning. Thrashing: its causes and prevention. In
+                                                                        AFIPS. ACM, 1968.
+[11] N. Buescher and S. Katzenbeisser. Faster secure com-
+     putation through automatic parallelization. In USENIX         [25] P. J. Denning. Virtual memory. CSUR, 2(3), 1970.
+     Security. USENIX, 2015.
+                                                                   [26] P. J. Denning. Working sets past and present. IEEE
+[12] Cape Privacy. https://medium.com/dropoutlabs.
+                                                                        Trans. Softw. Eng., SE-6(1), 1980.
+[13] S. Carpov, P. Dubrulle, and R. Sirdey. Armadillo: A
+     compilation chain for privacy preserving applications.        [27] Duality. https://dualitytech.com/.
+     In SCC. ACM, 2015.
+                                                                   [28] M. Farach and V. Liberatore. On local register allocation.
+[14] G. J. Chaitin, M. A. Auslander, A. K. Chandra, J. Cocke,           In SODA. SIAM, 1998.
+     M. E. Hopkins, and P. W. Markstein. Register allocation
+     via coloring. Computer Languages, 6(1), 1981.                 [29] C. Gentry, S. Halevi, and N. P. Smart. Fully homo-
+                                                                        morphic encryption with polylog overhead. In EURO-
+[15] H. Chen, M. Kim, I. P. Razensteyn, D. Rotaru, Y. Song,             CRYPT. Springer, Berlin, Heidelberg, 2012.
+     and S. Wagh. Maliciously secure matrix multiplication
+     with applications to private deep learning. 2020. https:      [30] Google Cloud.     Machine types.    https://
+     //eprint.iacr.org/2020/451.                                        cloud.google.com/compute/docs/machine-types.
+
+
+
+USENIX Association                           15th USENIX Symposium on Operating Systems Design and Implementation            381
+[31] C. Guo, J. Katz, X. Wang, C. Weng, and Y. Yu. Better       [46] Keyless. Keyless | zero-trust passwordless authentica-
+     concrete security for half-gates garbling (in the multi-        tion. https://keyless.io/.
+     instance setting). Cryptology ePrint Archive, Report
+     2019/1168, 2019. https://eprint.iacr.org/2019/             [47] V. Kolesnikov and T. Schneider. Improved garbled
+     1168.                                                           circuit: Free XOR gates and applications. In ICALP.
+                                                                     Springer, Berlin, Heidelberg, 2008.
+[32] K. Harty and D. R. Cheriton. Application-controlled
+                                                                [48] B. Kreuter, B. Mood, A. Shelat, and K. Butler. PCF:
+     physical memory using external page-cache manage-
+                                                                     A portable circuit format for scalable two-party secure
+     ment. In ASPLOS. ACM, 1992.
+                                                                     computation. In USENIX Security. USENIX, 2013.
+[33] M. Hashemi, K. Swersky, J. A. Smith, G. Ayers, H. Litz,
+                                                                [49] B. Kreuter, A. Shelat, and C.-H. Shen. Billion-gate
+     J. Chang, C. Kozyrakis, and P. Ranganathan. Learning
+                                                                     secure computation with malicious adversaries. In
+     memory access patterns. In ICML, 2018.
+                                                                     USENIX Security. USENIX, 2012.
+[34] M. Hastings, B. Hemenway, D. Noble, and S. Zdancewic.      [50] E. Kushilevitz and R. Ostrovsky. Replication is not
+     SoK: General purpose compilers for secure multi-party           needed: single databse, computationally-private infor-
+     computation. In S&P. IEEE, 2019.                                mation retrieval. In FOCS. IEEE, 1997.
+[35] J. He, J. Bent, A. Torres, G. Grider, G. Gibson,           [51] C. Liu, X. Wang, K. Nayak, Y. Huang, and E. Shi.
+     C. Maltzahn, and X.-H. Sun. I/O acceleration with               ObliVM: A programming framework for secure com-
+     pattern detection. In HPDC. ACM, 2015.                          putation. In S&P. IEEE, 2015.
+[36] A. Holzer, M. Franz, S. Katzenbeisser, and H. Veith.       [52] C. L. Liu and J. W. Layland. Scheduling algorithms for
+     Secure two-party computations in ANSI C. In CCS.                multiprogramming in a hard-real-time environment. J.
+     ACM, 2012.                                                      ACM, 20(1), 1973.
+[37] Y. Huang, D. Evans, J. Katz, and L. Malka. Faster secure   [53] J. Liu, M. Juuti, Y. Lu, and N. Asokan. Oblivious neural
+     two-party computation using garbled circuits. USENIX,           network predictions via MiniONN transformations. In
+     2011.                                                           CCS. ACM, 2017.
+[38] Inpher. https://inpher.io/.                                [54] C.-K. Luk, R. Cohn, R. Muth, H. Patil, A. Klauser,
+                                                                     G. Lowney, S. Wallace, V. J. Reddi, and K. Hazelwood.
+[39] A. Jain and C. Lin. Rethinking belady’s algorithm to
+                                                                     Pin: Building customized program analysis tools with
+     accommodate prefetching. In ISCA. ACM/IEEE, 2018.
+                                                                     dynamic instrumentation. In PLDI. ACM, 2005.
+[40] P. Jain, A. Jain, A. Nrusimha, A. Gholami, P. Abbeel,      [55] D. Malkhi, N. Nisan, B. Pinkas, and Y. Sella. Fairplay
+     K. Keutzer, I. Stoica, and J. Gonzalez. Checkmate:              — a secure two-party computation system. In USENIX
+     Breaking the memory wall with optimal tensor remate-            Security. USENIX, 2004.
+     rialization. In MLSys, 2020.
+                                                                [56] H. Al Maruf and M. Chowdhury. Effectively prefetching
+[41] S. Jha, L. Kruger, and V. Shmatikov. Towards practical          remote memory with leap. In ATC. USENIX, 2020.
+     privacy for genomic computation. IEEE, 2008.
+                                                                [57] Microsoft Azure.      Ddv4 and Ddsv4-series.
+[42] X. Jiang, M. Kim, K. Lauter, and Y. Song. Secure out-           https://docs.microsoft.com/en-us/azure/
+     sourced matrix computation and application to neural            virtual-machines/ddv4-ddsv4-series, 2020.
+     networks. ACM, 2018.
+                                                                [58] P. Mishra, R. Lehmkuhl, A. Srinivasan, W. Zheng, and
+[43] C. Juvekar, V. Vaikuntanathan, and A. Chandrakasan.             R. A. Popa. Delphi: A cryptographic inference service
+     GAZELLE: A low latency framework for secure neu-                for neural networks. In USENIX Security. USENIX,
+     ral network inference. In USENIX Security. USENIX,              2020.
+     2018.
+                                                                [59] P. Mohassel and Y. Zhang. SecureML: A system for
+[44] M. Keller, E. Orsini, and P. Scholl. MASCOT: faster             scalable privacy-preserving machine learning. In S&P.
+     malicious arithmetic secure computation with oblivious          IEEE, 2017.
+     transfer. In CCS. ACM, 2016.
+                                                                [60] B. Mood, D. Gupta, H. Carter, K. R. B. Butler, and
+[45] M. Keller, V. Pastro, and D. Rotaru. Overdrive: Making          P. Traynor. Frigate: A validated, extensible, and efficient
+     SPDZ great again. In EUROCRYPT. Springer, Cham,                 compiler and interpreter for secure computation. In
+     2018.                                                           EuroS&P. IEEE, 2016.
+
+
+
+382   15th USENIX Symposium on Operating Systems Design and Implementation                                USENIX Association
+[61] B. Mood, L. Letaw, and K. Butler. Memory-efficient          [74] O. Traub, G. Holloway, and M. D. Smith. Quality and
+     garbled circuit generation for mobile devices. In FC.            speed in linear-scan register allocation. In SIGPLAN.
+     Springer, Berlin, Heidelberg, 2012.                              ACM, 1998.
+
+[62] J. Nielsen. Nielsen’s law of Internet bandwidth. Ac-        [75] Unbound. https://www.unboundtech.com/.
+     cessed: May 26, 2020.
+                                                                 [76] Laakeri (https://cs.stackexchange.com/users/
+[63] V. Nikolaenko, U. Weinsberg, S. Ioannidis, M. Joye,              95646/laakeri).   Is there an algorithm to min-
+     D. Boneh, and N. Taft. Privacy-preserving ridge regres-          imize working set during a topological traver-
+     sion on hundreds of millions of records. In S&P. IEEE,           sal?   Computer Science Stack Exchange, 2020.
+     2013.                                                            https://cs.stackexchange.com/q/120274.
+
+                                                                 [77] D. Ustiugov, P. Petrov, M. Kogias, E. Bugnion, and
+[64] T. Peng.       Shared machine learning: Ant fi-
+                                                                      B. Grot. Benchmarking, analysis, and optimization of
+     nancial’s solution for data privacy.    https:
+                                                                      serverless function snapshots. In ASPLOS. ACM, 2021.
+     //medium.com/syncedreview/shared-machine-
+     learning-ant-financials-solution-for-data-                  [78] A. Viand, P. Jattke, and A. Hithnawi. SoK: Fully homo-
+     privacy-8069cffe7bb6.                                            morphic encryption compilers. In S&P. IEEE, 2021.
+
+[65] B. Pinkas, T. Schneider, N. P. Smart, and S. C. Williams.   [79] N. Volgushev, M. Schwarzkopf, B. Getchell, M. Varia,
+     Secure two-party computation is practical. In ASI-               A. Lapets, and A. Bestavros. Conclave: secure multi-
+     ACRYPT. Springer, Berlin, Heidelberg, 2009.                      party computation on big data. In EuroSys. ACM, 2019.
+
+[66] R. Poddar, S. Kalra, A. Yanai, R. Deng, R. A. Popa,         [80] F. Wang, C. Yun, S. Goldwasser, V. Vaikuntanathan, and
+     and J. M. Hellerstein. Senate: A maliciously-secure              M. Zaharia. Splinter: Practical private queries on public
+     MPC platform for collaborative analytics. In USENIX              data. In NSDI. USENIX, 2017.
+     Security. USENIX, 2021.
+                                                                 [81] K. C. Wang and M. K. Reiter. How to end password
+[67] B. Randell. A note on storage fragmentation and pro-             reuse on the web. In NDSS. Internet Society, 2019.
+     gram segmentation. CACM, 12(7), 1969.                       [82] X. Wang, A. J. Malozemoff, and J. Katz. EMP-toolkit:
+                                                                      Efficient MultiParty computation toolkit. https://
+[68] M. S. Riazi, M. Samragh, H. Chen, K. Laine, K. Lauter,
+                                                                      github.com/emp-toolkit, 2016.
+     and F. Koushanfar. X ONN: XNOR-based oblivious
+     deep neural network inference. In USENIX Security.          [83] X. Wang, S. Ranellucci, and J. Katz. Authenticated
+     USENIX, 2019.                                                    garbling and efficient maliciously secure two-party com-
+                                                                      putation. In CCS. ACM, 2017.
+[69] M. Rosulek. A brief history of practical garbled circuit
+     optimizations, 2015. https://simons.berkeley.edu/           [84] X. Wang, S. Ranellucci, and J. Katz. Global-scale secure
+     talks/mike-rosulek-2015-06-09,                  https:           multiparty computation. In CCS. ACM, 2017.
+     //www.youtube.com/watch?v=FTxh908u9y8.
+                                                                 [85] C. Wimmer and H. Mössenböck. Optimized interval
+[70] Z. Ruan, M. Schwarzkopf, M. K. Aguilera, and A. Be-              splitting in a linear scan register allocator. In VEE. ACM,
+     lay. AIFM: High-performance, application-integrated              2005.
+     far memory. In OSDI. USENIX, 2020.
+                                                                 [86] S. Yakoubov. A gentle introduction to Yao’s garbled
+[71] Microsoft SEAL (release 3.6). https://github.com/                circuits, 2017. http://web.mit.edu/sonka89/www/
+     Microsoft/SEAL, 2020. Microsoft Research, Red-                   papers/2017ygc.pdf.
+     mond, WA.                                                   [87] A. C.-C. Yao. Protocols for secure computations. In
+                                                                      FOCS. IEEE, 1982.
+[72] Z. Song, D. S. Berger, K. Li, and W. Lloyd. Learning
+     relaxed Belady for content distribution network caching.    [88] A. C.-C. Yao. How to generate and exchange secrets. In
+     In NSDI. USENIX, 2020.                                           FOCS. IEEE, 1986.
+
+[73] E. M. Songhori, S. U. Hussain, A.-R. Sadeghi, T. Schnei-    [89] S. Zahur and D. Evans. Obliv-C: A language for
+     der, and F. Koushanfar. TinyGarble: Highly compressed            extensible data-oblivious computation. Cryptology
+     and scalable sequential garbled circuits. In S&P. IEEE,          ePrint Archive, Report 2015/1153, 2015. https://
+     2015.                                                            eprint.iacr.org/2015/1153.
+
+
+
+USENIX Association                          15th USENIX Symposium on Operating Systems Design and Implementation            383
+[90] S. Zahur, M. Rosulek, and D. Evans. Two halves make a       Contents
+     whole: Reducing data transfer in garbled circuits using     Our artifact comprises (1) a prototype of MAGE and (2)
+     half gates. In EUROCRYPT. Springer, Berlin, Heidel-         scripts to run experiments from §8.
+     berg, 2015.
+                                                                 Prototype. Our MAGE prototype includes:
+                                                                 • The planner and interpreter for the MAGE system.
+[91] Zcash. Parameter generation.         https://z.cash/
+                                                                 • A utility program to read the bytecode format used by our
+     technology/paramgen/.
+                                                                   implementation and print a memory program in human-
+                                                                   readable form.
+[92] I. Zhang, A. Garthwaite, Y. Baskakov, and K. C. Barr.
+                                                                 • Implementations of the workloads used in our evaluation
+     Fast restore of checkpointed memory using working set
+                                                                   (§8.1) in MAGE’s DSLs.
+     estimation. In VEE. ACM, 2011.
+                                                                 • Utility programs to prepare inputs for these workloads.
+                                                                 • A wiki page that walks the user through using our MAGE
+[93] W. Zheng, R. Deng, W. Chen, R. A. Popa, A. Panda,
+                                                                   prototype to perform a computation.
+     and I. Stoica. Cerebro: A platform for multi-party cryp-
+     tographic collaborative learning. In USENIX Security.       Scripts. Our scripts to run our experiments include:
+     USENIX, 2021.                                               • A program, magebench.py, that can spawn cloud instances
+                                                                   on Microsoft Azure and Google Cloud and run experiments
+[94] W. Zheng, R. A. Popa, J. E. Gonzalez, and I. Stoica.          on the resulting cloud setup. The command line parameters
+     Helen: Maliciously secure coopetitive learning for linear     passed to this program can be used to specify the cloud
+     models. In S&P. IEEE, 2019.                                   setup and experiments to run; the user can change these
+                                                                   command line parameters to change aspects of the setup
+[95] R. Zhu, D. Cassel, A. Sabry, and Y. Huang. NANOPI:            (e.g., number of workers, memory size, problem size, etc.).
+     Extreme-scale actively-secure multi-party computation.      • A README file that describes how to use magebench.py
+     In CCS. ACM, 2018.                                            to run our experiments from §8 and obtain log files contain-
+                                                                   ing the results.
+                                                                 • An IPython notebook to produce graphs from the log files
+A     Artifact Appendix                                            output by magebench.py.
+Abstract                                                         • Utility scripts to help automate invoking magebench.py to
+Our artifact consists of a MAGE prototype and scripts to use       run experiments from §8.
+it to run our experiments from §8. The MAGE prototype can        Hosting
+execute SC efficiently even when the computation does not        Our artifact is available on GitHub. Our MAGE prototype is
+fit in memory. It does so by using memory programming            available at https://github.com/ucbrise/mage and our
+to provide a very efficient virtual memory abstraction. Our      scripts to run our experiments are available at https://
+prototype supports distributing an SC computation across         github.com/ucbrise/mage-scripts. The version we pro-
+workers that communicate over the network, allowing for          vided to the artifact evaluation committee is marked in both
+parallel and distributed SC execution. The MAGE prototype        repositories using the osdi21ae tag. However, we encourage
+presently supports two SC protocols: garbled circuits and        users to use the latest versions of each repository (on the main
+CKKS. It follows the layered architecture described in §4.3.     branch), as they include the newest features and bug fixes,
+                                                                 including scripts for additional experiments in §8.
+Scope
+Our artifact can be used to validate our central claim that,
+                                                                 Requirements
+using memory programming, MAGE can execute SC compu-             We developed and tested our artifact on Intel x86-64 sys-
+tations that do not fit in memory at nearly in-memory speeds.    tems running Ubuntu 20.04. We used clang++ 10.0.0 to
+Specifically, our artifact can be used to validate the perfor-   compile our MAGE prototype. The magebench.py script
+mance claims made in the figures and table in §8. Our submit-    spawns cloud instances with an environment appropriate for
+ted artifact package allowed the artifact evaluation committee   building and running our MAGE prototype. Spawning those
+to reproduce those results present in our submitted paper; we    cloud instances requires a subscription to Microsoft Azure
+have since added support for reproducing the measurements        and Google Cloud. The particular software dependencies for
+we have added since the original submission.                     our artifact are specified in the README files of our two
+                                                                 GitHub repositories.
+   Our artifact can also be used to run SC computations unre-
+lated to our evaluation of MAGE in §8. The user can describe     Workflow
+a custom SC computation using a DSL internal to C++, and         To use our MAGE prototype, the user first writes a config-
+then use our MAGE prototype to generate a memory program         uration file in YAML describing the execution setup (e.g.,
+for it and execute it efficiently.                               network information and swap file for each worker, number
+
+
+
+384   15th USENIX Symposium on Operating Systems Design and Implementation                                USENIX Association
+of concurrent OTs for garbled circuits, etc.). For SMPC, in-      taining the memory program, configuration, and input data
+formation needed only by other parties (e.g., the swap file       and writes a file containing the program’s output. Further
+for other parties’ workers) can be omitted from the configu-      details are given in the README file and wiki pages of the
+ration file. Next, the user writes a program in a DSL internal    mage repository on GitHub.
+to C++ specifying the computation to run. Then, the user             To use our script to run experiments, the user invokes
+runs MAGE’s planner, which accepts the DSL program and            magebench.py to spawn cloud virtual machines. The user
+configuration file as input, for each worker the user will run,   can then invoke magebench.py to run MAGE on those cloud
+and outputs a file containing a memory program for each           virtual machines, copy the resulting log files to the machine
+worker. The user prepares a file for each worker describing       where magebench.py is run, and finally, deallocate the cloud
+that worker’s input for the computation. Finally, the user runs   virtual machines. Further details are given in the README
+MAGE’s interpreter for each worker, which accepts files con-      file of the mage-scripts repository on GitHub.
+
+
+
+
+USENIX Association                          15th USENIX Symposium on Operating Systems Design and Implementation           385
+

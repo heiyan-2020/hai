@@ -1,0 +1,1487 @@
+    Focus: Querying Large Video Datasets
+       with Low Latency and Low Cost
+    Kevin Hsieh, Carnegie Mellon University; Ganesh Ananthanarayanan
+and Peter Bodik, Microsoft; Shivaram Venkataraman, Microsoft / UW-Madison;
+               Paramvir Bahl and Matthai Philipose, Microsoft;
+   Phillip B. Gibbons, Carnegie Mellon University; Onur Mutlu, ETH Zurich
+            https://www.usenix.org/conference/osdi18/presentation/hsieh
+
+
+      This paper is included in the Proceedings of the
+   13th USENIX Symposium on Operating Systems Design
+              and Implementation (OSDI ’18).
+                   October 8–10, 2018 • Carlsbad, CA, USA
+                              ISBN 978-1-939133-08-3
+
+
+
+                                         Open access to the Proceedings of the
+                                     13th USENIX Symposium on Operating Systems
+                                             Design and Implementation
+                                               is sponsored by USENIX.
+   Focus: Querying Large Video Datasets with Low Latency and Low Cost
+    Kevin Hsieh† Ganesh Ananthanarayanan§ Peter Bodik§ Shivaram Venkataraman§ℵ
+           Paramvir Bahl§ Matthai Philipose§ Phillip B. Gibbons† Onur Mutlu?†
+       † Carnegie Mellon University              § Microsoft      ℵ University of Wisconsin           ? ETH Zürich
+
+
+Abstract                                                          and slow. For example, even after using various motion
+Large volumes of video are continuously recorded by               detection techniques to filter out frames with no moving
+cameras deployed for traffic control and surveillance with        objects, using an object detector such as YOLOv2 [68]
+the goal of answering “after the fact” queries such as:           to identify frames with a given class (e.g., ambulance)
+identify video frames with objects of certain classes (cars,      on a month-long traffic video requires ≈ 190 hours on
+bags) from many days of recorded video. Current systems           a high-end GPU (NVIDIA P100 [12]) and costs over
+for processing such queries on large video datasets incur         $380 in the Azure cloud (Standard_NC6s_v2 instances).
+either high cost at video ingest time or high latency at          To achieve a query latency of say one minute on 190
+query time. We present Focus, a system providing both             GPU hours of work would require tens of thousands of
+low-cost and low-latency querying on large video datasets.        GPUs detecting objects in the video frames in parallel,
+Focus’ architecture flexibly and effectively divides the          which is two to three orders of magnitude more than
+query processing work between ingest time and query               what is typically provisioned (few tens or hundreds of
+time. At ingest time (on live videos), Focus uses cheap           GPUs) by traffic jurisdictions or retail stores. Recent work
+convolutional network classifiers (CNNs) to construct             like NoScope [51] has significantly improved the filtering
+an approximate index of all possible object classes in            of frames by using techniques like lightweight binary
+each frame (to handle queries for any class in the future).       classifiers for the queried class (e.g., ambulance) before
+At query time, Focus leverages this approximate index             running heavy CNNs. However, the latencies are still
+to provide low latency, but compensates for the lower             long, e.g., it takes 5 hours to query a month-long video on
+accuracy of the cheap CNNs through the judicious use              a GPU, in our evaluations. Moreover, videos from many
+of an expensive CNN. Experiments on commercial video              cameras often need to be queried, which increases the
+streams show that Focus is 48× (up to 92×) cheaper than           latency and the GPU requirements even more.
+using expensive CNNs for ingestion, and provides 125×                The objective of our work is to enable low-latency and
+(up to 607×) lower query latency than a state-of-the-art          low-cost querying over large historical video datasets.
+video querying system (NoScope).                                     A natural approach to enable low latency queries is
+                                                                  doing most of the work at ingest-time, i.e., on the live
+1. Introduction                                                   video that is being captured. If object detection, using say
+Cameras are ubiquitous, with millions of them deployed            YOLO, were performed on frames at ingest-time, queries
+by public and private entities at traffic intersections, enter-   for specific classes (e.g., ambulance) would involve only a
+prise offices, and retail stores. Videos from these cameras       simple index lookup to find video frames with the queried
+are continuously recorded [2,6], with the main purpose of         object class. There are, however, two main shortcomings
+answering “after-the-fact” queries such as: identify video        with this approach. First, most of the ingest-time work
+frames with objects of certain classes (like cars or bags)        may be wasteful because typically only a small fraction
+from many days of recorded video. Because the results             of recorded frames ever get queried [16], e.g., only after
+from these video analytics queries may be needed quickly          an incident that needs investigation. Second, filtering
+in many use cases, achieving low latency is crucial.              techniques that use binary classifiers (as in NoScope [51])
+   Advances in convolutional neural networks (CNNs)               are ineffective at ingest-time because any of a number
+backed by copious training data and hardware accelerators         of object classes could be queried later and running even
+(e.g., GPUs [12]) have led to highly accurate results in          lightweight binary classifiers for many classes can be
+tasks like object detection and classification of images.         prohibitively expensive.
+For instance, the ResNet152 classifier CNN [45], winner           Objectives & Techniques. We present Focus, a system
+of the ImageNet challenge 2015 [73], surpasses human-             to support low-latency, low-cost queries on large video
+level performance in classifying 1, 000 object classes on         datasets. To address the above challenges and shortcom-
+a public image dataset that has labeled ground truths [44].       ings, Focus has the following goals: (a) provide low-
+   Despite the accuracy of image classifier CNNs (like            cost indexing of multiple object classes in the video at
+ResNet152) and object detectors (like YOLOv2 [68]),               ingest-time, (b) achieve high accuracy and low latency
+using them for video analytics queries is both expensive          for queries, and (c) enable trade-offs between the cost at
+
+
+
+USENIX Association                   13th USENIX Symposium on Operating Systems Design and Implementation                269
+ingest-time and the latency at query-time. Focus takes as         which sharply improves one of ingest cost or query latency
+inputs from the user a ground-truth CNN (or “GT-CNN”,             for a small worsening of the other. It also allows for
+e.g., YOLO) and the desired accuracy of results that Focus        policies to balance the two, depending on the fraction of
+needs to achieve relative to the GT-CNN. With these in-           videos the application expects to get queried.
+puts, Focus uses three key techniques to achieve the above            In summary, Focus’ ingest-time and query-time oper-
+goals: (1) an approximate indexing scheme at ingest-time           ations are as follows. At ingest-time, Focus classifies
+using cheap CNNs, (2) redundancy elimination by clus-              the detected objects using a cheap CNN, clusters simi-
+tering similar objects, and (3) a tunable mechanism for            lar objects, and indexes each cluster centroid using the
+judiciously trading off ingest cost and query latency.             top-K most confident classification results, where K is
+   (1) Approximate indexing using a cheap ingest CNN.              auto-selected based on the user-specified precision, recall,
+To make video ingestion cheap, Focus uses compressed               and cost/latency trade-off point. At query-time, Focus
+and specialized versions of the GT-CNN that have fewer             looks up the ingest index for cluster centroids that match
+convolutional layers [78], use smaller image sizes, and            the class X requested by the user and classifies them using
+are trained to recognize the classes specific to each video        the GT-CNN. Finally, Focus returns all objects from the
+stream. The cheap ingest CNNs, however, are less accu-             clusters that are classified as class X to the user.
+rate than the expensive GT-CNN, both in terms of recall
+and precision. We define recall as the fraction of frames          Evaluation Highlights. We build Focus and evaluate it
+in the video that contain objects of the queried class that        on fourteen 12-hour videos from three domains – traffic
+were actually returned in the query’s results. Precision,          cameras, surveillance cameras, and news. We compare
+on the other hand, is the fraction of frames in the query’s        against two baselines: “Ingest-heavy”, which uses the heavy
+results that contain objects of the queried class.                 GT-CNN for ingest, and “NoScope”, a recent state-of-the-
+   Using a cheap CNN to filter frames upfront risks incor-         art video querying system [51]. We use YOLOv2 [68] as
+rectly eliminating frames. To overcome this potential loss         the GT-CNN. On average, across all the videos, Focus is
+in recall, Focus relies on an empirical observation: while         48× (up to 92×) cheaper than Ingest-heavy and 125× (up
+the top (i.e., most confident) classification results of the       to 607×) faster than NoScope, all the while achieving ≥
+cheap CNNs and expensive GT-CNN often do not match,                99% precision and recall. In other words, the latency to
+the top result of the expensive CNN often falls within the         query a month-long video drops from 5 hours to only 2.4
+top-K most confident results of the cheap CNN. Therefore,          minutes, at an ingest cost of $8/month/stream. Figure 1
+at ingest-time, Focus indexes each frame with the “top-K”          also shows representative results with different trade-off
+results of the cheap CNN, instead of just the top result.          alternatives for a surveillance video.
+To increase precision, at query-time, after filtering frames
+using the top-K index, we apply the GT-CNN and return                                Focus-Opt-Query          Focus-Opt-Ingest
+                                                                                     Focus-Balance            Ingest-heavy
+only frames that actually contains the queried object class.                         NoScope
+   (2) Redundancy elimination via clustering. To reduce                                                                      0.003     (I=90X, Q=403X)
+                                                               Normalized Query Latency
+
+
+
+
+the query-time latency of using the expensive GT-CNN,                                      1
+                                                                                          0.8                                0.002    (I=84X, Q=607X)
+Focus relies on the significant similarity between objects
+                                                                                          0.6
+in videos. For example, a car moving across a camera will                                                                    0.001
+                                                                                          0.4                                             (I=53X, Q=698X)
+look very similar in consecutive frames. Focus leverages
+                                                                                          0.2                                    0
+this similarity by clustering the objects at ingest-time. We                               0                                         0       0.01       0.02
+classify only the cluster centroids with the GT-CNN at                                          0   0.2 0.4 0.6 0.8 1                 Normalized Ingest Cost
+query-time, and assign the same class to all objects in the                                         Normalized Ingest Cost
+
+cluster. This considerably reduces query latency. Clus-
+tering, in fact, identifies redundant objects even across         Figure 1: Effectiveness of Focus at reducing both ingest cost
+non-contiguous and temporally-distant frames.                     and query latency, for an example surveillance video. We
+                                                                  compare against two baselines: “Ingest-heavy” that uses the
+   (3) Trading off ingest cost vs. query latency. Focus
+                                                                  YOLOv2 [68] object detector CNN for ingestion, and “No-
+intelligently chooses its parameters (including K and the         Scope”, the state-of-the-art video querying system [51]. On
+cheap ingest-time CNN) to meet user-specified targets             the left, we see that Focus (the Focus-Balance point) is simul-
+on precision and recall. Among the parameter choices              taneously 84× cheaper than Ingest-heavy in its cost (the I
+that meet the accuracy targets, it allows the user to trade       value) and 607× faster than NoScope in query latency (the
+off between ingest cost and query latency. For example,           Q value), all the while achieving at least 99% precision and
+using a cheaper ingest CNN reduces the ingest cost but            recall (not plotted). Zooming in, also shown are two alter-
+increases the query latency as Focus needs to use a larger K      native Focus designs offering different trade-offs, Focus-Opt-
+for the top-K index to achieve the accuracy targets. Focus        Query and Focus-Opt-Ingest, each with at least 99% precision
+automatically identifies the “sweet spot” in parameters,          and recall.
+
+
+
+
+270   13th USENIX Symposium on Operating Systems Design and Implementation                                                            USENIX Association
+Contributions: Our contributions are as follows.                             Because inference using state-of-the-art CNNs is com-
+ • We present a new architecture for low-cost and low-                    putationally expensive (and slow), two main techniques
+   latency querying over large video datasets, based on a                 have been developed to reduce the cost of inference. First,
+   principled split of ingest and query functionalities.                  compression is a set of techniques that can dramatically
+ • We propose techniques for efficient indexing of multi-                 reduce the cost of inference at the expense of accuracy.
+   ple object classes: we create a top-K index at ingest                  Such techniques include removing some expensive con-
+   time for high recall, while ensuring high precision by                 volutional layers [78], matrix pruning [34, 42], reducing
+   judiciously using expensive CNNs at query time.                        input image resolution [68], and others [48,71]. For exam-
+ • We show new policies that trade off between ingest                     ple, ResNet18, which is a ResNet152 variant with only 18
+   cost and query latency: our system is significantly                    layers, is 8× cheaper. Likewise, Tiny YOLO [68], a shal-
+   cheaper than an ingest-heavy design and significantly                  lower variant of the YOLO object detector, is 5× cheaper
+   faster than query-optimized techniques like NoScope.                   than YOLOv2. However, the tradeoff is that compressed
+                                                                          CNNs are usually less accurate than the original CNNs.
+2. Background and Motivation                                                 The second technique is CNN specialization [43],
+                                                                          where the CNNs are trained on a subset of a dataset
+We first provide a brief overview of convolutional Neural
+                                                                          specific to a particular context (such as a video stream).
+Networks, the state-of-the-art approach to detecting and
+                                                                          Specialization simplifies the task of a CNN because spe-
+classifying objects in images (§2.1). We then discuss new
+                                                                          cialized CNNs only need to consider a particular context.
+observations we make about real-world videos, which
+                                                                          For example, differentiating object classes in any possible
+motivate the design of our techniques (§2.2).
+                                                                          video is much more difficult than doing so in a traffic
+2.1. Convolutional Neural Networks                                        video, which is likely to contain far fewer object classes
+                                                                          (e.g., cars, bicycles, pedestrians). As a result, specialized
+Convolution Neural Networks (CNNs) are the state-of-the-                  CNNs can be more accurate and smaller at the expense of
+art method for many computer vision tasks such as object                  generality. Leveraging compressed and specialized CNNs
+detection and classification (e.g., [45, 53, 59, 68, 84]).                is a key facet of our solution (see §4).
+   Figure 2 illustrates the architecture of a representa-
+tive image classification CNN. Broadly, CNNs consist of                   2.2. Characterizing Real-world Videos
+different types of layers including convolutional layers,                 We aim to support queries of the form: find all frames
+pooling layers and fully-connected layers. The output                     in the video that contain objects of class X. We identify
+from the final layer of a classification CNN is the prob-                 some key characteristics of real-world videos towards
+abilities of all object classes (e.g., dog, flower, car), and             supporting these queries: (i) large portions of videos can
+the class with the highest probability is the predicted class             be excluded (§2.2.1), (ii) only a limited set of object
+for the object in the input image.                                        classes occur in each video (§2.2.2), and (iii) objects of
+                                          Fully-Connected                 the same class have similar feature vectors (§2.2.3). The
+Input                      Pooling        Layer
+                                                         Prob.(Apple) ✓
+                                                                          design of Focus is based on these characteristics.
+                           Layers
+Image                                                    Prob.(Car)          We analyze six 12-hour videos from three domains:
+                                                         Prob.(Orange)
+                                                         Prob.(Cat)
+                                                                          traffic cameras, surveillance cameras, and news channels
+                                     …                   Prob.(Flower)    (§6.1 provides the details.) In this paper, we use results
+                                                .        Prob.(Dog)
+                                                      .       .           from YOLOv2 [68], trained to classify 80 object classes
+                                                .             .
+         Convolutional +             Extracted        .       .
+                                                                          based on the COCO [60] dataset, as the ground truth.
+         Rectification Layers        Features
+                                                .     .
+                                                                          2.2.1. Excluding large portions of videos. We find con-
+  Figure 2: Architecture of an image classification CNN.                  siderable potential to avoid processing large portions of
+                                                                          videos at query-time. Not all the frames in a video are
+   The output of the penultimate (i.e., previous-to-last)                 relevant to a query because each query looks only for a
+layer can be considered as “representative features” of                   specific class of objects. In our video sets, an object class
+the input image [53]. The features are a real-valued vec-                 occurs in only 0.16% of the frames on average, and even
+tor, with lengths between 512 and 4096 in state-of-the-art                the most frequent object classes occur in no more than
+classifier CNNs (e.g., [45, 53, 78, 84]). It has been shown               26% − 78% of the frames. This is because while there
+that images with similar feature vectors (i.e., small Eu-                 are usually some dominant classes (e.g., cars in a traffic
+clidean distances) are visually similar [24, 53]. Thus,                   camera, people in a news channel), most other classes are
+the distance between feature vectors is a standard met-                   rare. Overall, the above data suggests considerable poten-
+ric to measure similarity of images in many applications,                 tial to speed up query latencies by indexing frames using
+such as face recognition (e.g., [47]) and image retrieval                 the object classes. Also, in our experience, a system for
+(e.g., [23, 24, 67]).                                                     querying videos is more useful for less frequent classes:
+
+
+
+USENIX Association                       13th USENIX Symposium on Operating Systems Design and Implementation                     271
+ querying for “ambulance” in a traffic video is more in-                        each object i, we find its nearest neighbor j using feature
+ teresting than querying for something commonplace like                         vectors from a cheap CNN (ResNet18) and compute the
+ “car”.                                                                         fraction of object pairs that belong to the same class. This
+   2.2.2. Limited set of object classes in each video. Most                     fraction is over 99% in each of our videos, which shows
+   video streams have a limited set of objects because each                     the promise of using feature vectors from cheap CNNs to
+   video has its own context (e.g., traffic cameras can have                    identify duplicate objects even across frames that are not
+   automobiles, pedestrians or bikes, but not airplanes).                       temporally contiguous.
+
+                           1                                                    3. Overview of Focus
+CDF (number of objects)
+
+
+
+
+                          0.9                                95% of objects     The goal of Focus is to index live video streams by the
+                          0.8                                                   object classes occurring in them and enable answering
+                                                 Auburn         Jackson Hole
+                          0.7                    Lausanne       Sittard         “after-the-fact” queries later on the stored videos of the
+                                                 CNN            MSNBC           form: find all frames that contain objects of class X. Op-
+                          0.6                                                   tionally, the query can be restricted to a subset of cameras
+                          0.5                                                   and a time range. Such a query formulation is the basis for
+                             0.0%    2.0% 4.0% 6.0% 8.0% 10.0% 12.0%            many widespread applications and could be used either
+                                        Percentage of COCO's 80 classes         on its own (such as for detecting all cars or bicycles in
+    Figure 3: CDF of frequency of object classes. The x-axis is                 the video) or used as a basis for further processing (e.g.,
+    the fraction of classes out of the 80 classes recognized by the             finding all collisions between cars and bicycles).
+    COCO [60] dataset (truncated to 12%).                                       System Configuration. Focus is designed to work with
+                                                                                a wide variety of current and future CNNs. The user
+      Figure 3 shows the cumulative distribution function                       (system administrator) provides a ground-truth CNN (GT-
+   (CDF) of the frequency of object classes in our videos                       CNN), which serves as the accuracy baseline for Focus,
+   (as classified by YOLOv2). We make two observations.                         but is far too costly to run on every video frame. Through
+   First, 2% − 10% of the most frequent object classes cover                    a sequence of techniques, Focus provides results of nearly-
+   ≥ 95% of the objects in all video streams. In fact, for                      comparable accuracy but at greatly reduced cost. In this
+   some videos like Auburn and Jackson Hole we find that                        paper, we use YOLOv2 [68] as the default GT-CNN.
+   only 11% − 19% object classes occur in the entire video.                        Because different applications require different accura-
+   Thus, for each video stream, if we can automatically                         cies, Focus permits the user to specify the accuracy target,
+   determine its most frequent object classes, we can train                     while providing reasonable defaults. The accuracy target
+   efficient CNNs specialized for these classes. Second, a                      is specified in terms of precision, i.e., fraction of frames
+   closer analysis reveals that there is little overlap between                 output by the query that actually contain an object of
+   the object classes among different videos. On average, the                   class X according to GT-CNN, and recall, i.e., fraction
+   Jaccard index [85] (i.e., intersection over union) between                   of frames that contain objects of class X according to
+   the videos based on their object classes is only 0.46. This                  GT-CNN that were actually returned by the query.
+   implies that we need to specialize CNNs for each video                       Architecture: Figure 4 overviews the Focus design.
+   stream separately to achieve the most benefits.                                • At ingest-time (left part of Figure 4), Focus classifies
+   2.2.3. Feature vectors for finding duplicate objects.                            objects in the incoming video frames and extracts
+   Objects moving in the video often stay in the frame for                          their feature vectors. For its ingest, Focus uses highly
+   several seconds; for example, a pedestrian might take 15                         compressed and specialized alternatives of the GT-
+   seconds to cross a street. Instead of classifying each in-                       CNN model (IT1 in Figure 4). Focus then clusters
+   stance of the same object across the frames, we would like                       objects based on their feature vectors (IT2 ) and assigns
+   to inexpensively find duplicate objects and only classify                        to each cluster the top K most likely classes these
+   one of them using a CNN (and apply the same label to all                         objects belong to (based on classification confidence
+   duplicates). Thus, given n duplicate objects, we would                           of the ingest CNN) (IT3 ). It creates a top-K index,
+   like only one CNN classification operation instead of n.                         which maps each class to the set of object clusters
+      Comparing pixel values across frames is an obvious                            (IT4 ). The top-K index is the output of Focus’ ingest-
+   technique to identify duplicate objects, however, this                           time processing of videos.
+   technique turns out to be highly sensitive to even small                       • At query-time (right part of Figure 4), when the user
+   changes in the camera’s view of an object. Instead, feature                      queries for a certain class X (QT1 ), Focus retrieves the
+   vectors extracted from the CNNs (§2.1) are more robust                           matching clusters from the top-K index (QT2 ), runs the
+   because they are specifically trained to extract visual fea-                     centroids of the clusters through GT-CNN (QT3 ), and
+   tures for classification. We verify the robustness of feature                    returns all frames from the clusters whose centroids
+   vectors using the following analysis. In each video, for                         were classified by GT-CNN as class X (QT4 ).
+
+
+
+    272                         13th USENIX Symposium on Operating Systems Design and Implementation                  USENIX Association
+                                                       Ingest-time        Query-time
+                        CNN
+                                                                                                      Frames with   QT4
+                    specialization
+                                                                                                       objects of
+       Frames                                                                    Querying for
+       Frames                                    IT2                                                    class X
+        Frames                        Object                               QT1     class X
+                                                        Object                                                        Matching
+                                      feature
+                                                       clusters                                                     clusters for X
+                                      vectors
+                                                                                  Centroid
+       Objects                                                                    objects
+                                             Object top-K
+                 IT1 Specialized,              classes                              QT2
+                                       IT3                              Top-K                   QT3
+                                                                                                      GT-CNN
+                  Compressed CNN                                  IT4
+                                                                        index
+
+                                                   Figure 4: Overview of Focus.
+
+The top-K ingest index is a mapping between the object                    3) Trading off ingest vs. query costs. Focus automati-
+classes and the clusters. In particular, we create a mapping              cally chooses the ingest CNN, its K, and specialization
+from each object class to the clusters with top K matching                and clustering parameters to achieve the desired precision
+object classes. Separately, we store the mapping between                  and recall targets. These choices also help Focus trade off
+clusters and their corresponding objects and frames. The                  between the work done at ingest-time and query-time. For
+structure of the index is:                                                instance, to save ingest work, Focus can select a cheaper
+ object class → hcluster IDi                                              ingest-time CNN, and then counteract the resultant loss
+ cluster ID → [centroid object, hobjectsi in                              in recall by using a higher K and running the expensive
+ cluster, hframe IDsi of objects]                                         GT-CNN on more objects at query time. Focus chooses its
+   We next explain how Focus’ key techniques keep ingest                  parameters so as to offer a sharp improvement in one of
+cost and query latency low while also meeting the user-                   the two costs for a small degradation in the other cost. Be-
+specified recall and precision targets.                                   cause the desired trade-off point is application-dependent,
+1) Top-K index via cheap ingesting: Focus makes index-                    Focus provides users with options: “ingest-optimized”,
+ing at ingest-time cheap by using compressed and special-                 “query-optimized”, and “balanced” (the default). Figure 1
+ized alternatives of the GT-CNN for each video stream.                    (§1) presents an example result.
+Compression of CNNs [34, 42, 48, 78] uses fewer con-
+volutional layers and other approximations (§2.1), while                  4. Video Ingest & Querying Techniques
+specialization of CNNs [43,75] uses the observation that a                We describe the main techniques used in Focus: construct-
+specific video stream contains only a small number of ob-                 ing approximate indexes with cheap CNNs at ingest-time
+ject classes and their appearance is more constrained than                (§4.1), specializing the CNNs to the specific videos (§4.2),
+in a generic video (§2.2.2). Both optimizations are done                  and identifying similar objects and frames to save on
+automatically by Focus and together result in ingest-time                 redundant CNN processing (§4.3). §4.4 describes how
+CNNs that are up to 96× cheaper than the GT-CNN.                          Focus flexibly trades off ingest cost and query latency.
+   The cheap ingest-time CNNs are less accurate, i.e.,
+their top-most results often do not match the top-most                    4.1. Approximate Index via Cheap Ingest
+classifications of GT-CNN. Therefore, to improve recall,                  Focus indexes the live videos at ingest-time to reduce the
+Focus associates each object with the top-K classification                query-time latency. We detect and classify the objects
+results of the cheap CNN, instead of only its top-most re-                within the frames of the live videos using ingest-time
+sult. Increasing K increases recall because the top-most re-              CNNs that are far cheaper than the ground-truth GT-CNN.
+sult of GT-CNN often falls within the ingest-time CNN’s                   We use these classifications to index objects by class.
+top-K results. At query-time, Focus uses the GT-CNN to                    Cheap ingest-time CNN. As noted earlier, the user pro-
+remove objects in this larger set that do not match the                   vides Focus with a GT-CNN. Optionally, the user can
+class, to regain the precision lost by including the top-K.               also provide other CNN architectures to be used in Focus’
+2) Clustering similar objects. A high value of K at                       search for cheap CNNs. Examples include object detector
+ingest-time increases the work done at query time, thereby                CNNs (which vary in their resource costs and accura-
+increasing query latency. To reduce this overhead, Focus                  cies) like YOLO [68] and Faster RCNN [69] that jointly
+clusters similar objects at ingest-time using feature vec-                detect the objects in a frame and classify them. Alterna-
+tors from the cheap ingest-time CNN (§2.2.3). In each                     tively, objects can be detected separately using relatively
+cluster, at query-time, we run only the cluster centroid                  inexpensive techniques like background subtraction [28],
+through GT-CNN and apply the classified result from the                   which are well-suited for static cameras, as in surveillance
+GT-CNN to all objects in the cluster. Thus, a tight cluster-              or traffic installations, and then the detected objects can
+ing of objects is crucial for high precision and recall.                  be classified using object classification CNN architectures
+
+
+
+USENIX Association                   13th USENIX Symposium on Operating Systems Design and Implementation                            273
+such as ResNet [45], AlexNet [53] and VGG [78].1                             priate model and K, Focus can achieve the target recall.
+   Starting from these user-provided CNNs, Focus ap-                         Achieving precision. Focus creates the top-K index from
+plies various levels of compression, such as removing                        the top-K classes output by CheapCNNingest for every
+convolutional layers and reducing the input image reso-                      object at ingest-time. While filtering for objects of the
+lution (§2.1). This results in a large set of CNN options                    queried class X using the top-K index (with the appro-
+for ingest, {CheapCNN1 , . . . , CheapCNNn }, with a wide                    priate K) will have a high recall, this will lead to very
+range of costs and accuracies, out of which Focus picks                      low precision. Because we associate each object with
+its ingest-time CNN, CheapCNNingest .                                        K classes (while it has only one true class), the average
+Top-K Ingest Index. To keep recall high, Focus indexes                       precision is only 1/K. Thus, at query time, to improve
+each object using the top K object classes from the output                   precision, Focus determines the actual class of objects
+of CheapCNNingest , instead of using just the top-most                       from the top-K index using the expensive GT-CNN and
+class. Recall from §2.1 that the output of the CNN is                        returns only the objects that match the queried class X.
+a list of classes for each object in descending order of                     Skipping GT-CNN for high-confidence indexes. Focus
+confidence. We make the following empirical observation:                     records the prediction confidence along with the top-K
+the top-most output of the expensive GT-CNN for an                           results by CheapCNNingest . The system can skip invok-
+object is often contained within the top-K classes output                    ing GT-CNN for the indexes with prediction confidence
+by the cheap CNN, for a small value of K.                                    higher than a chosen threshold (Skipth ). Not invoking
+   Figure 5 demonstrates the above observation by plot-                      GT-CNN for these indexes can cause precision to fall if
+ting the effect of K on recall on one of our video streams                   the threshold is too low. Hence, this parameter needs to
+from a static camera, lausanne (see §6.1). We explore                        be carefully selected to retain high precision.
+many cheaper ResNet18 [45] models by removing one                            Parameter selection. The selection of the cheap ingest-
+layer at a time with various input image sizes. The trend                    time CNN model (CheapCNNingest ) and the K value (for
+is the same among the CNNs we explore so we present                          the top-K results) has a significant influence on the recall
+three models for clarity: ResNet18, and ResNet18 with                        of the output produced. Lower values of K reduce recall,
+4 and 6 layers removed; correspondingly to each model,                       i.e., Focus will miss frames that contain the queried ob-
+the input images were rescaled to 224, 112, and 56 pixels,                   jects. At the same time, higher values of K increase the
+respectively. These models were also specialized to the                      number of objects to classify with GT-CNN at query time,
+video stream (more in §4.2). We make two observations.                       and hence adds to the latency. §4.4 describes how Focus
+                                                                             sets these parameters because they have to be jointly set
+    ResNet18         ResNet18 (4 fewer layers)   ResNet18 (6 fewer layers)
+         100%                                                                with other parameters described in §4.2 and §4.3.
+          80%
+         60%                                                                 4.2. Video-specific Specialization of Ingest CNN
+Recall
+
+
+
+
+         40%
+                                                                             To further reduce the ingest cost, Focus specializes the
+         20%
+                                                                             ingest-time CNN model to each video stream. As §2.1
+          0%
+                      1             2              3             4           describes, model specialization [43] reduces cost by sim-
+                          Number of selected results (K)                     plifying the task of CNNs. Specifically, model specializa-
+Figure 5: Effect of K on the recall of three cheap classifier                tion takes advantage of two characteristics in real-world
+CNNs to classify the detected objects. Recall is measured                    videos. First, most video streams have a limited set of ob-
+relative to the results of the GT-CNN, YOLOv2 [68].                          ject classes (§2.2.2). Second, objects in a specific stream
+                                                                             are often visually more constrained than objects in general
+   First, we observe steady increase in recall with increas-                 (say, in the COCO [60] dataset). The cars and buses that
+ing K, for all three CheapCNNs. As the figure shows, all                     occur in a specific traffic camera have much less variabil-
+the cheap CNNs reach ≥ 99% recall when K ≥ 4. Note                           ity, e.g., they have very similar angle, distortion and size,
+that all these models recognize 80 classes, so K = 4 rep-                    compared to a generic set of vehicle images. Thus, clas-
+resents only 5% of the possible classes. Second, there                       sifying objects from a specific camera is a much simpler
+is a trade-off between different models – typically, the                     task than doing so from all cameras, resulting in cheaper
+cheaper they are, the lower their recall with the same                       ingest-time CNNs.
+K. However, we can compensate for the loss in recall in                         While specializing CNNs to specific videos has been
+cheaper models using a larger K to reach a certain recall                    attempted in computer vision research (e.g., [43, 75]), we
+value. Overall, we conclude that by selecting the appro-                     explain its two key implications within Focus.
+   1 Focus is agnostic to whether object detection and classification
+                                                                             1) Lower K values. Because the specialized CNN classi-
+are done together or separately. In practice, the set of detected object
+                                                                             fies across fewer classes, they are more accurate, which
+bounding boxes (but not their classifications!) remain largely the same      enables Focus to achieved the desired recall with a much
+with different ingest CNNs, background subtraction, and the GT-CNN.          smaller K (for the top-K ingest index). We find that spe-
+
+
+
+274             13th USENIX Symposium on Operating Systems Design and Implementation                               USENIX Association
+cialized models can usually use K ≤ 4 (Figure 5), much                    Doing so dramatically reduces the work done by the GT-
+smaller compared to the typical K needed for generic                      CNN classifier at query time. Focus uses the feature vector
+cheap CNNs. A smaller K translates to fewer objects                       output by the previous-to-last layer of the cheap ingest
+that have to be classified by GT-CNN at query time, thus                  CNN (see §2.1) for clustering. Note that Focus clusters
+reducing latency.                                                         the objects in the frames and not the frames as a whole.3
+2) Most frequent classes. On each video stream, Focus                          The key questions regarding clustering are how we
+periodically obtains a small sample of video frames and                   cluster and when we cluster. We discuss both below.
+classifies their objects using GT-CNN to estimate the                     Clustering Heuristic. We require two properties in our
+ground truth of the distribution of object classes for the                clustering technique. First, given the high volume of
+video (similar to Figure 3). From this distribution, Focus                video data, it should be a single-pass algorithm to keep the
+selects the most frequently occurring Ls object classes to                overhead low, unlike most clustering algorithms, which
+retrain new specialized models. Because just a handful                    are quadratic complexity. Second, it should make no
+of classes often account for a dominant majority of the                   assumption on the number of clusters and adapt to outliers
+objects (§2.2.2), low values of Ls usually suffice.                       in data points on the fly. Given these requirements, we use
+   While Focus specializes the CNN towards the most                       the following simple approach for incremental clustering,
+frequently occurring Ls classes, we also want to support                  which has been well-studied in the literature [30, 65].
+querying of the less frequent classes. For this purpose,                       We put the first object into the first cluster c1 . To cluster
+Focus includes an additional class called “OTHER” in the                  a new object i with a feature vector fi , we assign it to the
+specialized model. Being classified as OTHER simply                       closest cluster c j if c j is at most distance T away from
+means not being one of the Ls classes. At query time,                      fi , where T is a distance threshold. However, if none
+if the queried class is among the OTHER classes of the                    of the clusters are within a distance T , we create a new
+ingest CNN’s index, Focus extracts all the clusters that                  cluster with centroid at fi . We measure distance as the L2
+match the OTHER class and classifies their centroids                      norm [9] between the cluster centroid feature vector and
+through the GT-CNN model.2                                                the object feature vector fi . To bound the time complexity
+   The parameter Ls (for each video stream) exposes the                   for clustering, we keep the number of clusters actively
+following trade-off. Using a small Ls enables us to train a               being updated at a constant C. We do this by sealing the
+simpler model with cheaper ingest cost and lower query-                   smallest cluster when the number of clusters hits C + 1,
+time latency for the popular classes, but, it also leads to a             but we keep growing the popular clusters (such as similar
+larger fraction of objects falling in the OTHER class. As                 cars). This maintains the complexity as O(Cn), which is
+a result, querying for the OTHER class will be expensive                  linear in n, the total number of objects. The value of C
+because all those objects will have to be classified by the               has a very minor impact on our evaluation results, and we
+GT-CNN. Using a larger value of Ls , on the other hand,                   set C as 100 in our evaluations.
+leads to more expensive ingest and query-time models,                          Clustering can reduce precision and recall depending
+but cheaper querying for the OTHER classes. We select                     on the parameter T . If the centroid is classified by GT-
+Ls in §4.4.                                                               CNN as the queried class X but the cluster contains an-
+4.3. Redundant Object Elimination                                         other object class, it reduces precision. If the centroid is
+                                                                          classified as a class different than X but the cluster has an
+At query time, Focus retrieves the objects likely matching
+                                                                          object of class X, it reduces recall. §4.4 discuss setting T .
+the user-specified class from the top-K index and infers
+their actual class using the GT-CNN. This ensures preci-                  Clustering at Ingest vs. Query Time. Focus clusters the
+sion of 100%, but could cause significant latency at query                objects at ingest-time rather than at query-time. Cluster-
+time. Even if this inference were parallelized across many                ing at query-time would involve storing all feature vectors,
+GPUs, it would incur a large cost. Focus uses the fol-                    loading them for objects filtered from the ingest index
+lowing observation to reduce this cost: if two objects are                and then clustering them. Instead, clustering at ingest
+visually similar, their feature vectors are also similar and              time creates clusters right when the feature vectors are
+they would likely be classified as the same class (e.g.,                  created and stores only the cluster centroids in the top-K
+cars) by the GT-CNN model (§2.2.3).                                       index. This makes the query-time latency much lower
+   Focus clusters objects that are similar, invokes the ex-
+                                                                          and also reduces the size of the top-K index. We observe
+pensive GT-CNN only on the cluster centroids, and as-                     that the ordering of indexing and clustering operations
+signs the centroid’s label to all objects in each cluster.                is mostly commutative in practice and has little impact
+    2 Specialized CNNs can be retrained quickly on a small dataset.           3 Recall from §4.1 that Focus’ ingest process either (i) employs an
+
+Retraining is relatively infrequent and done once every few days. Also,   object detector CNN (e.g., YOLO) that jointly detects and classifies ob-
+because there will be considerably fewer objects in the video belonging   jects in a frame; or (ii) detects objects with background subtraction and
+to the OTHER class, we proportionally re-weight the training data to      then classifies objects with a classifier CNN (e.g. ResNet). Regardless,
+contain equal number of objects of all the classes.                       we obtain the feature vector from the CNNs for each object in the frame.
+
+
+
+
+USENIX Association                        13th USENIX Symposium on Operating Systems Design and Implementation                               275
+                                                                                   0.0040
+on recall and precision (we do not present these results
+
+
+
+
+                                                                Normalized Query
+                                                                                   0.0035    Opt-Ingest
+due to space constraints). We therefore use ingest-time
+                                                                                   0.0030
+
+
+
+
+                                                                    Latency
+clustering due to its latency and storage benefits.
+                                                                                   0.0025
+                                                                                                Balance
+4.4. Trading off Ingest Cost and Query Latency                                     0.0020
+                                                                                                                Opt-Query
+                                                                                   0.0015
+Focus’ goals of high recall/precision, low ingest cost and
+                                                                                   0.0010
+low query latency are affected by its parameters: (i) K, the
+                                                                                         0.008        0.010         0.012        0.014
+number of top results from the ingest-time CNN to index                                                 Normalized Ingest Cost
+an object; (ii) Ls , the number of popular object classes
+we use to create a specialized model; (iii) CheapCNNi ,          Figure 6: Parameter selection based on the ingest cost and
+                                                                 query latency trade-off. The ingest cost is normalized to the
+the specialized ingest-time cheap CNN; (iv) Skipth , the
+                                                                 cost of ingesting all video frames with GT-CNN (YOLOv2),
+confidence threshold to skip invoking GT-CNN; and (v)
+                                                                 while the query latency is normalized to the query latency
+T , the distance threshold for clustering objects.               using NoScope. The dashed line is the Pareto boundary.
+Viable Parameter Choices. Focus first prunes the param-
+eter choices to only those that meet the desired precision
+and recall targets. Among the five parameters, four param-       classes that are recognizable by the ingest CNN. By de-
+eters (K, Ls , CheapCNNi , and T ) impact recall; only T         fault, Focus chooses a Balance policy that equally weighs
+and Skipth impact precision. Focus samples a representa-         ingest cost and query latency. Users can also provide any
+tive fraction of the video stream and classifies them using      other weighted function to optimize their goal.
+GT-CNN for the ground truth. Next, for each combination             Focus also allows for other configurations based on
+of parameter values, Focus computes the precision and            the application’s preferences and query rates. Opt-Ingest
+recall (relative to GT-CNN’s outputs) achievable for each        minimizes the ingest cost and is applicable when the ap-
+of the object classes, and selects only those combinations       plication expects most of the video streams to not get
+that meet the precision and recall targets.                      queried (such as surveillance cameras), as this policy min-
+   Among the viable parameter choices that meet the              imizes the amount of wasted ingest work. On the other
+precision and recall targets, Focus balances ingest- and         hand, Opt-Query minimizes query latency but it incurs
+query-time costs. For example, picking a more accurate           a larger ingest cost. More complex policies can be eas-
+CheapCNNingest will have higher ingest cost, but lower           ily implemented by changing how the query latency cost
+query cost because we can use a smaller K. Using a less          and ingest cost are weighted in our cost function. Such
+accurate CheapCNNingest will have the opposite effect.           flexibility enables Focus to fit a number of applications.
+Pareto Boundary. Focus identifies “intelligent defaults”
+that sharply improve one of the two costs for a small            5. Implementation
+worsening of the other cost. Figure 6 illustrates the trade-     Because Focus targets large video datasets, a key require-
+off between ingest cost and query latency for one of our         ment of Focus’ implementation is the ability to scale and
+video streams. The figure plots all the viable “configu-         distribute computation across many machines. To this
+rations” (i.e., parameter choices that meet the precision        end, we implement Focus as three loosely-coupled mod-
+and recall targets) based on their ingest cost (i.e., cost of    ules which handle each of its three key tasks. Figure 7
+CheapCNNingest ) and query latency (i.e., the number of          presents the architecture and the three key modules of
+clusters that need to be checked at query time according         Focus: the ingest processor (M1), the stream tuner (M2),
+to K, Ls , T and Skipth ).                                       and the query processor (M3). These modules can be flex-
+   We first extract the Pareto boundary [17], which is           ibly deployed on different machines based on the video
+defined as the set of configurations among which we can-         dataset size and the available hardware resources (such as
+not improve one of the metrics without worsening the             GPUs). We describe each module in turn.
+other. For example, in Figure 6, the yellow triangles are
+not Pareto optimal when compared to the points on the            5.1. Ingest Processor
+dashed line. Focus can discard all non-Pareto configura-         Focus’ ingest processor (M1) generates the approximate
+tions because at least one point on the Pareto boundary is       index (§4.1) for the input video stream. The work is
+better than all non-Pareto points in both metrics.               distributed across many machines, with each machine
+Tradeoff Policies. Focus balances ingest cost and query          running one worker process for each video stream’s inges-
+latency (Balance in Figure 6) by selecting the configu-          tion. An ingest processor handles its input video stream
+ration that minimizes the sum of ingest cost and query           with a four-stage pipeline: (i) extracting the moving ob-
+latency. We measure ingest cost as the compute cycles            jects from the video frames (IP1 in Figure 7), (ii) inferring
+taken to ingest the video and query latency as the average       the top-K indexes and the feature vectors of all detected
+time (or cycles) required to query the video on the object       objects with the ingest-time CNN (IP2 in Figure 7, §4.1),
+
+
+
+276   13th USENIX Symposium on Operating Systems Design and Implementation                                          USENIX Association
+                                                  GT-CNN,
+                                               Accuracy target
+                                                                  M2 Stream Tuner
+                                                                                     Trade-off policy
+                               ST1                       Model and parameter                                Frames
+                                                                                                            Frames
+        Frame / object                Specialized             selection
+                                                                         ST2
+           extraction                model training                                        Query
+                                                                 Ingest CNN and                            Frames with
+       IP1                                                                              object class
+                                                                   parameters                           queried object class
+
+
+                           Ingest CNN         Feature vector                           Centroid object        GT-CNN
+           Objects
+                            evaluation          clustering                               selection           evaluation
+                     IP2                   IP3                                                       QP1                  QP2
+                                                           Approximate index
+                              M1 Ingest Processor                                            M3 Query Processor
+
+
+                                                 Figure 7: Key components of Focus.
+
+(iii) using the feature vector to cluster objects (IP3 in Fig-         frames. The ingest-time CNN and the system parameters
+ure 7, §4.3), and (iv) storing the top-K indexes of centroid           are re-tuned if necessary to meet the accuracy targets.
+objects in a database for efficient retrieval at query time.
+    An ingest processor is configured differently for static
+                                                                       5.3. Query Processor
+(fixed-angle) and moving cameras. For static cameras, we               The task of the query processor is to return the video
+extract object boxes by subtracting each video frame from              frames that contain the user’s queried object class. In re-
+the background frame, which is obtained by averaging                   sponse to a user query for class X, the query processor first
+the frames in each hour of the video. We then index each               retrieves the centroid objects with matching approximate
+object box with an ingest-time object classifier CNN. We               indexes (QP1 in Figure 7), and then uses the GT-CNN to
+accelerate the background subtraction with GPUs [14].                  determine the frames that do contain object class X (QP2
+We use background subtraction for static cameras because               in Figure 7, §4.1). The GT-CNN evaluation can be easily
+running background subtraction with a cheap object clas-               distributed across many machines, if needed.
+sifier is much faster than running an ingest-time object                  We employ two optimizations to reduce the overhead
+detector CNN, and we find that both approaches have                    of GT-CNN evaluation. First, we skip the GT-CNN eval-
+almost the same accuracy in detecting objects in static                uation for high-confidence indexes (§4.1). Second, we
+cameras. Hence, we choose the cheaper ingest option.                   apply a query-specialized binary classifier [51] on the
+    For moving cameras, we use a cheap, ingest-time ob-                frames that need to be checked before invoking the GT-
+ject detector CNN (e.g., Tiny YOLO [68]) to generate                   CNN. These two optimizations make the query processor
+the approximate indexes. We choose the object detection                more efficient by not running GT-CNN on all candidate
+threshold (the threshold to determine if a box has an ob-              centroid objects.
+ject) for the object detector CNN such that we do not miss
+                                                                       6. Evaluation
+objects in GT-CNN while minimizing spurious objects.
+                                                                       We evaluate our Focus prototype with more than 160
+5.2. Stream Tuner                                                      hours of videos from 14 real video streams that span
+The stream tuner (M2) determines the ingest-time CNN                   traffic cameras, surveillance cameras, and news channels.
+and Focus’ parameters for each video stream (§4.4). It                 Our main results are:
+takes four inputs: the sampled frames/objects, the GT-                   • Focus is simultaneously 48× cheaper on average (up
+CNN, the desired accuracy relative to the GT-CNN, and                       to 92×) than the Ingest-heavy baseline in processing
+the tradeoff policy between ingest cost and query latency                  videos and 125× faster on average (up to 607×) than
+(§4.4). Whenever executed, the stream tuner: (i) generates                  NoScope [51] in query latency — all the while achiev-
+the ground truth of the sampled frames/objects with the                     ing at least 99% precision and recall (§6.2, §6.3).
+GT-CNN; (ii) trains specialized ingest-time CNNs based                   • Focus provides a rich trade-off space between ingest
+on the ground truth (ST1 in Figure 7); and (iii) selects the                cost and query latency. If a user wants to optimize for
+ingest-time CNN and Focus’ parameters (ST2 in Figure 7).                    ingest cost, Focus is 65× cheaper on average (up to
+   Focus executes the stream tuner for each video stream                    96×) than the Ingest-heavy baseline, while reducing
+before launching the corresponding ingest processor. As                     query latency by 100× on average. If the goal is to
+the characteristics of video streams may change over                        optimize for query latency, Focus can achieve 202×
+time, Focus periodically launches the stream tuner to vali-                (up to 698×) faster queries than NoScope with 53×
+date the accuracy of the selected parameters on sampled                     cheaper ingest. (§6.4).
+
+
+
+USENIX Association                       13th USENIX Symposium on Operating Systems Design and Implementation                   277
+            Table 1: Video dataset characteristics                       fitting, we use the training set of each video to explore
+ Type         Camera Name       Description
+                                A commercial area intersection in the    system parameters with various recall/precision targets
+                     auburn_c
+                                City of Auburn [5]                       (i.e., 100%–95% with a 0.5% step), and we report the
+                                A residential area intersection in the
+                     auburn_r
+                                City of Auburn [4]                       best system parameters that can actually achieve the re-
+                                A downtown intersection in the City of   call/precision target on the test set. We also evaluate other
+                     bellevue_d Bellevue. The video streams are
+ Traffic      Static            obtained from city traffic cameras.      recall/precision targets such as 97% and 95% (§6.5).
+                     bellevue_r
+                                A residential area intersection in the   Baselines. We use baselines at two ends of the design
+                                City of Bellevue
+                                A road-side camera in the City of        spectrum: (1) Ingest-heavy, the baseline system that uses
+                     bend
+                                Bend [7]                                 GT-CNN to analyze all frames at ingest time, and stores
+                     jackson_h A busy intersection in Jackson Hole [8]
+                                A night street in Jackson Hole. The      the results as an index for query; and (2) NoScope, a re-
+                     jackson_ts video is downloaded from the NoScope     cent state-of-the-art querying system [51] that analyzes
+                                project website [50].
+                                An aquarium video downloaded from        frames for the queried object class at query time. We
+                     coral
+                                the NoScope project website [50]         also use a third baseline, Ingest-NoScope that uses No-
+                                A pedestrian plaza (Place de la Palud)
+ Surveillance Static lausanne
+                                in Lausanne [10]                         Scope’s techniques at ingest time. Specifically, Ingest-
+                     oxford
+                                A bookshop street in the University      NoScope runs the binary classifiers of NoScope for all
+                                of Oxford [15]
+                     sittard    A market square in Sittard [3]           possible classes at ingest time, invokes GT-CNN if any of
+                     cnn        News channel                             the binary classifiers cannot produce a high-confidence
+ News         Moving foxnews    News channel
+                     msnbc      News channel
+                                                                         result, and stores the results as an index for query. To
+                                                                         further strengthen the baselines, we augment all baseline
+                                                                         systems with background subtraction, thus eliminating
+6.1. Methodology                                                         frames with no motion. As Focus is in the middle of
+Software Tools. We use OpenCV 3.4.0 [13] to decode                       the design spectrum, we compare Focus’ ingest cost with
+the videos into frames, and we feed the frames to our                    Ingest-heavy and Ingest-NoScope, and we compare Focus’
+evaluated systems, Focus and NoScope. Focus runs and                     query latency with NoScope.
+trains CNNs with Microsoft Cognitive Toolkit 2.4 [64], an                Metrics. We use two performance metrics. The first met-
+open-source deep learning system. Our ingest processor                   ric is ingest cost, the end-to-end machine time to ingest
+(§5.1) stores the approximate index in MongoDB [11] for                  each video. The second metric is query latency, the end-
+efficient retrieval at query time.                                       to-end latency for an object class query. Specifically, for
+Video Datasets. We evaluate 14 video streams that span                   each video stream, we evaluate the object classes that
+across traffic cameras, surveillance cameras, and news                   collectively make up 95% of the detected objects in GT-
+channels. We record each video stream for 12 hours to                    CNN. We report the average query latency on these object
+cover both day time and night time. Table 1 summarizes                   classes. We do not evaluate the bottom 5% classes be-
+the video characteristics. We strengthen our evaluation by               cause they are often random erroneous results in GT-CNN
+including down sampling (or frame skipping), one of the                  (e.g., “broccoli” or “orange” in a traffic camera).
+most straightforward approaches to reduce ingest cost and                    Both metrics include the time spent on all processing
+query latency, into our evaluation baseline. Specifically,               stages, such as detecting objects with background subtrac-
+as the vast majority of objects show up for at least one                 tion, running CNNs, clustering, reading and writing to
+second in our evaluated videos, we evaluate each video at                the approximate index, etc. Similar to prior work [51, 68],
+1 fps instead of 30 fps. We find that the object detection               we report the end-to-end execution time of each system
+results at these two frame rates are almost the same. Each               while excluding the video decoding time, as the decoding
+video is split evenly into a training set and a test set. The            time can be easily accelerated with GPUs or accelerators.
+training set is used to train video-specialized CNNs and                 Experimental Platform. We run the experiments on
+select system parameters. We then evaluate the systems                   Standard_NC6s_v2 instances on the Azure cloud. Each
+with the test set. In some figures, we show results for only             instance is equipped with a high-end GPU (NVIDIA Tesla
+eight representative videos to improve legibility.                       P100), 6-core Intel Xeon CPU (E5-2690), 112 GB RAM,
+Accuracy Target. We use YOLOv2 [68], a state-of-the-                     a 10 GbE NIC, and runs 64-bit Ubuntu 16.04 LTS.
+art object detector CNN, as our ground-truth CNN (GT-
+CNN): all objects detected by GT-CNN are considered                      6.2. End-to-End Performance
+to be the correct answers.4 For each query, our default                  Static Cameras. We first show the end-to-end perfor-
+accuracy target is 99% recall and precision. To avoid over-              mance of Focus on static cameras when Focus aims to
+    4 We do not use the latest YOLOv3 or other object detector CNN
+                                                                         balance these two metrics (§4.4). Figure 8 compares the
+such as FPN [59] as our GT-CNN because one of our baseline systems,
+                                                                         ingest cost of Focus and Ingest-NoScope with Ingest-heavy
+NoScope, comes with the YOLOv2 code. Fundamentally, there is no          and the query latency of Focus with NoScope. We make
+restriction on the selection of GT-CNN for Focus.                        three main observations.
+
+
+
+278     13th USENIX Symposium on Operating Systems Design and Implementation                                   USENIX Association
+                                                               Ingest-NoScope                                     Focus                                        (jackson_ts), busy plazas (lausanne and sittard),
+                                             66X 67X 84X                                  92X 60X     84X
+                           100                                                                            53X 57X                                              a university street (oxford), and an aquarium (coral).
+Ingest-heavy by (factor)
+                                  35X                                             40X 38X         44X
+  Ingest cheaper than
+
+
+
+                            10
+                                                                                                                                                               The gains in query latency are smaller for some videos
+                                                                                                                                                               (auburn_r, bellevue_r, bend, and jackson_ts). This
+                             1                                                                                                                                 is because Focus’ ingest CNN is less accurate on these
+                                 auburn_c
+
+
+
+
+                                                                     bellevue_r
+                                            auburn_r
+
+                                                       bellevue_d
+
+
+
+
+                                                                                         jackson_h
+
+
+
+
+                                                                                                                                     oxford
+                                                                                                                  coral
+                                                                                                     jackson_ts
+
+
+
+                                                                                                                          lausanne
+                                                                                  bend
+
+
+
+
+                                                                                                                                              sittard
+                                                                                                                                                               videos, and Focus selects more conservative parameters
+                                                                                                                                                               (e.g., a larger K such as 4–5 instead of 1–2) to attain the
+                                                                                                                                                               recall/precision targets. As a result, there is more work
+                                                                    Traffic                                           Surveillance                      Avg    at query time for these videos. Nonetheless, Focus still
+                   1000          304X                  444X                              288X                             322X 607X 350X 162X                  achieves at least 40× speedup over NoScope in query la-
+                                                                     75X 40X                                      122X
+                    100                     46X                                                      46X
+NoScope by (factor)
+
+
+
+
+                                                                                                                                                               tency. We conclude that the core techniques of Focus are
+ Query faster than
+
+
+
+
+                     10
+                      1
+                                                                                                                                                               general and effective on a variety of real-world videos.
+                                                                                                                  coral
+                                 auburn_c
+
+
+
+
+                                                                     bellevue_r
+                                            auburn_r
+
+                                                       bellevue_d
+
+
+
+                                                                                  bend
+
+                                                                                         jackson_h
+
+
+
+
+                                                                                                                                     oxford
+
+                                                                                                                                              sittard
+                                                                                                     jackson_ts
+
+
+
+                                                                                                                          lausanne
+                                                                                                                                                               Moving Cameras. We evaluate the applicability of Fo-
+                                                                                                                                                               cus on moving cameras using three news channel video
+                                                                                                                                                               streams. These news videos were recorded with moving
+                                                                    Traffic                                           Surveillance                      Avg    cameras and they change scenes between different news
+ Figure 8: (Top) Focus ingest cost compared to Ingest-heavy.                                                                                                   segments. For moving cameras, we use a cheap object
+ (Bottom) Focus query latency compared to NoScope.                                                                                                             detector (Tiny YOLO, which is 5× faster than YOLOv2
+                                                                                                                                                               for the same input image size) as our ingest-time CNN.
+                                                                                                                                                               Figure 9 shows the end-to-end performance of Focus on
+    First, Focus significantly improves query latency with                                                                                                     moving cameras.
+ a very small cost at ingest time. Focus achieves 162×
+ speedup (on average) in query latency over NoScope with                                                                                                                            10                                                   1000
+                                                                                                                                                                                             5X    5X        5X      5X
+                                                                                                                                                              Ingest-heavy by (factor)
+
+
+ a very small ingest cost (57× cheaper than Ingest-heavy,                                                                                                                                                                                                   122X
+
+
+
+
+                                                                                                                                                                                                                           NoScope by (factor)
+                                                                                                                                                                Ingest cheaper than
+
+
+
+
+                                                                                                                                                                                                                            Query faster than
+ on average), all the while retaining 99% recall and preci-                                                                                                                                                                                  100      27X             34X 49X
+ sion (not shown). Focus achieves two orders of magnitude                                                                                                                                                                                        10
+ speedup over NoScope because: (i) the ingest-time ap-
+                                                                                                                                                                                         1                                                        1
+ proximate indexing drastically narrows down the frames
+                                                                                                                                                                                             cnn
+
+
+
+
+                                                                                                                                                                                                                     Avg
+                                                                                                                                                                                                   foxnews
+
+                                                                                                                                                                                                             msnbc
+
+
+
+
+                                                                                                                                                                                                                                                      cnn
+
+
+
+
+                                                                                                                                                                                                                                                                              Avg
+                                                                                                                                                                                                                                                            foxnews
+
+                                                                                                                                                                                                                                                                      msnbc
+ that need to be checked at query time; and (ii) the feature-
+ based clustering further reduces the redundant work. In
+ contrast, NoScope needs to go through all the frames at
+ query time, which is especially inefficient for the object
+                                                                                                                                                               Figure 9: Focus performance on moving cameras. (Left)
+ classes that appear infrequently. We conclude that Focus’                                                                                                     Focus ingest cost compared to Ingest-heavy. (Right) Focus
+ architecture provides a valuable trade-off between ingest                                                                                                     query latency compared to NoScope.
+ cost and query latency.
+    Second, directly applying NoScope’s techniques at in-                                                                                                        As the figure shows, Focus is effective in reducing query
+ gest time (Ingest-NoScope) does not save much cost over                                                                                                      latency with only a modest ingest cost. Focus achieves a
+ Ingest-heavy. There are two reasons for this: (1) While                                                                                                      49× speedup in query latency on average over NoScope,
+ each binary classifier is relatively cheap, running multi-                                                                                                   with ingest cost that is 5× cheaper than Ingest-heavy. We
+ ple instances of binary classifiers (for all possible object                                                                                                 make two main observations. First, the ingest cost im-
+ classes) imposes non-trivial cost. (2) The system needs                                                                                                      provements on moving cameras (5×) is lower than the
+ to invoke GT-CNN when any one of the binary classifiers                                                                                                      ones on static cameras (57×). This is because moving
+ cannot derive the correct answer. As a result, GT-CNN                                                                                                        cameras require a detector CNN to detect objects, and it
+ is invoked for most frames. Hence, the ingest cost of                                                                                                        is more costly to run a cheap object detector (like Tiny
+ Focus is much cheaper than both, Ingest-heavy and Ingest-                                                                                                    YOLO) as opposed to using background subtraction to
+ NoScope. This is because Focus’ architecture only needs                                                                                                      detect the objects and then classifying them using a cheap
+ to construct the approximate index at ingest time which                                                                                                      classifier CNN (like compressed ResNet18). Our design,
+ can be done cheaply with an ingest-time CNN.                                                                                                                 however, does not preclude using much cheaper detectors
+    Third, Focus is effective across videos with varying                                                                                                      than Tiny YOLO, and we can further reduce the ingest
+ characteristics. It makes queries 46× to 622× faster                                                                                                         cost of moving cameras by exploring even cheaper object
+ than NoScope with a very small ingest cost (35× to                                                                                                           detector CNNs. Second, Focus’ techniques are very effec-
+ 92× cheaper than Ingest-heavy) among busy intersections                                                                                                      tive in reducing query latency on moving cameras. The
+ (auburn_c, bellevue_d and jackson_h), normal inter-                                                                                                          approximate index generated by a cheap detector CNN
+ sections (auburn_r, bellevue_r, bend), a night street                                                                                                        significantly narrows down the frames that need to be
+
+
+
+  USENIX Association                                                                                   13th USENIX Symposium on Operating Systems Design and Implementation                                                                                                   279
+ checked at query time. We conclude that the techniques                                                              cation goals (§4.4). Figure 11 (the zoom-in region of
+ of Focus are general and can be applied to a wide range                                                             Figure 1) depicts three alternative settings for Focus that il-
+ of object detection CNNs and camera types.                                                                          lustrate the trade-off space between ingest cost and query
+    Averaging over both static and moving cameras, Fo-                                                               latency, using the oxford video stream: (1) Focus-Opt-
+ cus’ ingest cost is 48× cheaper than Ingest-heavy and its                                                           Query, which optimizes for query latency by increasing
+ queries are 125× faster than NoScope.                                                                               ingest cost, (2) Focus-Balance, which is the default option
+    We now take a deeper look at Focus’ performance using                                                            that balances these two metrics (§4.4), and (3): Focus-
+ representative static cameras.                                                                                      Opt-Ingest, which is the opposite of Focus-Opt-Query. The
+                                                                                                                     results are shown relative to the Ingest-heavy and NoScope
+ 6.3. Effect of Different Focus Components                                                                           baselines. Each data label (I, Q) indicates its ingest cost
+ Figure 10 shows the breakdown of query latency gains                                                                is I× cheaper than Ingest-heavy, while its query latency is
+ for two core techniques of Focus: (1) Approximate indexing,                                                         Q× faster than NoScope.
+ which indexes each object with the top-K results of the
+ ingest-time CNN, and (2) Approximate indexing + Cluster-                                                                                              Focus-Opt-Query          Focus-Opt-Ingest
+                                                                                                                                                       Focus-Balance
+
+
+
+
+                                                                                                                         Normalized Query Latency
+ ing, which adds feature-based clustering at ingest time to
+ reduce redundant work at query time. We show the results                                                                                           0.003            (I=90X, Q=403X)
+ that achieve at least 99% recall and precision. We make
+                                                                                                                                                    0.002
+ two observations.                                                                                                                                              (I=84X, Q=607X)
+                                       Approximate indexing                          +Clustering              195X                                  0.001
+Faster than NoScope
+
+
+
+
+                 1000                                                                                     114X
+                                                                                                                                                                                  (I=53X, Q=698X)
+                      100
+     by (factor)
+
+
+
+
+                                                                                                                                                        0
+                       10                                                                                                                                   0              0.01                 0.02
+                        1                                                                                                                                          Normalized Ingest Cost
+                                                                                lausanne
+                                                    bend
+                            auburn_c
+
+
+
+
+                                                                        coral
+                                                           jackson_ts
+
+
+
+
+                                                                                                              Avg
+                                                                                           oxford
+                                       bellevue_d
+
+
+
+
+                                                                                                    sittard
+
+
+
+
+                                                                                                                      Figure 11: Focus’ trade-off policies on an example video
+
+                                                                                                                        As Figure 11 shows, Focus offers very good options
+ Figure 10: Effect of different Focus components on query                                                            in the trade-off space between ingest cost and query la-
+ latency reduction                                                                                                   tency. Focus-Opt-Ingest is 90× cheaper than Ingest-heavy,
+                                                                                                                     and makes the query 403× faster than a query-optimized
+   First, approximate indexing is the major source of                                                                system (NoScope). On the other hand, Focus-Opt-Query
+query latency improvement. This is because approxi-                                                                  reduces query latency even more (by 698×) but it is still
+mate indexing effectively eliminates irrelevant objects for                                                          53× cheaper than Ingest-heavy. As these points in the
+each query and bypasses the query-time verification for                                                              design space are all good options compared to the base-
+high-confidence ingest predictions. As a result, only a                                                              lines, such flexibility enables a user to tailor Focus for
+small fraction of frames need to be resolved at query time.                                                          different contexts. For example, a camera that requires
+On average, approximate indexing alone is 114× faster                                                                fast turnaround time for queries can use Focus-Opt-Query,
+than NoScope in query latency.                                                                                       while a video stream that will be queried rarely would
+   Second, clustering is a very effective technique to fur-                                                          choose Focus-Opt-Ingest to reduce the amount of wasted
+ther reduce query latency. Using clustering (on top of ap-                                                           ingest cost in exchange for longer query latencies.
+proximate indexing) reduces the query latency by 195×,                                                                  Figure 12 shows the (I, Q) values for both Focus-Opt-
+significantly better than approximate indexing alone. We                                                             Ingest (Opt-I) and Focus-Opt-Query (Opt-Q) for the repre-
+see that clustering is especially effective on surveillance                                                          sentative videos. As the figure shows, the flexibility to
+videos (e.g., coral, lausanne, and oxford) because ob-                                                               make different trade-offs exists in most other videos. On
+jects in these videos tend to stay longer in the camera (e.g.,                                                       average, Focus-Opt-Ingest is 65× (up to 96×) cheaper
+“person” on a plaza compared to “car” in traffic videos),                                                            than Ingest-heavy in ingest cost while providing 100× (up
+and hence there is more redundancy in these videos. This                                                             to 443×) faster queries. Focus-Opt-Query makes queries
+gain comes with a negligible cost because we run our                                                                 202× (up to 698×) faster with a higher ingest cost (53×
+clustering algorithm (§4.3) on the otherwise idle CPUs                                                               cheaper than Ingest-heavy). Note that there is no funda-
+of the ingest machine while the GPUs run the ingest-time                                                             mental limitation on the spread between Focus-Opt-Query
+CNN model.                                                                                                           and Focus-Opt-Ingest as we can expand the search space
+                                                                                                                     for ingest-time CNNs to further optimize ingest cost at
+ 6.4. Ingest Cost vs. Query Latency Trade-off                                                                        the expense of query latency (or vice versa). We conclude
+ One of the important features of Focus is the flexibility                                                           that Focus enables flexibly optimizing for ingest cost or
+ to tune its system parameters to achieve different appli-                                                           query latency for application’s needs.
+
+
+
+ 280                  13th USENIX Symposium on Operating Systems Design and Implementation                                                                                         USENIX Association
+Improvements (factor)
+                  1000                                    Ingest Cheaper by                             Query Faster by
+                                                                                                                                                                  to the number of object classes (compared to the 80 de-
+                        100                                                                                                                                       fault object classes in the COCO [60] dataset). Our result
+                         10                                                                                                                                       shows that Focus is 15× faster (on average) in query la-
+                          1
+                                                                                                                                                                  tency and 57× cheaper (on average) in ingest cost than
+                                                                                                                                                                  the baseline systems, while achieving 99% recall and pre-
+                                Opt-I
+
+
+
+                                                Opt-I
+
+
+
+                                                                Opt-I
+
+
+
+                                                                                Opt-I
+
+
+
+                                                                                                Opt-I
+
+
+
+                                                                                                                 Opt-I
+
+
+
+                                                                                                                                 Opt-I
+
+
+
+                                                                                                                                                  Opt-I
+                                        Opt-Q
+
+
+
+                                                        Opt-Q
+
+
+
+                                                                        Opt-Q
+
+
+
+                                                                                        Opt-Q
+
+
+
+                                                                                                         Opt-Q
+
+
+
+                                                                                                                         Opt-Q
+
+
+
+                                                                                                                                         Opt-Q
+
+
+
+                                                                                                                                                          Opt-Q
+                                                                                                                                                                  cision. We observe that the query latency improvements
+                               auburn_c bellevue_d                bend          jackson_ts        coral          lausanne         oxford           sittard
+                                                                                                                                                                  with 1000 object classes is lower than the ones with 80
+                              Figure 12: Ingest cost vs. query latency trade-off                                                                                  object classes. The reason is that ingest-time CNNs are
+                                                                                                                                                                  less accurate on more object classes, and we need to select
+     It is worth noting that the fraction of videos that get                                                                                                      a larger K to achieve the target recall. Nonetheless, the im-
+  queried can affect the applicability of Focus, especially in                                                                                                    provements of Focus are robust with more object classes
+  the case where only a tiny fraction of videos gets queried.                                                                                                     as Focus is over one order of magnitude faster than the
+  While Focus-Opt-Ingest can save the ingest cost by up to                                                                                                        baseline systems when differentiating 1000 object classes.
+  96×, it can be more costly than any purely query-time-
+  only solution if the fraction of videos that gets queried                                                                                                       7. Other Applications
+                1
+  is less than 96 ≈ 1%. In such a case, a user can still use                                                                                                      Applications that leverage CNNs to process large and
+  Focus to significantly reduce query latency, but the cost                                                                                                       continuously growing data share similar challenges as
+  of Focus can be higher than query-time-only solutions.                                                                                                          Focus. Examples of such applications are:
+                                                                                                                                                                  1) Video and audio. Other than querying for objects,
+   6.5. Sensitivity to Recall/Precision Target                                                                                                                    many emerging video applications are also based on
+   Figure 13 illustrates Focus’ reduction in query latency                                                                                                        CNNs, such as event detection (e.g., [90]), emotion recog-
+   compared to the baselines under different recall/precision                                                                                                     nition (e.g., [49]), video classification (e.g., [52]), and
+   targets. Other than the default 99% recall and precision                                                                                                       face recognition (e.g., [74]). Audio applications such as
+   target, we evaluate both Focus and NoScope with two                                                                                                            speech recognition (e.g., [19]) are also based on CNNs.
+   lower targets, 97% and 95%.                                                                                                                                    2) Bioinformatics and geoinformatics. Many bioinfor-
+                                                                                                                                                                  matics and geoinformatics systems leverage CNNs to
+                                        Precision/Recall:                        99%                     97%                     95%              167X
+NoScope by (factor)
+
+
+
+
+                                                                                                                                                                  process a large dataset, such as anomaly classification in
+ Query faster than
+
+
+
+
+                         1000                                                                                                            195X       169X
+                              100                                                                                                                                 biomedical imaging (e.g., [57, 72]), information decoding
+                               10                                                                                                                                 in biomedical signal recordings (e.g., [82]), and pattern
+                                1                                                                                                                                 recognition in satellite imagery (e.g., [20, 35]).
+                                                                                                                                                                     Naturally, these applications need to answer user-
+                                                   _d
+
+
+
+
+                                                                                                                                                    g
+                                        c
+
+
+
+
+                                                                                ts
+
+
+
+
+                                                                                                         ne
+
+
+
+
+                                                                                                                                    rd
+                                                                                             l
+                                                                nd
+
+
+
+
+                                                                                                                         d
+                                                                                          ra
+                                   n_
+
+
+
+
+                                                                                                                                                 Av
+                                                                                                                      r
+                                                                          n_
+
+
+
+
+                                                                                                                                 ta
+                                                                                                                   fo
+                                                ue
+
+
+
+
+                                                                                                      n
+                                                                be
+
+
+
+
+                                                                                        co
+
+
+
+
+                                                                                                                                                                  specified queries, such as “find all brain signal recordings
+                                 ur
+
+
+
+
+                                                                                                   sa
+
+
+
+
+                                                                                                                             sit
+                                                                                                                 ox
+                                                                        so
+                                               v
+                                 b
+
+
+
+
+                                                                                                   u
+                                           lle
+
+
+
+
+                                                                    ck
+                              au
+
+
+
+
+                                                                                                la
+                                        be
+
+
+
+
+                                                                                                                                                                  with a particular perception” or “find all audio record-
+                                                                  ja
+
+
+
+
+   Figure 13: Sensitivity of query latency reduction to re-                                                                                                       ings with a particular keyword”. Supporting these queries
+   call/precision target                                                                                                                                          faces similar challenges to Focus, as a system either: (i)
+                                                                                                                                                                  generates a precise index at ingest time, which incurs high
+     We observe that with lower accuracy targets, the query                                                                                                       cost; or (ii) does most of the heavy-lifting at query time,
+  latency improvement decreases slightly for most videos,                                                                                                         which results in high query latency. Hence, Focus’ archi-
+  while the ingest cost improvement does not change much                                                                                                          tecture offers a low-cost and low-latency option: building
+  (not graphed). The ingest cost is not sensitive to the accu-                                                                                                    an approximate index with cheap CNNs at ingest time
+  racy target because Focus still runs similar ingest CNNs.                                                                                                       and generating precise results based on the approximate
+  NoScope can however apply more aggressive query-time                                                                                                            index at query time. While the indexing structure may
+  optimization to reduce query latency given lower accu-                                                                                                          need to be adapted to different applications, we believe
+  racy targets. This decreases Focus’ improvement over                                                                                                            Focus’ architecture and techniques can benefit many of
+  NoScope for several videos. On average, Focus is faster                                                                                                         these emerging applications.
+  than NoScope in query latency by 195×, 167×, and 169×
+  with recall/precision of 99%, 97%, and 95%, respectively.                                                                                                       8. Related Work
+  We conclude that Focus’ techniques can achieve signifi-                                                                                                         To our knowledge, Focus is the first system that offers low-
+  cant improvements on query latency, irrespective of re-                                                                                                         cost and low-latency queries for CNN-based object de-
+  call/precision targets.                                                                                                                                         tection in videos by effectively splitting query-processing
+                                                                                                                                                                  work between ingest time and query time. We discuss key
+   6.6. Sensitivity to Object Class Numbers                                                                                                                       works related to our system.
+  We use the 1000 object classes in the ImageNet                                                                                                                  1) Cascaded classification. Various works in vision re-
+  dataset [73] to study the sensitivity of Focus’ performance                                                                                                     search propose speeding up classification by cascading a
+
+
+
+   USENIX Association                                                                                   13th USENIX Symposium on Operating Systems Design and Implementation                                              281
+series of classifiers. Viola et al. [88] is the earliest work   5) Database indexing. Using index structures to reduce
+that cascades a series of classifiers (from the simplest to     query latency [77] is a commonly-used technique in con-
+the most complicated) to quickly disregard regions in an        ventional databases (e.g., [26, 54]), key-value databases
+image. Many improvements follow (e.g., [58, 91, 92]).           (e.g., [62]), similarity search (e.g., [39,40]), graph queries
+CNNs are also cascaded (e.g., [29, 43, 56, 83]) to reduce       (e.g., [93]), genome analysis (e.g., [21, 89]), and many
+object detection latency. Our work is different in two          others. Our Ingest-heavy and Ingest-NoScope baselines are
+major ways. First, we decouple the compressed CNN               also examples that index all video frames at ingest time.
+from the GT-CNN, which enables us to choose from a              While queries are naturally faster with these baselines,
+wider range of ingest-time CNNs and thus enables better         they are too costly and are potentially wasteful for large-
+trade-offs between ingest cost and query latency, a key         scale videos. In contrast, our work offers new trade-off
+aspect of our work. Second, we cluster similar objects          options between ingest cost and query latency by creating
+using CNN features to eliminate redundant work, which           low-cost approximate indexes at ingest time and retaining
+is an effective technique for video streams.                    high accuracy with little work at query time.
+2) Context-specific model specialization. Context-
+specific specialization of models can improve accu-
+racy [63] or speed up inference [43, 51, 75]. Among
+                                                                9. Conclusion
+these, the closest to our work is NoScope [51]. No-             Answering queries of the form, find me frames that con-
+Scope optimizes for the specified class at query-time using     tain objects of class X, is an important workload on
+lightweight binary classifiers. In contrast, Focus’ architec-   recorded video datasets. Such queries are used by an-
+ture splits work between ingest and query times, leading        alysts and investigators for various immediate purposes,
+to two orders of magnitude lower latency (§6). To achieve       and it is crucial to answer them with low latency and
+these gains, Focus uses techniques to index all possible        low cost. We present Focus, a system that flexibly di-
+classes at ingest-time, and thus can handle any class that      vides the query processing work between ingest time and
+will get queried in the future. Focus’ indexing is espe-        query time. Focus performs low-cost ingest-time analytics
+cially effective for less frequent object classes, which is     on live video that later facilitates low-latency queries on
+arguably of more interest for video querying systems.           the recorded videos. At ingest time, Focus uses cheap
+3) Stream processing systems. Systems for general               CNNs to construct an approximate index of all possible
+stream data processing (e.g., [1,18,22,25,31,32,61,66,86,       object classes in each frame to retain high recall. At
+87, 95]) and specific to video stream analytics (e.g., [96])    query time, Focus leverages this approximate index to pro-
+mainly focus on general stream processing challenges            vide low latency, but compensates for the lower precision
+such as load shedding, fault tolerance, distributed exe-        by judiciously using expensive CNNs. This architecture
+cution, or limited network bandwidth. In contrast, our          enables orders-of-magnitude faster queries with only a
+work is specific to querying on recorded video data with        small investment at ingest time, and allows flexibly trad-
+ingest and query trade-offs, and, thus, mostly orthogonal.      ing off ingest cost and query latency. Our evaluations
+Focus coud be integrated with one of these general stream       using real-world videos from traffic, surveillance, and
+processing systems.                                             news domains show that Focus reduces ingest cost on av-
+4) Video indexing and retrieval. A large body of work           erage by 48× (up to 92×) and makes queries on average
+in multimedia and information retrieval research proposes       125× (up to 607×) faster compared to state-of-the-art
+various content-based video indexing and retrieval tech-        baselines. We conclude that Focus’ architecture and tech-
+niques to facilitate queries on videos (e.g., [46,55,80,81]).   niques make it a highly practical and effective approach to
+Among them, most works focus on indexing videos for             querying large video datasets. We hope that the ideas and
+different types of queries, such as shot boundary detection     insights behind Focus can be applied to designing efficient
+(e.g., [94]), semantic video search (e.g., [33,37,41]), video   systems for many other forms of querying on large and
+classification (e.g., [27]), spatio-temporal information-       continuously-growing datasets in many domains, such as
+based video retrieval (e.g., [38, 70]) or subsequence simi-     audio, bioinformatics, and geoinformatics.
+larity search (e.g., [76, 97]). Some works (e.g., [36, 79])
+focus on the query interface to enable querying by key-
+                                                                Acknowledgments
+words, concepts, or examples. These works are largely
+orthogonal to our work because we focus on reducing cost        We thank our shepherd, Andrew Warfield, and the anony-
+and latency of CNN-based video queries, not on creating         mous OSDI reviewers for their valuable and construc-
+an indexing structure for new query types or query inter-       tive suggestions. We acknowledge the support of our
+faces. We believe our approach of splitting ingest-time         industrial partners: Google, Huawei, Intel, Microsoft, and
+and query-time work can be extended to many different           VMware. This work is supported in part by NSF and Intel
+types of video queries (§7).                                    STC on Visual Cloud Systems (ISTC-VCS).
+
+
+
+282   13th USENIX Symposium on Operating Systems Design and Implementation                             USENIX Association
+References                                                        Gibbs, and E. E. Eichler. Personalized copy num-
+ [1] Apache Storm.      http://storm.apache.org/                  ber and segmental duplication maps using next-
+     index.html.                                                  generation sequencing. Nature genetics, 2009.
+ [2] Avigilon. http://avigilon.com/products/.                [22] L. Amini, H. Andrade, R. Bhagwan, F. Eskesen,
+ [3] City Cam, WebcamSittard: Town Square Sit-                    R. King, P. Selo, Y. Park, and C. Venkatramani. SPC:
+     tard (NL). https://www.youtube.com/watch?v=                  A distributed, scalable platform for data mining. In
+     iKxhsl3rurA.                                                 DM-SSP, 2006.
+ [4] City of Auburn North Ross St and East Magno-            [23] A. Babenko and V. S. Lempitsky. Aggregating deep
+     lia Ave. https://www.youtube.com/watch?v=                    convolutional features for image retrieval. In ICCV,
+     cjuskMMYlLA.                                                 2015.
+ [5] City of Auburn Toomer’s Corner Webcam. https:           [24] A. Babenko, A. Slesarev, A. Chigorin, and V. S.
+     //www.youtube.com/watch?v=yJAk_FozAmI.                       Lempitsky. Neural codes for image retrieval. In
+ [6] Genetec. https://www.genetec.com/.                           ECCV, 2014.
+ [7] Greenwood Avenue Bend, Oregon. https://www.             [25] P. Bailis, E. Gan, S. Madden, D. Narayanan,
+     youtube.com/watch?v=YqyERQwXA3U.                             K. Rong, and S. Suri. MacroBase: Prioritizing at-
+ [8] Jackson Hole Wyoming USA Town Square. https:                 tention in fast data. In SIGMOD, 2017.
+     //www.youtube.com/watch?v=K-F4CeVsWHA.                  [26] R. Bayer and E. M. McCreight. Organization and
+ [9] L2̂ Norm.     http://mathworld.wolfram.com/                  maintenance of large ordered indexes. In SIGFIDET,
+     L2-Norm.html.                                                1970.
+[10] Lausanne, Place de la Palud.     https://www.           [27] D. Brezeale and D. J. Cook. Automatic video clas-
+     youtube.com/watch?v=7uF7DsUQ9vc.                             sification: A survey of the literature. IEEE Trans.
+[11] MongoDB. https://www.mongodb.com/.                           Systems, Man, and Cybernetics, Part C, 2008.
+[12] Nvidia Tesla P100. http://www.nvidia.com/               [28] S. Brutzer, B. Höferlin, and G. Heidemann. Evalua-
+     object/tesla-p100.html.                                      tion of background subtraction techniques for video
+[13] Opencv 3.4. http://opencv.org/opencv-3-4.                    surveillance. In CVPR, 2011.
+     html.                                                   [29] Z. Cai, M. J. Saberian, and N. Vasconcelos. Learn-
+[14] OpenCV GPU-accelerated computer vision.                      ing complexity-aware cascades for deep pedestrian
+     https://docs.opencv.org/2.4/modules/gpu/                     detection. In ICCV, 2015.
+     doc/gpu.html.                                           [30] F. Cao, M. Ester, W. Qian, and A. Zhou. Density-
+[15] Oxford Martin School Webcam - Broad Street,                  based clustering over an evolving data stream with
+     Oxford. https://www.youtube.com/watch?v=                     noise. In SIAM International Conference on Data
+     Qhq4vQdfrFw.                                                 Mining, 2006.
+[16] Top Video Surveillance Trends for 2016. https:          [31] D. Carney, U. Çetintemel, M. Cherniack, C. Convey,
+     //technology.ihs.com/api/binary/572252.                      S. Lee, G. Seidman, M. Stonebraker, N. Tatbul, and
+[17] Wikipedia: Pareto efficiency.          https://en.           S. B. Zdonik. Monitoring streams - A new class of
+     wikipedia.org/wiki/Pareto_efficiency.                        data management applications. In VLDB, 2002.
+[18] D. J. Abadi, Y. Ahmad, M. Balazinska, U. Çet-           [32] S. Chandrasekaran, O. Cooper, A. Deshpande, M. J.
+     intemel, M. Cherniack, J. Hwang, W. Lindner,                 Franklin, J. M. Hellerstein, W. Hong, S. Krishna-
+     A. Maskey, A. Rasin, E. Ryvkina, N. Tatbul, Y. Xing,         murthy, S. Madden, F. Reiss, and M. A. Shah. Tele-
+     and S. B. Zdonik. The design of the Borealis stream          graphCQ: Continuous dataflow processing. In SIG-
+     processing engine. In CIDR, 2005.                            MOD, 2003.
+[19] O. Abdel-Hamid, A. Mohamed, H. Jiang, and               [33] S. Chang, W. Ma, and A. W. M. Smeulders. Recent
+     G. Penn. Applying convolutional neural networks              advances and challenges of semantic image/video
+     concepts to hybrid NN-HMM model for speech                   search. In ICASSP, 2007.
+     recognition. In ICASSP, 2012.                           [34] W. Chen, J. T. Wilson, S. Tyree, K. Q. Weinberger,
+[20] A. Albert, J. Kaur, and M. C. Gonzalez. Using con-           and Y. Chen. Compressing neural networks with the
+     volutional networks and satellite imagery to identify        hashing trick. CoRR, abs/1504.04788, 2015.
+     patterns in urban environments at a large scale. In     [35] G. Cheng, Y. Wang, S. Xu, H. Wang, S. Xiang, and
+     SIGKDD, 2017.                                                C. Pan. Automatic road detection and centerline
+[21] C. Alkan, J. M. Kidd, T. Marques-Bonet, G. Ak-               extraction via cascaded end-to-end convolutional
+     say, F. Antonacci, F. Hormozdiari, J. O. Kitzman,            neural network. IEEE Trans. Geoscience and Re-
+     C. Baker, M. Malig, O. Mutlu, S. C. Sahinalp, R. A.          mote Sensing, 2017.
+
+
+
+USENIX Association                13th USENIX Symposium on Operating Systems Design and Implementation           283
+[36] M. G. Christel and R. M. Conescu. Mining novice        [50] D. Kang, J. Emmons, F. Abuzaid, P. Bailis, and
+     user activity with TRECVID interactive retrieval            M. Zaharia. NoScope project website. https://
+     tasks. In CIVR, 2006.                                       github.com/stanford-futuredata/noscope.
+[37] S. Dagtas, W. Al-Khatib, A. Ghafoor, and R. L.         [51] D. Kang, J. Emmons, F. Abuzaid, P. Bailis, and
+     Kashyap. Models for motion-based video indexing             M. Zaharia. NoScope: Optimizing deep CNN-based
+     and retrieval. IEEE Trans. Image Processing, 2000.          queries over video streams at scale. PVLDB, 2017.
+[38] M. E. Dönderler, Ö. Ulusoy, and U. Güdükbay. Rule-     [52] A. Karpathy, G. Toderici, S. Shetty, T. Leung,
+     based spatiotemporal query processing for video             R. Sukthankar, and F. F. Li. Large-scale video clas-
+     databases. VLDB J., 2004.                                   sification with convolutional neural networks. In
+[39] A. Gionis, P. Indyk, and R. Motwani. Similarity             CVPR, 2014.
+     search in high dimensions via hashing. In VLDB,        [53] A. Krizhevsky, I. Sutskever, and G. E. Hinton. Ima-
+     1999.                                                       geNet classification with deep convolutional neural
+[40] A. Guttman. R-trees: A dynamic index structure for          networks. In NIPS, 2012.
+     spatial searching. In SIGMOD, 1984.                    [54] P. L. Lehman and S. B. Yao. Efficient locking
+[41] A. Hampapur. Semantic video indexing: Approach              for concurrent operations on B-trees. ACM Trans.
+     and issue. SIGMOD Record, 1999.                             Database Syst., 1981.
+                                                            [55] M. S. Lew, N. Sebe, C. Djeraba, and R. Jain.
+[42] S. Han, J. Pool, J. Tran, and W. Dally. Learning
+                                                                 Content-based multimedia information retrieval:
+     both weights and connections for efficient neural
+                                                                 State of the art and challenges. TOMCCAP, 2006.
+     network. In NIPS, 2015.
+                                                            [56] H. Li, Z. Lin, X. Shen, J. Brandt, and G. Hua. A con-
+[43] S. Han, H. Shen, M. Philipose, S. Agarwal,
+                                                                 volutional neural network cascade for face detection.
+     A. Wolman, and A. Krishnamurthy. MCDNN: An
+                                                                 In CVPR, 2015.
+     approximation-based execution framework for deep
+     stream processing under resource constraints. In       [57] Q. Li, W. Cai, X. Wang, Y. Zhou, D. D. Feng, and
+     MobiSys, 2016.                                              M. Chen. Medical image classification with convo-
+                                                                 lutional neural network. In ICARCV, 2014.
+[44] K. He, X. Zhang, S. Ren, and J. Sun. Delving deep
+     into rectifiers: Surpassing human-level performance    [58] R. Lienhart and J. Maydt. An extended set of Haar-
+     on imagenet classification. In ICCV, 2015.                  like features for rapid object detection. In ICIP,
+                                                                 2002.
+[45] K. He, X. Zhang, S. Ren, and J. Sun. Deep residual
+     learning for image recognition. In CVPR, 2016.         [59] T. Lin, P. Dollár, R. B. Girshick, K. He, B. Hariharan,
+                                                                 and S. J. Belongie. Feature pyramid networks for
+[46] W. Hu, N. Xie, L. Li, X. Zeng, and S. J. Maybank. A
+                                                                 object detection. In CVPR, 2017.
+     survey on visual content-based video indexing and
+     retrieval. IEEE Trans. Systems, Man, and Cybernet-     [60] T. Lin, M. Maire, S. J. Belongie, J. Hays, P. Perona,
+     ics, Part C, 2011.                                          D. Ramanan, P. Dollár, and C. L. Zitnick. Microsoft
+                                                                 COCO: common objects in context. In ECCV, 2014.
+[47] G. B. Huang, M. Ramesh, T. Berg, and E. Learned-
+     Miller. Labeled faces in the wild: A database for      [61] W. Lin, H. Fan, Z. Qian, J. Xu, S. Yang, J. Zhou,
+     studying face recognition in unconstrained environ-         and L. Zhou. StreamScope: Continuous reliable
+     ments. Technical Report 07-49, University of Mas-           distributed processing of big data streams. In NSDI,
+     sachusetts, Amherst, October 2007.                          2016.
+[48] M. Jaderberg, A. Vedaldi, and A. Zisserman. Speed-     [62] Y. Mao, E. Kohler, and R. T. Morris. Cache crafti-
+     ing up convolutional neural networks with low rank          ness for fast multicore key-value storage. In EuroSys,
+     expansions. CoRR, abs/1405.3866, 2014.                      2012.
+                                                            [63] A. Mhalla, H. Maâmatou, T. Chateau, S. Gazzah,
+[49] S. E. Kahou, C. J. Pal, X. Bouthillier, P. Frou-
+                                                                 and N. E. B. Amara. Faster R-CNN scene special-
+     menty, Ç. Gülçehre, R. Memisevic, P. Vincent,
+                                                                 ization with a sequential monte-carlo framework. In
+     A. C. Courville, Y. Bengio, R. C. Ferrari, M. Mirza,
+                                                                 DICTA.
+     S. Jean, P. L. Carrier, Y. Dauphin, N. Boulanger-
+     Lewandowski, A. Aggarwal, J. Zumer, P. Lamblin,        [64] Microsoft.      The microsoft Cognitive Toolkit.
+     J. Raymond, G. Desjardins, R. Pascanu, D. Warde-            https://www.microsoft.com/en-us/
+     Farley, A. Torabi, A. Sharma, E. Bengio, K. R.              cognitive-toolkit/.
+     Konda, and Z. Wu. Combining modality specific          [65] L. O’Callaghan, N. Mishra, A. Meyerson, and
+     deep neural networks for emotion recognition in             S. Guha. Streaming-data algorithms for high-quality
+     video. In ICMI, 2013.                                       clustering. In ICDE, 2002.
+
+
+
+284   13th USENIX Symposium on Operating Systems Design and Implementation                       USENIX Association
+[66] A. Rabkin, M. Arye, S. Sen, V. S. Pai, and M. J.        [81] C. G. M. Snoek and M. Worring. Concept-based
+     Freedman. Aggregation and degradation in Jet-                video retrieval. Foundations and Trends in Informa-
+     Stream: Streaming analytics in the wide area. In             tion Retrieval, 2009.
+     NSDI, 2014.                                             [82] S. Stober, D. J. Cameron, and J. A. Grahn. Using
+[67] A. S. Razavian, H. Azizpour, J. Sullivan, and                convolutional neural networks to recognize rhythm
+     S. Carlsson. CNN features off-the-shelf: An as-              stimuli from electroencephalography recordings. In
+     tounding baseline for recognition. In CVPR Work-             NIPS, 2014.
+     shops, 2014.                                            [83] Y. Sun, X. Wang, and X. Tang. Deep convolutional
+[68] J. Redmon and A. Farhadi. YOLO9000: Better,                  network cascade for facial point detection. In CVPR,
+     faster, stronger. CoRR, abs/1612.08242, 2016.                2013.
+[69] S. Ren, K. He, R. B. Girshick, and J. Sun. Faster       [84] C. Szegedy, W. Liu, Y. Jia, P. Sermanet, S. E. Reed,
+     R-CNN: Towards real-time object detection with               D. Anguelov, D. Erhan, V. Vanhoucke, and A. Rabi-
+     region proposal networks. In NIPS, 2015.                     novich. Going deeper with convolutions. In CVPR,
+[70] W. Ren, S. Singh, M. Singh, and Y. S. Zhu. State-of-         2015.
+     the-art on spatio-temporal information-based video      [85] P.-N. Tan, M. Steinbach, and V. Kumar. Introduction
+     retrieval. Pattern Recognition, 2009.                        to Data Mining, (First Edition). Addison-Wesley
+[71] A. Romero, N. Ballas, S. E. Kahou, A. Chassang,              Longman Publishing Co., Inc., Boston, MA, USA,
+     C. Gatta, and Y. Bengio. FitNets: Hints for thin             2005.
+     deep nets. CoRR, abs/1412.6550, 2014.                   [86] N. Tatbul, U. Çetintemel, and S. B. Zdonik. Stay-
+[72] H. R. Roth, L. Lu, J. Liu, J. Yao, A. Seff, K. M.            ing FIT: efficient load shedding techniques for dis-
+     Cherry, L. Kim, and R. M. Summers. Improving                 tributed stream processing. In VLDB, 2007.
+     computer-aided detection using convolutional neural     [87] Y. Tu, S. Liu, S. Prabhakar, and B. Yao. Load shed-
+     networks and random view aggregation. IEEE Trans.            ding in stream databases: A control-based approach.
+     Med. Imaging, 2016.                                          In VLDB, 2006.
+[73] O. Russakovsky, J. Deng, H. Su, J. Krause,
+                                                             [88] P. A. Viola and M. J. Jones. Rapid object detection
+     S. Satheesh, S. Ma, Z. Huang, A. Karpathy,
+                                                                  using a boosted cascade of simple features. In CVPR,
+     A. Khosla, M. Bernstein, A. C. Berg, and L. Fei-Fei.
+                                                                  2001.
+     ImageNet large scale visual recognition challenge.
+                                                             [89] H. Xin, D. Lee, F. Hormozdiari, S. Yedkar, O. Mutlu,
+     IJCV, 2015.
+                                                                  and C. Alkan. Accelerating read mapping with
+[74] F. Schroff, D. Kalenichenko, and J. Philbin. FaceNet:
+                                                                  FastHASH. BMC Genomics, 2013.
+     A unified embedding for face recognition and clus-
+     tering. In CVPR, 2015.                                  [90] Z. Xu, Y. Yang, and A. G. Hauptmann. A discrimi-
+                                                                  native CNN video representation for event detection.
+[75] H. Shen, S. Han, M. Philipose, and A. Krishna-
+                                                                  In CVPR, 2015.
+     murthy. Fast video classification via adaptive cas-
+     cading of deep models. In CVPR, 2017.                   [91] Z. E. Xu, M. J. Kusner, K. Q. Weinberger, and
+[76] H. T. Shen, B. C. Ooi, and X. Zhou. Towards effec-           M. Chen. Cost-sensitive tree of classifiers. In ICML,
+     tive indexing for very large video sequence database.        2013.
+     In SIGMOD, 2005.                                        [92] Q. Yang, C. X. Ling, X. Chai, and R. Pan. Test-cost
+[77] A. Silberschatz, H. F. Korth, and S. Sudarshan.              sensitive classification on data with missing values.
+     Database System Concepts, 5th Edition. McGraw-               IEEE Trans. Knowl. Data Eng., 2006.
+     Hill Book Company, 2005.                                [93] D. Yuan and P. Mitra. Lindex: a lattice-based index
+[78] K. Simonyan and A. Zisserman. Very deep convo-               for graph databases. VLDB J., 2013.
+     lutional networks for large-scale image recognition.    [94] J. Yuan, H. Wang, L. Xiao, W. Zheng, J. Li, F. Lin,
+     In ICLR, 2015.                                               and B. Zhang. A formal study of shot boundary
+[79] C. Snoek, K. E. A. van de Sande, O. de Rooij,                detection. IEEE Trans. Circuits Syst. Video Techn.,
+     B. Huurnink, E. Gavves, D. Odijk, M. de Rijke,               2007.
+     T. Gevers, M. Worring, D. Koelma, and A. W. M.          [95] M. Zaharia, T. Das, H. Li, T. Hunter, S. Shenker,
+     Smeulders. The mediamill TRECVID 2010 seman-                 and I. Stoica. Discretized streams: fault-tolerant
+     tic video search engine. In TRECVID 2010 work-               streaming computation at scale. In SOSP, 2013.
+     shop participants notebook papers, 2010.                [96] H. Zhang, G. Ananthanarayanan, P. Bodík, M. Phili-
+[80] C. Snoek and M. Worring. Multimodal video index-             pose, P. Bahl, and M. J. Freedman. Live video analyt-
+     ing: A review of the state-of-the-art. Multimedia            ics at scale with approximation and delay-tolerance.
+     Tools Appl., 2005.                                           In NSDI, 2017.
+
+
+
+USENIX Association                13th USENIX Symposium on Operating Systems Design and Implementation            285
+[97] X. Zhou, X. Zhou, L. Chen, and A. Bouguettaya.
+     Efficient subsequence matching over large video
+     databases. VLDB J., 2012.
+
+
+
+
+286   13th USENIX Symposium on Operating Systems Design and Implementation   USENIX Association
+

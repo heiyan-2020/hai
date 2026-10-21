@@ -1,0 +1,1238 @@
+         Caladan: Mitigating Interference at
+              Microsecond Timescales
+Joshua Fried and Zhenyuan Ruan, MIT CSAIL; Amy Ousterhout, UC Berkeley;
+                        Adam Belay, MIT CSAIL
+          https://www.usenix.org/conference/osdi20/presentation/fried
+
+
+
+
+      This paper is included in the Proceedings of the
+      14th USENIX Symposium on Operating Systems
+               Design and Implementation
+                           November 4–6, 2020
+                              978-1-939133-19-9
+
+
+
+                                      Open access to the Proceedings of the
+                                      14th USENIX Symposium on Operating
+                                       Systems Design and Implementation
+                                             is sponsored by USENIX
+                 Caladan: Mitigating Interference at Microsecond Timescales
+
+                           Joshua Fried, Zhenyuan Ruan, Amy Ousterhout† , Adam Belay
+                                            MIT CSAIL, † UC Berkeley
+                          Abstract                                  example, Intel’s Cache Allocation Technology (CAT) uses
+                                                                    way-based cache partitioning to reserve portions of the last
+The conventional wisdom is that CPU resources such as cores,
+                                                                    level cache (LLC) for specific cores [21]. Many systems use
+caches, and memory bandwidth must be partitioned to achieve
+                                                                    these partitioning mechanisms to improve performance isola-
+performance isolation between tasks. Both the widespread
+                                                                    tion [8, 12, 28, 38, 62, 73]. They either statically assign enough
+availability of cache partitioning in modern CPUs and the rec-
+                                                                    resources for peak load, leaving significant CPU utilization
+ommended practice of pinning latency-sensitive applications
+                                                                    on the table, or else make dynamic adjustments over hundreds
+to dedicated cores attest to this belief.
+                                                                    of milliseconds to seconds. Because each adjustment is incre-
+   In this paper, we show that resource partitioning is nei-
+                                                                    mental, converging to the right configuration after a change
+ther necessary nor sufficient. Many applications experience
+                                                                    in resource usage can take dozens of seconds [8, 12, 38].
+bursty request patterns or phased behavior, drastically chang-
+ing the amount and type of resources they need. Unfortunately,         Unfortunately, real-world workloads experience changes
+partitioning-based systems fail to react quickly enough to keep     in resource usage over much shorter timescales. For example,
+up with these changes, resulting in extreme spikes in latency       network traffic was observed to be very bursty in Google’s
+and lost opportunities to increase CPU utilization.                 datacenters, sometimes consuming more than a dozen cores
+                                                                    over short time periods [42], and a study of Microsoft’s Bing
+   Caladan is a new CPU scheduler that can achieve signifi-
+                                                                    reports highly bursty thread wakeups on the order of microsec-
+cantly better quality of service (tail latency, throughput, etc.)
+                                                                    onds [27]. Phased resource usage is also common. For exam-
+through a collection of control signals and policies that rely
+                                                                    ple, we found that tasks that rely on garbage collection (GC)
+on fast core allocation instead of resource partitioning. Cal-
+                                                                    periodically consume all available memory bandwidth (§2).
+adan consists of a centralized scheduler core that actively
+                                                                    Detecting and reacting to such sudden changes in resource
+manages resource contention in the memory hierarchy and
+                                                                    usage is not possible with existing systems.
+between hyperthreads, and a kernel module that bypasses
+the standard Linux Kernel scheduler to support microsecond-            Our goal is to maintain both high CPU utilization and strict
+scale monitoring and placement of tasks. When colocating            performance isolation (for throughput and tail latency) under
+memcached with a best-effort, garbage-collected workload,           realistic conditions in which resource usage, and therefore
+Caladan outperforms Parties, a state-of-the-art resource parti-     interference, changes frequently. A key requirement is faster
+tioning system, by 11,000×, reducing tail latency from 580          reaction times, as even microsecond delays can impact la-
+ms to 52 µs during shifts in resource usage while maintaining       tency after an abrupt increase in interference (§2). There are
+high CPU utilization.                                               two challenges toward achieving microsecond reaction times.
+                                                                    First, there are many types of interference in a shared CPU
+1   Introduction                                                    (hyperthreading, memory bandwidth, LLC, etc.), and obtain-
+                                                                    ing the right control signals that can accurately detect each of
+Interactive, data-intensive web services like web search, social    them over microsecond timescales is difficult. Second, exist-
+networking, and online retail commonly distribute requests          ing systems face too much software overhead to either gather
+across thousands of servers. Minimizing tail latency is critical    control signals or adjust resource allocations quickly.
+for these services because end-to-end response times are de-           To overcome these challenges, we present an interference-
+termined by the slowest individual response [4, 14]. Efforts to     aware CPU scheduler, called Caladan. Caladan consists of
+reduce tail latency, however, must be carefully balanced with       a centralized, dedicated scheduler core that collects control
+the need to maximize datacenter efficiency; large-scale data-       signals and makes resource allocation decisions, and a Linux
+center operators often pack several tasks together on the same      Kernel module, called KSCHED, that efficiently adjusts re-
+machine to improve CPU utilization in the presence of vari-         source allocations. Our scheduler core distinguishes between
+able load [22, 57, 66, 71]. Under these conditions, tasks must      high-priority, latency-critical (LC) tasks and low-priority, best-
+compete over shared resources such as cores, memory band-           effort (BE) tasks. To avoid the reaction time limitations im-
+width, caches, and execution units. When shared resource con-       posed by hardware partitioning (§3), Caladan relies exclu-
+tention is high, latency increases significantly; this slowdown     sively on core allocation to manage interference.
+of tasks due to resource contention is called interference.            Caladan uses a carefully selected set of control signals
+   The need to manage interference has led to the development       and corresponding actions to quickly and accurately detect
+of several hardware mechanisms that partition resources. For        and respond to interference over microsecond timescales. We
+
+
+
+USENIX Association                            14th USENIX Symposium on Operating Systems Design and Implementation               281
+observe that interference has two interrelated effects: first,                                        GC Init       Mark Phase        Sweep Phase
+interference slows down the execution speed of cores (more
+
+
+
+
+                                                                   Mem. B/W (%)
+                                                                                     100
+cache misses, higher memory latency, etc.), impacting the ser-
+vice times of requests; second, as cores slow down, compute                           50
+
+capacity drops; when it falls below offered load, queueing
+                                                                                       0
+delays increase dramatically.
+
+
+
+
+                                                                   99.9% Lat. (μs)
+                                                                                     105
+    Caladan’s scheduler targets these effects. It collects fine-                                                    memcached
+                                                                                     104
+grained measurements of memory bandwidth usage and re-                                    3
+                                                                                     10
+quest processing times, using these to detect memory band-
+                                                                                     102
+width and hyperthreading interference, respectively. It then
+                                                                                              0   1             2    3         4       5      6
+restricts cores from the antagonizing BE task(s), eliminating                                                       Time (s)
+most of the impact on service times. For LLC interference,
+                                                                   Figure 1: Periodic GC in a background task (shaded regions) in-
+Caladan cannot eliminate service time overheads directly, but      creases memory bandwidth usage (top), causing severe latency
+it can still prevent a decrease in compute capacity by allowing    spikes for a colocated memcached instance (bottom). Note the log-
+LC tasks to steal extra cores from BE tasks.                       scaled y-axis in the bottom graph.
+    The KSCHED kernel module accelerates scheduling opera-
+tions such as waking tasks and collecting interference metrics.    in resource usage can abruptly increase interference. This
+It does so by amortizing the cost of sending interrupts, of-       degrades request service times and causes request queues to
+floading scheduling work from the scheduler core to the tasks’     grow when the rate of arriving requests exceeds the rate at
+cores, and providing a non-blocking API that allows the sched-     which a task can process them.
+uler core to handle many inflight operations at once. These           To better understand the challenges associated with time-
+techniques eliminate scheduling bottlenecks, allowing Cal-         varying interference, we consider what happens when we
+adan to react quickly while scaling to many cores and tasks,       colocate an LC task, memcached [43], with a BE workload
+even under heavy interference.                                     that exhibits phased behavior due to garbage collection. In
+    To the best of our knowledge, Caladan is the first system      this example, we use the Boehm GC (see §7), which employs
+that can maintain both strict performance isolation and high       the mark-sweep algorithm to reclaim dead heap objects [10].
+CPU utilization under frequently changing interference and         We have observed similar problems with more sophisticated,
+load. To achieve these benefits, Caladan imposes two new re-       incremental GCs, such as the Go Language Runtime [60].
+quirements on applications: the adoption of a custom runtime          In this experiment, we offer a fixed load to memcached and
+system for scheduling and the need for LC tasks to expose          statically partition cores between the two tasks. memcached
+their internal concurrency (§8). In exchange, Caladan is able      is given enough cores to keep its 99.9th percentile tail latency
+to converge to the right resource configuration 500,000×           below 50 µs when run in isolation. As shown in Figure 1, this
+faster than the typical speed reported for Parties, a state-of-    allocation is sufficient to protect tail latency when the GC is
+the-art resource partitioning system [12]. We show that this       not running but it fails when the GC starts. The GC pauses
+speedup yields an 11,000× reduction in tail latency when           normal execution of the BE task for 100–200 ms and scans
+colocating memcached with a BE task that relies on garbage         the entire heap using all cores available to the BE task, which
+collection. Moreover, we show that Caladan is highly general,      saturates memory bandwidth. During this brief period, each
+scaling to multiple tasks and maintaining the same benefits        memcached request experiences a higher rate of cache misses
+while colocating a diverse set of workloads (memcached, an         and larger memory access latencies, causing the rate at which
+in-memory database, a flash storage service, an x264 video         memcached can service requests to drop by about half and
+encoder, a garbage collector, etc.). Caladan is available at       queues to build up. As a result, memcached’s queueing delay
+https://github.com/shenango/caladan.                               increases at a rate of 5 µs every 10 µs, eventually reaching a
+                                                                   tail latency that is 1000× higher than normal.
+2     Motivation                                                      This example illustrates that fixed core partitioning is in-
+                                                                   sufficient, and also indicates what core reallocation speed
+In this section, we demonstrate how performance can degrade        is necessary in order to effectively mitigate interference. If
+when interference is not quickly mitigated. Many workloads         changes in interference can instantaneously reduce the re-
+exhibit phased behavior, drastically changing the types and        quest service rate by half, then in order to keep latencies from
+quantities of resources they use at sub-second timescales.         increasing by X, the CPU scheduler must detect and respond
+Examples include compression, compilation, Spark compute           to interference within 2X. Thus, preventing a latency increase
+jobs, and garbage collectors [49, 59]. The request rates issued    of 50 µs requires reaction times within 100 µs. Unfortunately,
+to tasks can also change rapidly, with bursts occurring over       existing systems are not designed to respond this quickly
+microsecond timescales [5, 27, 42]; these bursts in load can       (§3), forcing datacenter operators to either tolerate severe tail
+cause bursts of resource usage. In both cases, abrupt changes      latency spikes, or else isolate these tasks on different servers.
+
+
+
+282    14th USENIX Symposium on Operating Systems Design and Implementation                                                      USENIX Association
+    System          Decision     Typical Con-   Requires   Supports       Thus, both Heracles and Parties take at least 50× as long to
+                    Interval     vergence       CAT        HT
+                                                                       adapt to changes in interference as the duration of a GC cycle
+    Heracles [38]   2–15 s       30 s           3          7
+    Parties [12]    500 ms       10–20 s        3          7           in our example. As a result, operators must make tradeoffs
+    Caladan         10–20 µs     20 µs          7          3           based on tunable parameters: either tail latency tolerances
+                                                                       (e.g., 99.9th percentile tail latency) can be set higher, causing
+Table 1: A comparison of Caladan to state-of-the-art systems that      the GC interference to be tolerated without resource realloca-
+use partitioning to manage interference. Caladan can converge to the
+                                                                       tions, or they can be set lower, causing the GC workload to be
+right resource configuration 500,000× faster.
+                                                                       throttled continuously. Because the GC workload causes min-
+                                                                       imal interference during the majority of its execution (while
+3      Background                                                      not collecting garbage), faster reaction times are needed to
+                                                                       keep cores busy without compromising tail latency.
+Throughout this paper, we discuss three forms of interference
+                                                                          In addition to convergence speed, existing systems suffer
+that can occur when sharing a CPU: hyperthreading interfer-
+                                                                       from scalability limitations. For example, a typical datacen-
+ence, memory bandwidth interference, and LLC interference.
+                                                                       ter server must handle several LC and BE tasks simultane-
+Hyperthreading interference is usually present at a baseline
+                                                                       ously [66, 71], but Heracles is limited to only a single LC
+level whenever tasks are running on sibling cores because
+                                                                       task (and many BE tasks). Parties can support multiple LC
+the CPU divides certain physical core resources (e.g., the
+                                                                       and BE tasks, but because it can only guess at which task is
+micro-op queue), but it can become more severe depending
+                                                                       causing interference, its convergence time increases with each
+on whether shared resources (L1/L2 caches, prefetchers, exe-
+                                                                       additional task.
+cution units, TLBs, etc.) are contended. Memory bandwidth
+                                                                          The hardware mechanisms on which these systems rely
+and LLC interference, on the other hand, can vary in intensity,
+                                                                       also impose limitations. For example, hyperthreads lack con-
+but impact all cores that share the same physical CPU. As
+                                                                       trol over resource partitioning, so Heracles and Parties turn
+memory bandwidth usage increases, memory access latency
+                                                                       them off entirely. Using both hyperthreads on a core simul-
+slowly increases due to interference, until memory bandwidth
+                                                                       taneously can yield up to 30% higher throughput than using
+becomes saturated; access latency then increases exponen-
+                                                                       a single hyperthread [40, 44, 45, 54], so this lowers system
+tially [62]. LLC interference is determined by the amount of
+                                                                       throughput significantly. Furthermore, the available hardware
+cache each application uses: when demand exceeds capacity,
+                                                                       partitioning mechanisms that can be controlled constrain both
+LLC miss rates increase.
+                                                                       reaction speeds and scalability. We discuss this problem next.
+   In this section, we discuss why existing systems are unable
+to manage abrupt changes in interference (§3.1) and explore            3.2    Limitations of Hardware Extensions
+the limitations imposed on them by the hardware extensions
+available in commercial CPUs (§3.2).                                   Intel has added several extensions to its server CPUs that are
+                                                                       designed to partition and monitor the LLC and memory band-
+3.1       Existing Approaches to Interference                          width. These extensions are optimized for scenarios where
+                                                                       resource demand changes slowly, but as shown in our study
+State-of-the-art systems such as Heracles [38] and Parties [12]        of the GC workload, this assumption does not always hold.
+handle interference by dynamically partitioning resources,             To better understand these limitations, we discuss each com-
+such as cores and LLC partition sizes. However, both Hera-             ponent in more detail.
+cles and Parties make decisions and converge to new resource              The most commonly used extension is CAT, a technology
+allocations too slowly to manage bursty interference (Table 1).        that divides portions of the LLC between tasks to increase
+There are two main reasons. First, both systems detect interfer-       performance determinism [21]. CAT’s way-based hardware
+ence using application-level tail latency measurements, which          implementation suffers from two limitations. First, changes
+must be measured over hundreds of milliseconds in order to             to the partition configuration can take considerable time to
+obtain stable results; the Parties authors found that shorter          have an effect; Intel cautions that “a reduction in the per-
+intervals produced “noisy and unstable results” [12]. Second,          formance of [CAT] may result if [tasks] are migrated fre-
+both systems make incremental adjustments to resource al-              quently” [26, sec. 17.19.4.2]. Appropriately sizing a partition,
+locations, gradually converging to a configuration that can            however, is challenging under time-varying demand because
+meet latency objectives. These systems lack the ability to             it must be large enough to accommodate peak usage. Sec-
+identify the source of interference (application and contended         ond, CAT must divide a finite number of set-associative ways
+resource) directly, so convergence can involve significant trial-      between partitions, reducing associativity within each parti-
+and-error as different resources are throttled, requiring sec-         tion. Unfortunately, performance can degrade significantly as
+onds to converge to a new resource allocation. During the              associativity decreases [56, 67]; KPart avoids this by group-
+adjustment period, latency often continues to suffer because           ing complementary tasks together in the same partition, but
+the LC task must wait to be given enough resources to reduce           it relies on frequent online profiling to identify groupings,
+its queueing delay buildup.                                            resulting in high tail latency [18].
+
+
+
+USENIX Association                              14th USENIX Symposium on Operating Systems Design and Implementation               283
+    Another extension called Memory Bandwidth Allocation                            Caladan’s Actions to Mitigate Interference
+(MBA) applies a per-core rate limiter to DRAM accesses to                                                 Impact of Interference
+                                                                       Contended Resource     ↑ Service Times           ↓ Compute Capacity
+throttle bandwidth consumption. MBA is necessary for sys-
+                                                                       Hyperthreads           idle sibling core         add victim cores
+tems that statically assign cores because it is the only method        Memory Bandwidth       throttle antagonist       add victim cores
+they can use to limit bandwidth consumption. Unfortunately,            LLC                    none                      add victim cores
+it is at odds with our goal of achieving high CPU utilization:
+a core that is heavily rate-limited by MBA will spend the ma-         Table 2: When a resource (left) becomes contended, Caladan takes
+                                                                      action to avoid increased service times (middle). When this is in-
+jority of its time stalling. Instead, we found it is more efficient
+                                                                      sufficient to maintain compute capacity, Caladan takes additional
+to allocate fewer cores, achieving the same throughput for a
+                                                                      action (right).
+task, but with higher per-core utilization.
+    Finally, configuring partitioning mechanisms effectively
+                                                                      and by dedicating a core to monitor these signals and take
+requires the attribution of resource usage to specific tasks.
+                                                                      action to mitigate interference as it arises. We address the
+To help with this goal, Intel introduced Cache Monitoring
+                                                                      challenge of scalability with a Linux Kernel module named
+Technology (CMT) and Memory Bandwidth Monitoring
+                                                                      KSCHED . We describe these in more detail below.
+(MBM) [72]. Unfortunately, these mechanisms are unable
+to detect changes in system conditions quickly. For example,
+                                                                      4.1    Caladan’s Approach
+when monitoring a streaming task with CMT, it takes 112
+ms for its cache occupancy measurement to stabilize [21].             Caladan dedicates a single core, called the scheduler, to con-
+Similarly, we discovered experimentally that MBM requires             tinuously poll and gather a set of control signals over mi-
+milliseconds to accurately estimate memory bandwidth usage.           crosecond timescales. The scheduler uses these signals to
+                                                                      detect interference and then reacts by adjusting core alloca-
+4     Challenges and Approach                                         tions. The scheduler is designed to manage several forms of
+                                                                      interference (§3), using control signals tailored to each. For
+Our overarching goal is to maintain performance isolation             hyperthreads, we assume interference is always present when
+while maximizing CPU utilization. Achieving this goal is              both siblings are active (because some physical core resources
+difficult because managing changes in interference requires           are partitioned) and focus on reducing interference for the
+microsecond-scale reaction times. Partitioning resources in           requests that will impact tail latency—that is, the longest run-
+hardware is too slow for these timescales (§3.2), so Caladan’s        ning requests [70]. We measure request processing times to
+approach is to instead manage interference by controlling             identify these requests. For memory bandwidth, we measure
+how cores are allocated to tasks. Prior systems have adjusted         global memory bandwidth usage to detect DRAM saturation
+cores as part of their strategy for managing interference [12,        and measure per-core LLC miss rates to attribute usage to a
+28, 38, 70], but Caladan is the first system to rely exclusively      specific task. For cases like the LLC where we cannot directly
+on core allocation to manage multiple forms of interference.          measure or infer interference, we can still measure a key side
+To mitigate interference quickly enough, we had to overcome           effect of interference: increased queueing delays, caused by
+two key challenges:                                                   reductions in compute capacity. By focusing on interference-
+  1. Sensitivity: For fast and targeted reactions, Caladan re-        driven control signals, Caladan can detect problems before
+      quires control signals that can identify the presence of in-    quality of service is degraded.
+      terference and its source—task and contended resource—             Table 2 summarizes the actions Caladan takes to mitigate
+      within microseconds. Commonly used performance met-             interference. We first try to prevent service time increases
+      rics like CPI [71] or tail latency [12, 38] (as well as hard-   by reducing interference directly. For example, Caladan re-
+      ware mechanisms like MBM and CMT) are too noisy to              duces hyperthreading interference by controlling which log-
+      be useful over short timescales. Metrics like queueing          ical cores (hyperthreads) may be used, idling a logical core
+      delay [8, 42, 47, 68] can be measured over microsecond          when its sibling exceeds a request processing time threshold.
+      timescales, but cannot identify the source of interference,     In addition, it reduces memory bandwidth interference by
+      only that a task’s performance is degrading.                    limiting how many cores each task may use; this is effective
+  2. Scalability: Existing systems depend heavily on the              because reducing the number of cores allocated to a task re-
+      Linux Kernel in order to gather control signals and adjust      duces its memory bandwidth usage. However, reducing LLC
+      resource allocations (e.g., using sched_setaffinity()           interference is more difficult: the magnitude of LLC inter-
+      to adjust core allocations) [8,12,20,38,47,52,68]. Unfor-       ference is determined primarily by how much LLC capacity
+      tunately, Linux adds overhead to these operations, and          a task uses, but reducing a task’s number of cores reduces
+      these overheads increase in the presence of interference        its LLC access rate rather than its LLC capacity. Therefore,
+      and as the number of cores and tasks increase.                  Caladan compensates for LLC interference—and any remain-
+   We address the challenge of sensitivity by carefully select-       ing hyperthreading and memory bandwidth interference—by
+ing control signals that enable fast detection of interference        granting extra cores to victim tasks, allowing them to recoup
+
+
+
+284    14th USENIX Symposium on Operating Systems Design and Implementation                                         USENIX Association
+ {Work Stealing}
+                                                                                             empting tasks, assigning cores to tasks, detecting when tasks
+                             Task 1                Unallocated           Task 2              have yielded voluntarily, and reading performance counters
+                             Runtime                                     Runtime             from remote cores.
+                    ksched   ksched    ksched        ksched         ksched     ksched           Caladan’s runtimes share many properties with those of
+                    Core 1   Core 2    Core 3            Core 4     Core 5     Core 6        Shenango. Applications managed by Caladan run inside nor-
+{Core Allocation}                                                                            mal Linux processes, which we refer to as tasks. Within each
+Shared Memory                                                                                task, the runtime provides “green” threads (light-weight, user-
+   DRAM                                    Scheduler                                         level threads) and kernel-bypass I/O (networking and storage).
+                                                                                   ioctl()
+  Controller                                                                                 Runtimes use work stealing to balance load across the cores
+    (PCIe)                                      ksched
+                                                                                             that are allocated to them—a best practice for minimizing tail
+                                                Core 0
+                                                                                             latency [51]—and yield cores when they run out of work to
+Figure 2: Caladan’s system architecture. Caladan relies on a sched-                          steal. Handling threading and I/O in userspace makes manag-
+uler core to gather control signals from shared memory regions                               ing interference easier in two ways. First, by performing all
+(provided by KSCHED, runtimes, and the DRAM controller). It uses
+                                                                                             processing inside the task that needs it, we can better manage
+these control signals to adjust core allocations via KSCHED.
+                                                                                             the resource contention it generates. By contrast, the Linux
+                                                                                             Kernel handles I/O on behalf of its tasks, making it difficult to
+the compute capacity lost to interference. Although this can-
+                                                                                             attribute resource usage or interference to a specific task. Sec-
+not fully protect service times, it can prevent queueing delays.
+                                                                                             ond, we can easily instrument the runtime system to export
+   Finally, Caladan introduces a Linux Kernel module called
+                                                                                             the right per-task control signals (discussed further in §5.2).
+KSCHED . KSCHED performs scheduling functions across
+many cores at once in a matter of microseconds, even in the                                  Provisioning cores: Users provision each task with a discrete
+presence of interference. KSCHED achieves these goals with                                   number of guaranteed cores (zero or more) that are always
+three main techniques: (1) it runs on all cores managed by                                   available when needed. They can also allocate tasks additional
+Caladan and shifts scheduling work away from the scheduler                                   burstable cores beyond the number guaranteed, allowing them
+core to cores running tasks; (2) it leverages hardware support                               to make use of any idle capacity. Additionally, each task is
+for multicast interprocessor interrupts (IPIs) to amortize the                               designated as LC or BE. BE tasks operate at a lower priority:
+cost of initiating operations on many cores simultaneously;                                  they are only allocated burstable cores when LC tasks do not
+and (3) it provides a fully asynchronous scheduler interface                                 need them, they are always provisioned zero guaranteed cores,
+so that the scheduler can initiate operations on remote cores                                and they are throttled as needed to manage interference.
+and perform other work while waiting for them to complete.                                      In some configurations, it may not be possible to manage
+                                                                                             interference without harming the performance of LC tasks.
+5      Design                                                                                To prevent these cases, we recommend a configuration that
+                                                                                             leaves a small number of cores that are not guaranteed to
+5.1        Overview                                                                          any task, providing enough slack to manage interference. Cal-
+Figure 2 presents the key components of Caladan and                                          adan can also detect when provisioning constraints prevent it
+the shared memory regions between them. Caladan shares                                       from mitigating interference. As a last resort, this information
+some architectural and implementation building blocks with                                   could be reported back to the cluster scheduler so that it could
+Shenango [47]: each application is linked with a runtime sys-                                migrate tasks to other machines. A rich body of prior work
+tem, and a dedicated scheduler core (run with root privileges)                               has explored adding similar types of interference coordina-
+busy polls shared memory regions to gather control signals                                   tion, as well as identifying complementary workloads, at the
+and make core allocations. Both systems are designed to inter-                               cluster scheduler layer [12, 15, 16, 41, 69, 71].
+operate in a normal Linux environment, potentially managing
+                                                                                             5.2    The Caladan Scheduler
+a subset of available cores.
+   Despite these commonalities, Caladan adopts a radically                                   Figure 3 shows the scheduler’s key components, the control
+different approach to scheduling and relies on different                                     signals they each use, and their interactions. Separate con-
+scheduling mechanisms. Shenango uses queueing delay as its                                   troller modules detect memory bandwidth and hyperthreading
+only control signal to manage changes in load; Caladan uses                                  interference, each placing constraints on how cores can be
+multiple control signals to manage several types of interfer-                                allocated and revoking cores as necessary. The memory band-
+ence as well as changes in load. Moreover, Shenango’s sched-                                 width controller restricts how many cores can be assigned
+uler core combines network processing with CPU scheduling;                                   to a task, while the hyperthread controller bans cores within
+Caladan’s scheduler core is only responsible for CPU schedul-                                sibling pairs. A top-level core allocator incorporates these re-
+ing, eliminating packet processing bottlenecks (§6). Finally,                                strictions and decides when to grant additional cores to tasks.
+Shenango relies on standard Linux system calls to allocate                                   It tries to minimize queueing delay (to manage changes in load
+cores, limiting its scalability; Caladan uses KSCHED to more                                 and any unmitigated interference), allocating cores to tasks in
+efficiently perform its scheduling functions, including pre-                                 a way that respects constraints from the controllers and each
+
+
+
+USENIX Association                                                14th USENIX Symposium on Operating Systems Design and Implementation                   285
+               Queueing
+                Delays                                                        1 while True:
+ runtimes                                                                     2    for each task T :
+               Processing        Hyperthread Banned Cores
+                 Times            Controller                                  3         if QueueingDelay(T ) < THRESH_QD[T]:
+                Memory                                        Top-level       4              continue;
+  DRAM
+ controller    Bandwidth          Memory                    Core Allocator    5         if T is limited by BW controller:
+                                 Bandwidth    Core Limits
+                LLC Miss         Controller
+                                                                              6              continue;
+                 Rates                                                        7         // try to allocate a core
+  ksched
+                 Idle                                                         8         for each core C:
+                Notices
+                                                                              9              if C is banned by HT controller:
+Figure 3: The flow of information through Caladan’s scheduler. Con-          10                   continue;
+trol signals flow from runtimes, the DRAM controller, and KSCHED             11              if task_on_core[C] has priority over T :
+to the controllers and top-level allocator. The hyperthread and mem-         12                   continue;
+ory bandwidth controllers impose constraints on which and how                13              score[C] = CalculateScore(C, T );
+many cores the top-level allocator may grant.                                14         find core C with highest score;
+                                                                             15         allocate C to T (if found);
+task’s resource configuration (the number of guaranteed cores,               16    sleep(10 µs);
+BE vs. LC, etc.). The controllers and core allocator run once                        Algorithm 1: The top-level core allocator.
+every 10 µs on the scheduler’s dedicated core. Because the                   loops over all cores, checking which cores are allowed by the
+scheduler can reallocate cores so quickly, it is possible to allo-           hyperthread controller and checking which tasks are running
+cate fractional cores to tasks on average over time (e.g., when              on each core. An idle core can be allocated to any task, but
+less than a full core is needed to accommodate load). This is                a busy core can only be preempted if the core provisioning
+made efficient through KSCHED’s scheduling optimizations                     configuration allows it. For example, if an LC task is only
+(§5.3).                                                                      using guaranteed cores, it cannot be preempted by another
+   The scheduler gathers control signals from three sources.                 task. Moreover, a BE task can never preempt an LC task.
+First, runtimes provide information about request processing                    Finally, CalculateScore() assigns a score to each core,
+times and about queueing delays. Second, the DRAM con-                       and the core allocator picks the allowed core with the highest
+troller provides information about global memory bandwidth                   score (if one is found). Our scoring function is based on
+usage. Third, KSCHED provides information about per-core                     three factors (in order of priority). First, we prefer sibling
+LLC miss rates and notifies the scheduler core when a task                   pairs that are both idle because they have no hyperthreading
+has yielded voluntarily. We now discuss each component in                    interference. Second, we prefer hyperthread pairings between
+more detail. We present each algorithm as synchronous code                   different tasks because hyperthreading is most efficient when
+for clarity, but to handle many tasks concurrently without                   tasks have different performance bottlenecks [31, 45]. Finally,
+delaying the scheduler, all code is asynchronous in practice.                we optimize for temporal locality: Caladan keeps track of the
+Each algorithm relies on one tunable parameter; these are                    time each task last used each core, and gives the most recent
+described in more detail in Appendix A.                                      timestamp the highest score. Timestamps are shared between
+                                                                             hyperthread siblings, reflecting their shared cache resources.
+5.2.1     The Top-level Core Allocator                                          The core allocator also receives notifications from KSCHED
+The goal of the top-level core allocator is to grant more cores              whenever a runtime yields a core voluntarily (not shown in Al-
+to tasks that are experiencing queueing delays, whether these                gorithm 1). When this happens, it updates the task_on_core
+delays are due to lingering interference (as shown in the                    array and immediately tries to grant the core to another task,
+rightmost column of Table 2) or due to changes in load. Algo-                reducing the cycles the core spends idling.
+rithm 1 shows its basic operation. The core allocator periodi-               5.2.2   The Memory Bandwidth Controller
+cally checks the queueing delay of each task, and, when per-
+mitted by the memory bandwidth controller, tries to add cores                Algorithm 2 shows our memory bandwidth controller. Our
+to the tasks that have delays above a configurable per-task                  aim is to use the majority of available memory bandwidth
+threshold (THRESH_QD). Queueing can occur in each runtime                    while avoiding saturation. The memory bandwidth controller
+core’s green thread runqueue, network ingress queue, stor-                   periodically polls the DRAM controller’s global memory
+age completion queue, and timer heap. Each queued element                    bandwidth usage counter, calculating the access rate since
+contains a timestamp of its arrival time, and all queues are                 the last polling interval, and triggers when it crosses a satura-
+placed in shared memory. QueueingDelay() computes the                        tion threshold (THRESH_BW). It then attributes memory band-
+delay for each core by summing the delays experienced by                     width usage to a specific task by relying on KSCHED to effi-
+the oldest element in each of its queues. It then reports the                ciently sample LLC misses from the performance monitoring
+maximum delay observed across the task’s cores.                              unit (PMU) [25] of each scheduled core. We found that LLC
+   When a task’s delay exceeds its THRESH_QD, the allocator                  misses are a good indicator of overall memory bandwidth
+
+
+
+286     14th USENIX Symposium on Operating Systems Design and Implementation                                            USENIX Association
+ 1 while True:                                                       use of the sibling hyperthread via KSCHED. The sibling’s run-
+ 2    if GlobalMemBandwidth() < THRESH_BW:                           time receives a request from KSCHED to preempt the core and
+ 3         increment the core limit on the most limited task;        places the current green thread back into its runqueue. The
+ 4         sleep(10 µs);                                             top-level core allocator can detect this as an increase in queue-
+ 5         continue;                                                 ing delay and add back a different (not banned) core. Then
+ 6    for each core C:                                               KSCHED places the sibling in the shallow C1 idle state us-
+ 7         start[C] = ReadLLCMisses(C);                              ing the mwait instruction; mwait parks the local hyperthread
+ 8    sleep(10 µs);                                                  and reallocates shared physical core resources to the sibling,
+ 9    for each core C:                                               increasing its performance.
+10         end = ReadLLCMisses(C);                                      Caladan’s hyperthread controller benefits from global
+11         misses[task_on_core[C]] += end - start[C];
+                                                                     knowledge. First, it will only ban a sibling that is handling
+12    find task T that is BE and has the highest misses;
+                                                                     an LC task if that LC task can be allocated another core, to
+13    decrement task T ’s core limit and revoke a core;
+                                                                     avoid degrading throughput under high load. Second, if there
+        Algorithm 2: The memory bandwidth controller.                are not enough cores available, it will prioritize speeding up
+                                                                     the green threads that have spent the most time processing
+ 1 while True:                                                       a request, keeping tail latency as low as available compute
+ 2    for each core C:                                               capacity permits. The hyperthread controller can also unban
+ 3         T = task_on_core[C]                                       cores, respecting the same priority, when the top-level core
+ 4         if T is LC and now - GetRequestStartTime(C) ≥             allocator needs to allocate a guaranteed core, but none are
+ 5            THRESH_HT[T]:                                          available due to bans.
+ 6              ban sibling of C;                                       Caladan’s approach to managing hyperthread interference
+ 7         else:                                                     was inspired by Elfen Scheduling [70]. Our policy for identi-
+ 8              unban sibling of C;                                  fying interference is similar to Elfen’s refresh budget policy,
+ 9    sleep(10 µs);                                                  and both use mwait to idle hyperthreads. However, Caladan’s
+           Algorithm 3: The hyperthread controller.                  approach differs in two key ways. First, Elfen relies on trusted
+usage, with the exception that they exclude non-temporal             BE tasks to measure interference and yield voluntarily, while
+memory accesses, which don’t allocate lines in the cache. For-       Caladan’s scheduler makes and enforces these decisions, lever-
+tunately, these are rarely used, but we recommend they be            aging the benefits of global knowledge. Second, Elfen can
+counted in future CPUs. Waiting 10 µs between samples is             only support pinning one LC task and one BE task to each
+enough to accurately estimate LLC misses. The bandwidth              hyperthread pair. Instead, we allow any pairing (even self
+controller revokes one core from the worst offending task            pairings) and can handle interference between LC tasks. This
+every time it runs until memory bandwidth is no longer satu-         enables significantly higher throughput because all logical
+rated. When one task is throttled, another task (that consumes       cores are available for use by any task (§7.3).
+less memory bandwidth) can still use the throttled core.             5.2.4   An Example: Reacting to Garbage Collection
+   While Algorithm 2 summarizes this controller’s basic be-
+havior, we had to take extra steps to improve its accuracy. First,   As an example, we explain how Caladan’s scheduler responds
+because ReadLLCMisses() initiates PMU counter reads with             when a GC cycle begins, causing memory bandwidth interfer-
+IPIs (see §5.3), there can be timing skew. Therefore, KSCHED         ence for an LC task (the workload depicted in Figure 1). As
+includes the local timestamp counter (TSC), which is stable          soon as global memory bandwidth usage exceeds THRESH_BW,
+across cores, when it stores PMU results. This allows us to          the memory bandwidth controller will revoke cores from the
+calculate an LLC miss rate instead of a raw miss count. Sec-         GC task, revoking one core every 10 µs until total memory
+ond, we discard samples from tasks that have yielded or have         bandwidth usage falls below THRESH_BW (Algorithm 2). In
+been preempted during the measurement interval.                      the meantime, the LC task may suffer from interference, in-
+                                                                     creasing its queueing delay. This will cause the top-level
+5.2.3     The Hyperthread Controller                                 core allocator to grant it additional cores, beginning with any
+Caladan’s hyperthread controller detects hyperthread interfer-       idle cores, but preempting additional cores from the GC task
+ence and then bans use of the sibling hyperthread until the cur-     if necessary. It will add one core every 10 µs until the LC
+rent request completes (Algorithm 3). Runtimes place times-          task’s queueing delay falls below its THRESH_QD again (Al-
+tamps in shared memory to indicate when each hyperthread             gorithm 1). Once the GC interference has been successfully
+begins handling a green thread. The hyperthread controller           mitigated, the LC task will yield the extra cores.
+then uses GetRequestStartTime() to retrieve these times-
+                                                                     5.3     KSCHED : Fast and Scalable Scheduling
+tamps and check if the current thread has been running for
+more than a per-task processing time threshold (THRESH_HT).          KSCHED ’s goal is to efficiently expose control over CPU
+  When the threshold has been exceeded, the controller bans          scheduling to the userspace scheduler core. A scheduler core
+
+
+
+USENIX Association                             14th USENIX Symposium on Operating Systems Design and Implementation              287
+that relies on the current Linux Kernel system call interface is   performs expensive operations such as sending signals and
+subject to its limitations; KSCHED must overcome these. First,     affinitizing tasks to cores on the targeted cores rather than
+Linux system calls, like sched_set_affinity(), perform             on the scheduler core. In combination, these three properties
+computationally expensive work (e.g., locking runqueues) on        allow KSCHED to perform scheduling operations with low
+the core that calls them. Second, Linux system calls block         overhead, enabling Caladan to support high rates of core real-
+and reschedule while waiting for their operation to complete,      location and performance counter sampling even with many
+preventing the scheduler core from performing other work.          concurrent tasks (§7.3).
+Third, Linux system calls can only perform one operation at
+a time, squandering any opportunity to amortize costs across       6   Implementation
+multiple operations and cores. Finally, cores may only directly
+read their own performance counters and Linux provides no          Caladan is derived from the open-source release of
+efficient mechanism to query those on other cores.                 Shenango [61], but we implemented a completely new sched-
+   KSCHED adopts a radically different approach from Linux’s       uler and the KSCHED kernel module, which are 3,524 LOC
+existing mechanisms, supporting direct communication be-           and 533 LOC, respectively. Shenango was a good starting
+tween the scheduler core and kernel code running on other          point for our system because of its feature-rich runtime with
+cores via per-core, shared-memory regions. The scheduler           support for green threads and TCP/IP networking. Moreover,
+core writes commands into these regions and then uses an           Shenango’s runtime is already designed to handle signals to
+ioctl() to kick the remote cores by sending them IPIs.             cleanly preempt cores [47].
+KSCHED then executes the commands (in kernelspace on                  We modified Shenango’s runtime in two important ways.
+the remote cores) and writes back results.                         First, Shenango relies on its scheduler core to forward packets
+   KSCHED supports three commands: waking tasks (poten-            in software to the appropriate runtime over shared memory
+tially preempting the current task), idling cores, and reading     queues. Instead, we linked the libibverbs library directly
+performance counters. Before preempting a task or idling a         into each runtime, providing fast, kernel-bypass access to
+core, KSCHED delivers a signal to the runtime to give it a         networking. This implementation strategy allowed us to com-
+few microseconds to yield cleanly, saving the current green        pletely eliminate the packet forwarding bottlenecks imposed
+thread’s register state and placing it back in the runqueue.       by Shenango and also reduced our scheduler core’s exposure
+Then, to wake a new task on a core, KSCHED locks the task’s        to interference, by reducing its memory and computational
+affinity so that Linux cannot migrate it to another core and       footprint. Our scheduler core measures packet queueing de-
+calls into the Linux scheduler. To idle a core instead, KSCHED     lay by mapping the NIC’s RX descriptor queues (for each
+calls mwait. Finally, KSCHED can sample any performance            task) over shared memory and accessing the packet arrival
+counter on any core, and includes the TSC in the response.         timestamps encoded in the descriptors by the NIC. Second,
+   When the scheduler kicks a core, the IPI handler immedi-        we augmented the runtime with support for NVMe storage us-
+ately processes any pending commands. Commands can also            ing Intel’s SPDK library to bypass the kernel. These changes
+be processed without IPIs by cores that are idle through effi-     required us to add 2,943 new LOC to the runtime, primarily
+cient polling. To achieve this, KSCHED bypasses the standard       to add integration with libibverbs and SPDK.
+Linux idle handler, setting a flag that notifies the scheduler        To support idling in KSCHED, each per-core shared mem-
+core that the current task has yielded voluntarily. KSCHED         ory region uses a single cache line (64 bytes) because mwait
+then checks for new commands; if none are available, it runs       can only monitor regions of this size. We packed these cache
+the monitor instruction, telling the core to watch the cache       lines into a contiguous array so that our scheduler core could
+line containing the shared region. Finally, it parks the core      take advantage of hardware prefetching to speed up polling.
+with the mwait instruction, placing it in the shallow C1 idle      KSCHED allows the scheduler core to control which idle state
+state. mwait monitors cache coherence messages and imme-           mwait enters, but we have not yet explored power manage-
+diately resumes execution when the shared region is written        ment. We also modified the Linux Kernel source to accelerate
+to by the scheduler core.                                          multicast IPIs; although the Linux Kernel provides an API
+   One of the most expensive operations that both Linux and        called smp_call_function_many() that supports this fea-
+KSCHED must perform is sending IPIs. When there are mul-           ture, it imposes additional software overhead, especially under
+tiple operations, KSCHED leverages the multicast capability        heavy memory bandwidth interference.
+of the interrupt controller to send multiple IPIs at once, sig-
+nificantly amortizing costs. To facilitate this, the scheduler     7   Evaluation
+core writes all pending operations to shared memory and
+then passes a list of cores to kick to an ioctl() that initi-      We evaluate Caladan by answering the following questions:
+ates IPIs. In addition, all of KSCHED’s commands are issued         1. How does Caladan compare to previous systems (§7.1)?
+asynchronously, so that the scheduler core can perform other        2. Can Caladan colocate different tasks while maintaining
+work while waiting for them to complete. Finally, KSCHED               low tail latency and high CPU utilization (§7.2)?
+
+
+
+288   14th USENIX Symposium on Operating Systems Design and Implementation                                  USENIX Association
+   3. How do the individual components of Caladan’s design        nist that continuously reads and writes arrays of memory in
+      enable it to perform well (§7.3)?                           two configurations: stream-L2 displaces the L2 cache, while
+Experimental setup: We evaluate our system on a server            stream-DRAM displaces the LLC and consumes all available
+with two 12 physical core (24 hyperthread) Xeon Broadwell         memory bandwidth.
+CPUs and 64 GB of RAM running Ubuntu 18.04 with kernel               All applications run in our modified Shenango runtime,
+5.2.0 (modified to speed up multicast IPIs). We do not con-       which supports standard abstractions such as TCP sockets and
+sider NUMA, and direct all interrupts, memory allocations,        the pthread interface (via a shim layer), making it relatively
+and threads to the first socket. The server is equipped with      straightforward to port and develop applications (§8).
+a 40 Gb/s ConnectX-5 Mellanox NIC and a 280 GB Intel
+Optane NVMe device capable of performing random reads at          Parameter tuning: Caladan has three parameters that are
+550,000 IOPS. To generate load, we use a set of quad-core ma-     user-tunable and can make tradeoffs between latency and
+chines with 10 Gb/s ConnectX-3 Mellanox NICs connected            CPU efficiency. Appendix A explains how to tune these pa-
+to our server via a Mellanox SX1024 non-blocking switch.          rameters and shows how sensitive Caladan’s performance is to
+We tune the machines for low latency in accordance with rec-      particular choices of these parameters. In our evaluation, we
+ommended practices, disabling TurboBoost, CPU idle states,        tuned all three for low latency. First, we set THRESH_QD (the
+CPU frequency scaling, and transparent hugepages [37]. We         queueing delay threshold) to 10 µs for all tasks. Second, we
+also disable Meltdown [2] and MDS [24] mitigations, since         set THRESH_BW (the memory bandwidth threshold) to 25 GB/s.
+these vulnerabilities have been fixed by Intel in recent CPUs.    Finally, we set a THRESH_HT (the processing time threshold)
+When evaluating Linux’s performance, we run BE tasks with         for each LC task (not supported for BE tasks). We set it to
+low-priority using SCHED_IDLE and use kernel version 5.4.0        25 µs for silo, 40 µs for storage, and infinite for memcached.
+to take advantage of recent improvements to SCHED_IDLE.
+We use loadgen, an open-loop load generator, to generate          Comparison with Parties: Parties [12] is the most relevant
+requests with Poisson arrivals over TCP connections [61]. Un-     prior work for mitigating interference. It builds upon Hera-
+less stated otherwise, we configure all Caladan experiments       cles [38] by adding support for multiple LC tasks. Ideally,
+with 22 guaranteed cores for LC tasks, leaving one physical       we would compare directly to Parties, but its source code
+core for the scheduler.                                           is not publicly available, and we were unable to obtain it
+                                                                  from the Parties authors. Instead, we reimplemented Parties
+Evaluated applications: We evaluate three LC tasks. First,
+                                                                  in accordance with the details described in its paper.
+memcached (v1.5.6) is a popular in-memory, key-value store
+that has been extensively studied [43]. We generate a mix            By implementing Parties ourselves, we were able to use
+of reads and writes based on Facebook’s USR request distri-       the same runtime system for both Caladan and Parties, so
+bution [6] (service times of about 1 µs). Second, silo is a       they could benefit equally from kernel-bypass I/O, allowing
+state-of-the-art, in-memory, research database [64]. We feed      us to evaluate only differences in scheduling policy. We did
+it the TPC-C request pattern, which has high service time         not implement some components in Parties that were not
+variability (20 µs median; 280 µs 99.9%-ile) [63]. Silo is        relevant to our experiments. Specifically, our workloads do not
+only a library, so we integrated it with a server that can han-   contend over disk, network, or memory capacity. Managing
+dle RPCs, performing one transaction per request. Finally,        these resources is important but unrelated to our focus on CPU
+we built a new NVMe block storage server inspired by Re-          interference. Moreover, we did not include the CPU frequency
+Flex [34], that we call storage. We added compression (using      scaling controller, as reducing energy consumption is outside
+Snappy [1]) and encryption (using AES-NI [46]) to study           the scope of our work. We did implement all of Parties’ key
+the hyperthreading effects of RPC frameworks that rely on         mechanisms, including core allocation, CAT, and an external
+vector processing. We preload the SSD with XML-formatted          measurement client that samples tail latencies over 500 ms
+data from Wikipedia [39], and issue requests for blocks of        periods. We also invested considerable effort in tuning Parties’
+varying lengths (99% 4KB, 1% 44KB) to evaluate service            latency thresholds to yield the best possible performance.
+time variability (35 µs and 250 µs for each respective size).        Normally, Parties leaves hyperthreads disabled because it is
+    For BE tasks, we use workloads from the PARSEC bench-         unable to manage this form of interference, reducing its CPU
+mark suite [9]. In particular, we evaluate x264, an H.264/AVC     throughput. Instead, we enabled hyperthreads with a policy
+video encoder, swaptions, a portfolio pricing tool, and stream-   that prefers self pairings. For specifically memcached—the
+cluster, an online clustering algorithm. We modified swap-        workload we evaluated—this forms a complementary pairing
+tions to use the Boehm garbage collector to allocate its mem-     that has minimal effect on latency, but allowed us to conduct
+ory objects [10], allowing us to study the interference caused    a direct comparison with the same number of cores. The
+by garbage collection; we call this version swaptions-GC.         addition of kernel-bypass networking and hyperthread pairing
+All three workloads exhibit phased behavior, changing their       enable our version of Parties to significantly outperform the
+resource usage over regular intervals (some have much larger      reported performance of the original, so we refer to it as
+variance than others). Finally, we evaluate a synthetic antago-   Parties*.
+
+
+
+USENIX Association                          14th USENIX Symposium on Operating Systems Design and Implementation             289
+                                                                Parties *                                            Caladan
+                               106
+                  99.9% Lat.
+
+
+                                                                                                                   memcached (LC)
+                               104
+                     (μs)
+
+
+                                                                                                                   swaptions-GC (BE)
+                               102
+                               101
+                               100
+                  BE Op/s
+                    (%)
+
+
+
+
+                                   50
+
+                                    0
+                  LLC Cores
+
+
+
+
+                                   20
+                                    0
+                  Ways
+
+
+
+
+                                   20
+                                    0
+                                        0            5              10             15        0             5            10             15
+                                                                                         Time (s)
+Figure 5: Timeseries of memcached colocated with a garbage-collected BE task for Parties* (left) and Caladan (right). Gray bars indicate GC
+cycles in the BE task. The Parties* resource controller algorithm is unable to provide performance isolation and high CPU utilization when
+tasks have dynamic resource demands, while Caladan maintains both. Top graphs have log-scaled y-axes.
+
+                                                               Linux
+                                                                                           preventing the Linux network stack or the scheduler core from
+                  106
+                                                               Linux + stream-DRAM         becoming a bottleneck. While adapting Shenango to use our
+                                                               Shenango                    runtime’s kernel-bypass network stack would eliminate this
+                  105
+99.9% Lat. (μs)
+
+
+
+
+                                                               Shenango + stream-DRAM
+                                                               Parties *
+                                                                                           throughput bottleneck, it would not improve the tail latency
+                  104                                                                      of LC tasks suffering from interference.
+                                                               Parties * + stream-DRAM
+                                                               Caladan
+                  103
+                                                               Caladan + stream-DRAM
+                                                                                           Phased interference: We now focus on interference caused
+                                                                                           by phased behavior, a more difficult and realistic case that
+                  102
+                                                                                           Caladan is designed to solve. We revisit the garbage collec-
+                  101                                                                      tion experiment from Section §2, colocating an instance of
+                               0            2       4          6           8       10      memcached with swaptions-GC. We issue 800,000 requests
+                                                Requests Per Second (Million)
+                                                                                           per second to memcached for a period of 120 seconds and
+Figure 4: Constant memory bandwidth interference degrades mem-                             measure its tail latency over 20 ms windows. We show the first
+cached performance for Linux and Shenango, but Caladan and Par-                            20 seconds of the experiment in Figure 5, which we found to
+ties* can mitigate it. Note the log-scaled y-axis.
+                                                                                           be representative of the behavior during the entire experiment.
+                                                                                              Caladan throttles the BE task’s cores as soon as each GC
+7.1                      Comparison to Other Systems                                       cycle starts, preventing latency spikes, and it gives back cores
+                                                                                           to the BE task as soon as the GC cycle ends, maintaining
+Constant interference: To demonstrate the necessity of man-
+                                                                                           high BE throughput. Parties* attempts to find an allocation of
+aging interference, we first compare Parties* and Caladan to
+                                                                                           cores and cache ways that minimizes latency and maximizes
+systems that do not explicitly manage interference. We evalu-
+                                                                                           resources for the BE task, but it is unable to converge when
+ate a relatively less challenging scenario, where an LC task
+                                                                                           resource demands are shifting at timescales much smaller
+(memcached) is colocated with stream-DRAM, a BE task that
+                                                                                           than its 500 ms adjustment interval. Often Parties* grants
+generates constant memory bandwidth interference.
+                                                                                           additional cores in response to GC cycles, but these adjust-
+   Figure 4 illustrates that, as expected, both Linux and                                  ments happen too slowly to prevent latency spikes. As a result,
+Shenango suffer significant increases in tail latency in the                               Parties* experiences 99.9% latency that is 11,000× higher
+presence of colocation, reaching tail latencies up to 235× and                             than Caladan during GC cycles. In addition, Parties* also
+6× higher than without interference, respectively. Shenango’s                              harms BE throughput, achieving an average of 5% less than
+throughput also decreases by 75% in the presence of inter-                                 Caladan because it punishes swaptions-GC by too much and
+ference, because its scheduler core becomes overloaded with                                for too long. These results show that faster reaction times are
+packet processing, due to higher cache miss rates and memory                               essential when handling tasks with phased behaviors.
+access latency caused by stream-DRAM. In contrast, Caladan
+and Parties* are both able to maintain similar tail latency with                           7.2      Diverse Colocations
+and without interference, because they manage it explicitly.
+Both also achieve much higher throughput than Linux and                                    Two tasks: To understand if Caladan can maintain its benefits
+Shenango because runtime cores send and receive packets                                    in diverse situations, we evaluate 15 colocations between pairs
+directly using our runtime’s kernel-bypass network stack (§6),                             of LC and BE tasks with different resource usages, service
+
+
+
+290                     14th USENIX Symposium on Operating Systems Design and Implementation                                        USENIX Association
+                                                              x264               streamcluster              swaptions-GC             stream-DRAM               stream-L2          No Colocation
+                                                                       storage                                           memcached                                         silo
+                                            800                                                     100                                            600
+                          99.9% Lat. (μs)
+
+
+
+
+                                                                                                                                                   400
+                                            400                                                        50
+                                                                                                                                                   200
+
+                                              0                                                       0                                              0
+                                            100                                                     100                                            100
+                           BE Tput (%)
+
+
+
+
+                                                50                                                     50                                           50
+
+
+                                                    0                                                   0                                            0
+                                                        0.0           0.2            0.4                    0.0      2.5    5.0    7.5     10.0          0.0         0.2          0.4      0.6
+                                                                                                                  Requests Per Second (Million)
+Figure 6: Caladan can colocate many combinations of LC and BE applications with only modest latency penalties for LC tasks (top), while
+maintaining excellent throughput for BE tasks (bottom).
+
+                                                               storage              memcached               silo                cached achieve nearly the same tail latency as they do without
+                                                                   swaptions-GC              streamcluster
+                                                                                                                                colocation. Silo experiences a small increase in tail latency at
+                                                                                                                                low load because it is sensitive to LLC interference, leading to
+                          750                                                                                                   service time but not queueing delay increases. At higher load,
+                          500                                                                                                   silo generates self interference, so it experiences similar tail
+                          250                                                                                                   latency with and without colocation. Overall, Caladan can eas-
+99.9% Latency (μs)
+
+
+
+
+                          100                                                                                                   ily maintain microsecond-level tail latency under challenging
+                                                                                                                                colocation conditions.
+                                 50
+                                                                                                                                   At the same time, Caladan yields excellent BE task through-
+                                                                                                                                put. The exact BE throughput depends on the degree of
+                                                                                                                                resource contention with the LC task. For example, x264,
+                          500
+                                                                                                                                swaptions-GC, and stream-L2 use less memory bandwidth
+                          250                                                                                                   (on average), so they can linearly trade CPU time with the LC
+                                                                                                                                task. Streamcluster and stream-DRAM both consume a larger
+ BE Op/s (%) LC RPS (%)
+
+
+
+
+                                 20
+                                                                                                                                amount of memory bandwidth, so they are throttled by our
+                                 10
+                                                                                                                                memory bandwidth controller. However, they also pair well
+                                            0
+                                                                                                                                with LC tasks as siblings (especially memcached) because
+                                                                                                                                they use different physical core resources. At higher LC load,
+                                 50
+                                                                                                                                these BE tasks are given fewer cores so they use less memory
+                                 25                                                                                             bandwidth and are then throttled less. Overall, BE throughput
+                                            0                                                                                   depends on the specific interactions between the BE and LC
+                                 10                                                                                             tasks, and varies with LC load. To the best of our knowledge,
+ Cores
+
+
+
+
+                                            5                                                                                   Caladan is the first system to achieve both microsecond-level
+                                                                                                                                LC tail latency and high BE throughput under such a broad
+                                            0
+                                                0              5            10        15          20               25
+                                                                                                                                range of conditions.
+                                                                                  Time (s)                                      Many tasks: To demonstrate Caladan’s ability to manage
+Figure 7: Caladan can colocate multiple LC and BE apps while                                                                    many tasks simultaneously, we colocate all 3 of the LC tasks
+providing performance isolation and high utilization. Gray bars                                                                 along with swaptions-GC and streamcluster (each LC task
+indicate GC cycles in swaptions-GC.                                                                                             is configured with 6 guaranteed cores). Figure 7 shows a 30-
+time distributions, and throughputs. 9 out of 15 pairings in-                                                                   second trace from this experiment, during which the load of
+clude BE tasks with phased behaviors. We consider the impact                                                                    each of the LC apps changes multiple times (4th graph) and
+on each LC task’s tail latency and the amount of throughput                                                                     swaptions-GC performs garbage collection three times (gray
+the BE task can achieve by using burstable cores.                                                                               bars). When load or interference changes, Caladan converges
+   In this experiment (Figure 6), each data point represents a                                                                  nearly instantly. When GC is not running, the combination of
+different fixed average load offered to an LC task (columns),                                                                   streamcluster and swaptions-GC does not saturate memory
+while it is paired with a BE task (colors/linetypes). Caladan is                                                                bandwidth. However, when GC begins, both tasks together
+highly effective at mitigating interference: storage and mem-                                                                   saturate DRAM bandwidth and are throttled by Caladan. Cal-
+
+
+
+USENIX Association                                                                                14th USENIX Symposium on Operating Systems Design and Implementation                            291
+                       100                                                                250                                                                             1000
+Scheduling Time (μs)
+
+
+
+                                      Linux Lat.                                                      Linux
+
+
+
+
+                                                                     99.9% Latency (μs)
+
+
+
+
+                                                                                                                                                     99.9% Latency (μs)
+                        80            Linux Work                                          200         ksched                                                               800
+
+                        60            ksched Lat.                                         150         pinned                                                               600
+                                      ksched Work
+                        40                                                                100                                                                              400
+
+                        20                                                                 50                                                                              200                      No Ctrlrs      B/W + HT
+                                                                                                                                                                                                    B/W            No Colocation
+                         0                                                                  0                                                                                0
+                             0        5        10       15      20                              0        1          2           3                                                0     100   200    300   400   500
+                                          # Cores Reallocated                                       Requests Per Second (Million)                                                    Requests Per Second (Thousand)
+
+                                 (a) Scheduling Scalability                               (b) Aggregated Latency of 11 LC Apps                                             (c) Contribution of Sub-controllers
+Figure 8: (a) KSCHED dramatically increases scheduling scalability over Linux. (b) Aggregated latency for 11 LC apps scheduled using
+KSCHED vs. Linux mechanisms. (c) The impact of each Caladan sub-controller on tail latency for storage paired with stream-DRAM.
+
+adan’s fast reactions (up to 230,000 core reallocations per                                                                                   Elfen Borrow Idle                                           Caladan
+second) enable all three LC tasks to maintain low tail latency                                                                                Elfen Refresh Budget                                        No HT Controller
+(top three graphs) throughout constantly shifting load and                                                                          800                                                             100
+
+
+
+
+                                                                                                                  99.9% Lat. (μs)
+interference.
+
+
+
+
+                                                                                                                                                                                      BE Op/s (%)
+                                                                                                                                    600
+
+7.3                          Microbenchmarks                                                                                        400                                                              50
+
+                                                                                                                                    200
+KSCHED :     To evaluate the benefits of KSCHED’s faster                                                                                                              0
+                                                                                                                                      0
+scheduling operations, we run a simple microbenchmark                                                                                     0    200    400                0     200                                       400
+                                                                                                                                                  Requests Per Second (Thousand)
+where we continuously rotate tasks to different cores. To
+measure scalability, we migrate different numbers of tasks                                                       Figure 9: Caladan enables higher LC throughput than Elfen by
+together in groups. We run the benchmark both with KSCHED                                                        allowing arbitrary tasks to co-run on a physical core (including the
+and with a variant that uses standard Linux system calls such                                                    same LC task).
+as sched_setaffinity(), tgkill(), and eventfd().                                                                 isolation across a variety of tasks and loads. To provide one
+   Figure 8a shows both the scheduling work (time spent by                                                       concrete example, Figure 8c evaluates the contribution of each
+the scheduler core) and the scheduling latency (time until                                                       controller module to the storage LC task when colocated with
+the migration completes) per migration. Both metrics benefit                                                     the stream-DRAM BE task. At very low loads, the bandwidth
+tremendously from KSCHED’s multicast IPIs, allowing it to                                                        controller is sufficient to provide low tail latency. This is
+amortize the cost of multiple simultaneous migrations. By                                                        because as Caladan revokes cores from the BE task, it leaves
+contrast, Linux’s system call interface suffers from overhead                                                    the hyperthread pair cores of the LC task idle, rendering the
+and because it cannot support batching; operations must be                                                       hyperthread controller unnecessary. However, at higher LC
+serialized, increasing scheduling work by 43× and scheduling                                                     loads, both controllers are necessary in order for the storage
+latency by 5× when moving 22 tasks. In addition, KSCHED                                                          task to achieve nearly the same tail latency as it would have
+maintains low scheduling work even with many tasks by of-                                                        without colocation.
+floading expensive operations such as sending signals to re-                                                        Next we focus on the hyperthread controller and evaluate
+mote cores.                                                                                                      the benefits of allowing any two tasks to co-run on a physical
+   We demonstrate the value of these improvements in an                                                          core (e.g., two LC tasks or even two hyperthreads in the same
+experiment with 11 synthetic LC tasks and 2 synthetic non-                                                       task). Figure 9 compares Caladan to two modified versions
+interfering BE tasks. The LC tasks have 5 µs average service                                                     of Caladan that implement Elfen’s [70] scheduling policies,
+times that are exponentially distributed and each is config-                                                     when colocating storage and stream-L2. Elfen’s borrow idle
+ured with 2 guaranteed cores. We compare against an earlier                                                      policy disallows co-running, only allowing the BE to run on a
+version of Caladan that employed the Linux scheduling mech-                                                      physical core when it is not being used by the LC; this yields
+anisms evaluated above. In Figure 8b, we show that Caladan                                                       low tail latency for the LC task but also low BE through-
+is able to maintain much lower tail latency for the LC tasks                                                     put. Elfen’s refresh budget policy, which Caladan generalizes
+(close to that of running with cores pinned). In this exper-                                                     (§5.2.3), yields higher BE throughput at the cost of a slight in-
+iment, Caladan performs up to 560,000 core reallocations                                                         crease in tail latency, demonstrating the benefits of using both
+per second at its peak (at a load of 0.65 million RPS), while                                                    hyperthreads simultaneously. Caladan achieves 37% more
+the version using Linux mechanisms bottlenecks at around                                                         LC throughput than Elfen by enabling the LC task to co-run
+285,000 allocations per second. KSCHED provides similar                                                          with itself. Similarly, at low LC loads, Caladan is able to
+benefits for sampling performance counters (not shown).                                                          achieve 5% higher BE throughput than Elfen since BE tasks
+Controllers: We found that both the memory bandwidth and                                                         can use both hyperthread lanes. Finally, running Caladan with
+hyperthread controllers were necessary in order to ensure                                                        the hyperthread controller disabled yields slightly higher BE
+
+
+
+292                      14th USENIX Symposium on Operating Systems Design and Implementation                                                                                                               USENIX Association
+throughput but at a cost of up to 117 µs higher tail latency,      cores. At the time of writing, a similar capability is under
+highlighting the need to explicitly manage hyperthread inter-      development for the Linux Kernel [13].
+ference to achieve both high throughput and low tail latency.      Future work: One promising opportunity for future work
+                                                                   is to incorporate hardware partitioning back into Caladan’s
+8   Discussion                                                     design. For example, if a BE task uses high memory band-
+                                                                   width and lacks temporal locality, many of the cache lines it
+Compatibility: Caladan requires applications to use its run-       occupies in the LLC will be wasted. Under these conditions,
+time system because it depends on it to export control signals     Caladan is still effective at preventing latency increases, but
+to the scheduler, and to rapidly map threads and packet pro-       it must allocate extra cores to victim tasks. If future hardware
+cessing work across a frequently changing set of available         partitioning mechanisms could be designed to accommodate
+cores. Our runtime is not fully Linux compatible, but it pro-      frequently shifting LLC usage—or if static LLC usage could
+vides a realistic, concurrent programming model (inherited         be identified and managed through existing mechanisms—
+from Shenango) that includes threads, mutexes, condition vari-     CPU efficiency could be further improved.
+ables, and synchronous I/O [47]. Caladan also includes a par-
+tial compatibility layer for system libraries (e.g., libpthread)   9   Related Work
+that can support PARSEC [9] without modifications, giving
+us some confidence our design is flexible enough to support        Interference management: Many prior systems manage in-
+unmodified Linux applications in the future. Applications that     terference between LC and BE tasks by statically partitioning
+do not use our runtime can coexist on the same machine, but        resources [19, 28, 50, 62]. While this approach can reduce
+they must run on cores that are not managed by Caladan, and        interference, it sacrifices CPU utilization because each task
+they cannot be throttled if they cause interference.               must be provisioned enough resources to accommodate peak
+    The more fundamental requirement for Caladan is the need       load. Heracles [38], Parties [12], and PerfIso [27] instead ad-
+for LC tasks to expose their internal concurrency to the run-      just partitions dynamically. However, unlike Caladan, these
+time (e.g., by spawning green threads), potentially requiring      systems cannot manage changes in interference while main-
+changes to existing code. If there is insufficient concurrency,    taining microsecond latency and high utilization.
+a task will be unable to benefit from additional cores, hinder-       Efforts to isolate the network [35, 36, 53] or storage [34]
+ing Caladan’s ability to manage shifts in load or interference.    are complementary to Caladan. We do not currently focus on
+In general, we recommend that tasks expose concurrency by          power management [32, 58] or TurboBoost [23], because we
+spawning either a thread per connection or a thread per request.   optimize for the setting in which all cores are fully utilized,
+For example, normally memcached multiplexes multiple TCP           but it should be possible to integrate power management with
+connections per thread, but we modified it to instead spawn a      Caladan to improve its CPU efficiency at lower utilization.
+separate thread to handle each TCP connection.                     User-level core allocators: To enable low latency in the
+    On the other hand, Caladan can support BE tasks that do not    face of fluctuating load, systems like IX [8], PerfIso [27],
+expose their internal concurrency, as it can still throttle them   Shenango [47], and Arachne [52] introduce user-level core
+if they cause too much interference. For example, if a BE task     allocators that estimate load and reallocate cores to BE tasks
+is single-threaded (i.e., has no concurrency), and it consumes     when they are not needed by LC tasks. Similarly, TAS [33] and
+too much memory bandwidth, Caladan will oscillate between          Snap [42] adjust cores in response to changes in packet pro-
+giving it one and zero cores, effectively time multiplexing its    cessing load. Like these systems, Caladan manages changes
+memory bandwidth usage. However, BE tasks can optionally           in load through core allocations, but it goes a step further by
+achieve higher performance by exposing their internal con-         using core allocation to manage interference too.
+currency: load will be more evenly balanced and they will be       Scheduling optimizations: Shinjuku [30] proposes fine-
+able to take advantage of burstable cores.                         grained preemption to reduce tail latency, using Dune [7]
+Limitations: Our current implementation of Caladan has two         to provide fast, direct access to IPIs in userspace. KSCHED
+limitations. First, it is unable to manage interference across     includes kernel optimizations that allow for similar perfor-
+NUMA nodes. NUMA introduces additional shared resources            mance when sending an IPI to a single core, but it speeds up
+that are vulnerable to interference, including an inter-socket     IPIs over Shinjuku’s reported speeds when sending more than
+interconnect and separate memory controllers per node. For-        one IPI at a time because of its multicast IPI optimization.
+tunately, high-precision performance counters are available        Dataplane systems: There has also been significant work
+for these resources, and we plan to explore NUMA-aware in-         on optimizing OS networking for throughput and latency [8,
+terference mitigation strategies in the future, such as revoking   29, 33, 48, 52, 55]. ZygOS proposes work stealing as a tech-
+cores or migrating tasks between nodes. Second, our schedul-       nique to reduce tail latency under variable service times [51].
+ing policies do not minimize the threat of transient execution     Arachne [52] and Shenango [47] build a similar latency reduc-
+attacks across hyperthread siblings [3, 11, 65]. Ideally, only     tion strategy on top of green threads to improve programma-
+mutually-trusting tasks should be allowed to run on sibling        bility. Caladan builds upon all of these ideas to eliminate
+
+
+
+USENIX Association                           14th USENIX Symposium on Operating Systems Design and Implementation             293
+                   800
+ 99.9% Lat. (μs)
+
+
+
+                   600
+                   400
+                                                                                                                                     23 GB/s
+                   200                               5μs                                  20μs
+                                                                                                                                     25 GB/s
+                    0                                10μs                                 40μs                                       31 GB/s
+                   100                               100μs                                200μs                                      33 GB/s
+  BE Op/s (%)
+
+
+
+
+                                                     500μs                                400μs
+
+                   50
+
+
+                    0
+                         0   100   200   300   400     500   0    100    200    300    400   500     0     100     200    300     400    500
+                                                                 Requests Per Second (Thousand)
+
+                             (a) THRESH_QD                           (b) THRESH_HT                                (c) THRESH_BW
+Figure 10: Parameter sensitivity for the storage LC task; the parameters used in our evaluation appear in bold. (a) THRESH_QD allows an
+operator to achieve better tail latencies at the expense of BE throughput. (b) THRESH_HT reins in the latency of long requests, but setting it too
+low reduces BE throughput. (c) THRESH_BW is set to avoid exponential increases in memory access latencies.
+
+network processing and queueing bottlenecks, allowing it to                   cate the storage workload with stream-L2. For THRESH_BW,
+manage interference unperturbed by software overheads or                      we colocate the storage workload with stream-DRAM. In
+load imbalances.                                                              each case, we vary a single parameter, while fixing other pa-
+                                                                              rameters to the values used in our evaluation.
+10                  Conclusion                                                   THRESH_QD represents the per-task queueing delay limit
+                                                                              before the top-level core allocator tries to grant another
+This paper presented Caladan, an interference-aware CPU                       core. As shown in Figure 10a, an operator can trade some
+scheduler that significantly improves performance isolation                   LC tail latency for higher BE throughput using a value of
+while maintaining high CPU utilization. Caladan’s effective-                  THRESH_QD larger than Caladan’s default 10 µs. For example,
+ness comes from its speed: by matching control signals and                    a THRESH_QD of 100 µs enables 7% more BE throughput at
+actions to the same timescale that interference affects perfor-               the cost of 54 µs higher LC tail latency for these workloads.
+mance, Caladan can mitigate interference before it can harm                   We chose to optimize for tail latency, and found that values be-
+quality of service. Caladan relies on a carefully selected set                low 10 µs degraded BE throughput without further improving
+of control signals to manage multiple forms of interference                   LC tail latency.
+in a coordinated fashion, and combines a wide range of op-                       THRESH_HT places a worst-case limit on how long a request
+timizations to rapidly gather control signals and make core                   can be delayed by a task generating interference on its hyper-
+allocations faster. These contributions allow Caladan to de-                  thread sibling. If it is set too low (i.e., most request processing
+liver microsecond-level tail latency and high CPU utilization                 requires a dedicated physical core), BE throughput will suffer
+while colocating multiple tasks with phased behaviors.                        and LC latency will degrade at high load due to insufficient
+                                                                              compute capacity. For a skewed service time distribution, like
+11                  Acknowledgments                                           our storage workload, choosing a value above the median is a
+                                                                              good heuristic. Figure 10b illustrates that setting THRESH_HT
+We thank our shepherd Kathryn S. McKinley, the anony-                         below the median of 35 µs significantly lowers BE throughput,
+mous reviewers, Frans Kaashoek, Malte Schwarzkopf, Ak-                        while values that are slightly above the median yield increased
+shay Narayan, and other members of PDOS for their use-                        BE throughput and good tail latency. For workloads with ser-
+ful feedback. We thank CloudLab [17] and Eitan Zahavi at                      vice times less than 5 µs (e.g., memcached), we recommend
+Mellanox for providing equipment used to test and evaluate                    setting THRESH_HT to infinite because mwait requires a few
+Caladan. This work was funded by the DARPA FastNICs                           microseconds to park a hyperthread.
+program under contract #HR0011-20-C-0089, by a Facebook                          Finally, THRESH_BW represents the global maximum al-
+Research Award, and by a Google Faculty Award.                                lowed memory bandwidth usage before Caladan begins to
+                                                                              throttle tasks. THRESH_BW should be set once per machine to a
+A                   Parameter Tuning and Sensitivity                          bandwidth just low enough to avoid the exponential increase
+                                                                              in memory access latency that occurs close to memory band-
+In this Appendix, we describe how to set Caladan’s three                      width saturation. We use 25 GB/s for our machine (70–80% of
+user-tunable parameters and show how sensitive Caladan’s                      its capacity), which keeps memory latency low for any access
+performance is to particular choices of these parameters. To il-              pattern. Figure 10c shows this setting trades a small amount
+lustrate the behavior of THRESH_QD and THRESH_HT, we colo-                    of BE throughput in exchange for predictable latency.
+
+
+
+294                  14th USENIX Symposium on Operating Systems Design and Implementation                                 USENIX Association
+B    Artifact                                                    [15] C. Delimitrou and C. Kozyrakis. QoS-aware schedul-
+                                                                      ing in heterogeneous datacenters with Paragon. TOCS,
+Caladan’s source code, ported applications, and experiment            2013.
+scripts can be found at https://github.com/shenango/
+caladan-all.                                                     [16] C. Delimitrou and C. Kozyrakis. Quasar: resource-
+                                                                      efficient and QoS-aware cluster management. In AS-
+                                                                      PLOS, 2014.
+References
+                                                                 [17] D. Duplyakin, R. Ricci, A. Maricq, G. Wong, J. Duerig,
+ [1] Snappy. https://github.com/google/snappy.                        E. Eide, L. Stoller, M. Hibler, D. Johnson, K. Webb,
+                                                                      A. Akella, K. Wang, G. Ricart, L. Landweber, C. Elliott,
+ [2] Intel analysis of speculative execution side channels.           M. Zink, E. Cecchet, S. Kar, and P. Mishra. The design
+     Technical report, January 2018.                                  and operation of CloudLab. In USENIX ATC, 2019.
+ [3] A. C. Aldaya, B. B. Brumley, S. ul Hassan, C. P. García,    [18] N. El-Sayed, A. Mukkara, P. Tsai, H. Kasture, X. Ma,
+     and N. Tuveri. Port contention for fun and profit. In            and D. Sánchez. KPart: A hybrid cache partitioning-
+     IEEE S&P, 2019.                                                  sharing technique for commodity multicores. In HPCA,
+ [4] I. Arapakis, X. Bai, and B. B. Cambazoglu. Impact of             2018.
+     response latency on user behavior in web search. In         [19] S. Grant, A. Yelam, M. Bland, and A. C. Snoeren.
+     SIGIR, 2014.                                                     SmartNIC performance isolation with FairNIC: Pro-
+ [5] D. Ardelean, A. Diwan, and C. Erdman. Performance                grammable networking for the cloud. In SIGCOMM,
+     analysis of cloud applications. In NSDI, 2018.                   2020.
+
+ [6] B. Atikoglu, Y. Xu, E. Frachtenberg, S. Jiang, and          [20] T. Harris, M. Maas, and V. J. Marathe. Callisto: co-
+     M. Paleczny. Workload analysis of a large-scale key-             scheduling parallel runtime systems. In EuroSys, 2014.
+     value store. In SIGMETRICS, 2012.                           [21] A. Herdrich, E. Verplanke, P. Autee, R. Illikkal, C. Gi-
+ [7] A. Belay, A. Bittau, A. J. Mashtizadeh, D. Terei, D. Maz-        anos, R. Singhal, and R. Iyer. Cache QoS: From concept
+     ières, and C. Kozyrakis. Dune: Safe user-level access to         to reality in the Intel R Xeon R processor E5-2600 v3
+     privileged CPU features. In OSDI, 2012.                          product family. In HPCA, 2016.
+
+ [8] A. Belay, G. Prekas, M. Primorac, A. Klimovic, S. Gross-    [22] B. Hindman, A. Konwinski, M. Zaharia, A. Ghodsi,
+     man, C. Kozyrakis, and E. Bugnion. The IX operating              A. D. Joseph, R. H. Katz, S. Shenker, and I. Stoica.
+     system: Combining low latency, high throughput, and              Mesos: A platform for fine-grained resource sharing in
+     efficiency in a protected dataplane. TOCS, 2017.                 the data center. In NSDI, 2011.
+
+ [9] C. Bienia. Benchmarking Modern Multiprocessors. PhD         [23] C. Hsu, Y. Zhang, M. A. Laurenzano, D. Meisner,
+     thesis, Princeton University, January 2011.                      T. F. Wenisch, J. Mars, L. Tang, and R. G. Dreslinski.
+                                                                      Adrenaline: Pinpointing and reining in tail queries with
+[10] H. Boehm, A. J. Demers, and S. Shenker. Mostly parallel          quick voltage boosting. In HPCA, 2015.
+     garbage collection. In PLDI, 1991.
+                                                                 [24] Intel.          Microarchitectural data sampling.
+[11] J. V. Bulck, M. Minkin, O. Weisse, D. Genkin,                    https://software.intel.com/security-software-
+     B. Kasikci, F. Piessens, M. Silberstein, T. F. Wenisch,          guidance/deep-dives/deep-dive-intel-analysis-
+     Y. Yarom, and R. Strackx. Foreshadow: Extracting the             microarchitectural-data-sampling.
+     keys to the Intel SGX kingdom with transient out-of-
+     order execution. In USENIX Security, 2018.                  [25] Intel Corporation. Intel 64 and IA-32 Architectures
+                                                                      Performance Monitoring Events, December 2017.
+[12] S. Chen, C. Delimitrou, and J. F. Martínez. PARTIES:
+     QoS-aware resource partitioning for multiple interactive    [26] Intel Corporation. Intel 64 and IA-32 Architectures
+     services. In ASPLOS, 2019.                                       Software Developer’s Manual - Volume 3B, April 2020.
+
+[13] J. Corbet. Completing and merging core scheduling.          [27] C. Iorgulescu, R. Azimi, Y. Kwon, S. Elnikety, M. Sya-
+     https://lwn.net/Articles/820321/, Sept. 2020.                    mala, V. R. Narasayya, H. Herodotou, P. Tomita,
+                                                                      A. Chen, J. Zhang, and J. Wang. PerfIso: Performance
+[14] J. Dean and L. A. Barroso. The tail at scale. Communi-           isolation for commercial latency-sensitive services. In
+     cations of the ACM, 2013.                                        USENIX ATC, 2018.
+
+
+
+USENIX Association                          14th USENIX Symposium on Operating Systems Design and Implementation         295
+[28] S. A. Javadi, A. Suresh, M. Wajahat, and A. Gandhi.         [42] M. Marty, M. de Kruijf, J. Adriaens, C. Alfeld, S. Bauer,
+     Scavenger: A black-box batch workload resource man-              C. Contavalli, M. Dalton, N. Dukkipati, W. C. Evans,
+     ager for improving utilization in cloud environments. In         S. Gribble, N. Kidd, R. Kononov, G. Kumar, C. Mauer,
+     SoCC, 2019.                                                      E. Musick, L. E. Olson, E. Rubow, M. Ryan, K. Spring-
+                                                                      born, P. Turner, V. Valancius, X. Wang, and A. Vahdat.
+[29] E. Jeong, S. Woo, M. A. Jamshed, H. Jeong, S. Ihm,
+                                                                      Snap: a microkernel approach to host networking. In
+     D. Han, and K. Park. mTCP: a highly scalable user-
+                                                                      SOSP, 2019.
+     level TCP stack for multicore systems. In NSDI, 2014.
+[30] K. Kaffes, T. Chong, J. T. Humphries, A. Belay, D. Maz-     [43] Memcached community. memcached – a distributed
+     ières, and C. Kozyrakis. Shinjuku: Preemptive schedul-           memory object caching system. https://memcached.org/.
+     ing for µsecond-scale tail latency. In NSDI, 2019.
+                                                                 [44] Michael Larabel.  Intel hyper threading perfor-
+[31] S. Kanev, J. P. Darago, K. M. Hazelwood, P. Ran-                 mance with a Core i7 on Ubuntu 18.04 LTS.
+     ganathan, T. Moseley, G. Wei, and D. M. Brooks. Pro-             https://www.phoronix.com/scan.php?page=
+     filing a warehouse-scale computer. IEEE Micro, 2016.             article&item=intel-ht-2018&num=4, 2018.
+
+[32] H. Kasture, D. B. Bartolini, N. Beckmann, and               [45] J. Nakajima and V. Pallipadi. Enhancements for hyper-
+     D. Sanchez. Rubik: Fast analytical power management              threading technology in the operating system: Seeking
+     for latency-critical systems. In MICRO, 2015.                    the optimal scheduling. In WIESS, 2002.
+[33] A. Kaufmann, T. Stamler, S. Peter, N. K. Sharma, A. Kr-     [46] OpenSSL. OpenSSL cryptography and SSL/TLS toolkit.
+     ishnamurthy, and T. Anderson. TAS: TCP acceleration              https://openssl.org/.
+     as an OS service. In EuroSys, 2019.
+                                                                 [47] A. Ousterhout, J. Fried, J. Behrens, A. Belay, and H. Bal-
+[34] A. Klimovic, H. Litz, and C. Kozyrakis. Reflex: Remote
+                                                                      akrishnan. Shenango: Achieving high CPU efficiency
+     flash ≈ local flash. In ASPLOS, 2017.
+                                                                      for latency-sensitive datacenter workloads. In NSDI,
+[35] A. Kumar, S. Jain, U. Naik, A. Raghuraman, N. Kasi-              2019.
+     nadhuni, E. C. Zermeno, C. S. Gunn, J. Ai, B. Carlin,
+     M. Amarandei-Stavila, M. Robin, A. Siganporia, S. Stu-      [48] J. K. Ousterhout, A. Gopalan, A. Gupta, A. Kejriwal,
+     art, and A. Vahdat. BwE: Flexible, hierarchical band-            C. Lee, B. Montazeri, D. Ongaro, S. J. Park, H. Qin,
+     width allocation for WAN distributed computing. In               M. Rosenblum, S. M. Rumble, R. Stutsman, and S. Yang.
+     SIGCOMM, 2015.                                                   The RAMCloud storage system. TOCS, 2015.
+
+[36] P. Kumar, N. Dukkipati, N. Lewis, Y. Cui, Y. Wang, C. Li,   [49] K. Ousterhout, C. Canel, S. Ratnasamy, and S. Shenker.
+     V. Valancius, J. Adriaens, S. Gribble, N. Foster, et al.         Monotasks: Architecting for performance clarity in data
+     PicNIC: predictable virtualized NIC. In SIGCOMM.                 analytics frameworks. In SOSP, 2017.
+     2019.
+                                                                 [50] S. Peter, J. Li, I. Zhang, D. R. K. Ports, D. Woos, A. Kr-
+[37] J. Leverich and C. Kozyrakis. Reconciling high server            ishnamurthy, T. E. Anderson, and T. Roscoe. Arrakis:
+     utilization and sub-millisecond quality-of-service. In           The operating system is the control plane. In OSDI,
+     EuroSys, 2014.                                                   2014.
+[38] D. Lo, L. Cheng, R. Govindaraju, P. Ranganathan, and        [51] G. Prekas, M. Kogias, and E. Bugnion. ZygOS: Achiev-
+     C. Kozyrakis. Heracles: improving resource efficiency            ing low tail latency for microsecond-scale networked
+     at scale. In ISCA, 2015.                                         tasks. In SOSP, 2017.
+[39] M. Mahoney. Large text compression benchmark.
+                                                                 [52] H. Qin, Q. Li, J. Speiser, P. Kraft, and J. K. Ousterhout.
+     http://www.mattmahoney.net/text/text.html, 2011.
+                                                                      Arachne: Core-aware thread management. In OSDI,
+[40] D. T. Marr, F. Binns, D. L. Hill, G. Hinton, D. A. Ko-           2018.
+     ufaty, J. A. Miller, and M. Upton. Hyper-threading
+     technology architecture and microarchitecture. Intel        [53] S. Radhakrishnan, Y. Geng, V. Jeyakumar, A. Kabbani,
+     Technology Journal, 6(1), 2002.                                  G. Porter, and A. Vahdat. SENIC: scalable NIC for
+                                                                      end-host rate limiting. In NSDI, 2014.
+[41] J. Mars, L. Tang, R. Hundt, K. Skadron, and M. L. Soffa.
+     Bubble-up: increasing utilization in modern warehouse       [54] S. Ren, Y. He, S. Elnikety, and K. S. McKinley. Exploit-
+     scale computers via sensible co-locations. In MICRO,             ing processor heterogeneity in interactive services. In
+     2011.                                                            ICAC, 2013.
+
+
+
+296   14th USENIX Symposium on Operating Systems Design and Implementation                                USENIX Association
+[55] L. Rizzo. netmap: A novel framework for fast packet         [71] X. Zhang, E. Tune, R. Hagmann, R. Jnagal, V. Gokhale,
+     I/O. In USENIX ATC, 2012.                                        and J. Wilkes. CPI2 : CPU performance isolation for
+                                                                      shared compute clusters. In EuroSys, 2013.
+[56] D. Sánchez and C. Kozyrakis. Scalable and efficient fine-
+     grained cache partitioning with Vantage. IEEE Micro,        [72] L. Zhao, R. R. Iyer, R. Illikkal, J. Moses, S. Makineni,
+     2012.                                                            and D. Newell. CacheScouts: Fine-grain monitoring of
+                                                                      shared caches in CMP platforms. In PACT, 2007.
+[57] M. Schwarzkopf, A. Konwinski, M. Abd-El-Malek, and
+     J. Wilkes. Omega: flexible, scalable schedulers for large   [73] H. Zhu and M. Erez. Dirigent: Enforcing QoS for
+     compute clusters. In EuroSys, 2013.                              latency-critical tasks on shared multicore systems. In
+                                                                      ASPLOS, 2016.
+[58] E. Sharafzadeh, S. A. S. Kohroudi, E. Asyabi, and
+     M. Sharifi. Yawn: A CPU idle-state governor for data-
+     center applications. In APSys, 2019.
+
+[59] T. Sherwood, E. Perelman, G. Hamerly, S. Sair, and
+     B. Calder. Discovering and exploiting program phases.
+     IEEE Micro, 2003.
+
+[60] The Go Community. The go programming language.
+     https://golang.org.
+
+[61] The Shenango Authors. Shenango’s open-source release.
+     https://github.com/shenango/shenango.
+
+[62] A. Tootoonchian, A. Panda, C. Lan, M. Walls, K. J. Ar-
+     gyraki, S. Ratnasamy, and S. Shenker. ResQ: Enabling
+     SLOs in network function virtualization. In NSDI, 2018.
+
+[63] TPC. TPC-C benchmark. http://www.tpc.org/tpcc/.
+
+[64] S. Tu, W. Zheng, E. Kohler, B. Liskov, and S. Madden.
+     Speedy transactions in multicore in-memory databases.
+     In SOSP, 2013.
+
+[65] S. van Schaik, A. Milburn, S. Österlund, P. Frigo,
+     G. Maisuradze, K. Razavi, H. Bos, and C. Giuffrida.
+     RIDL: rogue in-flight data load. In IEEE S&P, 2019.
+
+[66] A. Verma, L. Pedrosa, M. Korupolu, D. Oppenheimer,
+     E. Tune, and J. Wilkes. Large-scale cluster management
+     at Google with Borg. In EuroSys, 2015.
+
+[67] R. Wang and L. Chen.            Futility scaling: High-
+     associativity cache partitioning. In MICRO, 2014.
+
+[68] M. Welsh, D. E. Culler, and E. A. Brewer. SEDA: an
+     architecture for well-conditioned, scalable internet ser-
+     vices. In SOSP, 2001.
+
+[69] H. Yang, A. D. Breslow, J. Mars, and L. Tang. Bubble-
+     flux: precise online QoS management for increased uti-
+     lization in warehouse scale computers. In ISCA, 2013.
+
+[70] X. Yang, S. M. Blackburn, and K. S. McKinley.
+     Elfen scheduling: Fine-grain principled borrowing from
+     latency-critical workloads using simultaneous multi-
+     threading. In USENIX ATC, 2016.
+
+
+
+USENIX Association                          14th USENIX Symposium on Operating Systems Design and Implementation         297
+

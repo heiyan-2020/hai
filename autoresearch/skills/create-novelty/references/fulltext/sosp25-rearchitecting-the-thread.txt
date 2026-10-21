@@ -1,0 +1,1170 @@
+              Rearchitecting the Thread Model of In-Memory
+                       Key-Value Stores with μTPS
+                              Youmin Chen, Jiwu Shu† , Yanyan Shen, Linpeng Huang, Hong Mei
+                                               Shanghai Jiao Tong University                     † Tsinghua University
+
+
+Abstract                                                                                    efforts over the years to push the boundaries of throughput,
+This paper presents μTPS, a new thread architecture tailored                                latency, and resource efficiency [21, 26, 46, 47, 50].
+for in-memory key-value stores (KVSs) that operate at tens of                                  In a KVS, the thread architecture defines how client requests
+millions of operations per second. We show through analysis                                 are mapped to server threads and scheduled on CPU cores,
+and demonstration that the widely used run-to-completion                                    critically determining the throughput, latency, scalability, and
+thread architecture, which executes monolithic functions from                               programmability [59]. Traditional storage systems [19, 36,
+start to finish, often suffers from cache inefficiencies and con-                           44] often adopt a thread-per-stage (TPS) architecture, based
+tention issues. To address this, we revisit the once widely used                            loosely on SEDA design principles [64]. In this approach,
+thread-per-stage (TPS) architecture, but with a fresh perspec-                              request processing is decomposed into a series of stages (or
+tive – separating cache-resident, contention-free stages and                                functions), each running on a dedicated thread pool; requests
+memory-resident, conflict-prone stages into distinct thread                                 traverse these stages via event queues and are scheduled by the
+pools, and scheduling them with dedicated hardware resources                                operating system (OS). For example, HBase employs over 10
+(e.g., CPU cores, cache ways). This novel division enables                                  such stages (e.g., RPC handling, logging, data streaming) and
+independent optimization of each stage, significantly improv-                               ∼1000 interacting threads [36]. The advantages of the TPS
+ing cache efficiency and mitigating contention. Additionally,                               approach are manifold, including much faster code velocity
+μTPS incorporates reconfigurable RPC, resizable caching, and                                due to the modular design, increased scheduling flexibility,
+an auto-tuner to enhance its schedulability and performance.                                and independent scaling of individual stages [17, 66].
+We implement two in-memory key-value stores, μTPS-H and                                        Over the past years, cloud networks evolved from 1Gbps
+μTPS-T, to demonstrate the effectiveness of this approach.                                  and a few hundred 𝜇𝑠 to over 200Gbps and single-digit 𝜇𝑠;
+Evaluation results show that μTPS achieves higher perfor-                                   emerging memory/storage technologies like CXL-attached
+mance than the run-to-completion counterparts.                                              RAM [24], memory-semantic SSDs [11], and Optane mem-
+                                                                                            ory [6] can deliver millions of IOPS with sub-𝜇𝑠 latency. The
+ACM Reference Format:                                                                       latency of these devices is significantly below the OS schedul-
+Youmin Chen, Jiwu Shu† , Yanyan Shen, Linpeng Huang, Hong
+                                                                                            ing latency (typically measured in 𝑚𝑠), driving a fundamental
+Mei. 2025. Rearchitecting the Thread Model of In-Memory Key-
+                                                                                            shift in the thread architecture design. A prominent example
+Value Stores with μTPS. In ACM SIGOPS 31st Symposium on
+Operating Systems Principles (SOSP ’25), October 13–16, 2025,                               of this shift can be seen in userspace dataplane libraries (e.g.,
+Seoul, Republic of Korea. ACM, New York, NY, USA, 16 pages.                                 DPDK [2], RDMA libibverbs [14]). They employ a non-
+https://doi.org/10.1145/3731569.3764794                                                     preemptive thread architecture, where threads are pinned on
+                                                                                            CPU cores, interact directly with the hardware, and use spin-
+1     Introduction                                                                          polling to check hardwares’ completion status, eliminating
+                                                                                            the costly context switch overhead.
+In-memory key-value stores (KVSs) are a cornerstone of                                         The non-preemptive thread architecture delivers impressive
+modern data centers, enabling fast, concurrent, and shared                                  performance gains, exemplified by recent in-memory KVSs
+access to data across distributed clients. Optimizing KVS                                   such as MICA [47] and FaRM [26, 27]. They typically adopts
+design has become a vital area of research, driving extensive                               a run-to-completion (RTC) model, where each worker thread
+                                                                                            handles an entire request from start to finish. In doing so,
+Permission to make digital or hard copies of all or part of this work for
+personal or classroom use is granted without fee provided that copies are not               conventionally decomposed processing stages are collapsed
+made or distributed for profit or commercial advantage and that copies bear                 into a single monolithic function, which diminishes CPU
+this notice and the full citation on the first page. Copyrights for components              cache efficiency and amplifies contention at extremely high
+of this work owned by others than the author(s) must be honored. Abstracting                throughputs (e.g., >10M ops/s). In a KVS, processing a
+with credit is permitted. To copy otherwise, or republish, to post on servers or
+                                                                                            KV operation typically involves multiple steps: fetching and
+to redistribute to lists, requires prior specific permission and/or a fee. Request
+permissions from permissions@acm.org.                                                       parsing the network request, traversing the index structure
+SOSP ’25, Seoul, Republic of Korea                                                          to locate the data item, read or write data by copying it
+© 2025 Copyright held by the owner/author(s). Publication rights licensed to                between the network buffer and KVS storage, and returning
+ACM.                                                                                        a response to the client. These sub-tasks exhibit varying
+ACM ISBN 979-8-4007-1870-0/25/10                                                            memory access patterns and multicore scalability. For instance,
+https://doi.org/10.1145/3731569.3764794
+
+
+
+
+                                                                                     1099
+SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea                                                        Youmin Chen, Jiwu Shu, et al.
+
+
+request polling involves sequential accesses to a small network           load fluctuates. Similar adjustments should also be made for
+buffer range and scales efficiently; instead, index traversal             cache way allocation and hotspot management. These factors
+and data copying require accessing a much broader memory                  not only create a complex scheduling space to explore and
+space and often necessitate locking mechanisms to handle                  optimize, but also require a more sophisticated design for each
+request conflicts. With the non-preemptive thread architecture,           stage to adapt to such dynamic changes. We introduce an auto-
+these heterogeneous sub-tasks are executed sequentially by                tuner that hierarchically explores the optimal configurations
+each server thread, easily leading to cache thrashing and                 for each stage, complemented by tailored RPC and caching
+unnecessary blocking between stages.                                      mechanisms to support runtime reconfigurations.
+   The impact of this issue is more severe than it may seem.                 We implement two in-memory KVSs, μTPS-H and μTPS-
+Modern NICs deliver packets at rates >10 Mops/s, requiring                T, based on μTPS, which use libcuckoo and MassTree,
+each request to be completed at nanosecond-scale latencies.               respectively, as their index structures. Our extensive evalua-
+With insufficient cache capacity, accesses are thus increasingly          tion demonstrates that μTPS achieves a 1.03-5.46× speedup
+served by main memory, resulting in higher per-request pro-               over KVSs with a RTC thread architecture, while maintaining
+cessing times. This overhead translates to degraded throughput            comparable latency levels. We also show that μTPS can be
+and latency – a single cache miss can introduce a delay of                automatically reconfigured to adapt to different workloads.
+50–150𝑛𝑠 [18], while completing a KV operation takes only                 With hash-based index or uniform workloads, the performance
+a few hundred 𝑛𝑠. Recent works, e.g., ShRing [54], Iat [67],              gains achieved by uTPS are modest; however, we believe these
+and CacheDirector [30], advocate for improving the LLC                    improvements are still valuable: even minor reductions in
+efficiency through better cache allocation and data structure             latency or increases in throughput can lead to significant cost
+designs. However, they leave the thread architecture as is,               savings at scale in production environments.
+and thus cannot fundamentally address the cache thrashing                    In summary, our paper makes the following contributions:
+problem due to interferences between sub-tasks.                           • We provide a detailed taxonomy of KVS thread architectures
+   Instead, we address the problem by re-embracing the TPS                  to motivate the design of μTPS.
+architecture in a non-preemptive context, and thus propose                • We introduce μTPS, a novel thread architecture that reem-
+μTPS. Rather than adhering strictly to the classic modular                  braces the TPS design in a non-preemptive context.
+design philosophy, μTPS is approached from a different per-               • We implement two in-memory KVSs based on μTPS and
+spective – separating cache-resident, contention-free stages                our evaluation shows μTPS achieves excellent performance.
+and memory-resident, conflict-prone stages into two distinct
+thread pools. This bisected approach minimizes the frequency              2   Background and Motivation
+of cross-stage communication, while enabling independent                  In this section, we first present a taxonomy of KVS thread
+optimization of each stage. At the cache-resident layer, we               architectures (§2.1), which motivates our work through em-
+allocate dedicated worker threads and cache ways, and em-                 pirical analysis (§2.2); then, we discuss the challenges when
+ploy customized data organization, ensuring that the managed              realizing the system (§2.3).
+data is never evicted out of the CPU cache. At the memory-
+resident layer, we extensively utilize batching and prefetching           2.1 A Taxonomy of the KVS Thread Architecture
+to mitigate cache miss penalties. Moreover, this separation               A KVS thread architecture essentially defines two aspects
+allows more scalable stages to operate independently, thereby             – how threads are scheduled on CPU cores and how client
+preventing potential blocking overhead.                                   requests are divided among threads. Based on the two dimen-
+   While μTPS offers compelling advantages, its practical                 sions, we present a hierarchical taxonomy of existing KVS
+implementation faces several challenges. First, not all stages            thread architectures (Figure 1).
+offer a clear distinction between cache residency and memory
+residency. For example, index traversal and data copying in               2.1.1 Preemptive Thread Architecture. Network and stor-
+a KVS are workload-dependent: skewed workloads, which                     age devices were initially slow, with technologies like Gigabit
+are common in production environments [20, 65], can create                Ethernet and HDDs exhibiting millisecond-scale latencies.
+hotspots at specific memory locations. We address this by                 To hide such high latencies, operating systems introduced
+further dividing such stages, where hot data is managed                   preemptive multitasking to improve CPU efficiency. When
+separately by the cache-resident layer. Second, μTPS still                interacting with a device, the CPU core performs a context
+incurs additional overhead for inter-stage communication,                 switch, yielding control to another task (thread), instead of
+which may offset the benefits of the separation. We mitigate              blocking on the current IO; when the IO completes, the device
+this through a lightweight, scalable queue design and more                sends an interrupt to the CPU core, allowing the original
+effective stage placement. Third, in μTPS, pinned worker                  thread to resume. Therefore, preemptive multitasking enables
+threads are no longer scheduled by the OS scheduler, and                  multiple threads to time-share the same CPU core. We further
+the storage software is responsible for adjusting the number              investigate the request-to-thread assignment policies when
+of CPU cores (or threads) allocated to each stage as the                  applying the preemptive thread architecture in a KVS.
+
+
+
+                                                                   1100
+Rearchitecting the Thread Model of In-Memory Key-Value Stores with μTPS                           SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea
+
+                     Thread Architecture
+                                                                                SILK [17] prevents latency spikes in log-structured merge
+    CPU
+              Disk/Ethernet         IB/DRAM
+                                                                                KVS by throttling background compaction activities. KVSs1
+                Preemptive                 Non-Preemptive                       that adopt P-TPS: RocksDB [25], TiKV [37], HBase [36],
+              interrupt, ~1ms               polling, ~1us
+                                                                                Cassandra [44], MongoDB [19], etc.
+                          P-TPR                        NP-TPR
+                          - Early BDB, …               - Arachne, …
+    Request
+
+
+
+
+                                                                                2.1.2 Non-preemptive Thread Architecture. Userspace
+                         P-TPQ                         NP-TPQ                   dataplane libraries (e.g., DPDK, RDMA) typically employ a
+                         - Memcached, …                - MICA, FaRM, …
+                                                                                non-preemptive thread architecture, which use busy polling
+                         P-TPS                         NP-TPS?                  to interact with the device. Unlike preemptive multitasking,
+                         - RocksDB, Hbase, …           - µTPS
+                                                                                non-preemptive thread architectures rely heavily on the run-
+Figure 1. A Taxonomy of thread architectures. P and NP                          to-completion model, making request-to-thread assignment
+indicate preemptive and non-preemptive, respectively.                           policies a critical design space. Among them, we identify two
+Thread per request (P-TPR) was once a commonly used de-                         widely used policies in existing KVSs.
+sign and is well supported by many RPC frameworks [38, 58].                     Thread per request (NP-TPR). Spawning and destroying
+In this architecture, a new thread is spawned for each new                      threads for each request is prohibitively expensive when
+request or connection to handle its processing. Although                        managing fast hardware devices. Recent systems leverage
+straightforward to implement, TPR introduces significant                        lightweight green threads or uthreads to implement NP-TPR [3,
+scheduling overhead: as the offered load increases, the num-                    15, 55]. These systems maintain a lightweight context for
+ber of worker threads grows proportionally, leading to fre-                     each uthread in userspace and use longjump instructions
+quent thread switching when they time-share CPU cores. This                     for fast context switching, bypassing the OS kernel. For
+results in cache pollution and context switch overhead, ul-                     example, Arachne [55] can spawn a new uthread in just 320ns.
+timately degrading performance severely. KVSs that adopt                        However, the overhead of temporarily creating and destroying
+P-TPR: BerkeleyDB with its RPC server wrapper [52], early                       threads remains significant when dealing with network devices
+Voldemort [13] with default configuration, etc.                                 delivering tens of millions of IOPS. KVSs that adopt NP-TPR:
+Thread per queue (P-TPQ) is a more scalable design used                         Memcached running inside Arachne [55].
+in recent KVSs [31, 32]. In this model, a number of threads                     Thread per queue (NP-TPQ). The application of TPQ in
+are created at system startup, which loop continuously from                     non-preemptive thread architectures is facilitated by several
+their dedicated queues and process requests when available;                     key optimizations. First, traditional P-TPQ relies on a central-
+optionally, a dispatching thread is responsible for forwarding                  ized dispatcher to assign requests to a pool of threads, which
+incoming requests to these worker threads. A key distinction                    easily becomes a bottleneck in face of high-speed network
+between P-TPQ and P-TPR is that the former reuses worker                        devices. Recent systems [26, 27, 47] avoid this bottleneck
+threads among requests. This reuse is further facilitated by                    by establishing dedicated connections between client and
+issuing asynchronous I/Os (e.g., libaio), where request pro-                    worker thread pairs and binding threads to specific CPU cores,
+cessing is implemented as finite state machines (FSM), and                      allowing clients to directly send requests to specific server
+completion notifications trigger transition between states. TPQ                 cores. Second, to avoid expensive synchronization among
+interleaves computation and I/O across requests within the                      server threads, these systems often employ the share-nothing
+system software, improving resource utilization and scalabil-                   design [43, 45], where each thread exclusively manages a
+ity. KVSs that adopt P-TPQ: Memcached [32], KeyDB [10]                          subset of data (i.e., shard), enabling lock-free data modifica-
+(a multithreaded fork of Redis), etc.                                           tions. Third, to better utilize CPU cores, these systems often
+Thread per stage (P-TPS). As KVSs becomes increasingly                          employ batching to amortize the cost when interacting with
+complex, processing a single request often involves multiple                    the device [41, 42, 45]. Last, coroutines [1] are extensively
+stages (e.g., indexing, journaling, data I/O) and background                    used to further harvest the CPU cycles that would otherwise be
+activities (e.g., garbage collection). As a result, P-TPS is                    wasted for busy-polling completion notifications [43]. KVSs
+widely adopted by modern KVSs to handle this complex-                           that adopt P-TPQ: MICA [47], FaRM-KV [26, 27], etc.
+ity. P-TPS follows loosely on SEDA design principles [64],                      Why not thread per stage (i.e., NP-TPS)? In the non-
+which employs a series of thread pools, each responsible for                    preemptive thread architecture, NP-TPQ has become the de
+a specific stage of request processing, connected via event                     facto choice for building storage systems targeting fast net-
+queues. TPS improves code modularity and simplifies applica-                    work/storage devices. This is in contrast to the preemptive
+tion design by compartmentalizing distinct stages. Moreover,                    thread architecture, where P-TPS is widely adopted. The key
+dividing stages into separate thread pools further enhances                     reason is that TPS introduces frequent inter-thread communi-
+scheduling flexibility and performance isolation. For exam-                     cation among stages, making it challenging to fully exploit
+ple, TAM [66] retrofitted many existing TPS-based systems                       the performance potential of modern high-speed hardware.
+with advanced scheduling features (e.g., weighted fairness)
+by manipulating the request queues among stages; similarly,                     1 Databases that use KVSs as the storage engine are included as well.
+
+
+
+
+                                                                         1101
+SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea                                                                               Youmin Chen, Jiwu Shu, et al.
+
+
+
+
+                                                                           Throughput (Mops/s)
+                                                                                                      NP-TPQ    NP-TPS
+2.2 The Opportunity of NP-TPS                                                                         NP-TPQ-CAT (ideal)
+                                                                                                                                      Base             SE   µTPS
+                                                                                                                                      Partition        SN
+In contrast to conventional wisdom, our work presents a                                          40                        100                    40
+contrary observation, showcasing NP-TPS’s strengths in cache
+                                                                                                 20                         50                    20
+friendliness and contention mitigation. Building on these
+insights, we design and implement a network-attached in-                                          0                          0                0
+                                                                                                      8      64 256 1K           1M 10M 100M 0     10 20 30
+memory KVS, demonstrating the viability of NP-TPS to
+                                                                                                          Item Size (B)            Keyspace # of Worker Threads
+manage fast hardware devices.                                                                                  (a)                    (b)           (c)
+                                                                           Figure 2. Comparison between NP-TPS and NP-TPQ. a)
+2.2.1 Cache friendliness. As illustrated above, NP-TPQ                     Throughput of get oprations with an uniform workload; b) Through-
+necessitates each worker thread to process requests from start             put of index lookup in MassTree with a skewed workload; c) Through-
+to finish in a run-to-completion manner. This necessitates                 put of put operations with a skewed workload (64B items).
+executing a single, monolithic function for every request. In
+an in-memory KVS, the function encompasses tasks such as                   communication, achieves a 1.22-1.54× throughput improve-
+polling requests from the network queue, performing index                  ment over the TPQ one. To better understand this performance
+lookups, copying data buffers, and sending responses to clients.           gain, we use Intel’s Performance Counter Monitor (PCM [7])
+However, executing monolithic functions is inherently cache-               to measure last-level cache (LLC) miss rates. The results
+unfriendly due to the heterogeneity of their sub-steps in terms            reveal that: i) threads in the first stage exhibit a significantly
+of memory access patterns.                                                 lower LLC miss rate of just 2%, compared to 33% in NP-TPQ;
+   For example, in a KVS, polling requests via a userspace                 ii) threads in the second stage maintain a similar LLC miss
+network dataplane (e.g., RDMA) involves issuing load in-                   rate to those in NP-TPQ. Furthermore, TPS reduces the in-
+structions from the network buffer to retrieve newly received              struction cache footprint for each worker thread, contributing
+requests. Modern processors (e.g., Intel CPU) support direct               to improved overall cache efficiency.
+cache access (DCA), enabling an NIC to directly populate the               Separating LLC? The current implementation of DCA in
+fast on-chip last-level cache (LLC), bypassing the slower main             Intel processors (i.e., data direct I/O, DDIO [4]) typically
+memory. With proper network buffer design (e.g., keeping                   uses the two rightmost ways in LLC [29]. Hence, this setup
+buffer size smaller than LLC), polling can nearly eliminate                raises a potential argument: could the cache inefficiency of
+cache misses. However, index lookup and data access stages                 NP-TPQ be mitigated by preventing worker threads from
+involve accessing a broader memory space, which is the main                using the cache ways reserved for DCA? Tools such as Intel’s
+source of cache misses. Intuitively, packing such stages into a            Cache Allocation Technology (CAT) [9] enable cache way
+single function often leads to cache thrashing at various cache            partitioning, which could, in theory, isolate DCA-reserved
+levels, severely degrading CPU pipeline efficiency.                        cache ways from being polluted by worker threads. However,
+Benefits of separating network buffers. To quantify the                    our experiment shows that cache partitioning has a very close
+cache inefficiency of NP-TPQ, we prototyped an in-memory                   performance to NP-TPQ for small item sizes, and only shows
+KVS using RDMA network and MassTree [49], adhering to                      slight performance improvements with larger item sizes, still
+the NP-TPQ design. In our prototype, multiple worker threads               lagging behind NP-TPS (Figure 2a). This outcome stems from
+are launched to poll requests from clients, parse them to extract          the intricate behavior of DDIO: DDIO uses the two rightmost
+the request type and key, perform lookups in MassTree to                   ways in LLC only for cache allocation triggered by cache
+locate the corresponding data items, and return responses to               misses; if a cacheline already resides in the LLC (beyond the
+the clients. For comparison, we also implement a NP-TPS                    DCA-reserved ways), DDIO modifies or accesses it directly.
+version, where the request polling/parsing/response stages                 In TPQ, when worker threads poll new requests or prepare
+and the index lookup/data access stages are split into separate            response messages, these data items in the network buffer
+thread pools. To isolate the benefits of TPS, we remove inter-             can be fetched into arbitrary LLC ways except for the two
+stage communication through deterministic replay at each                   rightmost ones, and subsequent stages, such as indexing and
+stage: instead of forwarding requests via inter-stage queues,              data access, can further evict these fetched cachelines, still
+the second stage uses a deterministic generator to reproduce               leading to frequent DDIO-initiated cache misses. In contrast,
+the exact same sequence of requests for processing. Because                TPS assigns indexing and data access stages to separate worker
+the two stages operate independently without communication,                threads, ensuring that cached network buffers mostly remain
+we manually tuned the number of threads in each stage to                   intact, thereby preserving cache efficiency.
+ensure the two stages process requests at matching rates.                  Benefits of separating hotspots. Skewed workloads, which
+   We use two client nodes to send requests to a server node,              are common in production environments, create hotspots at
+which are connected via a 200Gbps RDMA network; the de-                    specific memory locations, blurring the distinction between
+tailed experiment setup will be described in §5.1. As shown in             cache residency and memory residency of stages such as
+Figure 2a, TPS-based KVS, without the overhead of inter-stage              indexing and data access. These hotspots, however, can be
+
+
+
+                                                                    1102
+Rearchitecting the Thread Model of In-Memory Key-Value Stores with μTPS                    SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea
+
+
+managed by dedicated threads and LLC ways, preventing them                  This is particularly critical in fast in-memory KVSs, where
+from being evicted from the CPU cache. To demonstrate the                   suboptimal thread division can result in performance degra-
+benefits of this approach, we conduct experiments measuring                 dation of up to millions of ops/s. Moreover, factors such as
+the throughput of index lookup in MassTree, where we redirect               cache way allocation and hotspot management also require
+0.1‰ queries associated with the hottest keys to a dedicated                careful attention. For example, the memory-resident stages
+thread pool for processing. As shown in Figure 2b, given the                often experience high cache miss rates, making it inefficient
+same total number of worker threads, the separation yields                  to allocate additional cache ways to them. Similarly, hot items
+an average throughput improvement of 1.08× with Zipfian-                    must be dynamically adjusted in response to shifting hotspots.
+distributed keys generated by YCSB.                                         These factors create a multidimensional scheduling landscape
+   In summary, handling frequently accessed data in dedi-                   that must be automatically explored in real time.
+cated threads and cache ways can potentially enhance cache                  Reconfiguration overhead. Given the single-digit 𝜇s access
+efficiency, thereby improving overall system performance.                   latencies of a KVS, each stage must be designed to adapt
+2.2.2 Contention Mitigation. We further find that NP-TPS                    rapidly to dynamic reconfiguration to prevent latency spikes.
+strikes a better balance between load balancing and contention              As noted, the non-preemptive thread architecture relies on
+mitigation under skewed workload. With the TPQ architecture,                client software to direct requests to specific worker threads.
+a KVS typically employs a shared-nothing (SN) design, where                 Consequently, when the number of threads for the request
+each worker thread is assigned a distinct shard to manage,                  polling stage changes due to reconfiguration, this information
+minimizing the need for synchronization between threads.                    must be propagated to the clients – introducing additional
+However, under skewed workloads, this approach often re-                    blocking overhead and increasing software complexity.
+sults in uneven load distribution, causing some threads to                  Inter-stage communication. The superior performance of NP-
+become idle while others are overloaded. On the contrary, a                 TPS observed in §2.2.1 assumes no inter-stage communication.
+share-everything (SE) architecture allows clients to handle any             However, reintroducing such overhead can undermine these
+requests, achieving better load distribution. However, the ben-             advantages. Addressing this challenge requires attention to two
+efits come at the cost of significant synchronization overhead,             key aspects: designing a more efficient communication queue,
+especially as the number of threads increases. Our experi-                  and minimizing the frequency of inter-stage communication
+ments illustrate this trade-off: as shown in Figure 2c, the peak            through more effective stage placement.
+throughput of SE initially exceeds that of SN, but degrades
+rapidly as more threads are added due to synchronization. Our               3   μTPS Design
+key insight lies in the fact that not all stages are equally sus-           3.1 Overview
+ceptible to workload contention – stages other than index/data              We present the design of μTPS to address the aforementioned
+updates are highly scalable. In NP-TPQ, different stages are                challenges. Figure 3 depicts the overall architecture of μTPS,
+sequentially executed by each thread, synchronization at a                  which organizes the stages of an in-memory KVS into two
+stage forces the worker thread to be blocked, preventing other              layers: a cache-resident (CR) layer and a memory-resident
+stages from making progress. Instead, NP-TPS allows different               (MR) layer, and uses an auto-tuner to dynamically adjust the
+stages to be processed by different threads, so we can throttle             two layers’ configuration.
+the number of threads assigned to the index update stage,                   • Cache-resident layer. Mainstream enterprise-level CPUs
+leaving other threads to process other stages without being                   has shared LLC (e.g., 42MB LLC in Xeon Gold 6330 CPU
+blocked. This effectively mitigates the contention issue, as is               and 504MB LLC in Xeon 6978P CPU) and private L1/L2
+demonstrated by our experiments in Figure 2c.                                 caches. The cache-resident layer ensures that frequently
+                                                                              accessed data is largely resident in the CPU LLC. We
+2.3 Challenges
+                                                                              achieves this with a combination of the following ways: i)
+While the NP-TPS architecture offers compelling advantages                    using separate worker threads and pinning them to specific
+in cache efficiency and contention mitigation, its practical                  CPU cores to execute the cache-resident layer; ii) allocating
+implementation introduces several challenges.                                 dedicated LLC ways for these threads; and iii) keeping
+Reconfiguration complexity. In order to keep each stage                       the amount of data at the cache-resident layer small to
+within its operating regime, P-TPS systems need to adapt the                  fit in the cache – only managing the hottest KV items
+number of threads based on observed performance. However,                     and network buffers. Note that these techniques cannot
+reconfiguration in NP-TPS is inherently more complex: work-                   completely eliminate cache evictions. For instance, in a
+load variations impact not only the total number of threads                   set-associative cache, conflicts among cachelines mapping
+needed (e.g., under load changes) but also how threads are                    to the same set can still occur, leading to cache misses.
+distributed across stages. Workload shifts, such as changes                 • Memory-resident layer. The full index and data items are
+in access skew or item size, can alter the processing time                    stored at the memory-resident layer. At this layer, worker
+at each stage, requiring finer-grained thread reassignment.                   threads fetch requests from the CR-MR queue posted by the
+
+
+
+                                                                     1103
+SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea                                                                        Youmin Chen, Jiwu Shu, et al.
+
+    req.                   resp.                                                                                                          append
+                                                     Auto-tuner                         C1
+        Reconfigurable RPC
+                                                                                                                     2 …
+                                                                                                             0
+           network buffer                                                              C2                        1             m              recv buf
+                                                                                       …
+Thread                   …                                   …    Thread                                                       m mod n = i
+ pool                                                              pool                Cn                             …          …
+                                                                                                         0       1         i        n-1      CR Layer
+                                                                                     Clients
+  Hot                               CR-MR                …         Full
+ index                              queue
+                                                             …
+                                                                  index           Figure 4. Receive buffer management in reconfigurable RPC.
+                            miss
+                   hit                …
+ Hot                                                               Full           3.2 Cache-Resident Layer
+ data                                                              data
+            CR layer                                 MR layer
+                                                                                  At the cache-resident layer, the number of worker threads
+                                                                                  and cached hot items should be dynamically changed as load
+                     …                                       …
+                                                                                  functuates, and their memory footprint should be kept low.
+               poll & parse        indexing   data      resp.                     We achieve this by introducing dedicated RPC and caching
+                                                                                  designs.
+Figure 3. μTPS’s architecture and interactions. CR and MR
+                                                                                  3.2.1 Reconfigurable RPC. RPC systems based on kernel-
+stand for cache- and memory-resident, respectively. The bottom part
+                                                                                  bypass networking (e.g., RDMA or DPDK) should maintain a
+describes the main steps for processing KV requests, with colored
+                                                                                  memory pool of network buffers to send and receive packets
+box reflecting which layer(s) is(are) mapped to.
+                                                                                  through the NIC. Sizing the memory pool requires consider-
+                                                                                  ation of several factors, including the number of open con-
+                                                                                  nections, the worst-case delay in packet processing time, and
+  cache-resident layer, and extensively use batching, prefetch-                   the network round trip time [34]. For example, RPC systems
+  ing, and coroutines [1] to amortize the cost of cache misses                    that rely on one-sided RDMA verbs, such as FaRM-RPC [26],
+  when processing them.                                                           require a separate receive buffer for each client at each worker
+• Auto-tuner. The auto-tuner dynamically adjust the config-                       thread, leading to substantial memory overhead that can easily
+  uration of the cache- and memory-resident layers to react                       exceed CPU cache sizes as the number of clients increases;
+  fast to load changes. At its core, the auto-tuner employs a                     eRPC [40], a fast and general-purpose RPC library, needs to
+  feedback loop to monitor the system’s performance, using                        allocate a 15-MB buffer per worker thread.
+  this data in conjunction with hierarchical searching to guide                      Moreover, these RPCs do not support increasing or decreas-
+  adjustments in the number of worker threads, cache ways,                        ing the number of worker threads dynamically, and simply
+  and the management of hot and cold items at each layer.                         reframing their software stack introduces extra overhead. For
+   Like existing KVSs, μTPS provides standard APIs (e.g.,                         example, both FaRM-RPC and eRPC allows clients to spec-
+put, get, and delete) to remote clients. The KVS server                           ify a worker thread to send requests to; when the number
+node supports organizing key-value items using different                          of worker threads changes, this information should be syn-
+data structures (e.g., hash table, B+ -tree, etc.). As shown in                   chronized across all clients. We address these challenges by
+Figure 3, when a new request arrives, the worker thread at                        introducing reconfigurable RPC.
+the cache-resident layer fetches the request from the network                        At the core of reconfigurable RPC is a single-queue receive
+receive buffer, parse it, and process it if it correspond to hot                  buffer at the server node (see Figure 4). Clients send requests
+items; otherwise, the request is forwarded to the memory-                         concurrently to the server node, and the server-side RNIC
+resident layer for further processing. Once the request finishes                  appends requests of different clients to the end of a single
+processing, the cache-resident layer worker thread sends the                      receive buffer. The worker threads then fetch and parse requests
+response back to the client.                                                      from the receive buffer in a round-robin manner. Specifically,
+   uTPS differs from the traditional TPS in the following                         the 𝑖 𝑡ℎ worker thread only fetches requests located at the
+three aspects. First, traditional TPS follows a modular design,                   𝑚𝑡ℎ slot where 𝑚 mod 𝑛 = 𝑖, while requests at other slots
+dividing the system into multiple stages based on functional                      are untouched (𝑛 denotes the number of worker threads).
+boundaries; uTPS only has two stages, with task assignment                        Moreover, the requests in the receive buffer are processed
+driven by cache residency. Second, traditional TPS optimizes                      independently – a request is fetched and processed without
+slow I/O bottlenecks using techniques like DRAM buffering                         waiting for the former ones in the queue to finish; this reduces
+to boost throughput; In uTPS, modern NICs enable worker                           the potential risk of head-of-line blocking. The single-queue
+threads to operate at extremely high speeds. To fully leverage                    design offers several advantages. First, it reduces the memory
+this, uTPS introduces CR-MR queue, polling, and batching to                       overhead by sharing the receive buffer among all worker
+ensure efficient interaction among cores and the NIC. Finally,                    threads. Second, the KVS server can easily adjust to a new
+traditional TPS relies on the OS scheduler when adjusting the                     configuration by simply changing a global variable 𝑛 (i.e.,
+thread pool at each stage as load changes; uTPS pins threads                      the number of worker threads) at the KVS server, eliminating
+on cores and schedules them in the storage software for rapid                     costly coordination with clients. A detailed reconfiguration
+adaptation with low blocking overhead.                                            procedure will be shown in §3.5.
+
+
+
+                                                                           1104
+Rearchitecting the Thread Model of In-Memory Key-Value Stores with μTPS                       SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea
+
+
+   Reconfigurable RPC is realized by creating a shared receive                                                              CR-MR queue
+queue (SRQ) [14] to associate all client connections (i.e.,                                              push                 pop
+                                                                                                        queue                queue Y
+queue pairs). SRQ is a standard feature supported by all                                           N                    N
+                                                                            recv buf                                                         resp. buf
+NVIDIA RNICs. Specifically, we use a management thread to                              poll req.                                     resp.
+post receive buffer slots (using the recv verb) into the SRQ in                                            miss
+                                                                                          Y
+an increasing address order, and clients use the send verbs to                                         indexing              data
+                                                                                                                  hit
+send requests to the server. Newly received data are DMAed
+into the first receive buffer slot in SRQ by the server-side RNIC.          Figure 5. FSM execution model at the cache-resident layer.
+Whenever a slot is digested by the RNIC, the management                        Second, the cached items should be organized to occupy
+thread posts another recv to push the slot back in SRQ.                     less memory space. When using a tree-based index structure
+Similar to prior work [63], we adopt the multi-packet receive               that supports range queries, we organize the cached index
+queue (MP-RQ) [12] to alleviate the overhead of posting recv                items at the cache-resident layer as an ordered array, as it
+verbs, where a receive buffer slot associated with a recv verb              eliminates the intermediate pointers present in tree-based
+can accommodate multiple requests. For sending response                     structures. A sorted array is well-suited for this scenario since
+messages back to clients, we assign a dedicated response                    the hot set is periodically constructed and refreshed, avoiding
+buffer to each worker thread. The size of the response buffer               the overhead from temporary insertions and deletions, while
+can be kept small (e.g., 64KB), as it can be reused among                   still enabling efficient binary search. For KVS systems that
+different batches of requests.                                              use a hash table as the index, we directly reuse the main
+                                                                            index structure to manage the hot set. Note that we do not
+3.2.2 Resizable Cache. The cache-resident layer also caches                 need to keep an extra copy of data items for caching at the
+hot items to prevent them from being evicted from the CPU                   cache-resident layer – CPU loads them automatically into the
+cache. Regarding the dynamic nature of real workload, the                   cache when they are accessed.
+cache-resident layer should adapt to changing of the hot set
+and use as little memory space as possible.                                 3.2.3 FSM Execution Model. The worker threads in the
+   Conventional caching mechanisms, such as LRU, incur                      cache-resident layer process requests using a finite state ma-
+heavy bookkeeping overhead to track frequently accessed                     chine (FSM). As shown in Figure 5, the state is transitioned
+items, and are not suitable for the cache-resident layer. Instead,          along two main paths: the hit path and the miss path. For
+we adopt a hot set-based approach [56, 61]: using a background              each incoming request, the worker thread first checks if the
+thread to identify the hottest items and cache them, and                    corresponding index item is cached. If it is, the worker thread
+periodically refresh the cache to react to load changes. We                 directly reads or writes data and sends the response back to
+leverage Nap [61]’s non-blocking algorithms to manage the                   the client; otherwise, the worker thread forwards the request
+hot set. Periodically, the background thread samples recently               to the memory-resident layer through the CR-MR queue and
+accessed keys and uses a combination of count-min sketch [23]               begins polling for new requests. Responses from the memory-
+and min heap to track the hottest items (10K items in our                   resident layer are awaited asynchronously. Once the response
+implementation); then, it switches the cache space to the                   is received from the memory-resident layer, the worker thread
+new hot set via an epoch-based approach [33], ensuring that                 then sends it back to the client.
+cache modifications are reflected atomically to all worker                     To ensure efficient state transitions in the FSM, polling
+threads. The resizable cache distincts from existing hot set-               requests from the receive buffer and CR-MR queue is designed
+based approaches in that the cache layer is managed separately              to be non-blocking: the operation returns immediately after
+at the cache-resident layer with dedicated worker threads and               an one-shot scan of the queue. The two queues are polled
+LLC ways, and requires further refining to ensure the cache                 iteratively when they are empty, ensuring that new requests
+module fits well with the cache-resident layer.                             are discovered without delay.
+   First, the number of cached items must be resizable to
+                                                                            3.3 Memory-Resident Layer
+prevent the hot set from being set to unreasonably large. Man-
+aging a large hot set in μTPS is instead counterproductive                  The memory-resident layer manages the full index and data
+since the performance difference between the cache- and                     items, and processes requests sent from the cache-resident
+memory-resident layers is not an order of magnitude apart (un-              layer. Batch and prefetch are extensively used to amortize the
+like the disparity between DRAM and HDD). A large hot set                   cost of cache misses.
+would result in a significant penalty when processing requests              Batched indexing. Index traversing at the memory-resident
+that miss at the cache-resident layer. To this end, during each             layer incurs random pointer-chasing operations, and is the
+refresh of the hot set, the management thread heuristically                 major source of cache misses. The memory-resident layer
+adjusts the number of cached items using the epoch-based                    employs batched prefetching with coroutine and hardware
+approach until a maximal performance is achieved (see §3.5                  prefetch to mitigate this overhead. While the concept of
+for details).                                                               batched indexing is not new, our design is distinct in that the
+
+
+
+                                                                     1105
+SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea                                                           Youmin Chen, Jiwu Shu, et al.
+
+
+cache-resident layer has already filtered out the hottest items.                    0 1 … m pop      tail
+                                                                               0                                 batch       u64 key;
+This prevents unnecessary context-switching overhead that                                                         1 …
+                                                                                                                             u64 type : 8;
+                                                                          push 1
+                                                                                                             0
+                                                                                                                             u64 size : 24;
+
+
+
+
+                                                                                …
+would otherwise occur when prefetching cache lines already                                                                   u64 buf : 32;
+                                                                                n
+residing in the CPU cache.                                                                    head
+   Stackless coroutines, as supported in C++20 [1], achieve                     Figure 6. The architecture of the CR-MR queue.
+single-dight nanosecond latencies for constructing and switch-
+ing coroutines. We transform basic indexing operations (i.e.,             bits within each item to serialize access conflicts. Specifically,
+put/get) into their coroutine counterparts using co_wait and              updates to data items of 8 bytes or smaller are performed
+co_return keywords, and insert prefetch and co_yield                      directly using atomic instructions. For larger items, a worker
+before each pointer dereference operation. To support batched             thread first employs an atomic CAS operation to modify the
+indexing, each worker thread retrieves multiple requests from             lock bits, placing the item in a locked state. The data item
+the CR-MR queue simultaneously and creates indexing corou-                is then updated, and the lock is subsequently released. The
+tines for each of them. The worker thread then functions as a             item’s version is incremented both before and after the update.
+scheduler that switches between these coroutines. Whenever a              Read operations are conducted in a lock-free manner, where
+coroutine issues a prefetch, control is transferred to execute            the version is read both before and after accessing the data
+the computation stage of another operation. This approach                 item. The old and new versions are then compared to ensure
+effectively hides the latency of loading data from memory                 the atomicity of the read operation.
+across the batch of operations, improving overall efficiency.
+                                                                          3.4 CR-MR Queue
+Copying data items. Batched indexing helps with locating
+                                                                          The CR-MR queue is used for efficient communication be-
+the data items in the KVS, then the worker threads read or
+                                                                          tween the cache- and memory-resident layers. It is a multi-
+write these data items. Data items are not transferred between
+                                                                          producer, multi-consumer queue designed for high scalability
+the cache- and memory-resident layers through the CR-MR
+                                                                          and high throughput. As shown in Figure 6, the CR-MR queue
+queue; instead, the worker threads at the memory-resident layer
+                                                                          establishes an all-to-all mapping between cache-resident layer
+copies data between the network buffer and the KV storage
+                                                                          threads and memory-resident layer threads, where each pair
+directly without introducing redundant memory copies. For
+                                                                          of threads is assigned a dedicated, lock-free ring buffer for
+get operations, data items are copied from the KVS to the
+                                                                          message transfer. To balance the load at the memory-resident
+response network buffer; once finished, the cache-resident
+                                                                          layer, threads at the cache-resident layer push new requests
+layer sends the response messages back to clients. Notably, the
+                                                                          to memory-resident layer threads in a round-robin fashion.
+response network buffer can be cached at the memory-resident
+                                                                          Accordingly, a worker thread at the memory-resident layer
+layer during the data copy process; however, this does not
+                                                                          needs to scan the queues corresponding to all cache-resident
+result in cache misses at the cache-resident layer when the
+                                                                          layer threads to pop new messages. To further mitigate the
+worker threads post the buffer to the RNIC. This is because the
+                                                                          overhead of pushing (popping) items to (from) the CR-MR
+RNIC is responsible for moving data from the response buffer
+                                                                          queue, each slot in the ring buffer can accommodate multiple
+to the RNIC cache, and the cache-resident layer never touches
+                                                                          requests. This means that a worker thread in the cache-resident
+the buffer directly. For put operations, the memory-resident
+                                                                          layer will push a new item only when enough requests have
+layer copies data items from the receive buffer to the target
+                                                                          accumulated. Similarly, memory-resident layer threads can
+storage location. Still, since the memory-resident layer only
+                                                                          use a single pop to retrieve multiple requests at once.
+reads the receive buffer and does not modify it, there is no
+                                                                             As shown in the right part of Figure 6, Each request is
+cache invalidation at the cache-resident layer.
+                                                                          compactly represented in 16 bytes of memory. Specifically,
+Concurrency control. Note that the separation of the cache-               the key field (8 bytes) stores the key directly. If the key is
+and memory-resident layers does not change the concurrency                larger than 8 bytes, it is hashed into an 8-byte value. In the
+control protocol of μTPS. A point query is served by either the           rare case of a hash collision, multiple items are chained in a
+cache-resident layer or the memory-resident layer, depending              linked list, and the original key is used to disambiguate them.
+on its hotness, so we only need to enforce concurrency control            type and size fields indicate the request type and the size of
+at each layer independently. We adopt a share-everything                  the KV item. buf field (32 bits) points to a slot in the network
+design at both cache- and memory-resident layers while con-               buffer. Since each slot has a fixed size, this field only needs to
+figuring the number of the worker threads assigned to each                identify the slot’s position. Depending on the operation, buf
+layer to maximize system efficiency. This approach requires               may point to a receive buffer (for put) or a response buffer
+the index structure and data management to be thread-safe, al-            (for get). For efficiency, memory-resident layer threads do
+lowing concurrent accesses and modifications to each KV item.             not explicitly send completion messages back to the cache-
+For the index structure, we reuse existing thread-safe and scal-          resident layer. Instead, they piggyback this information on the
+able implementation (i.e., MassTree [49] and libcuckoo [28])              advancement of the tail pointer. A tail pointer is updated only
+directly. For data items, we embed additional lock and version            after all requests in the batch have been processed and their
+
+
+
+                                                                   1106
+Rearchitecting the Thread Model of In-Memory Key-Value Stores with μTPS                     SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea
+
+
+responses placed in the response buffers. At that point, the                size change, etc.). The auto-tuner employs a feedback loop to
+cache-resident layer threads can safely deliver the response                monitor the system’s throughput, and uses it as a hint to auto-
+buffers to clients.                                                         matically adjust the above three reconfiguration parameters.
+                                                                            Note that thread reallocation and cache resizing cannot be
+3.5 Auto-tuner                                                              tuned independently. This is because cache resizing alters the
+We first explain the detailed steps of thread reassignment,                 load between the cache- and memory-resident layers, which in
+cache resizing, and cache way allocation; then, we present                  turn affects the number of worker threads required at each layer.
+how to automatically tune these reconfiguration parameters.                 To address this, the auto-tuner uses a hierarchical searching
+Thread reassignment. This process involves reassigning                      algorithm to find the optimal configuration. For each cache
+worker threads between the cache- and memory-resident                       size, the manager thread iterates through all possible thread
+layers – i.e., moving some threads from the cache-resident                  allocations to identify the best allocation choice. Then, among
+layer to the memory-resident layer or vice versa. The main                  all possible cache sizes, the manager thread selects the one
+challenge is to prevent message loss during reassignment, and               that achieves the best performance as the final configuration.
+we describe the procedures for each direction separately.                   Cache way allocation, which affects system performance in
+   When moving threads from the cache-resident layer to the                 an orthogonal manner, is tuned independently.
+memory-resident layer, the manager thread first updates two                    To speed up the search process, we introduce a trisecting
+global variables, 𝑁𝐶𝑅 and 𝑁𝑀𝑅 , which represent the number                  approach. We observe that system performance follows an
+of worker threads in the cache- and memory-resident layers,                 convex curve with respect to thread allocation and LLC
+respectively. It then notifies all cache-resident layer threads             allocation, where the performance initially increases and then
+to switch at a predefined receive buffer slot. Upon reaching                decreases. Based on this, we trisect the searching space into
+this slot: cache-resident layer threads that should remain in               three parts (i.e., [0, a], (a, b), and [b, max]). If 𝑃𝑎 < 𝑃𝑏 ( where
+their current layer update their local copies of 𝑁𝐶𝑅 and 𝑁𝑀𝑅                𝑃𝑥 denotes the system throughput when the parameter is set to
+to match the global values, and then continue processing                    𝑥), the optimal configuration must be in the range [a, max], or
+requests using the updated variables for modulo operations                  conversely, within the range [0, b] if 𝑃𝑎 > 𝑃𝑏 . The algorithm
+and CR-MR communication; cache-resident layer threads that                  then iteratively trisects the best-performing part of the search
+are designated to move to the memory-resident layer invoke                  space until the optimal configuration is found. Note that the
+the memory-resident layer’s entry function to switch roles;                 trisecting approach is inapplicable in cache resizing since it
+original memory-resident layer threads update their local                   does not exhibit a strict unimodal trend – cache resizing allows
+copies of the two variables only after the CR layer threads                 finer-grained load balancing between the cache- and memory-
+have switched to the memory-resident layer and their CR-MR                  resident layers (varying thread counts does not always lead to
+queues do not contain residual requests.                                    an optimal division of load). To this end, the auto-tuner finds
+   When moving threads from the memory-resident layer to                    an optimal cache size by using a linear probe with a fixed
+the cache-resident layer, the process differs slightly. Memory-             step (e.g., 1K in our implementation). Our evaluation shows
+resident threads that slate to move to the cache-resident layer             that, with a performance monitor time window of 10𝑚𝑠, the
+continue processing memory-resident requests upon receiving                 entire reconfiguration process completes in 0.9 seconds; this
+the manager’s notification. They wait until all CR-layer threads            is acceptable as load changes in real-world workloads are not
+have reached the predefined slot and their CR-MR queues are                 that frequent [20, 60]. Moreover, the reconfiguration process
+empty. Only then do they invoke the cache-resident layer’s en-              never blocks request processing, meaning that the system
+try function to switch roles. As illustrated, thread reallocation           remains operational during the reconfiguration period.
+is performed without blocking request processing.
+Cache resizing. When the hot set is refreshed, the manager                  4    Implementation
+thread further adjusts the number of cached items to improve
+                                                                            Based on μTPS, we implement two in-memory KVSs, namely
+the overall performance. With a target cache size 𝐾, the top
+                                                                            μTPS-H and μTPS-T, which use libcuckoo and MassTree,
+𝐾 items from the hot set are selected to replace the original
+                                                                            respectively, as the index structure. μTPS-H supports point
+cache. Cache resizing is performed in a similar way to cache
+                                                                            queries while μTPS-T supports both point and range queries.
+refreshing, using an epoch-based approach (§3.2.2).
+                                                                            In μTPS-T, a range query is processed collaboratively by the
+LLC allocation. The manager thread allocates cache ways                     cache-resident and memory-resident layers. KV items cached
+using the PQOS utility [8]. The manager thread first associates             at the cache-resident layer are first copied to the receive buffer,
+the worker threads of the cache- and memory-resident layers                 and the range query request is subsequently forwarded to the
+into different classes of service (CLOS), and then allocates                memory-resident layer for further processing. The memory-
+cache ways to each CLOS accordingly.                                        resident layer leverages the full index to handle the request,
+Automatic tuning. The auto-tuner is triggered when the sys-                 skipping items that are already present in the receive buffer.
+tem load exhibits significant changes (e.g., hot set shift, KV              To support this process, the request structure for range queries
+
+
+
+                                                                     1107
+SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea                                                         Youmin Chen, Jiwu Shu, et al.
+
+
+exchanged between the cache-resident and memory-resident                 index, μTPS achieves 1.30× and 1.29× the throughput of
+layers is extended to include the lower and upper bounds                 BaseKV on average under the YCSB-B and YCSB-C work-
+of the key range, and the number of items to return. Since               loads, respectively. This advantage stems from μTPS’s de-
+range queries typically have much lower throughput than                  sign, which separately manages cache-resident and memory-
+point queries, a larger request structure introduces negligible          resident items, making it more cache-friendly than BaseKV’s
+performance overhead.                                                    run-to-completion model. However, μTPS’s performance ad-
+                                                                         vantage is less significant under uniform workloads (i.e., 100%-
+5     Evaluation                                                         Get-Uniform), where the cache module at the cache-resident
+5.1   Experimental Setup                                                 layer cannot identify hot items, rendering it less effective in en-
+                                                                         hancing performance. eRPC-KV performs much slower than
+Testbed. The server node is equipped with two 28-core Intel              μTPS and BaseKV under skewed workloads, due to its request
+Xeon Gold 6330 CPUs and 256 GB of memory (each CPU                       dispatch mechanism, which uses the modulo operation on keys
+has 42MB of LLC). Two client nodes are installed with two                to assign requests to server threads, causing load imbalance. In
+16-core Intel Xeon(R) Silver 4314 CPUs and 64 GB of mem-                 contrast, under the uniform workload, eRPC-KV outperforms
+ory. All nodes run the Ubuntu 20.04 and are equipped with                BaseKV, and even delivers throughput comparable to μTPS
+Mellanox ConnectX-6 200 Gbps NICs for communication,                     (e.g., with hash indexes and small items). In this case, the
+interconnected through a Mellanox 200 Gbps switch. Unless                load is evenly distributed across worker threads; and eRPC’s
+otherwise specified, all experiments are conducted on 28 cores           highly optimized implementation delivers higher throughput
+on a single NUMA node of the server. The client nodes utilize            than Reconfigurable RPC, which relies on a single receive
+all available CPU cores to generate maximum load.                        buffer queue. Passive KVSs, such as RaceHash and Sherman,
+Compared systems. We compare μTPS against the following                  perform poorly since they require multiple one-sided verbs
+systems: (1) BaseKV. This system is identical to μTPS except             to locate a KV item. We also notice that Sherman exhibits
+for its use of a run-to-completion thread pool architecture.             excellent performance with 1KB items; in this case, internal
+Optimizations such as reconfigurable RPC, batching, and                  nodes are cached at the client node, and the throughput is
+prefetching are enabled in BaseKV. (2) eRPCKV. This variant              primarily constrained by network bandwidth.
+replaces BaseKV’s RPC module with eRPC [40] and uses
+                                                                         Write-intensive skewed workload. μTPS’s threading design
+a share-nothing architecture that directs requests to worker
+                                                                         also enables it to deliver superior performance over BaseKV in
+threads by modding the key. We also compare with passive
+                                                                         write-intensive skewed workloads (e.g., YCSB-A and 100%-
+KVSs where clients use one-sided RDMA verbs to access
+                                                                         Put-Skew). Specifically, BaseKV’s performance degrades
+KV items, bypassing the server-side CPUs. Among them,
+                                                                         significantly with 64B and 256B items when using a hash
+RaceHash [68] is a state-of-the-art passive KVS that employs
+                                                                         index. This behavior aligns with the results in §2.2, since
+a hash table as its index structure; Sherman [62] is a passive
+                                                                         BaseKV relies on locks to serialize concurrent accesses to the
+KVS that uses B+ tree as its index structure.
+                                                                         same key, which leads to high contention overhead when a
+5.2 Overal Performance                                                   large number of worker threads are used. In contrast, μTPS
+                                                                         dynamically tunes its configuration to minimize contention
+We evaluate μTPS using both synthetic workloads (YCSB [22])              by adjusting the number of worker threads at each stage,
+and production workloads (Meta’s ETC pool [16] and Twit-                 effectively mitigating the performance impact. BaseKV’s
+ter [65]). Unless otherwise specified, all tests are conducted           performance normalizes with 8B items because updates to
+on a pre-populated database containing 10M KV items.                     8-byte values can be performed atomically, avoiding the
+5.2.1 Synthetic workloads. As shown in Figure 7, we eval-                need for locks. For items larger than 8 bytes, eRPC-KV
+uate the compared systems under the YCSB workload by                     outperforms BaseKV in most cases and occasionally achieves
+varying item sizes, index types and operation mixes. we vary             slightly higher throughput than μTPS (up to 12%). eRPC-
+the value size from 8 bytes to 1 KB and evaluate both uniform            KV’s shared-nothing architecture eliminates the need for
+and Zipfian key distributions. We select workloads A (50%                locks, and the benefits of avoiding contention often outweigh
+put and 50% get), B (5% put and 95% get), C ((100% get)),                the disadvantages of uneven load distribution. Nevertheless,
+and E (95% scan and 5% put), omitting workload D as it                   μTPS provides more consistent performance across various
+closely resembles workload B. Additionally, we include a                 item sizes and operation mixes, demonstrating its robustness
+custom workload consisting of 100% put operations to specif-             and adaptability under diverse workload conditions.
+ically evaluate write performance. Our evaluation yields the             Write-intensive uniform workload. μTPS’s performance ad-
+following key observations:                                              vantage over BaseKV is less pronounced under write-intensive
+Read-intensive workload. μTPS consistently outperforms                   uniform workload (e.g., 100%-Put-Uniform). For example,
+BaseKV in read-intensive workloads across various item                   with 8B items, μTPS achieves only 3.01% and 11.8% higher
+sizes and index structures. For instance, with a tree-based              throughput than BaseKV when using hash- and tree-based
+
+
+
+                                                                  1108
+Rearchitecting the Thread Model of In-Memory Key-Value Stores with μTPS                                                     SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea
+
+
+                                                       Sherman                  eRPC-KV                          BaseKV                   µTPS-T
+                        60                                60                                                                                  30
+                                 (a) 8B, Tree index                   (b) 64B, Tree index                        (c) 256B, Tree index                      (d) 1KB, Tree index
+Throughput (Mops/s)
+
+
+
+
+                        40                                40                                   40                                                20
+
+                        20                                20                                   20                                                10
+
+                         0                                    0                                    0                                              0
+                             A     B   C    Put-SGet- Put-U       A     B   C    Put-SGet- Put-U             A        B   C     Put-SGet- Put-U       A     B       C     Put-SGet- Put-U
+                                                     U                                    U                                              U                                         U
+
+                                                       RaceHash                 eRPC-KV                          BaseKV                   µTPS-H
+  Throughput (Mops/s)
+
+
+
+
+                                                                                                                                              30
+                                 (e) 8B, hash Index                   (f) 64B, Hash index      60                (g) 256B, Hash index                      (h) 1KB, Hash index
+                        80                                80
+                        60                                60                                   40                                                20
+                        40                                40
+                                                                                               20                                                10
+                        20                                20
+                         0                                    0                                    0                                              0
+                             A     B   C    Put-SGet- Put-U       A     B   C    Put-SGet- Put-U             A        B   C     Put-SGet- Put-U       A     B       C     Put-SGet- Put-U
+                                                     U                                    U                                              U                                         U
+
+Figure 7. μTPS’s overall performance. PUT-S, GET-U, and PUT-U indicate 100% put-skewed, 100% get-uniform, and 100% put-uniform,
+respectively. The top half shows the throughput with MassTree as the index, while the bottom half is with libcuckoo as the index.
+
+indexes, respectively. For put operations, newly received KV                                        15
+                                                                                                                 (a) Scan            (b) ETC, Tree index                (c) ETC, Hash
+items are stored at the receive buffer managed by the cache-                                                      eRPC-KV       60          eRPC-KV          80             eRPC-KV
+                                                                                                                  BaseKV                    BaseKV                          BaseKV
+resident layer. When the memory-resident layer processes                                                          µTPS-T                    µTPS-T           60             µTPS-H
+                                                                                                    10                          40
+the request, it fetches data directly from the receive buffer,                                                                                               40
+which incurs cache misses at the memory-resident layer. This                                                                    20
+                                                                                                       5                                                     20
+results in excessive cache-coherence traffic to the worker
+threads at the cache-resident layer, since data has already been                                                                 0                              0
+                                                                                                       0                              10:9050:5090:10               10:9050:5090:10
+prefetched into the CPU cache by the hardware when they                                                      Scan E                   Read/Write Ratio              Read/Write Ratio
+parse the requests. The cache-coherence traffic significantly
+impacts the efficiency of the cache-resident layer worker                                          Figure 8. (a) Throughput of scan; (b)-(c) Throughput with
+threads, especially with smaller items. In some rare cases,                                        the ETC pool. Scan: scan-only; E: YCSB-E (95%-scan + 5%-put).
+μTPS underperforms eRPC-KV (e.g., with 8B and 64B items),
+since eRPC achieves higher throughput than Reconfigurable
+                                                                                                                          µTPS-T                            µTPS-H
+RPC. It is worth noting that integrating μTPS with eRPC                                                          80
+                                                                                                                          BaseKV                            BaseKV
+                                                                                                    Throughput
+                                                                                                     (Mops/s)
+
+
+
+
+could further improve the performance of eRPC-KV, although                                                       60       uTPS-T                            uTPS-H
+these results are not shown here.                                                                                40
+                                                                                                                 20
+Effects of index type. In general, μTPS achieves greater                                                          0
+                                                                                                                          C12      C19     C31              C12          C19    C31
+performance improvements over BaseKV when using the
+tree-based index. For instance, μTPS-T outperforms BaseKV                                                         Figure 9. Throughput with the Twitter traces.
+by 11.87% to 26.56% with 8B items under different operation                                        Scan. As shown in Figure 8a, we use the YCSB-E workload
+mixes, while μTPS-H outperforms BaseKV by 3.01% to                                                 to evaluate the scan performance of μTPS; the results of
+8.56% (except for 100%-Put-Skew). The reason for this is                                           the scan-only workload are shown in the figure as well. We
+also straightforward – traversing a tree-based index generates                                     set the average range size to 50 and use 8B items to avoid
+more cache misses, creating a larger opportunity for μTPS to                                       network bandwidth bottlenecks. μTPS-T outperforms BaseKV
+optimize cache usage.                                                                              by 33.1% and 25.1%, and outperforms eRPC-KV by 58.9%
+                                                                                                   and 40.5% under the YCSB-E and scan-only workloads,
+Effects of item size. μTPS consistently outperforms BaseKV                                         respectively. Scan-intensive workloads can be regarded as a
+across different item sizes. For read-intensive workloads, the                                     special case of read-intensive workloads, and the results in
+performance gap between μTPS and BaseKV increases as                                               this experiment are highly consistent with the results in the
+the item size grows. For example, with the tree-based index                                        YCSB-B experiments.
+and YCSB-B workload, μTPS-T outperforms BaseKV by
+19.71% with 8B items, and by 43.53% with 1KB items. μTPS                                           5.2.2 Real Workloads. For ETC, we use its default key and
+requires inter-core communication when processing each                                             value size distributions. Value sizes are distributed as follows:
+request, whose overhead is amortized with larger items.                                            1-13 bytes (Zipfian, 40%), 14-300 bytes (Zipfian, 55%), and
+
+
+
+                                                                                            1109
+SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea                                                                                                            Youmin Chen, Jiwu Shu, et al.
+
+
+                                 eRPC-KV         BaseKV         µTPS-H/T                                                              eRPC-KV             BaseKV          µTPS-T/H
+                                                                                                                   80
+
+
+
+
+                                                                                             Throughput (Mops/s)
+                    30
+P50 Latency (µs)
+
+
+                             (a) P50, Tree index           (b) P50, Hash index                                                 (a) 8B                (b) 256B        (c) 8B              (d) 256B
+                                                                                                                   60        Tree index             Tree index     Hash index           Hash index
+                    20
+                                                                                                                   40
+                    10                                                                                             20
+
+                     0                                                                                              0
+                                                                                                                        0        10   20       0    10 20      0    10 20           0    10   20 30
+P99 Latency (µs)
+
+
+
+
+                             (c) P99, Tree index           (d) P99, Hash index                                                                      # of Worker Threads
+                   100
+
+                                                                                             Figure 11. Scalability with varying number of worker threads.
+                    50                                                                       We use the YCSB-A workload.
+
+                     0                                                                                                                     µTPS-T                               µTPS-H
+                                  20         40     0       20     40     60     80                                         80
+
+
+
+
+                                                                                                   Throughput
+                             Throughput (Mops/s)           Throughput (Mops/s)
+
+
+
+
+                                                                                                    (Mops/s)
+                                                                                                                            60
+                                                                                                                            40
+Figure 10. Throughput vs. P50 and P99 latencies by varying                                                                  20
+the number of clients. We use YCSB-A workload and 8B items.                                                                  0
+                                                                                                                                  1   2    4       8 12 16 20        1   2      4   8 12 16 20
+
+                                                                                                                    Figure 12. Effects of Batching. YCSB-A and 8B items.
+larger than 300 bytes (uniform, 5%). For Twitter, we select
+three representative traces.                                                                 We can observe that μTPS exhibits slightly higher median
+                                                                                             latency than BaseKV with the hash index; in other cases, they
+                         Table 1. Details of The selected Twitter traces.                    have very close median or P99 latencies. Overall, the extra
+                                                                                             latency introduced by μTPS is minimal. μTPS uses an all-to-all
+                                        Cluster-12 Cluster-19 Cluster-31                     mapping to direct requests to worker threads at the memory-
+                    Ratio of put           80%            25%          94%                   resident layer, effectively balancing the load among worker
+                   Avg. value size        1030B           101B         15B                   threads without introducing extra queuing delays. Inter-core
+                     Zipf alpha            0.30           0.74          0                    communication itself only introduces ∼100ns latency, and is
+                                                                                             further amortized through batching, making it negligible.
+
+ETC. When evaluating the ETC workload, we set the get                                        5.4 Scalability
+ratio to 10%, 50%, and 90%, respectively. The results are                                    We evaluate μTPS’s scalability by varying the number of
+shown in Figure 8b-c. In general, the performance of all                                     worker threads from 1 to 28 with in increments of 4. We
+compared KVSs shows a similar trend to the skewed YCSB                                       use the YCSB-A workload with 8B and 256B items; both
+workload (e.g., A, B) with 256B items. Specifically, μTPS-T                                  hash- and tree-based indexes are evaluated. The results are
+outperforms BaseKV by 29.1%, 13.0%, and 26.6% under the                                      shown in Figure 11, and we make the following observations.
+10%, 50%, and 90% get ratio, respectively, and outperforms                                   First, when using fewer worker threads, μTPS’s performance
+eRPC-KV by 55.9%, 54.5%, and 67.3%.                                                          is similar to competitors’, or even slightly worse. Using fewer
+Twitter. As shown in Table 1, we select three representa-                                    cores increases the likelihood of load imbalance between
+tive traces from Twitter. Among them, Cluster-12 is skewed                                   the cache-resident and memory-resident layers, as thread
+and write-intensive; Cluster-19 is skewed and read-intensive;                                reallocation is constrained to integer increments. For instance,
+Cluster-31 is write-dominant and uniform. Figure 9 shows the                                 if the ideal core allocation for the cache-resident and memory-
+results: the performance of μTPS is highly consistent with                                   resident layers is 2:5, using only 3 cores would force an actual
+the results under the YCSB and ETC workload. Specifically,                                   allocation of 1:2 instead. μTPS gradually outperforms other
+μTPS-T outperforms BaseKV by 44.5%, 39.8%, and 0.1%,                                         systems as the number of worker threads increases; with more
+and outperforms eRPC-KV by 29.4%, 35.5%, and 39.5%                                           worker threads, μTPS can provide an actual allocation that
+under Cluster-12, Cluster-19, and Cluster-31, respectively.                                  is closer to the ideal case. Meanwhile, μTPS is more robust
+                                                                                             to workload contention and can scale well with more worker
+5.3 Latency                                                                                  threads, while BaseKV suffers from performance decline with
+μTPS introduces additional latency due to the inter-core                                     the hash index and 256B items.
+communication. In this experiment, we evaluate the latency
+of μTPS under the YCSB workload with 8B items. As shown                                      5.5 Ablation Study
+in Figure 10, we increase the number of client threads from 2                                5.5.1 Effects of Batching. μTPS extensively uses batching
+to 64 in increments of 4, and report both the median and 99th                                to amortize the overhead of inter-core communication and
+percentile latencies as a function of the current throughput.                                cache misses. In this experiment, we vary the batch size from
+
+
+
+                                                                                      1110
+Rearchitecting the Thread Model of In-Memory Key-Value Stores with μTPS                                                               SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea
+
+
+                            Skew                            Skew                        Tree index                      size. Under skewed workloads and uniform workloads with
+    100M 0.39 0.43 0.50 0.54 OOM 0.92 1.00 1.00 1.00 OOM 0.54 0.08 0.46 0.08 0.31                                       large item sizes, the auto-tuner assigns almost all cache ways
+           50M 0.43 0.43 0.43 0.57 0.68 0.83 1.00 1.00 1.00 1.00 0.31 0.15 0.31 0.31 0.54                               to the memory-resident layer. However, under the uniform
+Keyspace
+
+
+
+
+           10M 0.32 0.39 0.43 0.50 0.68 1.00 1.00 1.00 1.00 0.92 0.15 0.31                    0    0.23 0.23            workload with small item sizes, fewer cache ways are allocated
+            1M 0.32 0.32 0.36 0.54 0.57 1.00 0.92 1.00 0.92 1.00 0.54 0.08 0.38 0.69 0.08
+                                                                                                                        to the memory-resident layer. This is because assigning more
+                                                                                                                        cache ways does not improve the cache hit rate of the memory-
+      0.1M 0.32 0.29 0.29 0.61 0.68 1.00 0.92 1.00 0.83 0.92 0.69 0.69 0.23 0.15 0.62
+                                                                                                                        resident layer, and instead leads to cache thrashing when cache
+                        Uniform                         Uniform                        Hash index
+                                                                                                                        ways are shared with the cache-resident layer.
+    100M 0.54 0.54 0.61 0.75 OOM 0.42 0.50 1.00 1.00 OOM 0.23                           0     0    0.62 0.46
+                                                                                                                        Cache resize. In Figure 13c, we report the ratio of cached
+           50M 0.54 0.54 0.50 0.75 0.79 0.58 0.58 1.00 0.92 1.00 0.38 0.54 0.15 0.31 0.23
+Keyspace
+
+
+
+
+                                                                                                                        items at the cache-resident layer to the total hot set as we
+           10M 0.43 0.54 0.57 0.75 0.79 0.42 0.83 0.83 0.92 1.00 0.38 0.62 0.38 0.62 0.69
+                                                                                                                        vary skewness and index type. As expected, the number of
+            1M 0.46 0.46 0.54 0.71 0.75 0.58 0.33 1.00 1.00 1.00 0.23 0.46 0.62 0.23 0.62                               cached items shows no clear correlation with skewness, since
+      0.1M 0.32 0.43 0.50 0.68 0.75 0.33 0.50 1.00 1.00 1.00 0.08 0.46                        0    0.15    0            the cache layer is not only used to cache hot items, but also
+                                                                                                                        rebalances the load between the cache-resident and memory-
+                 8B
+                      64B
+                             256B
+                                    512B
+                                           1KB
+
+                                                 8B
+                                                      64B
+                                                             256B
+                                                                    512B
+                                                                           1KB
+
+                                                                                 0.6
+                                                                                       0.7
+                                                                                             0.8
+                                                                                                   0.9
+                                                                                                          0.99
+                                                                                                                        resident layer at a finer granularity.
+                      Item Size                       Item Size                       Skewness
+                 (a) Core Allocation             (b) LLC Allocation               (c) Cache Resize                      Dynamic Workloads In this experiment, we evaluate μTPS’s
+Figure 13. The effectiveness of the auto-tuner. (a)-(b) the                                                             ability to react to dynamic workloads by changing the value
+numbers indicate the ratio of worker threads and the ratio of cache                                                     sizes from 512 bytes to 8 bytes. Figure 14 shows the throughput
+ways assigned to the memory-resident layer, respectively; (c) the                                                       over time. The workload changes at time 4s. Initially, μTPS
+ratio of cached items from the hot set at the cache-resident layer.                                                     does not discover the change in workload and still using
+                                                                                                                        the old configuration. At 4.3s, the auto-tuner detects the
+1 to 20 and evaluate the performance of μTPS under the                                                                  change and starts to reconfigure the system: for each cache
+YCSB-A workload with 8B items. The batch size determines                                                                size, it searches for the optimal thread allocation with a
+the number of requests sent and received by the cache-resident                                                          trisecting approach, and subsequently probes for the optimal
+and memory-resident layer at a time, and also presents the                                                              LLC allocation. The auto-tuner finishes at 5.2s, resulting in
+number of indexing operations processed together. As shown                                                              a 20% increase in throughput. Notably, the system remains
+in Figure 12, batching improves the performance of μTPS-                                                                operational throughout the reconfiguration process, with no
+T and μTPS-H by 51.6% and 93.7%, respectively. μTPS-H                                                                   downtime required.
+is more sensitive to the batch size since the overhead of
+inter-layer communication is more significant.                                                                          6   Related Work
+5.5.2 Effects of Auto-tuner. In this part, we evaluate the                                                              Fast inter-core communication. ffwd [57] is a delegation
+effectiveness of μTPS’s auto-tuner. By default, we use the                                                              system that uses one thread process requests on behalf of
+YCSB-A workload with 8B items and a tree-based index.                                                                   multiple client threads, and thus removes the requirements
+                                                                                                                        of using locks. ffwd achieves fast inter-thread communica-
+Core Allocation.As shown in Figure 13a, we report the                                                                   tion by effectively hiding the latency of interconnect link
+ratio of worker threads assigned to the memory-resident                                                                 between cores. μTPS holds a similar goal of fast inter-core
+layer as we vary the keyspace and item size. We make two                                                                communication, but it is designed for the multi-producer multi-
+observations. First, the auto-tuner assigns more worker threads                                                         consumer scenario. Intel Dynamic Load Balancer (DLB) [5]
+to the memory-resident layer as we increase item size or                                                                is a hardware queue supported by the 4th and 5th generation
+keyspace. A larger item or keyspace increases the overhead                                                              Xeon CPUs, which enables efficient and scalable core-to-core
+of processing each request, requiring more worker threads                                                               communicatio. We believe DLB can further enhance μTPS’s
+in the memory-resident layer for parallel processing. Second,                                                           performance, and we leave this as our future work.
+for the same keyspace and item size, the auto-tuner assigns                                                             Single receive queue. Using a single receive queue to handle
+fewer worker threads to the memory-resident layer when                                                                  incoming packets has received significant attention in recent
+using a skewed workload. This is because the cache-resident                                                             years. ShRing [54] shares each Rx ring among multiple cores
+layer already processes the requests of hot keys, leaving                                                               to avoid the DMA leak problem; Junction [34] supplies per-
+less workload to be processed by the memory-resident layer                                                              core receive queues with a shared buffer queue to minimize
+workers.                                                                                                                buffer memory consumption. μTPS shares the same goal
+LLC allocation. Our offline profiling suggests that allocating                                                          with them of using a smaller receive buffer to avoid cache
+all cache ways to the cache-resident layer and reusing a portion                                                        misses; moreover, a single receive queue also enables flexible
+for the memory-resident layer provides the best performance.                                                            reconfiguration when μTPS reassigns CPU cores.
+In Figure 13b, we report the ratio of cache ways reused by                                                              Userspace core scheduling. Recent operating systems intro-
+the memory-resident layer as we vary the keyspace and item                                                              duced userspace core scheduling to handle microsecond-scale
+
+
+
+                                                                                                                 1111
+SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea                                                                               Youmin Chen, Jiwu Shu, et al.
+
+                                                    Cache resize
+                  YCSB-A               Thread allocation                                   References
+                  Value: 512B to 8B
+                                                                                            [1] The boost c++ libraries. https://theboostcpplibraries.com/boost.
+Throughput
+
+
+
+                  Tree index
+ (Mops/s)
+
+
+
+                                                                                                coroutine/.
+             50              Auto-tuner starts                                              [2] Data plane development kit. https://www.dpdk.org/.
+                              Load change                     Auto-tuner finishes           [3] The go programming language. https://golang.org/.
+             30
+                                                              LLC resize                    [4] Intel data direct i/o technology. https://www.intel.com/content/www/
+             10                                                                                 us/en/io/data-direct-i-o-technology.html.
+                  0          2000            4000           6000           8000             [5] Intel dynamic load balancer. https://www.intel.com/content/www/us/
+             Figure 14. Throughput with workloads change.                                       en/download/686372/intel-dynamic-load-balancer.html.
+                                                                                            [6] Intel optane memory - responsive memory, accelerated perfor-
+tasks. For example, Shinjuku [39] avoids head-of-line block-                                    mance. https://www.intel.com/content/www/us/en/products/details/
+ing by using hardware support for virtualization to preempt                                     memory-storage/optane-memory.html.
+requests as often as every 5 𝜇𝑠. Shenango [53] achieves high                                [7] Intel performance counter monitor (intel pcm). https://github.com/
+                                                                                                intel/pcm.
+CPU efficiency by providing a fast path that reallocates CPU
+                                                                                            [8] Intel rdt software package. https://github.com/intel/intel-cmt-cat.
+cores among applications at very fine granularity. Caladan [35]                             [9] Introduction to cache allocation technology in the intel xeon
+and Arachne [55] further introduce scheduling policies that                                     processor e5 v4 family. https://www.intel.com/content/www/us/
+assign an appropriate number of cores among applications                                        en/developer/articles/technical/introduction-to-cache-allocation-
+and enforce load balancing among CPU cores. These systems                                       technology.html.
+                                                                                           [10] Keydb - the faster redis alternative. https://docs.keydb.dev/.
+can work in conjunction with μTPS to further save CPUs
+                                                                                           [11] Memory-semantic ssd. https://samsungmsl.com/ms-ssd/.
+when the reserved cores is under-saturated.                                                [12] Multi-packet rq.          https://docs.nvidia.com/networking/display/
+RDMA-based KVS. Many recent systems leverage one-sided                                          rdmacore50/multi-packetrq.
+RDMA verbs to build high-performance key-value stores while                                [13] Project voldemort. http://project-voldemort.com/.
+minimizing server-side CPU usage. For instance, FaRM [26]                                  [14] Rdma aware network programming user manual. https://docs.nvidia.
+                                                                                                com/rdma-aware-networks-programming-user-manual-1-7.pdf.
+and Pilaf [51] offload the processing of get operations to clients
+                                                                                           [15] uthreads: Concurrent user threads in c++. https://github.com/
+by issuing multiple read verbs iteratively to locate and retrieve                               samanbarghi/uThreads.
+a KV item; put operations involve extra memory allocation                                  [16] Berk Atikoglu, Yuehai Xu, Eitan Frachtenberg, Song Jiang, and Mike
+and concurrency control and are handled by the server. Recent                                   Paleczny. Workload analysis of a large-scale key-value store. SIGMET-
+KVSs designed specifically for disaggregated memory, such as                                    RICS Perform. Eval. Rev., 40(1):53–64, jun 2012.
+                                                                                           [17] Oana Balmau, Florin Dinu, Willy Zwaenepoel, Karan Gupta, Ravis-
+Sherman [62], SMART [48], and RaceHashing [68], further
+                                                                                                hankar Chandhiramoorthi, and Diego Didona. SILK: Preventing latency
+offload the processing of put operations to clients as well.                                    spikes in Log-Structured merge Key-Value stores. In 2019 USENIX An-
+While they effectively minimize CPU usage, they come at the                                     nual Technical Conference (USENIX ATC 19), pages 753–766, Renton,
+cost of increased network traffic, lower overall performance,                                   WA, July 2019. USENIX Association.
+the requirement of customizing data structures, and higher                                 [18] Rahul Bera, Konstantinos Kanellopoulos, Shankar Balachandran, David
+                                                                                                Novo, Ataberk Olgun, Mohammad Sadrosadati, and Onur Mutlu. Her-
+software overhead on the client side. The threading design
+                                                                                                mes: Accelerating long-latency load requests via perceptron-based
+of μTPS can be broadly applied to systems that require CPU                                      off-chip load prediction. In Proceedings of the 55th Annual IEEE/ACM
+involvement and operate at extremely fast speed.                                                International Symposium on Microarchitecture, MICRO ’22, page 1–18.
+                                                                                                IEEE Press, 2022.
+7        Conclusion                                                                        [19] Shannon Bradshaw, Eoin Brazil, and Kristina Chodorow. MongoDB:
+                                                                                                the definitive guide: powerful and scalable data storage. O’Reilly
+In this work, we presented μTPS, a novel thread architec-                                       Media, 2019.
+ture designed to address the limitations of run-to-completion                              [20] Zhichao Cao, Siying Dong, Sagar Vemuri, and David H.C. Du. Charac-
+designs in in-memory KVS. μTPS separates monolithic run-to-                                     terizing, modeling, and benchmarking RocksDB Key-Value workloads
+completion functions into cache-resident and memory-resident                                    at facebook. In 18th USENIX Conference on File and Storage Tech-
+                                                                                                nologies (FAST 20), pages 209–223, Santa Clara, CA, February 2020.
+stages, enabling finer-grained optimization for each. Comple-                                   USENIX Association.
+mented by advanced techniques such as reconfigurable RPCs,                                 [21] Badrish Chandramouli, Guna Prasaad, Donald Kossmann, Justin Levan-
+resizable caching, and an integrated auto-tuner, μTPS offers                                    doski, James Hunter, and Mike Barnett. Faster: A concurrent key-value
+improved schedulability and performance.                                                        store with in-place updates. In Proceedings of the 2018 International
+                                                                                                Conference on Management of Data, SIGMOD ’18, page 275–290,
+                                                                                                New York, NY, USA, 2018. Association for Computing Machinery.
+Acknowledgments                                                                            [22] Brian F. Cooper, Adam Silberstein, Erwin Tam, Raghu Ramakrishnan,
+We thank the anonymous reviewers and our shepherd, Atul                                         and Russell Sears. Benchmarking cloud serving systems with ycsb. In
+Adya, for their insightful comments. This work is supported                                     Proceedings of the 1st ACM Symposium on Cloud Computing, SoCC ’10,
+                                                                                                page 143–154, New York, NY, USA, 2010. Association for Computing
+by the National Key R&D Program of China (Grant No.                                             Machinery.
+2022YFB4500302), National Natural Science Foundation of                                    [23] Graham Cormode and Shan Muthukrishnan. An improved data stream
+China (Grant No. U22B2023, 62202255), and SJTU-Huawei                                           summary: the count-min sketch and its applications. Journal of Algo-
+Explore X Program. Corresponding author: Youmin Chen                                            rithms, 55(1):58–75, 2005.
+(chenyoumin@sjtu.edu.cn).
+
+
+
+                                                                                    1112
+Rearchitecting the Thread Model of In-Memory Key-Value Stores with μTPS                                   SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea
+
+
+[24] Debendra Das Sharma, Robert Blankenship, and Daniel Berger. An                          June 2016. USENIX Association.
+     introduction to the compute express link (cxl) interconnect. ACM                   [42] Anuj Kalia, Michael Kaminsky, and David G. Andersen. FaSST: Fast,
+     Comput. Surv., 56(11), July 2024.                                                       scalable and simple distributed transactions with Two-Sided (RDMA)
+[25] Siying Dong, Andrew Kryczka, Yanqin Jin, and Michael Stumm.                             datagram RPCs. In 12th USENIX Symposium on Operating Systems
+     Rocksdb: Evolution of development priorities in a key-value store                       Design and Implementation (OSDI 16), pages 185–201, Savannah, GA,
+     serving large-scale applications. ACM Trans. Storage, 17(4), October                    November 2016. USENIX Association.
+     2021.                                                                              [43] Kornilios Kourtis, Nikolas Ioannou, and Ioannis Koltsidas. Reaping
+[26] Aleksandar Dragojević, Dushyanth Narayanan, Orion Hodson, and                           the performance of fast nvm storage with udepot. In Proceedings of the
+     Miguel Castro. Farm: Fast remote memory. In Proceedings of the 11th                     17th USENIX Conference on File and Storage Technologies, FAST’19,
+     USENIX Conference on Networked Systems Design and Implementation,                       page 1–15, USA, 2019. USENIX Association.
+     NSDI’14, page 401–414, USA, 2014. USENIX Association.                              [44] Avinash Lakshman and Prashant Malik. Cassandra: a decentralized
+[27] Aleksandar Dragojević, Dushyanth Narayanan, Edmund B. Nightingale,                      structured storage system. SIGOPS Oper. Syst. Rev., 44(2):35–40, April
+     Matthew Renzelmann, Alex Shamis, Anirudh Badam, and Miguel                              2010.
+     Castro. No compromises: Distributed transactions with consistency,                 [45] Baptiste Lepers, Oana Balmau, Karan Gupta, and Willy Zwaenepoel.
+     availability, and performance. In Proceedings of the 25th Symposium                     Kvell: the design and implementation of a fast persistent key-value store.
+     on Operating Systems Principles, SOSP ’15, page 54–70, New York,                        In Proceedings of the 27th ACM Symposium on Operating Systems
+     NY, USA, 2015. Association for Computing Machinery.                                     Principles, SOSP ’19, page 447–461, New York, NY, USA, 2019.
+[28] Bin Fan, David G. Andersen, and Michael Kaminsky. MemC3: Compact                        Association for Computing Machinery.
+     and concurrent memcache with dumber caching and smarter hashing.                   [46] Bojie Li, Zhenyuan Ruan, Wencong Xiao, Yuanwei Lu, Yongqiang
+     In Proc. 10th USENIX NSDI, Lombard, IL, April 2013.                                     Xiong, Andrew Putnam, Enhong Chen, and Lintao Zhang. Kv-direct:
+[29] Alireza Farshin, Amir Roozbeh, Gerald Q. Maguire Jr., and Dejan Kostić.                 High-performance in-memory key-value store with programmable nic.
+     Reexamining direct cache access to optimize I/O intensive applications                  In Proceedings of the 26th Symposium on Operating Systems Principles,
+     for multi-hundred-gigabit networks. In 2020 USENIX Annual Technical                     SOSP ’17, page 137–152, New York, NY, USA, 2017. Association for
+     Conference (USENIX ATC 20), pages 673–689. USENIX Association,                          Computing Machinery.
+     July 2020.                                                                         [47] Hyeontaek Lim, Dongsu Han, David G. Andersen, and Michael Kamin-
+[30] Alireza Farshin, Amir Roozbeh, Gerald Q. Maguire, and Dejan Kostić.                     sky. Mica: A holistic approach to fast in-memory key-value storage. In
+     Make the most out of last level cache in intel processors. In Proceedings               Proceedings of the 11th USENIX Conference on Networked Systems
+     of the Fourteenth EuroSys Conference 2019, EuroSys ’19, New York,                       Design and Implementation, NSDI’14, page 429–444, USA, 2014.
+     NY, USA, 2019. Association for Computing Machinery.                                     USENIX Association.
+[31] Roy T. Fielding and Gail Kaiser. The apache http server project. IEEE              [48] Xuchuan Luo, Pengfei Zuo, Jiacheng Shen, Jiazhen Gu, Xin Wang,
+     Internet Computing, 1(4):88–90, 1997.                                                   Michael R. Lyu, and Yangfan Zhou. SMART: A High-Performance
+[32] Brad Fitzpatrick. Distributed caching with memcached. Linux journal,                    adaptive radix tree for disaggregated memory. In 17th USENIX Sym-
+     2004(124):5, 2004.                                                                      posium on Operating Systems Design and Implementation (OSDI 23),
+[33] Keir Fraser. Practical lock-freedom. Technical report, University of                    pages 553–571, Boston, MA, July 2023. USENIX Association.
+     Cambridge, Computer Laboratory, 2004.                                              [49] Yandong Mao, Eddie Kohler, and Robert Tappan Morris. Cache
+[34] Joshua Fried, Gohar Irfan Chaudhry, Enrique Saurez, Esha Choukse,                       craftiness for fast multicore key-value storage. In Proceedings of the
+     Inigo Goiri, Sameh Elnikety, Rodrigo Fonseca, and Adam Belay. Making                    7th ACM European Conference on Computer Systems, EuroSys ’12,
+     kernel bypass practical for the cloud with junction. In 21st USENIX                     page 183–196, New York, NY, USA, 2012. Association for Computing
+     Symposium on Networked Systems Design and Implementation (NSDI                          Machinery.
+     24), pages 55–73, Santa Clara, CA, April 2024. USENIX Association.                 [50] Alexander Merritt, Ada Gavrilovska, Yuan Chen, and Dejan Milojicic.
+[35] Joshua Fried, Zhenyuan Ruan, Amy Ousterhout, and Adam Belay.                            Concurrent log-structured memory for many-core key-value stores.
+     Caladan: Mitigating interference at microsecond timescales. In Pro-                     Proc. VLDB Endow., 11(4):458–471, December 2017.
+     ceedings of the 14th USENIX Conference on Operating Systems Design                 [51] Christopher Mitchell, Yifeng Geng, and Jinyang Li. Using One-Sided
+     and Implementation, pages 281–297, 2020.                                                RDMA reads to build a fast, CPU-Efficient Key-Value store. In 2013
+[36] Lars George. HBase: The Definitive Guide. O’Reilly Media, Inc, 2011.                    USENIX Annual Technical Conference (USENIX ATC 13), pages 103–
+[37] Dongxu Huang, Qi Liu, Qiu Cui, Zhuhe Fang, Xiaoyu Ma, Fei Xu,                           114, San Jose, CA, June 2013. USENIX Association.
+     Li Shen, Liu Tang, Yuxing Zhou, Menglong Huang, Wan Wei, Cong Liu,                 [52] Michael A Olson, Keith Bostic, and Margo I Seltzer. Berkeley db. In
+     Jian Zhang, Jianjun Li, Xuelian Wu, Lingyu Song, Ruoxi Sun, Shuaipeng                   USENIX Annual Technical Conference, FREENIX Track, pages 183–191,
+     Yu, Lei Zhao, Nicholas Cameron, Liquan Pei, and Xin Tang. Tidb:                         1999.
+     a raft-based htap database. Proc. VLDB Endow., 13(12):3072–3084,                   [53] Amy Ousterhout, Joshua Fried, Jonathan Behrens, Adam Belay, and
+     August 2020.                                                                            Hari Balakrishnan. Shenango: Achieving high cpu efficiency for latency-
+[38] RMI Java. Java remote method invocation. Sun Microsystems Inc, 2010.                    sensitive datacenter workloads. In NSDI, volume 19, pages 361–378,
+[39] Kostis Kaffes, Timothy Chong, Jack Tigar Humphries, Adam Belay,                         2019.
+     David Mazières, and Christos Kozyrakis. Shinjuku: Preemptive sched-                [54] Boris Pismenny, Adam Morrison, and Dan Tsafrir. ShRing: Networking
+     uling for 𝜇second-scale tail latency. In 16th USENIX Symposium                          with shared receive rings. In 17th USENIX Symposium on Operating
+     on Networked Systems Design and Implementation (NSDI 19), pages                         Systems Design and Implementation (OSDI 23), pages 949–968, Boston,
+     345–360, 2019.                                                                          MA, July 2023. USENIX Association.
+[40] Anuj Kalia, Michael Kaminsky, and David Andersen. Datacenter RPCs                  [55] Henry Qin, Qian Li, Jacqueline Speiser, Peter Kraft, and John Ousterhout.
+     can be general and fast. In 16th USENIX Symposium on Networked                          Arachne: Core-Aware thread management. In 13th USENIX Symposium
+     Systems Design and Implementation (NSDI 19), pages 1–16, Boston,                        on Operating Systems Design and Implementation (OSDI 18), pages
+     MA, February 2019. USENIX Association.                                                  145–160, Carlsbad, CA, October 2018. USENIX Association.
+[41] Anuj Kalia, Michael Kaminsky, and David G. Andersen. Design guide-                 [56] Ziyue Qiu, Juncheng Yang, Juncheng Zhang, Cheng Li, Xiaosong Ma,
+     lines for high performance RDMA systems. In 2016 USENIX Annual                          Qi Chen, Mao Yang, and Yinlong Xu. Frozenhot cache: Rethinking cache
+     Technical Conference (USENIX ATC 16), pages 437–450, Denver, CO,                        management for modern hardware. In Proceedings of the Eighteenth
+
+
+
+
+                                                                                 1113
+SOSP ’25, October 13–16, 2025, Seoul, Republic of Korea                                                                         Youmin Chen, Jiwu Shu, et al.
+
+
+     European Conference on Computer Systems, EuroSys ’23, page 557–573,            [63] Qing Wang, Youyou Lu, Jing Wang, and Jiwu Shu. Replicating per-
+     New York, NY, USA, 2023. Association for Computing Machinery.                       sistent memory Key-Value stores with efficient RDMA abstraction. In
+[57] Sepideh Roghanchi, Jakob Eriksson, and Nilanjana Basu. ffwd: del-                   17th USENIX Symposium on Operating Systems Design and Implemen-
+     egation is (much) faster than you think. In Proceedings of the 26th                 tation (OSDI 23), pages 441–459, Boston, MA, July 2023. USENIX
+     Symposium on Operating Systems Principles, SOSP ’17, page 342–358,                  Association.
+     New York, NY, USA, 2017. Association for Computing Machinery.                  [64] Matt Welsh, David Culler, and Eric Brewer. Seda: an architecture for
+[58] Raj Srinivasan and RPC RFC1831. Remote procedure call protocol                      well-conditioned, scalable internet services. SIGOPS Oper. Syst. Rev.,
+     specification version 2. Sun Microsystems, August, 1995.                            35(5):230–243, October 2001.
+[59] Akshitha Sriraman and Thomas F. Wenisch. µtune: auto-tuned threading           [65] Juncheng Yang, Yao Yue, and K. V. Rashmi. A large scale analysis
+     for oldi microservices. In Proceedings of the 13th USENIX Conference                of hundreds of in-memory cache clusters at twitter. In 14th USENIX
+     on Operating Systems Design and Implementation, OSDI’18, page                       Symposium on Operating Systems Design and Implementation (OSDI
+     177–194, USA, 2018. USENIX Association.                                             20), pages 191–208. USENIX Association, nov 2020.
+[60] Jing Wang, Youyou Lu, Qing Wang, Minhui Xie, Keji Huang, and Jiwu              [66] Suli Yang, Jing Liu, Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-
+     Shu. Pacman: An efficient compaction approach for Log-Structured Key-               Dusseau. Principled schedulability analysis for distributed storage
+     Value store on persistent memory. In 2022 USENIX Annual Technical                   systems using thread architecture models. In Proceedings of the 13th
+     Conference (USENIX ATC 22), pages 773–788, Carlsbad, CA, July                       USENIX Conference on Operating Systems Design and Implementation,
+     2022. USENIX Association.                                                           OSDI’18, page 161–176, USA, 2018. USENIX Association.
+[61] Qing Wang, Youyou Lu, Junru Li, and Jiwu Shu. Nap: A Black-Box                 [67] Yifan Yuan, Mohammad Alian, Yipeng Wang, Ren Wang, Ilia Kurakin,
+     approach to NUMA-Aware persistent memory indexes. In 15th USENIX                    Charlie Tai, and Nam Sung Kim. Don’t forget the i/o when allocating
+     Symposium on Operating Systems Design and Implementation (OSDI                      your llc. In Proceedings of the 48th Annual International Symposium
+     21), pages 93–111. USENIX Association, July 2021.                                   on Computer Architecture, ISCA ’21, page 112–125. IEEE Press, 2021.
+[62] Qing Wang, Youyou Lu, and Jiwu Shu. Sherman: A write-optimized                 [68] Pengfei Zuo, Jiazhao Sun, Liu Yang, Shuangwu Zhang, and Yu Hua.
+     distributed b+tree index on disaggregated memory. In Proceedings of                 One-sided RDMA-Conscious extendible hashing for disaggregated
+     the 2022 International Conference on Management of Data, SIGMOD                     memory. In 2021 USENIX Annual Technical Conference (USENIX ATC
+     ’22, page 1033–1048, New York, NY, USA, 2022. Association for                       21), pages 15–29. USENIX Association, July 2021.
+     Computing Machinery.
+
+
+
+
+                                                                             1114
+

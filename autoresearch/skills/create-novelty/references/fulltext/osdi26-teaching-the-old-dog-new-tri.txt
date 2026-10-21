@@ -1,0 +1,1226 @@
+Teaching The Old Dog New Tricks: Building Efficient
+  Data Pipelines for Large-Scale LLM Pre-training
+              (Operational Systems)
+ Luofan Chen and Chenhan Wang, University of Science and Technology of China
+ and ByteDance Seed; Weidong Zhang, Jinxin Chi, Hequan Zhang, Zanbo Wang,
+  Chenyuan Wang, Lishu Luo, Sijin Wu, Junqi Hu, Jun Wang, and Cheng Chen,
+ ByteDance Seed; Lixin Huang, Liyang Zhao, Yong Tian, and Jun Guo, ByteDance;
+    Youhui Bai, University of Science and Technology of China; Wencong Xiao,
+ ByteDance Seed; Kang Chen, Tsinghua University; Cheng Li, University of Science
+and Technology of China and Institute of Artificial Intelligence, Hefei Comprehensive
+                              National Science Center
+           https://www.usenix.org/conference/osdi26/presentation/chen-luofan
+
+
+
+  This paper is included in the Proceedings of the 20th USENIX
+ Symposium on Operating Systems Design and Implementation.
+                        July 13–15, 2026 • Seattle, WA, USA
+                                ISBN 978-1-939133-55-7
+
+
+            Open access to the Proceedings of the 20th USENIX Symposium on
+             Operating Systems Design and Implementation is sponsored by
+          Teaching The Old Dog New Tricks: Building Efficient Data Pipelines for
+                  Large-Scale LLM Pre-training (Operational Systems)
+    Luofan Chen1,2∗† Chenhan Wang1,2∗† Weidong Zhang2‡ Jinxin Chi2 Hequan Zhang2 Zanbo Wang2
+             Chenyuan Wang2 Lishu Luo2 Sijin Wu2 Junqi Hu2 Jun Wang2 Cheng Chen2
+                    Lixin Huang3 Liyang Zhao3 Yong Tian3 Jun Guo3 Youhui Bai1‡
+                                Wencong Xiao2 Kang Chen4 Cheng Li1,5
+                                1 University of Science and Technology of China               2 ByteDance Seed
+                                                        3 ByteDance   4 Tsinghua University
+                       5 Institute of Artificial Intelligence, Hefei Comprehensive National Science Center
+
+                               Abstract                                 FLOPs Utilization (MFU) [6]. However, the data pipelines
+                                                                        responsible for loading, transforming, and delivering exabytes
+Data pipelines play a critical role in the performance of large-
+                                                                        of training data have received significantly less scrutiny.
+scale pre-training jobs running on thousands of GPUs. In
+this work, we present a comprehensive quantitative analy-                  This oversight is critical because the data pipeline is no
+sis of data access patterns from production workloads and               longer a passive utility. It is a primary performance deter-
+reveal three previously underreported bottlenecks. First, cross-        minant. In this paper, we present a comprehensive anal-
+datacenter (cross-DC) traffic emerges as a major source of la-          ysis of data access patterns from production pre-training
+tency when evaluating in-training models using remote check-            workloads. Our environment manages tasks ranging from
+points. Second, checkpoint loading during startup phases fre-           billion-parameter text models to trillion-parameter multi-
+quently suffers from I/O contention that delays job initial-            modal models. We rely on the Hadoop Distributed File Sys-
+ization. Third, data transformation during loading becomes              tem (HDFS) [47] as our storage backbone due to its cost-
+a significant and CPU-intensive bottleneck for multimodal               effectiveness and capacity to hold exabytes of data.
+models. Guided by these findings, we introduce three op-                   We analyze 30 thousand training job traces collected over a
+timizations: global-namespace-based predictive checkpoint               90-day period to characterize the interaction between modern
+replication, proactive hot-file replication, and offloading data        pre-training jobs and traditional storage architectures. Our
+transformation to storage-tier CPU resources. Crucially, we             analysis reveals three distinct bottlenecks that arise when
+demonstrate that these optimizations are not system-specific            general-purpose storage systems confront the extreme scale
+but address fundamental architectural mismatches in the LLM             of large model training.
+era. They are broadly applicable to both legacy and modern                 First, we identify a Cross-DC Latency Trap. To ensure
+storage systems, offering a high-return path to upgrade in-             model quality, production training runs rely on companion
+frastructure with minimal engineering intrusion. Together,              evaluation, an out-of-band validation pipeline that periodi-
+these techniques reduce wasted GPU hours per evaluation                 cally loads recent checkpoints and runs benchmark suites in
+from 16,800 to 4,000, shorten checkpoint loading time at                parallel with training. Because evaluation jobs have different
+each training start by 40.8%, and reduce training stalls caused         scheduling and hardware requirements from training, they
+by data loading by 63.2%.                                               often run in remote datacenters. We find that fetching check-
+                                                                        point shards across the Wide Area Network is bound by the
+                                                                        Round-Trip Time of thousands of small tensor reads rather
+1     Introduction                                                      than available bandwidth. This latency dominance results in
+                                                                        severe delays and wastes millions of GPU hours.
+The training of foundation models has shifted the center of                Second, we observe an Initialization I/O Storm. Large-scale
+gravity in systems infrastructure [1, 7, 13, 18, 25, 56]. Training      training involves frequent restarts due to debugging or fail-
+models with over 100 billion parameters now requires the                ures [4,51, 57]. Job initialization triggers a synchronous surge
+coordination of thousands of GPUs across massive clusters for           of read operations where thousands of workers contend for a
+extended periods. The systems community has aggressively                small set of hot files, such as global metadata and shared em-
+optimized compute scheduling [15, 16, 24, 34, 40, 46, 59, 60]           bedding parameters. This contention saturates storage nodes
+and network collectives [10, 20, 41, 55] to maximize Model              and creates tail latencies that block the entire cluster.
+    ∗ Equal contribution.                                                  Third, we encounter a Transformation Wall in multimodal
+    † Work done during internships at ByteDance Seed.                   training. Unlike text-only models, multimodal training in-
+    ‡ Corresponding authors.                                            volves CPU-intensive transformations like video and image
+
+
+
+USENIX Association                                  20th USENIX Symposium on Operating Systems Design and Implementation           349
+decoding. We show that host CPUs on training nodes cannot          Training          Step 1         Step 2               Step 200
+keep pace with GPU consumption. This shifts the bottleneck              Initialize    FW       BW    FW      BW           FW        BW
+from storage I/O to local compute and causes significant              CKPT           Token Logits Token Logits           Token Logits CKPT
+pipeline stalls.
+                                                                                                        Data Loader
+   We argue that these bottlenecks persist because storage
+systems operate reactively while training workloads are in-                          Data           Data                 Data
+
+herently deterministic. To address this, we introduce three                                     Storage (HDFS)
+software-defined optimizations that expose application-level
+patterns to the storage layer.                                               CKPT        Safetensor Safetensor Shards     Eval Sets
+
+• Predictive Checkpoint Replication. We leverage the regu-                           Convert                 Reshard        Evaluate
+
+  lar schedule of evaluation jobs to replicate checkpoints and     Companion Evaluation
+  prioritize urgent feedback signals. This reduces companion
+  evaluation I/O time by 76.1%.                                                Figure 1: Data Pipeline in Pre-training
+• Proactive Hotspot Prediction. We implement a coopera-
+  tive mechanism where the training framework signals hot
+  files to the storage system before execution. The storage       our storage infrastructure, because it was the existing, cost-
+  layer proactively replicates these files to diffuse the I/O     effective infrastructure capable of holding exabytes of data.
+  storm. This reduces checkpoint loading time by 40.8%.           As shown in Figure 1, the pipeline consists of two primary
+• Storage-Side Transformation Offloading. We utilize un-          components: a storage tier and a dataloader.
+  derutilized CPUs on storage nodes to perform data process-          The storage tier persists all artifacts required during pre-
+  ing. This Just-in-Time mechanism pipelines transformation       training, including training datasets, model checkpoints, and
+  with training and reduces data loading stalls by 63.2%.         logits. Training datasets encompass heterogeneous modali-
+                                                                  ties such as text, images, and videos. Checkpoints contain
+   Our work demonstrates that legacy Big Data systems like
+                                                                  metadata together with sharded tensors for model parame-
+HDFS can meet the rigorous demands of exabyte-scale large
+                                                                  ters and optimizer states [21] and serve as the authoritative
+model training without requiring a complete architectural
+                                                                  record of training progress. Logits capture the raw, unnor-
+replacement. Our contributions are as follows:
+                                                                  malized prediction vectors emitted after each forward pass,
+1. We characterize pre-training data access patterns using pro-   which are typically not used during training but are essential
+   duction traces and identify three key bottlenecks that have    for debugging and monitoring model behavior.
+   long been overlooked: cross-DC latency traps for compan-           The dataloader sits between storage and the training frame-
+   ion evaluation, synchronous initialization I/O storms, and     work. It transforms raw data into the formats expected by the
+   the multimodal transformation wall.                            model and coordinates data movement through CPU memory
+2. We propose software-defined optimizations leveraging           onto GPUs. The transformation operations include compu-
+   workload determinism, including predictive checkpoint          tationally intensive steps such as video and image decoding,
+   replication to mask latency, proactive hot-file replication    spatial resizing for vision inputs, tokenization and sequence
+   to diffuse contention, and storage-side offloading for CPU-    packing for text data [30, 33]. The dataloader thus acts as
+   intensive transformations. These optimizations substan-        both a transformation engine and a staging mechanism that
+   tially reduce wasted training time and improve overall         prepares and pipelines data efficiently to the accelerator stack.
+   efficiency.                                                        Pre-training jobs interact with the data pipeline through
+3. We demonstrate that these optimizations serve as a general-    two I/O paths. They issue direct reads and writes to the stor-
+   izable framework for addressing architectural mismatches       age tier when initializing from checkpoints, persisting check-
+   in the LLM era. By bridging the gap between infrastructure     points, and emitting logits. In parallel, they obtain training
+   and training, we provide a practical blueprint for evolving    data through the dataloader, which performs storage reads and
+   general storage to meet LLM demands. We validate these         executes sample transformation. Together, these interactions
+   findings in a production environment and plan to release       define the steady state and bursty I/O patterns imposed on the
+   the anonymized traces to support future research.              storage subsystem.
+                                                                      We characterize pre-training execution as consisting of
+2     Background and Motivation                                   three phases: initialization, iterative training, and compan-
+                                                                  ion evaluation, each with different data access behaviors.
+2.1    Pre-training Data Pipeline                                     During the initialization phase, the training framework
+                                                                  issues blocking operations on the critical path. Specifically,
+We present the data pipeline architecture that supports pre-      it loads the full model checkpoint, including parameters and
+training jobs on thousands to tens of thousands of GPUs           optimizer states, from the storage tier. These tensors are
+in our production environment. We choose HDFS [47] as             distributed or replicated across thousands of ranks, i.e., the
+
+
+
+350    20th USENIX Symposium on Operating Systems Design and Implementation                                            USENIX Association
+        1                                   1                             text-only and multimodal workloads.
+      0.8                                 0.8                           • Scale: The tasks range from small (billions-parameter) to
+      0.6                                 0.6
+CDF
+
+
+
+
+                                    CDF
+                                                                          large (trillion-parameter) models, utilizing training cluster
+      0.4                                 0.4
+                                                                          sizes between approximately 4K and 20K GPUs.
+      0.2                                 0.2
+                                                                        • Training strategy: We incorporate diverse distributed
+        0                                   0
+         1B   1K      1M 1G    1T            1B   1K      1M 1G    1T     strategies, including FSDP [59], FSDP2 [37], and Mega-
+                   File Size                           File Size          tron [46], which constitute the dominant paradigms in our
+          (a) T-L Dataset                    (b) MM-L Dataset             training environment.
+                                                                           To characterize these workloads, we employ a multi-
+Figure 2: The file size distribution in datasets used in T-L and        layered tracing approach that spans both the training frame-
+MM-L traces.                                                            work and the storage layer. At the storage layer, we collect
+                                                                        per-operation records from HDFS client and server endpoints,
+                                                                        including the access path, operation type (e.g., open, read,
+worker processes participating in distributed training that typi-
+                                                                        pread, write, and close), request size, start and end times-
+cally own one GPU each, according to the adopted paralleliza-
+                                                                        tamps, and observed latency. At the training layer, we use Py-
+tion strategy [40, 46, 59].
+                                                                        Torch Profiler [38] and manual instrumentation to record the
+   After initialization, the job enters the iterative training
+                                                                        start and end times of major phases, including checkpoint load-
+phase, which executes a sequence of training steps. We define
+                                                                        ing and saving, dataloader fetch and transformation, forward
+a step as the processing of a full batch of data, culminating
+                                                                        and backward computation, logits saving, and companion-
+in a single model parameter update after the necessary for-
+                                                                        evaluation merge and resharding. We then join these records
+ward and backward passes. During this phase, storage access
+                                                                        using timestamps to distinguish raw storage service time from
+proceeds largely asynchronously with GPU computation. The
+                                                                        framework-visible end-to-end latency, which is necessary for
+dataloader continuously prefetches and transforms data for
+                                                                        interpreting the data loading measurements in Table 2. We
+future steps, while the training framework writes logits after
+                                                                        will release the traces once anonymized.
+every forward pass and periodically persists checkpoints to
+storage. These activities generate sustained read and write
+traffic throughout the training run.                                    2.2.2   Data Types
+   The companion evaluation phase runs periodically in par-             Based on our sampled traces, we classify the data flowing
+allel with iterative training on separate evaluation clusters, as       through the pipeline into three primary types: datasets, check-
+evaluation usually imposes different scheduling and resource            points, and logits. Table 2 quantifies the distinct I/O patterns,
+needs compared to training. Since training metrics such as              including average I/O sizes per training host, average I/O la-
+loss are often insufficient to detect issues such as quality degra-     tency, and I/O frequency, exhibited by each type across our
+dation or model collapse, companion evaluation provides an              production workloads.
+external measurement of progress by assessing the model on a            Dataset: During each training step, the dataloader retrieves
+recent checkpoint and on data that is distinct from the training        part of the dataset from storage, transforms each sample into
+set (i.e., real-world benchmarks [14, 26, 27]). Each evaluation         model-ready tensors through operations like decoding, crop-
+cycle loads the latest checkpoint from storage, merges the              ping and tokenization, and feeds the result to the GPU for
+sharded tensors into unified formats, and then loads both the           computation. The modality of the model significantly influ-
+merged checkpoint and benchmark suites, before executing                ences the characteristics of the dataset. For instance, in the
+inference and writing the results back to storage. Although             text-based T-L training task, the dataset occupies approxi-
+logically separate from training, the results of companion              mately 20 TB across 20K files. In contrast, the multimodal
+evaluation can feed back to the training control plane and              MM-L task employs a vastly larger dataset containing di-
+trigger a rollback.                                                     verse file types, with a total size of about 6 PB and a file
+                                                                        count exceeding 3 million. Figure 2 illustrates the file size
+2.2      Data in Pre-training                                           distribution for these datasets. Table 2 reports the end-to-end
+                                                                        data loading latency, which includes both the retrieval and the
+2.2.1     Traces                                                        transformation steps; we further break this down in Section 5.
+                                                                        Checkpoint data: A training checkpoint consists of model
+To investigate I/O access patterns, we select a set of five repre-
+                                                                        parameters, optimizer states, dataloader states, and miscella-
+sentative training tasks from a pool of 30 thousand traces col-
+                                                                        neous metadata. At regular intervals (e.g., every 100 or 500
+lected over a 90-day period. As detailed in Table 1, these tasks
+                                                                        steps), this checkpoint data is persisted to the underlying stor-
+exemplify state-of-the-art production workloads, accounting
+                                                                        age system to ensure fault tolerance [29, 50]. We detail the
+for 70% of total GPU hours while capturing diversity in:
+                                                                        checkpoint sizes for the sampled traces in Table 1. The trace-
+• Modality: We cover mainstream training domains spanning               level view in Table 2 further shows per-host checkpoint read
+
+
+
+USENIX Association                                 20th USENIX Symposium on Operating Systems Design and Implementation             351
+Table 1: Model training strategies, types, and checkpoint sizes of the representative trials sampled for this study. Each trial runs
+on a production cluster with thousands of GPUs.
+
+                           Trace                                  Strategy         Type         Checkpoint Size
+                           Text Small (T-S)                        FSDP2          Text               ≈1 - 5 TB
+                           Text Large (T-L)                       Megatron        Text               ≈5 - 10 TB
+                           MultiModal Small (MM-S)                 FSDP         Multimodal           ≈1 - 5 TB
+                           Multimodal Large (MM-L)                 FSDP2        Multimodal           ≈1 - 5 TB
+                           Multimodal Omni (MM-O)                  FSDP         Multimodal           ≈5 - 10 TB
+
+Table 2: Average I/O size, latency, and interval statistics. Values represent the average size per training host. Each metric reports
+the end-to-end data pipeline latency observed by the training framework. The symbol ’–’ indicates data is unavailable because
+the feature was disabled during model training.
+
+                 Read checkpoint               Data loading                  Save checkpoint                   Save logits         Step
+      Trace        Size       Lat       Size      Lat   Interval      Size       Lat      Interval      Size     Lat    Interval   Time
+                  (GB)        (s)      (GB)       (s)    (step)      (GB)        (s)       (step)      (GB)      (s)     (step)     (s)
+      T-S         688       137.58  0.01         5.77         1      11.21      56.27         500        –        –          –     14.03
+      T-L       606.57      109.79 0.009         5.51         1       7.03      25.74         200      1.99     2.96         1      8.27
+      MM-S      351.27      300.33* 0.05         8.64         1       1.40      106.83        200        –        –          –     19.20
+      MM-L       373.81     139.25  0.02         5.29         1       5.84      68.31         200      0.18     2.34         1     18.17
+      MM-O      1133.63     106.83  0.01         6.16         1      13.93     128.605        200        –        –          –     14.39
+      * Denotes that this data is obtained before predictive hotspot prediction (Section 4)
+
+
+
+
+and save sizes, which differ substantially due to deduplicated               IO latency trap” where fetching thousands of small tensors
+writes; Section 4 explains the source of this asymmetry in                   is bound by WAN RTT rather than bandwidth, and severe
+detail.                                                                      bandwidth contention from concurrent background tasks. To
+Logits data: Logits represent the raw, unnormalized predic-                  mitigate these issues, we introduce Predictive Checkpoint
+tion vectors output by the final layer on each rank. Depend-                 Replication, which leverages the regular evaluation interval
+ing on the model configuration, this results in approximately                to pipeline and batch checkpoint replication in advance, and
+30 MB to 300 MB of data. Unlike checkpoints, which are                       Signal-Driven Prioritization, which allocates bandwidth to
+required for fault tolerance, logits are mainly persisted for de-            urgent evaluations triggered by training anomalies.
+bugging and monitoring. Developers optionally enable logits                  2. The initialization I/O storm (§4). The initialization phase
+saving during phases such as early training, configuration up-               is bottlenecked by an “I/O storm” where synchronous check-
+dates, or divergence diagnosis, while stable steady-state runs               point loading triggers massive data contention on a small set
+often disable it to conserve I/O bandwidth. When enabled,                    of hot files (e.g., global metadata and replicated parameters).
+logits are generated after every forward pass and persisted at               This contention saturates storage nodes, creating straggler
+every step.                                                                  reads that block the entire cluster and waste significant GPU
+                                                                             cycles. To resolve this, we introduce Proactive Hotspot Predic-
+                                                                             tion, a cooperative mechanism where the training framework
+2.3    Emerging Storage Challenges
+                                                                             explicitly signals deterministic access patterns to the stor-
+During pre-training, distinct data types are accessed at specific            age layer. This allows the system to pre-replicate hot files
+phases of the lifecycle, often generating I/O operations that                before the job starts, diffusing contention and converting un-
+consume a significant portion of the total timeline. In this                 predictable tail latency into constant-time access.
+paper, we characterize the unique I/O bottlenecks inherent to                3. The transformation wall (§5). For multimodal (e.g., MM-
+each distinct phase and present our production mechanisms                    L) pre-training, data loading shifts from being I/O-bound to
+to address them.                                                             compute-bound due to the high cost of transforming video
+1. Cross-DC I/O in companion evaluation (§3). Companion                      and image data (e.g., decoding, cropping). This “transforma-
+evaluation is critical for validating pre-training models, but is            tion wall” creates severe straggler issues where slow host-side
+bottlenecked by the need to fetch checkpoints from remote                    processing forces GPUs to idle, wasting significant compute
+(cross-DC) training clusters due to scheduling and hardware                  resources during the iterative training phase. Offline trans-
+constraints. This creates significant I/O challenges: a “small-              formation is infeasible due to extreme storage amplification
+
+
+
+352   20th USENIX Symposium on Operating Systems Design and Implementation                                               USENIX Association
+(50× ∼ 100×) and inflexibility to hyperparameter changes.          Table 3: Data read/write sizes and time consumption for the
+To resolve this, we introduce Storage-Side Transformation Of-      MM-L model. The checkpoint merging phase dominates I/O
+floading. By leveraging the predictable ordering provided by       time due to cross-DC traffic.
+our deterministic dataloader and underutilized CPUs on stor-
+age nodes, we push compute-intensive transformations down          Stage            Read          Write       Total           I/O
+to the storage tier. This “Just-in-Time” processing pipeline                        (GB)          (GB)       (Time)        (Time)
+overlaps transformation with training and reduces both la-
+                                                                   Merging          2631*         1742      2h 03m        2h 03m
+tency and stall time.
+                                                                   Reshard            872         1435         18m           18m
+                                                                   Evaluation        8954            0      1h 55m            4m
+3     Cross-DC Companion Evaluation                                  * Denotes Cross-DC Traffic
+
+Training large-scale foundation models with hundreds of bil-
+lions of parameters is a costly and extended process that          must be converted into a standard inference format such
+involves thousands of GPUs running for weeks or months.            as safetensors [42]. The evaluation cluster therefore re-
+In this environment, detecting training issues early is es-        trieves the relevant parameter shards from remote storage
+sential. Although monitoring training loss is common prac-         and performs merging separately for each modality: it recon-
+tice [48, 56], our production experience shows that in-loop        structs the complete parameter tensors, discards optimizer
+signals such as loss and gradient norms are not reliable indica-   states and other tensors that are unnecessary for inference,
+tors of model health. A model may show stable training loss        and writes each merged modality submodel to local storage
+while already exhibiting forgetting or collapse on downstream      as safetensors files.
+tasks. This gap motivates the use of companion evaluation,            Next, model resharding reorganizes the merged checkpoint
+a continuous, out-of-band validation pipeline that assesses        to match the device topology and parallelism configuration of
+model performance in parallel with training. In our deploy-        the evaluation cluster. This reshaping ensures that inference
+ment, companion evaluation serves as a critical safeguard          can be executed efficiently across the available devices.
+that helps prevent the training system from progressing on an         Finally, the model evaluation stage uses a client-server
+already diverging model state.                                     architecture. The server component loads the resharded model
+   In our production environment, companion evaluations ex-        and initializes the HTTP serving endpoint, while the client
+ecute on separate clusters that are often located in different     simultaneously executes inference across benchmark datasets
+datacenters. This design is driven by two primary constraints.     to quantitatively assess model quality. The system writes the
+First, pre-training jobs demand strict synchronous execution       resulting metrics to storage, and the training control system
+across thousands of GPUs, relying on gang scheduling [12]          subsequently ingests them.
+to maintain lockstep progress; consequently, inserting evalua-        This workflow requires substantial data movement and
+tion tasks into the same cluster would fragment scheduling         local processing, and its efficiency is directly shaped by the
+and degrade training throughput. On the other hand, while          network and storage behavior observed during checkpoint
+pre-training necessitates the latest accelerator generation with   merging. Table 3 shows the data sizes and time distribution
+high-speed interconnects to minimize the step time, evaluation     of these stages.
+workloads are throughput-oriented and can run effectively on
+older, more cost-efficient hardware. These evaluation clus-
+ters are typically deployed wherever power and space are           3.2     Checkpoint Merging Bottlenecks
+available, often resulting in physical separation from training
+resources.                                                         Our study spans a 30-day observation window covering 19
+                                                                   pre-training tasks across models ranging from small to large
+                                                                   parameter counts. During this period, the system executed
+3.1    Companion Evaluation Workflow                               3,589 companion evaluations, which contributed to opera-
+The bottom part of Figure 1 illustrates the end-to-end work-       tional efficiency by identifying 156 critical model regressions.
+flow of companion evaluation. Each evaluation run transforms          The value of this mechanism depends on timely feedback.
+a distributed training checkpoint [8] into an inference-ready      When evaluation results are delayed, training continues to ad-
+model and then executes benchmark workloads. The work-             vance on a divergent model state, which both wastes training
+flow proceeds in three stages.                                     GPU time and makes recovery harder.
+   First, checkpoint merging converts distributed checkpoint          The root of this delay lies in data I/O. For a representa-
+shards into inference-ready modality submodels. During             tive multimodal large model (MM-L), Table 3 shows that a
+training, the training framework writes checkpoints as many        single evaluation cycle can exceed four hours, with data I/O
+distributed shards optimized for parallel writes on large          accounting for approximately 56.6% of the end-to-end time.
+training clusters [50]. For evaluation, however, these shards      The cost of this I/O bottleneck is substantial: across the 156
+
+
+
+USENIX Association                           20th USENIX Symposium on Operating Systems Design and Implementation             353
+                                                                                                       8
+                           1                                                                                   Read
+ Cumulative Probability
+
+
+
+
+                                                                                  Throughput (GiB/s)
+                                                                                                               Write
+                          0.8                                                                          6
+
+                          0.6                                                                                    Cross-DC read small tensors
+                                                                                                       4
+                          0.4
+                                                                                                       2
+                          0.2
+
+                           0                                                                           0
+                            1B           1 KB             1 MB        1 GB                                 0            2000         4000           6000
+                                                Tensor Size                                                               Elapsed Time (seconds)
+
+Figure 3: CDF of tensor sizes in a typical checkpoint. The                      Figure 4: Throughput during Checkpoint Read. The perfor-
+prevalence of small tensors exacerbates the latency penalty of                  mance is limited by the high RTT of cross-DC links when
+cross-DC reads.                                                                 fetching small tensors.
+
+
+regressions in our dataset, I/O-induced delays wasted approx-                   illustrates this contention; the average available bandwidth
+imately 2.6 million GPU hours, offsetting nearly half of the                    per task fluctuates significantly and often degrades to less
+5.5 million training GPU hours that the evaluation system                       than 1 GB/s. A naive “First-Come, First-Served” policy fails
+would otherwise have saved.                                                     in this context because it treats latency-critical evaluations
+    Of this long data I/O time, we further find that 84.8% is                   indistinguishably from background archival jobs.
+consumed by the checkpoint merging phase, which must read
+approximately 2.6 TB of data over the Wide Area Network.                        3.3                        Training-Aware I/O Optimization
+Unlike later stages that operate entirely on local storage,
+checkpoint merging requires retrieving tensors across dat-                      To address the cross-DC I/O bottlenecks identified earlier,
+acenters, which makes it the principal source of evaluation                     we apply two training-aware optimizations that require no
+delay. Specifically, we identify two primary causes of the                      dedicated network hardware.
+delay:                                                                          Predictive checkpoint replication. Companion evaluations
+                                                                                follow a predictable interval, typically every one thousand
+Small-I/O latency trap. Transformer-based models consist
+                                                                                training steps. This regularity allows us to initiate pipelined
+of thousands of disjoint tensors, particularly small LayerNorm
+                                                                                checkpoint replication as soon as the training system begins
+parameters and Biases. As illustrated in Figure 3, over 60% of
+                                                                                saving a checkpoint at the scheduled interval. Rather than
+the tensors in the MM-L checkpoint are smaller than 16 KB.
+                                                                                letting the merge script issue thousands of tensor-granularity
+Because the per-modality merge described in Section 3.1 re-
+                                                                                WAN reads, the storage system batches the required check-
+trieves only the parameter tensors needed for each submodel,
+                                                                                point shards into large contiguous transfers and caches them
+the resulting reads are issued at tensor granularity rather than
+                                                                                in the evaluation cluster’s storage tier. A lightweight server-
+as bulk transfers. Even when the merge server fetches ten-
+                                                                                side namespace service, NNProxy, then directs evaluation
+sors concurrently, each request still requires several cross-DC
+                                                                                jobs to read from these local cached shards when they are
+WAN round trips. This fragmentation interacts poorly with
+                                                                                available. This converts many Wide Area Network reads into
+the underlying distributed file system, which is optimized for
+                                                                                local reads and removes both cross-DC RTT and small-read
+coarse-grained 128-MB blocks. This mismatch produces two
+                                                                                fragmentation from most scheduled evaluations.
+effects:
+                                                                                Signal-driven prioritization. Not all evaluations have equal
+• Read amplification. Fetching a 4 KB tensor often requires                     urgency. While periodic evaluations follow a fixed sched-
+   reading a significantly larger block on HDFS data nodes,                     ule, others are triggered by training anomalies such as loss
+   incurring about 1.5× read amplification.                                     spikes or abnormal gradient behavior. These events require
+• RTT-bound throughput. On a high-latency WAN link                              faster feedback. We introduce a simple priority signal that
+   (typical 100 ms RTT), the throughput for these thousands                     combines model scale, task importance, and anomaly severity.
+   of small tensor reads becomes bound by latency rather than                   The storage scheduler uses this signal to preempt background
+   bandwidth. This manifests as the “sawtooth” throughput                       traffic and allocate network bandwidth to urgent evaluations,
+   pattern in Figure 4, where effective utilization drops to a                  reducing delay when fast diagnosis is needed.
+   fraction of the available link capacity (i.e., 60 Gbps).
+Bandwidth contention. Even for large tensors, cross-DC
+                                                                                3.4                        Evaluation
+bandwidth remains a scarce resource contended for by hun-
+dreds of concurrent tasks (208 on average), including data                      By applying the above optimizations, we convert previously
+migration, log aggregation, and parallel evaluations. Figure 5                  unmanaged I/O contention into predictable resource alloca-
+
+
+
+354                         20th USENIX Symposium on Operating Systems Design and Implementation                                               USENIX Association
+              4                                                                                    Table 4: Breakdown of training startup latency.
+                          Mean
+                       Top 10%
+              3    Bottom 10%
+                                                                              Stage                             Operation                      Time (s)
+Rate (GB/s)
+
+
+
+
+              2                                                                                                 Cluster Startup                       23
+                                                                              Job Init.
+                                                                                                                Dist. Context Init.                  130
+              1                                                               Model Const.                      Model Construction                   118
+                                                                                                                Coordination                          76
+              0
+                                                                              Ckpt. Recovery                    Downloading from HDFS                300
+                  11
+
+
+                         11
+
+
+                                 11
+
+
+                                       11
+
+
+                                             12
+
+
+                                                   12
+
+
+                                                         12
+
+
+                                                               12
+                                                                                                                Parameter Loading                    104
+                   -2
+
+
+                           -2
+
+
+                                  -2
+
+
+                                        -3
+
+
+                                              -0
+
+
+                                                    -0
+
+
+                                                          -0
+
+
+                                                                -0
+                    4
+
+
+                            6
+
+
+                                  8
+
+
+                                        0
+
+
+                                              2
+
+
+                                                    4
+
+
+                                                          6
+
+
+                                                                8
+                                                                              Total                                                                  751
+Figure 5: The average cross-DC data transmission rate in our
+production environment. The bandwidth is highly contended
+                                                                                                                                               28.6 11.9
+and bursty.                                                                                7
+                                                                                           6
+
+
+
+
+                                                                        Duration (Hours)
+tion. These training-aware mechanisms reduce average check-                                5
+point merging latency by 76.1%, with improvements reaching                                 4
+89.3% for the T-S model and 70.8% for the MM-L model.
+                                                                                           3
+They also cut I/O-induced compute waste per regression from
+16,800 GPU hours to 4,000 GPU hours. In total, these op-                                   2
+timizations recover nearly 2 million GPU hours across our                                  1
+observation window.
+                                                                                           0
+                                                                                               0           20         40        60        80         100
+                                                                                                                       Trial Run
+3.5                 Future Directions
+                                                                        Figure 6: Duration of continuous training sessions between
+To further improve performance across geographically dis-               restarts in the MM-S trace. Short bars indicate frequent
+tributed clusters, we plan to implement vertical co-design              restarts, while long bars indicate longer uninterrupted training
+between training frameworks and storage layers. Two direc-              periods.
+tions are especially promising.
+Training informed storage control. Training frameworks
+should expose signals such as evaluation interval and conver-           and, most notably, intensive debugging cycles during model
+gence indicators to the storage control plane. These signals            development [18, 51]. Initialization is a fully synchronous
+would allow the storage system to anticipate latency-sensitive          barrier because training cannot resume until every rank has
+operations, allocate resources accordingly, and avoid interfer-         reloaded its share of the latest checkpoint from storage. When
+ence from background traffic.                                           thousands of ranks restart in lockstep, they issue concurrent
+I/O-Aware checkpoint formats. Standard distributed check-               reads against a small set of hot files at the same instant, turning
+point layouts are optimized almost exclusively for high-                the storage tier into the bottleneck of the start phase.
+throughput, parallel writes during training, which inherently
+introduces the structural fragmentation that plagues selec-
+tive cross-DC reads. A promising direction is the design of             4.1                        Synchronized Loading Bottleneck
+layout-agnostic or multi-layout checkpoint formats. By re-
+                                                                        In our production environment, we observe that job initial-
+structuring how tensors are grouped, such as packing frag-
+                                                                        ization is a significant overhead. The breakdown of training
+mented parameters (e.g., LayerNorm layers and biases) into
+                                                                        startup latency in the MM-S trace, as shown in Table 4, re-
+contiguous, storage-block-aligned extents while segregating
+                                                                        veals that blocking I/O operations during file download are
+volatile optimizer states, the framework could natively support
+                                                                        the primary bottleneck, consuming 39.95% of the total startup
+zero-overhead, selective WAN streaming without requiring
+                                                                        duration.
+extensive server-side merging.
+                                                                           The operational impact of this latency is magnified by the
+                                                                        bursty nature of job restarts. Figure 6 depicts the restart dis-
+4                 Initialization I/O Storm                              tribution from our MM-S trace. Each bar corresponds to one
+                                                                        restart interval, with the y-axis showing the elapsed training
+Large-scale model training is characterized not by continuous           time before the next restart. We observe distinct clusters of
+execution, but by frequent interruptions and restarts; these            activity where developers repeatedly restart jobs for code up-
+arise from hardware failures, automated system maintenance,             dates or hyperparameter tuning. For instance, within a single
+
+
+
+USENIX Association                                  20th USENIX Symposium on Operating Systems Design and Implementation                             355
+                    3     Avg                           200                           Figure 8a plots the CDF of download latency. The distribu-
+      Latency (s)
+
+                          P99
+                        P99.9                           150                           tion exhibits a pronounced long tail, indicating that while the
+                    2
+
+
+
+
+                                                 KQPS
+                         Max
+                                                        100                           majority of downloads complete quickly, a small fraction of
+                    1
+                                                         50                           tasks suffer from significantly high latency. Our breakdown
+                                                          0                           shows that these few straggler reads dominate the completion
+                        0   10 20 30 40 50                 0     10 20 30 40 50       time, accounting for 67.97% of the total wait.
+                               Time (s)                             Time (s)
+                                                                                         By calculating the peak QPS for each file within 0.5-second
+                        (a) Read Latency                       (b) Read QPS           windows, we observe a heavy-tailed distribution in Figure 8b.
+                                    Avg                 20                            The cumulative load represents the contribution to the ag-
+Latency (ms)
+
+
+
+
+               40                   P99
+                                  P99.9                 15                            gregate peak QPS (i.e., the sum of all individual file peaks).
+               30
+                                                 KQPS
+                                   Max
+               20                                       10                            Specifically, the top 5% of files account for 38.8% of this total
+               10                                        5                            pressure. These hotspots are typically caused by two sources:
+                                                         0                            global metadata files (e.g., .metadata or common_states)
+                        0 10 20 30 40 50 60 70               0 10 20 30 40 50 60 70   accessed by all ranks, and more significantly, access skew
+                              Time (s)                             Time (s)           resulting from redundancy elimination.
+                     (c) OpenFile Latency                     (d) OpenFile QPS           This skew is a byproduct of current checkpointing sys-
+                                                                                      tems [8, 35, 50, 52], which prioritize write throughput and
+ Figure 7: Latency and throughput (QPS) for Read and Open-                            storage efficiency by employing parallel saving coupled with
+ File operations under the default 3-replica policy.                                  redundancy elimination. While effective for writing, this ap-
+                                                                                      proach causes loading asymmetry. We illustrate this issue us-
+                                                                                      ing the Embeddings and MoE layers. For Embeddings (which
+                                                                                      are replicated parameters), the system persists only a single
+                                                                                      copy to minimize overhead; consequently, restoring this layer
+                                                                                      triggers a one-to-many access storm where hundreds of ranks
+                                                                                      concurrently contend for a solitary file. Under the standard
+                                                                                      3-replica policy, the limited replicas are overwhelmed by such
+                                                                                      concurrent requests, causing latencies to increase sharply. In
+                    (a) Access latency CDF.      (b) Cumulative load distribution.    contrast, MoE experts (which are sharded parameters) are
+                                                                                      saved as distinct files corresponding to their parallel groups.
+ Figure 8: Characterization of I/O contention. (a) Latency                            This allows subsets of ranks to access different files con-
+ distribution for file downloads. (b) Load distribution relative                      currently, effectively distributing the load and avoiding the
+ to the fraction of files.                                                            single-point bottlenecks observed in the embedding layer.
+
+
+111-minute debugging window, a job underwent 4 consecu-
+                                                                                      4.3    Proactive Hotspot Prediction
+tive restarts. With an average downloading cost of 5 minutes                          Facing this challenge, traditional storage systems employ re-
+per run, this I/O overhead accounts for 18.02% of the total                           active replication [3, 54]: they detect heat via runtime moni-
+wall-clock time, severely throttling developer velocity and                           toring and trigger replication when thresholds are breached.
+wasting costly GPU cycles. Extrapolating to our cluster-wide                          In the context of training startup, this approach is fundamen-
+operation, the startup delay would result in a loss of more                           tally flawed for two reasons. First, the contention window
+than one million GPU hours annually.                                                  is transient (often lasting only tens of seconds). By the time
+                                                                                      the system detects the hotspot and creates new replicas, the
+ 4.2                    The Anatomy of an I/O Storm                                   loading phase is already over. Second, initiating replication
+                                                                                      traffic during the I/O storm competes for the already saturated
+To pinpoint the root cause of slow checkpoint loading, we                             network bandwidth, exacerbating the bottleneck rather than
+conduct a controlled experiment scaling to 2,048 GPUs. We                             relieving it. To address these limitations, mitigation must be
+instrument the storage client to decompose the latency of                             proactive, leveraging the training framework’s information to
+every I/O request.                                                                    prepare the storage layer before the storm begins.
+   Contrary to common assumptions that metadata operations                               We propose a cooperative mechanism in which the train-
+(e.g., open, getattr) are the bottleneck in distributed file                          ing framework explicitly informs the storage system about
+systems [23], our analysis reveals that data contention is the                        upcoming access patterns via a SetReplicationHints in-
+primary culprit. As illustrated in Figure 7, open latencies                           terface. Since training configurations (parallelism strategy,
+remain low and stable. However, read operations exhibit ex-                           world size) are known at job submission, the set of hot files
+treme tail latencies that correlate perfectly with QPS spikes.                        is deterministic. The framework identifies two categories of
+
+
+
+ 356                    20th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+                                 Avg                                                 grows with training scale. Without intervention, synchronized
+Latency (ms)
+
+
+               800               P99                800
+               600             P99.9
+                                                    600                              checkpoint recovery creates increasingly severe contention
+
+
+
+
+                                             KQPS
+                                Max
+               400                                  400                              as more ranks restart together. By preparing replicas before
+               200                                  200                              the recovery phase, proactive replica expansion turns an un-
+                                                      0                              predictable, scale-dependent storage bottleneck into a more
+                     0     10    20     30                0       10    20   30      stable loading process. Based on these results, we have codi-
+                           Time (s)                               Time (s)
+                                                                                     fied replication guidelines for our production environment: 64
+                     (a) Read Latency                         (b) Read QPS           replicas for 10k-GPU clusters and 128 replicas for 20k-GPU
+               250               Avg                20                               clusters.
+Latency (ms)
+
+
+
+
+               200               P99
+                               P99.9
+                                             KQPS
+                                                    15                                  The benefit of replica expansion depends on how the train-
+               150              Max
+                                                    10                               ing parallelism strategy materializes model state during check-
+               100
+                50                                   5                               pointing. In the most favorable case, fully sharded data paral-
+                                                     0                               lelism already spreads parameter shards across ranks and files.
+                     0   10 20 30 40 50                  0     10 20 30 40 50        The remaining imbalance usually comes from a small set
+                           Time (s)                               Time (s)           of shared structures, such as checkpoint metadata, common
+                 (c) OpenFile Latency                     (d) OpenFile QPS           states, or other non-sharded tensors. Expanding only these
+                                                                                     structures is often enough to make the recovery load well
+ Figure 9: Latency and throughput (QPS) for Read and Open-                           balanced across storage replicas, with little storage overhead.
+ File operations under the default 128-replica policy.                               The common production case is less ideal but still highly tar-
+                                                                                     geted: each rank typically saves a small number of tensors,
+                                                                                     often a single tensor, so most files have clear ownership while
+ data: global metadata, where the target replication factor is set
+                                                                                     replicated tensors and global states still create a few hot files.
+ proportional to the job’s world size N, and replicated tensors,
+                                                                                     Replica expansion is effective here because the system only
+ where access demands are aggregated based on tensor-to-rank
+                                                                                     needs to expand this small hot subset instead of increasing the
+ mappings to determine the expected concurrency degree ω f
+                                                                                     replication factor of the entire checkpoint. A less favorable
+ for each file f . Upon receiving these hints, typically immedi-
+                                                                                     case arises when a replicated tensor is packed together with
+ ately after a checkpoint is written or before a job is scheduled,
+                                                                                     much larger sharded parameter shards in the same checkpoint
+ the storage system proactively replicates the identified hot
+                                                                                     file. Since the replication decision is made at file granularity,
+ files using a heuristic policy:
+                                                                                     expanding the file for the shared tensor also replicates the
+                                          ωf                                         unrelated sharded data.
+                       Rtarget ( f ) = ⌈       ⌉               (1)
+                                         Cload
+ where Cload represents the safe concurrent load capacity of a
+ single replica. To prevent storage bloat, these ephemeral repli-                    4.5    Future Directions
+ cas are tagged with a Time-To-Live (TTL) and automatically
+ reclaimed after the startup phase concludes.                                        To further improve checkpoint recovery at larger training
+                                                                                     scales, future systems could better align checkpoint file layout
+                                                                                     and recovery-time fanout with replica expansion.
+ 4.4                 Evaluation and Discussion                                       Deduplication-aware checkpoint packing. A natural exten-
+ We evaluate proactive replica expansion on the 2,048-GPU                            sion is to consider recovery-time replication when partitioning
+ training job. Based on the job scale and the predicted check-                       tensor saving tasks. Tensors that are aggressively dedupli-
+ point access pattern, the policy increases the replication factor                   cated, and therefore likely to be read by many ranks during
+ of hot metadata and replicated-parameter files to 128 before                        recovery, should be placed in dedicated files or co-packed
+ checkpoint recovery begins.                                                         with tensors that require similar replica expansion. This lay-
+    As shown in Figure 9, replica expansion improves check-                          out keeps file-level replica decisions aligned with tensor-level
+ point loading in two ways. First, the peak aggregate Read                           demand: expanding a hot file increases capacity for shared
+ QPS increases, indicating that compute nodes spend less time                        reads without also copying large unrelated shards.
+ blocked on storage and can issue requests more aggressively.                        Communication-assisted checkpoint loading. The loading
+ Second, and more importantly, the average read latency de-                          plan of checkpoint recovery already indicates which ranks
+ creases because the hottest files are no longer served by only                      share the same checkpoint shards, providing the informa-
+ a small number of replicas. By eliminating straggler reads,                         tion needed to organize communication-assisted fanout. De-
+ the total checkpoint loading time decreases from 38.48 s to                         pending on deployment scale, rank locality, and framework-
+ 22.78 s, a 40.8% improvement.                                                       integration constraints, future systems could serve a hot shard
+    While the absolute saving in this controlled 2,048-GPU                           through additional storage replicas, a scoped broadcast path,
+ experiment is on the order of seconds, the operational impact                       or a hybrid of both.
+
+
+
+ USENIX Association                                              20th USENIX Symposium on Operating Systems Design and Implementation             357
+      Video Decoder                                                                      Multi-Modal                    Text-Only      MM step     Text step
+                          ② transform            ③ transfer
+     Audio Normalizer
+                                                                                                              40
+
+
+
+
+                                                                                         Transform Time (s)
+                                      Dataloader
+     Resolution Scaler                                        GPUs
+            ⋯
+    Pre-Processors                           ① load data                                                      30
+
+                     Step N - 1         Step N          Step N + 1           Step Info
+                                                                                                              20
+
+                  Sample N1                Sample N2                                                          10
+            {video, offset, length}    {video, offset, length}      …     Metadata Map
+            {audio, offset, length}     {text , offset, length}                                                0
+                                                                                                                   0   200   400      600    800   1000    1200
+                                                                                                                                    Time (s)
+                                                                               Bins
+                                                                                         Figure 11: Maximum dataloader latency: Text (T-L) vs. Multi-
+         Bin 1                    Bin 2                           Bin 3
+                                                                                         modal (MM-L). MM-L suffers from extreme tail latency due
+                                                                                         to heterogeneous transformation costs.
+Figure 10: Structure of the on-disk format and the data loading
+pipeline for the deterministic dataloader.
+
+
+5     MM-L Transformation Wall                                                           byte offsets and lengths within the binary bins. Our produc-
+                                                                                         tion datasets contain roughly ten thousand map files totaling
+In conventional text-only model training, the data loading                               about 0.7 TB. Finally, we utilize per-step info files to manage
+process is effectively hidden behind GPU computation. Data                               ordering. Since each training epoch consumes all samples
+reads and lightweight tokenization finish well before each step                          in a shuffled order, we generate a file listing the exact se-
+starts, leaving the training loop compute-bound. However, as                             quence of sample identifiers to be read. This allows shuffling
+training moves from text-only models to multimodal models,                               to be performed entirely by permuting index entries offline,
+the dataloader must serve not only text but also heterogeneous                           achieving a new global order without touching or rewriting
+data such as audio, video, and images. As a result, data loading                         the underlying physical data.
+for multimodal training can no longer be fully overlapped
+                                                                                           During training, the dataloader performs the following se-
+with GPU execution, causing the input pipeline to exceed the
+                                                                                         quence to prepare data for the next training step:
+compute time by a wide margin and become the dominant
+source of training stalls.
+                                                                                         • Metadata resolution. The dataloader begins by reading
+                                                                                           the per-step info file to get the sample identifiers required
+5.1      Deterministic Dataloader
+                                                                                           for the upcoming batch. It then consults the metadata maps
+Multimodal training in our environment uses a determinis-                                  to translate these identifiers into byte offsets and lengths
+tic dataloader architecture. Unlike standard loaders such as                               within the consolidated binary bins.
+the PyTorch DataLoader [39] or streaming dataloaders [32]                                • Data retrieval. Using the resolved offsets, the dataloader
+that incur runtime overhead from dynamic shuffle computa-                                  issues read or pread system calls to fetch the correspond-
+tion and complex state management, our approach utilizes                                   ing byte ranges from the binary bins. This stage performs
+an offline-generated global execution plan. This guarantees                                random access into the underlying files to retrieve only the
+strict deterministic ordering across thousands of workers and                              specific samples needed for the current batch.
+achieves global random shuffling.                                                        • Sample transformation. Once the raw bytes are retrieved,
+   Figure 10 illustrates the three data formats used to organize                           the dataloader applies modality-specific transformations.
+and serve raw training data. Under the hood, the system re-                                For instance, video samples will go through a series of
+lies on consolidated binary bins where raw multimodal data                                 operations such as video decoding, frame extraction, and
+including audio, video, and concatenated image and text is                                 cropping, followed by conversion to tensors, while image
+stored as large contiguous binary files in the global storage                              samples will be decoded, resized, and transformed into
+system. We choose a bin size of 20 GB to balance file man-                                 tensors. These operations are executed on the host CPU
+agement overhead against the cost of merging bins, providing                               to avoid the large memory overhead of GPU-based trans-
+precise byte range access without the read amplification com-                              formation and to keep GPU resources focused on model
+mon in columnar formats like Parquet [49]. To enable fast                                  computation. The resulting tensors are staged for transfer
+lookup, we employ metadata maps that serve as a logical-to-                                to the GPU at the start of the next step.
+physical translation layer, converting sample identifiers into
+
+
+
+358     20th USENIX Symposium on Operating Systems Design and Implementation                                                                 USENIX Association
+Table 5: Breakdown of Data Loading Latency in MM-L.                                           behind model computation. In our sampled phase, a host pro-
+Transformation dominates the pipeline, and high variance                                      cessing a 161.9 MB sample requires 41.5 seconds to finish the
+(Max vs. Avg) indicates severe straggler issues.                                              transformation, causing the time variation. In contrast, other
+                                                                                              hosts process an average of only 20 MB and complete the
+                                       Read (s)       Process (s)    Other (s)    Total (s)   transformation in 5.05 seconds. In extreme cases, a machine
+Metric                             Metadata   Data    Transform      Overhead      Time       assigned a 500 MB H.264 video of about 10 minutes requires
+                                                                                              over 2.18 minutes for decoding and frame extraction, even
+Avg                                 0.007     0.013      5.05         0.279         5.35      with decord using hardware-accelerated decoding and four
+Max                                 0.506     0.266     41.52         0.428        42.72
+                                                                                              concurrent decoding threads. Such stragglers force thousands
+                                                                                              of GPUs to idle, waiting for them to complete. Figure 12
+                           5                                                                  illustrates the variance in training step duration. We find that
+ Max Step Difference (s)
+
+
+
+
+                                                                                              for a single step, the execution time difference across hosts
+                           4                                                                  can reach up to 5 seconds, forcing other nodes to wait for the
+                                                                                              straggler. This temporal skew directly translates to a waste of
+                           3
+                                                                                              over 10,000 GPU hours per day.
+                           2
+                                                                                              5.3    Storage-Side Transformation Offload
+                           1
+                                                                                              Addressing this bottleneck requires reducing the cost of the
+                           0                                                                  transformation phase. While performing offline transforma-
+                               0            200       400           600          800
+                                                      Step                                    tion (i.e., decoding and transforming raw samples into ready-
+                                                                                              to-train tensors before training) seems like a straightforward
+Figure 12: The time difference in training step time across                                   solution, it is not viable at the production scale for two fun-
+different machines.                                                                           damental reasons. First, storage amplification makes stor-
+                                                                                              ing decoded data prohibitive. High-resolution images and
+                                                                                              videos are typically archived in space-efficient formats such as
+5.2                            Transformation Stalls                                          JPEG [19] and H.265 [17]. Decoding them into float tensors
+                                                                                              causes extreme storage expansion: video footprints increase
+Table 5 decomposes the data loading latency into four phases                                  by more than 40×, while images exhibit a smaller but still
+in the MM-L training trace: metadata resolution, data retrieval,                              substantial expansion of several tens of times. At the petabyte
+transformation, and runtime overheads such as timing and                                      scale, the decoded representation would demand storage in
+threading. Transformation overwhelmingly dominates the                                        the exabyte range, merely shifting the bottleneck from on-
+critical path, accounting for 94.4% of the total data loading                                 line CPU transformation to raw storage capacity. Second,
+time (5.05 s of 5.35 s). I/O retrieval itself is negligible, aver-                            offline transformation suffers from inherent inflexibility. The
+aging only 13.6 ms. This shows that MM-L workloads are                                        required transformations depend heavily on model hyperpa-
+compute-bound: limited CPU capacity, rather than storage                                      rameters such as crop size, frame count, and resolution, all
+bandwidth, drives up the time required for transformation.                                    of which vary across pre-training runs. Any alteration to the
+   The heterogeneous nature of multimodal data, mixing short                                  model architecture or data augmentation policy necessitates
+text with high-resolution images and long video clips, intro-                                 a complete regeneration of the pre-transformed dataset. This
+duces substantial variability in transformation cost. Figure 11                               process consumes millions of GPU hours and significantly
+compares the maximum data loading latency across hosts for                                    hampers model development velocity.
+T-L and MM-L traces. While T-L workloads show tightly                                            Instead, we exploit a resource that is already paid for: stor-
+clustered latencies, MM-L workloads exhibit a pronounced                                      age nodes in high-throughput clusters often have underuti-
+long tail. For instance, the slowest host can take 42.72 s in                                 lized CPU capacity. While training hosts are saturated by
+our sampled period, where the average data loading time for                                   model computation and media processing, storage nodes are
+that step is 5.35 s. This produces a 37.4 s gap in that single                                typically bottlenecked by network or disk bandwidth, leaving
+step.                                                                                         significant compute capacity idle.
+   This variability is driven by sample-length variance in                                       This opportunity arises from a fundamental I/O-compute
+multimodal datasets rather than by a transient storage issue.                                 mismatch in our cluster. We observe that while training nodes
+To preserve training coverage, MM-L batches include both                                      are Compute/Memory saturated, storage nodes are typically
+lightweight samples and long video clips whose transforma-                                    bounded by HDD seek latency or Network Interface Card
+tion cost scales with duration, codec complexity, and the num-                                (NIC) limits. Our telemetry indicates that storage node CPUs
+ber of sampled frames. As GPU step time continues to shrink,                                  often sit at 20–30% utilization waiting for I/O interrupts, a
+this host-side long tail becomes increasingly difficult to hide                               resource gap we exploit to hide the format conversion cost.
+
+
+
+USENIX Association                                                    20th USENIX Symposium on Operating Systems Design and Implementation                359
+   We redesign the storage layer to act not just as a data repos-   5.5    Future Directions
+itory, but as a Disaggregated Pre-processing Engine. This
+design is fundamentally enabled by the strict determinism           Storage-side transformation offload depends on co-located
+of our deterministic dataloader (Section 5.1). Since the data       compute headroom in the storage tier. This assumption holds
+consumption sequence is fixed in the global index, the stor-        in our environment because the same storage clusters support
+age system can accurately predict future data access patterns,      large-scale data processing and often have idle CPU cycles
+allowing it to perform transformation using its idle cores. We      while waiting on disks or network. It may not hold for cloud
+implement a Pushdown Transformation Engine with three               object stores or lean storage appliances that expose little pro-
+core mechanisms:                                                    grammable compute near the data [2, 28]. In such cases, other
+                                                                    techniques are also possible to improve the transformation
+Schedule synchronization. Upon training initialization, the         performance and reduce the training slowdown:
+training framework shares the dataset identifier and step
+                                                                    Processed-sample caching: Caching preprocessed sam-
+progress with the storage system. Storage nodes, having ac-
+                                                                    ples [22, 30, 58], as previous work suggests, can complement
+cess to the per-step info files, autonomously resolve the se-
+                                                                    storage-side offload when training repeatedly revisits data.
+quence of upcoming data blocks. This eliminates the need
+                                                                    In large-scale pre-training, which is the focus of this paper,
+for the training client to issue millions of data and metadata
+                                                                    globally shuffled samples are rarely revisited within the use-
+operation RPCs during the critical path.
+                                                                    ful lifetime of a cache, so processed-data caching provides
+Just-in-Time (JIT) transformation. Storage nodes maintain           little hit-rate benefit while adding consistency and capacity
+a Consumer Queue for the training job. They speculatively           pressure. In regimes with repeated sample access, such as
+read raw binary data and execute the registered transformation      reinforcement learning or repeated fine-tuning over a smaller
+graph such as decoding, random cropping, and normalization          corpus, caching becomes effective and can store the trans-
+in the background. This pipelining ensures that while the           formed outputs produced by the storage-side engine.
+GPU computes Step N, the storage layer is already preparing         Predictive transform-aware batching: Since the determin-
+tensors for Step N + 1. For video samples, the storage-side         istic dataloader knows the exact sample sequence offline, a
+engine also applies frame sampling before data is sent back to      lightweight cost model can be used to predict each sample’s
+the training cluster. This keeps the network payload bounded        transformation cost in advance, based on metadata such as
+despite the temporary expansion caused by decoding and              raw sample size, codec, resolution, and clip duration. With
+prevents format inflation from becoming a new tail-latency          these estimates, batches can then be composed to balance
+source.                                                             transformation cost across hosts, mixing heavy and light sam-
+Load-aware fallback. To prevent saturating the storage node,        ples so that no single host is assigned a disproportionate share
+we implement dynamic backpressure to guarantee storage              of expensive clips.
+stability, which is a hard constraint in our shared production
+environment. If a storage node’s CPU usage exceeds a safety
+threshold (e.g., 80%), it aborts the transformation and returns     6     What If?
+raw bytes to the training dataloader. The training client de-
+                                                                    Building an efficient data pipeline for exabyte-scale pre-
+tects the data format (Tensor vs. Binary) and falls back to
+                                                                    training necessitates navigating trade-offs between storage
+local processing. This hybrid approach allows us to absorb
+                                                                    cost, compute efficiency, and engineering complexity. Along
+transformation spikes using the aggregate compute power of
+                                                                    our operational journey, we critically evaluated several alter-
+the storage fleet while protecting the storage control plane
+                                                                    natives that we eventually discarded as impractical at scale.
+from overload.
+                                                                    We structure this discussion as a series of “What If” questions.
+                                                                    Q1: What if we used Peer-to-Peer (P2P) distribution for
+                                                                    model loading?
+5.4    Evaluation                                                      In Section 4, we address the initialization storm by proac-
+                                                                    tively replicating data on storage nodes. While P2P distri-
+This architecture yields significant improvements in our pro-       bution (e.g., NCCL [10] and UCX [45]) theoretically scales
+duction environment, validating the effectiveness of moving         linearly with cluster size, we strictly prioritize a hierarchical
+compute to the storage tier. Specifically, by offloading heavy      client-server model to mitigate multi-tenancy interference and
+lifting to the storage pool, the P99 data loading latency drops     tail latency sensitivity.
+by 85.7%, effectively mitigating the straggler effect. In terms        First, large GPU clusters concurrently execute multiple
+of training efficiency, stall time due to transformation strag-     training tasks. P2P’s unstructured, all-to-all traffic pattern in-
+glers is reduced by 63.2%, translating to a relative 10.8%          duces network congestion, saturating buffers and disrupting
+improvement in MFU. Finally, for resource utilization, we ob-       the latency-sensitive NCCL collectives of concurrent jobs.
+serve a 94% reduction in data loading CPU usage on training         Second, training initialization functions as a synchronous
+hosts, practically eliminating the host-side bottleneck.            barrier constrained by the slowest node. P2P performance re-
+
+
+
+360   20th USENIX Symposium on Operating Systems Design and Implementation                                     USENIX Association
+mains inherently probabilistic; a single slow peer—suffering       Blob [28] offer scalability but incur high latency and lim-
+from throttling or local congestion—delays the startup of the      ited random access throughput. While emerging AI-native
+entire gang. In contrast, our hierarchical replication guaran-     systems (e.g., 3FS [11], AIStore [9]) address these limita-
+tees a deterministic SLA with confined north-south traffic,        tions via kernel-bypass networking and specialized caching,
+effectively isolating the cluster from cross-tenant interference   they often require greenfield deployments. As detailed in
+and probabilistic tail latencies.                                  Section 6, migrating exabytes of legacy data to specialized
+Q2: What if we deploy a dedicated transformation cluster           stacks is operationally infeasible. Our work demonstrates that
+as an alternative to storage-side processing?                      by exposing application-level determinism, general-purpose
+   In Section 5, we address multimodal transformation over-        Big Data systems (HDFS [47]) can meet strict training SLAs
+head by offloading compute to storage nodes. An alternative is     without fundamental architectural replacement.
+a dedicated sample transformation cluster, a fleet of CPU-rich     Data loading and global coordination. Prior research op-
+machines that decode and transform data before forwarding          timizes data loading through domain-specific caching (e.g.,
+tensors to training hosts. This architecture, exemplified by       Quiver [22] and SiloD [58]) or coordinated fetching (e.g.,
+tf.data service [33] and Ray Data [31], decouples data prepa-      CoorDL [30]). These systems are primarily reactive, depend-
+ration from training. We reject this design due to significant     ing on runtime hit rates. In contrast, our deterministic dat-
+network amplification and operational overhead.                    aloader (Section 5.1) exploits the determinism of LLM train-
+   First, decoded tensors dwarf their compressed sources.          ing to convert random access into sequential streams. Re-
+Video decompression inflates data volume by 50–100×; trans-        garding data formats, solutions like TFRecord [33], Web-
+ferring these tensors over the datacenter network shifts the       Dataset [53], and Lance [36] mitigate random seeks by ag-
+bottleneck from CPU to bandwidth and saturates the shared          gregating samples but complicate global shuffling. Our index-
+fabric. Second, a standalone cluster introduces provisioning       based approach ensures global randomness without physical
+complexity: capacity must be sized for peak multimodal de-         data movement. Finally, while works like CrossPipe [5] opti-
+mand yet remains idle during text-only workloads. In contrast,     mize pipeline schedules, we address the storage logistics of
+our storage-side offloading exploits spare CPU cycles already      companion evaluation (Section 3) by leveraging namespace-
+provisioned on storage nodes, avoiding network amplification       level predictive checkpoint replication to mask cross-DC la-
+and eliminating the need for a dedicated resource pool.            tency.
+Q3: What if we migrate to a specialized AI-native storage
+system as a modern alternative to HDFS?
+   Recent works propose specialized AI storage systems (e.g.,      8   Conclusion
+3FS, AIStore) offering superior small-file performance and
+kernel-bypass networking. We retain and optimize a legacy          We identify critical storage bottlenecks in large-scale pre-
+Big Data system over a greenfield solution primarily due to        training, including cross-DC latency during companion eval-
+data gravity and operational continuity.                           uation, initialization storms, and multimodal transformation
+   HDFS serves as our unified data lake, hosting exabytes of       overhead. By leveraging workload determinism, we imple-
+data across diverse business lines beyond AI training. Migrat-     ment software-defined optimizations such as predictive check-
+ing this volume to a new system is operationally infeasible and    point replication, proactive replication, and storage-side of-
+cost-prohibitive. Moreover, AI-native systems often require        floading to convert the storage tier into a proactive partner.
+specific hardware configurations (e.g., all-NVMe) or custom        These mechanisms significantly reduce companion evalua-
+clients that break compatibility with the broader ecosystem        tion latency, startup time, and data loading stalls. Our work
+(e.g., Spark-based cleaning pipelines). Our work demonstrates      demonstrates that legacy systems like HDFS can effectively
+that by exposing application-level patterns, legacy systems        support exabyte-scale training through vertical co-design.
+like HDFS can meet strict LLM training requirements with-
+out wholesale replacement. This software-defined approach
+enables iterative infrastructure evolution while maintaining
+service stability.                                                 Acknowledgments
+
+                                                                   We are grateful to the anonymous reviewers and shepherd for
+7   Related Work                                                   their constructive feedback. We also thank our colleagues
+                                                                   from the storage, training infrastructure, and pre-training
+Storage infrastructure for model training. Traditional Par-        teams for their support in deploying and evaluating the tech-
+allel File Systems (PFS) such as Lustre [44] and GPFS [43]         niques described in this paper. This work is supported in part
+provide high checkpointing bandwidth but degrade under             by the National Natural Science Foundation of China under
+the massive metadata pressure of multimodal datasets. Con-         Grant No.: U25B2020 and 62572454. Weidong Zhang and
+versely, disaggregated object stores like S3 [2] and Azure         Youhui Bai are the corresponding authors.
+
+
+
+USENIX Association                           20th USENIX Symposium on Operating Systems Design and Implementation           361
+References                                                     [10] NVIDIA Corporation. NVIDIA/NCCL. https://
+                                                                    github.com/NVIDIA/nccl, June 2026.
+[1] Josh Achiam, Steven Adler, Sandhini Agarwal, Lama
+    Ahmad, Ilge Akkaya, Florencia Leoni Aleman, Diogo          [11] DeepSeek-AI. DeepSeek-AI/3FS: A high-performance
+    Almeida, Janko Altenschmidt, Sam Altman, Shyamal                distributed file system designed to address the chal-
+    Anadkat, et al. GPT-4 technical report. arXiv preprint          lenges of AI training and inference workloads. https:
+    arXiv:2303.08774, 2023.                                         //github.com/deepseek-ai/3FS, June 2026.
+
+[2] Amazon. Amazon S3 - cloud object storage - AWS.            [12] Dror G. Feitelson and Larry Rudolph. Gang schedul-
+    https://aws.amazon.com/s3/, June 2026.                          ing performance benefits for fine-grain synchroniza-
+                                                                    tion. Journal of Parallel and Distributed Computing,
+[3] Ganesh Ananthanarayanan, Sameer Agarwal, Srikanth               16(4):306–318, December 1992.
+    Kandula, Albert Greenberg, Ion Stoica, Duke Harlan,
+    and Ed Harris. Scarlett: Coping with skewed content        [13] Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri,
+    popularity in mapreduce clusters. In Proceedings of             Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle,
+    the Sixth Conference on Computer Systems, EuroSys               Aiesha Letman, Akhil Mathur, Alan Schelten, Alex
+    ’11, pages 287–300, New York, NY, USA, April 2011.              Vaughan, et al. The Llama 3 herd of models. arXiv
+    Association for Computing Machinery.                            preprint arXiv:2407.21783, 2024.
+
+[4] BigScience Workshop.     BigScience/train/tr11-            [14] Wenyi Hong, Yean Cheng, Zhuoyi Yang, Weihan Wang,
+    176b-ml/chronicles.md.  https://github.com/                     Lefan Wang, Xiaotao Gu, Shiyu Huang, Yuxiao Dong,
+    bigscience-workshop/bigscience/blob/master/                     and Jie Tang. MotionBench: Benchmarking and improv-
+    train/tr11-176B-ml/chronicles.md, June 2026.                    ing fine-grained video motion understanding for vision
+                                                                    language models, 2025.
+[5] Tiancheng Chen, Ales Kubicek, Langwen Huang, and
+                                                               [15] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan
+    Torsten Hoefler. CrossPipe: Towards optimal pipeline
+                                                                    Firat, Dehao Chen, Mia Chen, HyoukJoong Lee, Jiquan
+    schedules for cross-datacenter training. In Proceedings
+                                                                    Ngiam, Quoc V Le, Yonghui Wu, et al. GPipe: Effi-
+    of the 2025 USENIX Conference on Usenix Annual Tech-
+                                                                    cient training of giant neural networks using pipeline
+    nical Conference, USENIX ATC ’25, pages 1089–1108,
+                                                                    parallelism. Advances in neural information processing
+    USA, July 2025. USENIX Association.
+                                                                    systems, 32, 2019.
+[6] Aakanksha Chowdhery, Sharan Narang, Jacob De-
+                                                               [16] Changho Hwang, Wei Cui, Yifan Xiong, Ziyue Yang,
+    vlin, Maarten Bosma, Gaurav Mishra, Adam Roberts,
+                                                                    Ze Liu, Han Hu, Zilong Wang, Rafael Salas, Jithin Jose,
+    Paul Barham, Hyung Won Chung, Charles Sutton, Se-
+                                                                    Prabhat Ram, HoYuen Chau, Peng Cheng, Fan Yang,
+    bastian Gehrmann, Parker Schuh, Kensen Shi, Sasha
+                                                                    Mao Yang, and Yongqiang Xiong. Tutel: Adaptive
+    Tsvyashchenko, Joshua Maynez, Abhishek Rao, Parker
+                                                                    mixture-of-experts at scale. In D. Song, M. Carbin,
+    Barnes, Yi Tay, Noam Shazeer, Vinodkumar Prab-
+                                                                    and T. Chen, editors, Proceedings of Machine Learning
+    hakaran, Emily Reif, Nan Du, Ben Hutchinson, Reiner
+                                                                    and Systems, volume 5, pages 269–287. Curan, 2023.
+    Pope, James Bradbury, Jacob Austin, Michael Isard, Guy
+    Gur-Ari, et al. PaLM: Scaling language modeling with       [17] ITU-T. H.265: High efficiency video coding. https:
+    pathways. Journal of Machine Learning Research,                 //www.itu.int/rec/T-REC-H.265, June 2026.
+    24(240):1–113, 2023.
+                                                               [18] Ziheng Jiang, Haibin Lin, Yinmin Zhong, Qi Huang,
+[7] Gheorghe Comanici, Eric Bieber, Mike Schaekermann,              Yangrui Chen, Zhi Zhang, Yanghua Peng, Xiang Li,
+    Ice Pasupat, Noveen Sachdeva, Inderjit Dhillon, Marcel          Cong Xie, Shibiao Nong, et al. MegaScale: Scaling large
+    Blistein, Ori Ram, Dan Zhang, Evan Rosen, et al. Gem-           language model training to more than 10,000 GPUs. In
+    ini 2.5: Pushing the frontier with advanced reasoning,          21st USENIX Symposium on Networked Systems Design
+    multimodality, long context, and next generation agentic        and Implementation (NSDI 24), pages 745–760, 2024.
+    capabilities. arXiv preprint arXiv:2507.06261, 2025.
+                                                               [19] Joint Photographic Experts Group. JPEG. https://
+[8] PyTorch Contributors. Getting started with distributed          jpeg.org/index.html, June 2026.
+    checkpoint (DCP). https://docs.pytorch.org/
+    tutorials/recipes/distributed_checkpoint_                  [20] Heehoon Kim, Junyeol Ryu, and Jaejin Lee. TCCL:
+    recipe.html, June 2026.                                         Discovering better communication paths for PCIe GPU
+                                                                    clusters. In Proceedings of the 29th ACM International
+[9] NVIDIA Corporation. NVIDIA/AIStore. https://                    Conference on Architectural Support for Programming
+    github.com/NVIDIA/aistore, June 2026.                           Languages and Operating Systems, Volume 3, volume 3
+
+
+
+362   20th USENIX Symposium on Operating Systems Design and Implementation                            USENIX Association
+     of ASPLOS ’24, pages 999–1015, New York, NY, USA,           [31] Philipp Moritz, Robert Nishihara, Stephanie Wang,
+     April 2024. Association for Computing Machinery.                 Alexey Tumanov, Richard Liaw, Eric Liang, Melih Eli-
+                                                                      bol, Zongheng Yang, William Paul, Michael I Jordan,
+[21] Diederik P Kingma. Adam: A method for stochastic                 et al. Ray: A distributed framework for emerging AI
+     optimization. arXiv preprint arXiv:1412.6980, 2014.              applications. In 13th USENIX symposium on operating
+                                                                      systems design and implementation (OSDI 18), pages
+[22] Abhishek Vijaya Kumar and Muthian Sivathanu. Quiver:             561–577, 2018.
+     An informed storage cache for deep learning. In 18th
+     USENIX Conference on File and Storage Technologies          [32] MosaicML. MosaicML/streaming: A data streaming
+     (FAST 20), pages 283–296. USENIX Association, Febru-             library for efficient neural network training. https:
+     ary 2020.                                                        //github.com/mosaicml/streaming, June 2026.
+
+[23] Jiahao Li, Biao Cao, Jielong Jian, Cheng Li, Sen Han,       [33] Derek G. Murray, Jiří Šimša, Ana Klimovic, and Ihor
+     Yiduo Wang, Yufei Wu, Kang Chen, Zhihui Yin, Qiushi              Indyk. tf.data: A machine learning data processing
+     Chen, et al. Mantle: Efficient hierarchical metadata man-        framework. Proceedings of the VLDB Endowment,
+     agement for cloud object storage services. In Proceed-           14(12):2945–2958, July 2021.
+     ings of the ACM SIGOPS 31st Symposium on Operating          [34] Deepak Narayanan, Aaron Harlap, Amar Phanishayee,
+     Systems Principles, pages 928–943, 2025.                         Vivek Seshadri, Nikhil R Devanur, Gregory R Ganger,
+                                                                      Phillip B Gibbons, and Matei Zaharia. Pipedream: Gen-
+[24] Zhiqi Lin, Youshan Miao, Quanlu Zhang, Fan Yang,
+                                                                      eralized pipeline parallelism for dnn training. In Pro-
+     Yi Zhu, Cheng Li, Saeed Maleki, Xu Cao, Ning Shang,
+                                                                      ceedings of the 27th ACM symposium on operating sys-
+     Yilei Yang, et al. nnScaler: Constraint-guided paral-
+                                                                      tems principles, pages 1–15, 2019.
+     lelization plan generation for deep learning training. In
+     18th USENIX Symposium on Operating Systems Design           [35] NVIDIA. Dist_checkpointing package — Megatron
+     and Implementation (OSDI 24), pages 347–363, 2024.               Core. https://docs.nvidia.com/megatron-core/
+                                                                      developer-guide/latest/api-guide/core/
+[25] Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao             dist_checkpointing.html, June 2026.
+     Wu, Chengda Lu, Chenggang Zhao, Chengqi Deng,
+     Chenyu Zhang, Chong Ruan, et al. DeepSeek-V3 tech-          [36] Weston Pace, Chang She, Lei Xu, Will Jones, Albert
+     nical report. arXiv preprint arXiv:2412.19437, 2024.             Lockett, Jun Wang, and Raunak Shah. Lance: Efficient
+                                                                      random access in columnar storage through adaptive
+[26] Quanfeng Lu, Wenqi Shao, Zitao Liu, Fanqing Meng,                structural encodings, April 2025.
+     Boxuan Li, Botong Chen, Siyuan Huang, Kaipeng
+     Zhang, Yu Qiao, and Ping Luo. Gui odyssey: A compre-        [37] PyTorch. Getting started with fully sharded data parallel
+     hensive dataset for cross-app gui navigation on mobile           (FSDP2) — PyTorch tutorials 2.9.0+cu128 documen-
+     devices. arXiv preprint arXiv:2406.08451, 2024.                  tation.  https://docs.pytorch.org/tutorials/
+                                                                      intermediate/FSDP_tutorial.html, June 2026.
+[27] Kaijing Ma, Xinrun Du, Yunran Wang, Haoran Zhang,
+     Zhoufutu Wen, Xingwei Qu, Jian Yang, Jiaheng Liu,           [38] PyTorch.       PyTorch profiler — PyTorch tu-
+     Minghao Liu, Xiang Yue, Wenhao Huang, and Ge Zhang.              torials 2.9.0+cu128 documentation.       https:
+     KOR-Bench: Benchmarking language models on                       //docs.pytorch.org/tutorials/recipes/
+     knowledge-orthogonal reasoning tasks, 2025.                      recipes/profiler_recipe.html, June 2026.
+                                                                 [39] PyTorch. torch.utils.data — PyTorch 2.9 documen-
+[28] Microsoft.     Azure Blob Storage | Microsoft                    tation. https://docs.pytorch.org/docs/stable/
+     Azure.     https://azure.microsoft.com/en-us/                    data.html, June 2026.
+     products/storage/blobs, June 2026.
+                                                                 [40] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and
+[29] Jayashree Mohan, Amar Phanishayee, and Vijay Chi-                Yuxiong He. ZeRO: Memory optimizations toward train-
+     dambaram. CheckFreq: Frequent, fine-grained DNN                  ing trillion parameter models. In SC20: International
+     checkpointing. In 19th USENIX Conference on File and             Conference for High Performance Computing, Network-
+     Storage Technologies (FAST 21), pages 203–216, 2021.             ing, Storage and Analysis, pages 1–16. IEEE, 2020.
+[30] Jayashree Mohan, Amar Phanishayee, Ashish Raniwala,         [41] Zhenghang Ren, Yuxuan Li, Zilong Wang, Xinyang
+     and Vijay Chidambaram. Analyzing and mitigating data             Huang, Wenxue Li, Kaiqiang Xu, Xudong Liao, Yi-
+     stalls in dnn training. Proc. VLDB Endow., 14(5):771–            jun Sun, Bowen Liu, Han Tian, Junxue Zhang, Mingfei
+     784, January 2021.                                               Wang, Zhizhen Zhong, Guyue Liu, Ying Zhang, and
+
+
+
+USENIX Association                          20th USENIX Symposium on Operating Systems Design and Implementation          363
+      Kai Chen. Enabling efficient GPU communication over      [51] Borui Wan, Gaohong Liu, Zuquan Song, Jun Wang, Yun
+      multiple NICs with FuseLink. In 19th USENIX Sympo-            Zhang, Guangming Sheng, Shuguang Wang, Houmin
+      sium on Operating Systems Design and Implementation           Wei, Chenyuan Wang, Weiqiang Lou, et al. Robust LLM
+      (OSDI 25), pages 91–108, 2025.                                training infrastructure at ByteDance. In Proceedings of
+                                                                    the ACM SIGOPS 31st Symposium on Operating Sys-
+[42] Safetensors Contributors. safetensors: Simple, safe way        tems Principles, pages 186–203, 2025.
+     to store and distribute tensors. https://github.com/
+     safetensors/safetensors, June 2026.                       [52] Guanhua Wang, Olatunji Ruwase, Bing Xie, and Yux-
+                                                                    iong He. FastPersist: Accelerating model checkpoint-
+[43] Frank Schmuck and Roger Haskin. GPFS: A shared-disk            ing in deep learning. arXiv preprint arXiv:2406.13768,
+     file system for large computing clusters. In Proceed-          2024.
+     ings of the 1st USENIX Conference on File and Storage
+     Technologies, FAST’02, page 16, USA, January 2002.        [53] webdataset. WebDataset/WebDataset. https://
+     USENIX Association.                                            github.com/webdataset/webdataset, June 2026.
+
+[44] Philip Schwan et al. Lustre: Building a file system for   [54] Ouri Wolfson, Sushil Jajodia, and Yixiu Huang. An
+     1000-node clusters. In Proceedings of the 2003 Linux           adaptive data replication algorithm. ACM Trans.
+     symposium, volume 2003, pages 380–386, 2003.                   Database Syst., 22(2):255–314, June 1997.
+
+                                                               [55] Guanbin Xu, Zhihao Le, Yinhe Chen, Zhiqi Lin, Zewen
+[45] Pavel Shamis, Manjunath Gorentla Venkata, M Graham
+                                                                    Jin, Youshan Miao, and Cheng Li. AutoCCL: Auto-
+     Lopez, Matthew B Baker, Oscar Hernandez, Yossi Itigin,
+                                                                    mated collective communication tuning for accelerating
+     Mike Dubman, Gilad Shainer, Richard L Graham, Liran
+                                                                    distributed and parallel DNN training. In 22nd USENIX
+     Liss, et al. UCX: an open source framework for HPC
+                                                                    Symposium on Networked Systems Design and Imple-
+     network APIs and beyond. In 2015 IEEE 23rd Annual
+                                                                    mentation (NSDI 25), pages 667–683, 2025.
+     Symposium on High-Performance Interconnects, pages
+     40–43. IEEE, 2015.                                        [56] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang,
+                                                                    Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chen-
+[46] Mohammad Shoeybi, Mostofa Patwary, Raul Puri,
+                                                                    gen Huang, Chenxu Lv, et al. Qwen3 technical report.
+     Patrick LeGresley, Jared Casper, and Bryan Catanzaro.
+                                                                    arXiv preprint arXiv:2505.09388, 2025.
+     Megatron-LM: Training multi-billion parameter lan-
+     guage models using model parallelism, March 2020.         [57] Susan Zhang, Stephen Roller, Naman Goyal, Mikel
+                                                                    Artetxe, Moya Chen, Shuohui Chen, Christopher De-
+[47] Konstantin Shvachko, Hairong Kuang, Sanjay Radia,              wan, Mona Diab, Xian Li, Xi Victoria Lin, Todor Mi-
+     and Robert Chansler. The Hadoop distributed file sys-          haylov, Myle Ott, Sam Shleifer, Kurt Shuster, Daniel
+     tem. In 2010 IEEE 26th Symposium on Mass Storage               Simig, Punit Singh Koura, Anjali Sridhar, Tianlu Wang,
+     Systems and Technologies (MSST), pages 1–10, May               and Luke Zettlemoyer. OPT: Open pre-trained trans-
+     2010.                                                          former language models, 2022.
+[48] Kimi Team, Yifan Bai, Yiping Bao, Guanduo Chen, Ji-       [58] Hanyu Zhao, Zhenhua Han, Zhi Yang, Quanlu Zhang,
+     ahao Chen, Ningxin Chen, Ruijue Chen, Yanru Chen,              Mingxia Li, Fan Yang, Qianxi Zhang, Binyang Li,
+     Yuankun Chen, Yutian Chen, et al. Kimi K2: Open                Yuqing Yang, Lili Qiu, et al. SiloD: A co-design of
+     agentic intelligence. arXiv preprint arXiv:2507.20534,         caching and scheduling for deep learning clusters. In
+     2025.                                                          Proceedings of the Eighteenth European Conference on
+                                                                    Computer Systems, pages 883–898, 2023.
+[49] Deepak Vohra. Apache parquet. In Deepak Vohra,
+     editor, Practical Hadoop Ecosystem: A Definitive Guide    [59] Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo,
+     to Hadoop-Related Frameworks and Tools, pages 325–             Chien-Chin Huang, Min Xu, Less Wright, Hamid Sho-
+     335. Apress, Berkeley, CA, 2016.                               janazeri, Myle Ott, Sam Shleifer, Alban Desmaison,
+                                                                    Can Balioglu, Pritam Damania, Bernard Nguyen, Geeta
+[50] Borui Wan, Mingji Han, Yiyao Sheng, Yanghua Peng,              Chauhan, Yuchen Hao, Ajit Mathews, and Shen Li. Py-
+     Haibin Lin, Mofan Zhang, Zhichao Lai, Menghan Yu,              Torch FSDP: Experiences on scaling fully sharded data
+     Junda Zhang, Zuquan Song, Xin Liu, and Chuan Wu.               parallel, September 2023.
+     ByteCheckpoint: A unified checkpointing system for
+     large foundation model development. In 22nd USENIX        [60] Lianmin Zheng, Zhuohan Li, Hao Zhang, Yonghao
+     Symposium on Networked Systems Design and Imple-               Zhuang, Zhifeng Chen, Yanping Huang, Yida Wang,
+     mentation (NSDI 25), pages 559–578, 2025.                      Yuanzhong Xu, Danyang Zhuo, Eric P Xing, et al. Alpa:
+
+
+
+364   20th USENIX Symposium on Operating Systems Design and Implementation                            USENIX Association
+    Automating inter-and intra-operator parallelism for dis-
+    tributed deep learning. In 16th USENIX Symposium on
+    Operating Systems Design and Implementation (OSDI
+    22), pages 559–578, 2022.
+
+
+
+
+USENIX Association                        20th USENIX Symposium on Operating Systems Design and Implementation   365
+

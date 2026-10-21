@@ -1,0 +1,1346 @@
+A Unified Architecture for Accelerating Distributed
+DNN Training in Heterogeneous GPU/CPU Clusters
+   Yimin Jiang, Tsinghua University and ByteDance; Yibo Zhu, ByteDance;
+  Chang Lan, Google; Bairen Yi, ByteDance; Yong Cui, Tsinghua University;
+                       Chuanxiong Guo, ByteDance
+           https://www.usenix.org/conference/osdi20/presentation/jiang
+
+
+
+
+      This paper is included in the Proceedings of the
+      14th USENIX Symposium on Operating Systems
+               Design and Implementation
+                            November 4–6, 2020
+                               978-1-939133-19-9
+
+
+
+                                       Open access to the Proceedings of the
+                                       14th USENIX Symposium on Operating
+                                        Systems Design and Implementation
+                                              is sponsored by USENIX
+          A Unified Architecture for Accelerating Distributed DNN Training in
+                           Heterogeneous GPU/CPU Clusters
+
+              Yimin Jiang⇤† , Yibo Zhu† , Chang Lan‡ , Bairen Yi† , Yong Cui⇤ , Chuanxiong Guo†
+                                 ⇤ Tsinghua University, † ByteDance, ‡ Google
+
+
+
+
+                         Abstract                                  in reinforcement learning. These GPU/CPU machines are
+   Data center clusters that run DNN training jobs are inher-      connected by high-speed Ethernet or Infiniband network to
+ently heterogeneous. They have GPUs and CPUs for computa-          facilitate distributed training. Based on our experience in
+tion and network bandwidth for distributed training. However,      operating production GPU clusters (§3.1) and recent literature
+existing distributed DNN training architectures, all-reduce        from others [35], GPUs are usually better utilized while there
+and Parameter Server (PS), cannot fully utilize such heteroge-     are often spare CPU and bandwidth resources.
+neous resources. In this paper, we present a new distributed          There are two major families of distributed training archi-
+DNN training architecture called BytePS. BytePS can lever-         tectures, all-reduce [54] and Parameter Server (PS) [44]. They
+age spare CPU and bandwidth resources in the cluster to            are both based on data parallelism (§2). In a task that uses
+accelerate distributed DNN training tasks running on GPUs.         all-reduce, only GPU machines are involved. In an iteration,
+It provides a communication framework that is both proved          GPUs compute the gradients of the model parameters inde-
+optimal and unified – existing all-reduce and PS become two        pendently, and then aggregate gradients using the all-reduce
+special cases of BytePS. To achieve the proved optimality in       primitive. In PS tasks, both GPU machines and CPU machines
+practice, BytePS further splits the functionalities of a parame-   can be used. Different from all-reduce, the gradients are sent
+ter optimizer. It introduces a Summation Service abstraction       to PS, which typically runs on CPU machines and aggregates
+for aggregating gradients, which is common for all the op-         the received gradients. PS then runs certain DNN training
+timizers. Summation Service can be accelerated by AVX              optimizer, e.g., SGD [76] or Adam [42] and sends back the
+instructions and can be efficiently run on CPUs, while DNN         updated model. For both all-reduce and PS, the above happens
+model-related optimizer algorithms are run on GPUs for com-        in every iteration, until the training finishes.
+putation acceleration. BytePS can accelerate DNN training             All-reduce and PS are quite different, in both theory and
+for major frameworks including TensorFlow, PyTorch and             practice. Given a set of GPU machines without additional
+MXNet. For representative DNN training jobs with up to 256         CPU machines, all-reduce is proved to be bandwidth opti-
+GPUs, BytePS outperforms the state-of-the-art open source          mal [54]. However, with additional CPU and bandwidth re-
+all-reduce and PS by up to 84% and 245%, respectively.             sources, the optimality of all-reduce no longer holds – we
+                                                                   find that, in theory, PS can offer even better performance by
+1   Introduction                                                   utilizing additional CPU machines to aid the GPU machines
+In recent years, research on Deep Neural Networks (DNNs)           (§2). It seems to be a good opportunity to accelerate DNN
+has experienced a renaissance. DNNs have brought break-            training because GPU clusters indeed have spare CPU and
+throughs to computer vision [32, 43], speech recognition and       bandwidth resources (§3.1). Unfortunately, in practice, all
+synthesis [33, 69], natural language processing (NLP) [26],        the existing PS have inferior performance for multiple design
+and many other areas. Training these DNN models usually            reasons, as we shall see soon in this paper. It is therefore not
+requires a huge amount of arithmetic computation resources.        a surprise to see that distributed DNN training speed records
+Consequently, GPUs are preferred. To run many such tasks           are dominated by all-reduce [27, 49, 73].
+and achieve high resource utilization, large GPU clusters with        We are thus motivated to design BytePS 1 , an architecture
+thousands or more GPUs are introduced [29, 35, 52, 71].            that is communication-optimal, both in theory and in practice.
+   Such GPU clusters have not only GPUs, but also CPUs and         Fundamentally, both all-reduce and PS are theoretically op-
+high speed networks. GPU machines typically also have high-        timal only in very specific GPU/CPU setups, while are not
+end CPUs [2, 11]. There may also be CPU-only machines              1 The name BytePS was chosen in the early stage of this project [4]. However,
+
+used for training data pre-processing and generation, e.g.,         it is conceptually different from the conventional PS architecture.
+
+
+
+
+USENIX Association                           14th USENIX Symposium on Operating Systems Design and Implementation                         463
+the optimal for more generic settings, e.g., there are some fi-            2 Background
+nite additional CPU resources. By carefully allocating traffic
+                                                                           2.1 Distributed DNN Training
+loads, BytePS unifies the cases where PS or all-reduce is the-
+oretically optimal, and generalizes the optimality to any given            A DNN model consists of many parameters. DNN training
+number of GPU/CPU machines with different PCIe/NVLink                      involves three major steps: (1) forward propagation (FP),
+configurations, with analytical proofs.                                    which takes in a batch of training data, propagates it through
+   On top of that, BytePS pushes its real-world performance                the DNN model, and calculates the loss function; (2) back-
+close to the theoretical limit, by removing bottlenecks in exist-          ward propagation (BP), which uses the loss value to compute
+ing PS designs. With fast high-speed networks, we found that               the gradients of each parameter; (3) parameter update, which
+CPUs are not fast enough for the full fledged DNN optimiz-                 uses the aggregated gradients to update the parameters with a
+ers. We introduce a new abstraction, Summation Service, to                 certain optimizer (e.g., SGD [76], Adam [42], etc.). Training
+address this issue. We split an optimizer into gradient aggre-             a DNN refines the model parameters with the above three
+gation and parameter update. We keep gradient aggregation                  steps iteratively, until the loss function reaches its minimal.
+in Summation Service running on CPUs and move param-                          On top of it, users can optionally run distributed train-
+eter update, which is more computation intensive, to GPUs.                 ing. The most popular distributed DNN training approach
+In addition, in implementation, we incorporated the idea of                is data parallelism, which partitions the dataset to multiple
+pipelining and priority-scheduling from prior work [34, 55]                distributed computing devices (typically GPUs) while each
+and resolved multiple RDMA-related performance issues.                     GPU holds the complete DNN model. Since the data input
+   As a drop-in replacement for all-reduce and PS, BytePS                  to each GPU is different, the gradients generated by BP will
+aims to accelerate distributed training without changing the               also be different. Thus data parallelism demands all GPUs to
+DNN algorithm or its accuracy at all. Prior work on top of all-            synchronize during each training iteration.
+reduce and PS, like tensor compression [21, 45], can directly                 In large enterprises or in public clouds, users often run
+apply to BytePS. Our BytePS implementation supports pop-                   these DNN training tasks in shared GPU clusters. Such clus-
+ular DNN training frameworks including TensorFlow [20],                    ters are built with hundreds to thousands of GPU machines
+PyTorch [53], and MXNet [22] with Horovod-like [60] API                    connected by high-speed RDMA networks [35, 52]. Those
+and native APIs.                                                           GPU machines typically have multiple GPUs, tens of CPU
+   This paper makes the following contributions:                           cores, hundreds of GB of DRAM, and one to several 100Gb/s
+                                                                           NICs. These clusters run many training jobs simultaneously,
+• We design a new distributed DNN training architecture,                   with many jobs using GPUs intensively while not using CPUs
+  BytePS, for heterogeneous GPU/CPU clusters. With spare                   heavily. A public dataset on a DNN cluster [35] indicates that
+  CPU cores and network bandwidth in the cluster, BytePS                   50% of hosts have CPU utilization lower than 30%.
+  can achieve communication optimality 2 for DNN training                     For distributed training, there are two families of data paral-
+  acceleration. BytePS provides a unified framework which                  lelism approaches, i.e., all-reduce and Parameter Server (PS).
+  includes both all-reduce and PS as two special cases.                    In what follows, we introduce all-reduce and PS and analyze
+• We further optimize the intra-machine communication. We                  their communication overheads. We assume that we have
+  explain the diverse and complicated topology in GPU ma-                  n GPU machines for a data-parallel training job. The DNN
+  chines and present the optimal strategy and principles.                  model size is M bytes. The network bandwidth is B.
+
+• We propose Summation Service, which accelerates DNN                      2.2    All-reduce
+  optimizers by keeping gradient summation running in
+  CPUs, and moving parameter update, which is the more                     Originated from the HPC community, all-reduce aggregates
+  computation intensive, to GPUs. This removes the CPU                     every GPU’s gradients in a collective manner before GPUs
+  bottleneck in the original PS design.                                    update their own parameters locally. In all-reduce, no addi-
+                                                                           tional CPU machine is involved. Ring is the most popular
+   As a major online service provider, we have deployed                    all-reduce algorithm. All-reduce has been optimized for many
+BytePS internally and used it extensively for DNN training.                years, and most state-of-the-art training speed records are
+We evaluate BytePS using six DNN models and three training                 achieved using all-reduce, including classical CNN-based Im-
+frameworks in production data centers. The results show that               ageNet tasks [27, 36, 49, 73], RNN-based language modeling
+with 256 GPUs, BytePS consistently outperform existing all-                tasks [56], and the pre-training of BERT [26, 74].
+reduce and PS solutions by up to 84% and 245%, respectively.                  Fig. 1 shows an example of ring-based all-reduce for three
+We also released an open source version [4], which attracted               nodes. We can dissect an all-reduce operation into a reduce-
+interests from thousands in the open source community, sev-                scatter and an all-gather. Reduce-scatter (Fig. 1(a)) partitions
+eral top-tier companies and multiple research groups.                      the whole M bytes into n parts, and use n rings with different
+2 The optimality means to achieve minimized communication time for data-   starting and ending point to reduce the n parts, respectively.
+ parallel distributed DNN training, given a fixed number of GPUs.          Each node will send (n 1)M/n traffic, because each node
+
+
+
+464    14th USENIX Symposium on Operating Systems Design and Implementation                                           USENIX Association
+acts as the last node for just 1 ring and thus sends 0, while for                        A0AA
+                                                                                            0B0 0BB
+                                                                                                  0C0 0CC
+                                                                                                        00                        ΣAΣAB0BB0C0 0CC0 0
+                                                                                                                                     ΣA                                   ΣAΣAΣBΣB
+                                                                                                                                                                             ΣA   ΣCΣC
+                                                                                                                                                                                 ΣB  ΣC
+                                                                                         A0 B0 C0                                 ΣA B0 C0                                 ΣA ΣB ΣC
+each of the other n 1 rings, it must send M/n bytes.                                       A0 B0 C0                                ΣA B0 C0                                ΣA ΣB ΣC
+
+   Next, all-gather requires each node to broadcast its reduced                A2AA
+                                                                                  2B2 2BB
+                                                                                        2C2 2CC
+                                                                                              2 2 A 1AA
+                                                                                                      1B1 1BB
+                                                                                                            1C    1 1 A 2AA
+                                                                                                              1 1CC       2B2 2BB
+                                                                                                                                2ΣC  ΣCA1AA1ΣB
+                                                                                                                                  2 ΣC      1 ΣBC1CC1 1 ΣAΣA
+                                                                                                                                               ΣB           ΣBΣB
+                                                                                                                                                           ΣA   ΣCΣC
+                                                                                                                                                               ΣB  ΣCΣAΣAΣBΣB
+                                                                                                                                                                        ΣA   ΣCΣC
+                                                                                                                                                                            ΣB  ΣC
+                                                                               A2A B2B C2C A1A B1B C1C                AA2 BB2 ΣC   ΣC AA1 ΣB ΣB CC1      ΣA  ΣB ΣC
+                                                                                                                                                                 ΣC ΣAΣA ΣB
+                                                                                                                                                                          ΣB ΣC
+                                                                                                                                                                              ΣC
+part to all other (n 1) nodes using a ring. In the end, all nodes                  2     2     2      1      1    1         2     2            1         ΣA ΣB
+                                                                                                                                                          1
+
+
+have identical data that have been all-reduced (Fig. 1(c)).                     (a) Reduce-scatter                              (b) All-gather                                (c) Result
+Similar to reduce-scatter, each node also sends (n 1)M/n                            Figure
+                                                                              Server-0
+                                                                               Server-0
+                                                                                 Server-0    1: The communication
+                                                                                          Server-1
+                                                                                           Server-1
+                                                                                             Server-1   Server-2      workflow
+                                                                                                         Server-2 Machine-0
+                                                                                                      Server-2     Machine-0
+                                                                                                                    Machine-0   of all-reduce.
+                                                                                                                             Machine-1
+                                                                                                                              Machine-1
+                                                                                                                               Machine-1 Machine-2
+                                                                                                                                          Machine-2
+                                                                                                                                           Machine-2
+egress traffic during this operation.                                         Server-0
+                                                                                Server-0
+                                                                                   ΣAΣA
+                                                                                                   Server-1
+                                                                                                    Server-1
+                                                                                                       ΣBΣB
+                                                                                                          ΣB
+                                                                                                                      Server-2
+                                                                                                                       Server-2
+                                                                                                                          ΣCΣC
+                                                                                                                             ΣC
+                                                                                                                                            Machine-0
+                                                                                                                                            Machine-0
+                                                                                                                                               ΣAΣA
+                                                                                                                                                      Machine-1
+                                                                                                                                                      Machine-1
+                                                                                                                                                         ΣBΣB
+                                                                                                                                                            ΣB                       Machine-2
+                                                                                                                                                                                     Machine-2
+                                                                                                                                                                                        ΣCΣC
+                                                                                                                                                                                           ΣC
+                                                                                      ΣA                                                          ΣA
+                                                                                    ΣAΣA                  ΣBΣB              ΣC
+                                                                                                                             ΣC                    ΣA
+                                                                                                                                                   ΣA                   ΣB                  ΣC
+                                                                                                                                                                                            ΣC
+   Adding the two steps together, in an all-reduce operation,
+each node sends (and receives) 2(n 1)M/n traffic to (and                       A0AA
+                                                                                  0B    0C
+                                                                                    0 0BB     0 0 A 1AA
+                                                                                          0 0CC       1B    1C
+                                                                                                        1 1BB     1 1 A 2AA
+                                                                                                              1 1CC       2B    2C
+                                                                                                                            2 2BB     2 2 A 0AA
+                                                                                                                                  2 2CC       0B    0C
+                                                                                                                                                0 0BB     0 0 A 1AA
+                                                                                                                                                      0 0CC       1B     1C
+                                                                                                                                                                    1 1 BB      1 1 A 2 AA2B
+                                                                                                                                                                           1 1 CC          2 2 BB2C
+                                                                                                                                                                                                  2 2 CC22
+                                                                               A0A0B0B0 C0C0 A1A1 B1B1 C1C1 AA2 2 BB2 2 CC22              AA00 BB00 CC00       A1 B11 CC11          AA22 BB22 CC22
+from) the network. With B network bandwidth, the time re-                     Worker-0
+                                                                                 Worker-0 Worker-1
+                                                                               Worker-0        Worker-1 Worker-2
+                                                                                             Worker-1
+                                                                                Worker-0 Worker-1
+                                                                                                              Worker-2
+                                                                                                            Worker-2
+                                                                                              Worker-1 Worker-2
+                                                                                                            Worker-2
+                                                                              Worker-0
+quired is 2(n 1)M/nB, which is proved to be the optimal in
+                                                                                       (a) Non-colocated mode                                            (b) Colocated mode
+topologies with uniformed link bandwidth [54], assuming no                   Figure 2: The communication pattern of PS. A solid arrow line
+additional resources.                                                        indicates the network traffic. A dashed arrow line represents the
+   In hierarchical topologies with non-uniformed link band-                  loop-back (local) traffic.
+width, the optimal hierarchical strategy would require at least
+2(n0 1)M/n0 B0 communication time, where B0 is the slowest                      Assuming k = n, PS would theoretically be faster than
+link bandwidth and n0 is the number of nodes with the slowest                all-reduce, as summarized in Table 1. In fact, PS is com-
+links. In distributed DNN training, n0 is usually the number of              munication optimal in such setting, since M is the absolute
+GPU machines and B0 is usually the network bandwidth per                     lower bound each GPU machine has to send and receive.
+machine. For simplicity and without impacting our analysis,                  However, with fewer CPU machines (smaller k), the commu-
+below we assume each machine has just one GPU and is con-                    nication time nM/kB on CPU machines would increase and,
+nected by the same network bandwidth, i.e., n = n0 , B = B0 .                if k  n/2, become slower than all-reduce. The network band-
+   All-reduce has no way to utilize additional non-worker                    width of GPU machines would become under-utilized because
+nodes, since it was designed for homogeneous setup. Next,                    the CPU machines would be the communication bottleneck.
+we will show that the 2(n 1)M/nB communication time is                          The other strategy is colocated mode (Fig. 2(b)), which
+no longer optimal with additional CPU machines.                              does not use any CPU machines. Instead, it starts a PS process
+                                                                             on every GPU worker and reuses its spare CPU resources. The
+2.3     Parameter Server (PS)                                                PS and GPU worker on the same machine will communicate
+The PS architecture [44] contains two roles: workers and PS.                 through loopback traffic. In this case, it is easy to calculate
+Workers usually run on GPU machines, perform FP and BP,                      that communication time is the same as all-reduce (Table 1).
+and push the gradients to PS. PS aggregates the gradients                    All-reduce vs. PS. They have different communication pat-
+from different workers and update the parameters. Finally,                   terns. PS uses a bipartite graph. Non-colocated PS can lever-
+workers pull the latest parameters from PS and start the next                age additional CPU and bandwidth resources to aid GPU
+iteration. According to our experience in industry, the PS                   machines, while may under-utilize the resources of GPU ma-
+processes usually run on CPUs because of cost-effectiveness.                 chines. Colocated PS and all-reduce utilize the GPU worker
+Since GPUs (and GPU memory) are much more expensive                          resources better, while cannot use additional CPU machines.
+than CPUs,3 we want GPUs to focus on the most computation-                      Another difference is that PS supports asynchronous train-
+intensive tasks instead of storing the model parameters.                     ing, which allows GPU workers to run at different speed and
+   There are two placement strategies for PS. One is non-                    mitigates the impact of stragglers, while all-reduce does not
+colocated mode (Fig. 2(a)), in which PS processes are de-                    support it. However, asynchronous training is less popular
+ployed on dedicated CPU machines, separate from the GPU                      because it can slow down model convergence. We will mainly
+machines. Suppose that we have k CPU machines,4 the DNN                      focus on synchronous training in this paper while briefly ad-
+model will be partitioned into k parts and stored on the k ma-               dress asynchronous training in §5.
+chines, respectively. In every iteration, each GPU worker must
+send M bytes gradients and receives M bytes parameters back.
+                                                                             3 Motivation and BytePS Architecture
+Each CPU machine must receive in total nM/k gradients from                   3.1 Motivation
+the GPU workers and send back nM/k parameters.                               Before the deployment of BytePS in our internal GPU clusters,
+3 AWS price sheet [18] shows that p3.16xlarge (8 NVIDIA V100 GPUs and        our users mostly used all-reduce as the distributed training
+  64 CPU cores) costs nearly $25 per hour. However, r4.16xlarge, which is    architecture due to its higher performance than existing PS
+  the same as p3.16xlarge minus GPUs, costs only $4.2 per hour.              designs. The remaining users choose PS for tasks where asyn-
+4 In this paper, for simplicity, we assume that a CPU machine has the same
+                                                                             chronous training is acceptable or preferable. With multiple
+  network bandwidth as a GPU machine. If not, all analysis and design will
+  remain valid as long as the number of CPU machines scales accordingly.
+                                                                             years of experience and efforts on accelerating DNN tasks
+  For example, use 4⇥ CPU machines if their bandwidth is 25% of GPU          and improving resource utilization, we have the following
+  machines.                                                                  observation.
+
+
+
+USENIX Association                                  14th USENIX Symposium on Operating Systems Design and Implementation                                                                           465
+Table 1: The theoretical communication time required by each                         100%
+training iteration. n is the number of GPU machines. k is the number                                                                    % G3U Pachines
+                                                                                                                                        foU Gist-tUaining
+                                                                                      50%
+of additional CPU machines. M is the model size. B is the network                                                                       AveUage C3U
+bandwidth. We will revisit the Optimal? row in §4.1.                                   0%                                               utilization
+                                                                                             1-01   1-21   2-10   3-01    3-21
+                  All-reduce         Non-Colocated PS          Colocated PS            2020-0 2020-0 2020-0 2020-0 2020-0
+                    2(n 1)M                                        2(n 1)M
+  Time                 nB              max( M    nM
+                                             B , kB )                 nB            Figure 3: Daily statistics of our internal DNN training clusters from
+ Optimal?        Only if k = 0         Only if k = n            Only if k = 0       2020-01-01 to 2020-03-31.
+
+Opportunity: there are spare CPUs and bandwidth in
+production GPU clusters. Large-scale GPU clusters simulta-
+neously run numerous jobs, many of which do not heavily use
+CPUs or network bandwidth. Fig. 3 shows a 3-month trace
+collected from one of our GPU clusters that have thousands
+of GPUs. The GPUs have been highly utilized in that period
+(approaching 96% allocation ratio in peak times). We find
+that, 55%-80% GPU machines have been assigned as GPU                                Figure 4: VGG-16 training performance of different architectures.
+                                                                                    We use 4 GPU machines with 32 GPUs in total. Linear Scaling
+workers for at least one distributed training task. This leaves
+                                                                                    represents the maximal performance (in theory) of using 32 GPUs.
+the network bandwidth of 20%-45% GPU machines unused
+because they are running non-distributed jobs.5 The cluster-                        works on top of PS or all-reduce, and thus has the same limi-
+wide average CPU utilization is only around 20%-35%. This                           tations. BytePS outperforms all of above at any given number
+aligns with the findings in prior work from Microsoft [35].                         of CPU machines (more in §7).
+   This observation, combined with the all-reduce vs. non-                          Our solution: BytePS. It is a unified architecture for dis-
+colocated PS analysis in §2.1, inspires us – if we can better                       tributed DNN training that can leverage spare CPU and band-
+utilize these spare CPUs and bandwidth, it is possible to ac-                       width resources. It achieves the following goals.
+celerate distributed training jobs running on given GPUs.                              First, BytePS is always communication optimal with any
+Existing all-reduce and PS architectures are insufficient.                          additional CPU and bandwidth resources, i.e., 0  k  n, al-
+Unfortunately, the analysis in §2.1 also shows that all-reduce                      located by the cluster scheduler. In practice, the volume of
+and PS have a common issue: they do not utilize additional                          spare resources can be dynamic (Fig. 3), so BytePS must adapt
+CPU and bandwidth resources well. All-reduce and colocated                          well. In addition, the hardware setup of GPU machines can
+PS only use resources on GPU workers, and non-colocated                             be diverse, especially the internal PCIe or NVLink topology.
+PS may not fully utilize the CPU cores and NIC bandwidth                            BytePS is also proved optimal in intra-machine communi-
+on GPU workers. The former is communication optimal only                            cation. All-reduce and PS, when they are communication
+when k = 0, while the latter is optimal only when k = n. When                       optimal, are two special cases of BytePS (§4).
+the number of CPU machine k is 0 < k < n, neither would be                             Second, BytePS can achieve communication time very
+optimal. We defer further analysis to §4.1. Here, we use an                         close to the theoretical optimal. This is important, as shown
+experiment to show the end-to-end performance of existing                           in the existing PS case – PS performance is far from its theo-
+all-reduce and PS.                                                                  retical limit. We found that original PS designs have several
+   Fig. 4 shows the training speed of VGG-16 [63] using 32                          implementation bottlenecks (which we will discuss in §6). But
+V100 GPUs (4 GPU machines), with 100GbE RDMA net-                                   even after all the bottlenecks are removed, PS performance is
+work. The batch size is 32 images for each GPU. We run the                          still inferior to optimal. This leads to BytePS’s second design
+latest MXNet native PS RDMA implementation [1] and (one                             contribution: Summation Service. We find that running the
+of) the most popular all-reduce library NCCL-2.5.7 [13]. We                         full optimizers on CPU can be a bottleneck. We divide the
+also tested TensorFlow’s native PS, and got similar results. We                     computation of optimizers and only put summation on CPUs.
+vary the number of additional CPU machines for each setup.                          We will elaborate the rationale of this design in §5.
+All-reduce plot is flat because additional CPU machines are                            All the BytePS designs are generic to DNN training.
+of no use, while PS has the worst performance even with                             BytePS can therefore accelerate various DNN training frame-
+additional CPU machines. Both of them are far from optimal.                         works including TensorFlow, PyTorch, and MXNet. We start
+Even with ByteScheduler [55], which is a state-of-the-art tech-                     from presenting BytePS’s architecture.
+nique that can improve the communication performance, both
+all-reduce and PS are still far from the linear scaling, i.e., 32⇥                  3.2     Architecture Overview
+of single-GPU training speed. This is because ByteScheduler                         Fig. 5 shows the architecture of BytePS. BytePS has two
+5 Our machines have dedicated but slower NIC for data I/O. This is a common         main modules – Communication Service (CS) and Summa-
+ practice in industry [52]. In addition, data I/O traffic is usually much smaller   tion Service (SS). In BytePS, we aim to leverage any CPU
+ than the distributed training traffic between GPU machines.                        resources, whether on GPU machines or CPU machines, to
+
+
+
+466     14th USENIX Symposium on Operating Systems Design and Implementation                                                     USENIX Association
+                CPU Machine0       CPU Machinek-1                     whole system, we must balance the communication time of
+                 Summation     …      Summation
+                   Service              Service                       all machines. In what follows, we assume the network has
+                                                                      full bisection bandwidth, which is a common practice in deep
+                                                                      learning clusters [52]. We also assume that the full bisection
+ GPU Machine0 Communication         Communication GPU Machinen-1
+                   Service              Service                       bandwidth can be fully utilized due to the newly introduced
+     GPU                                              GPU
+  Computation    Summation            Summation    Computation        RDMA congestion control algorithms, e.g., DCQCN [75].
+                   Service     …        Service                          On each CPU machine, the summation workload of its SS
+Figure 5: BytePS architecture. Solid lines: the connection between    determines the network traffic. For example, if a SS is re-
+CPU machines and GPU machines. Dashed lines: the data flow            sponsible for summing up x% of the DNN model, the CPU
+inside GPU machines.                                                  machine would send and receive x% ⇥ M bytes traffic to every
+                                                                      GPU machine during each training iteration. However, the
+achieve the best communication efficiency. This is achieved
+                                                                      network traffic of a GPU machine is determined by the com-
+by SS, which runs on the CPU of every machine, including
+                                                                      bination of CS and SS running on it. Due to this difference,
+the CPU machines and GPU machines. The CPU machines
+                                                                      BytePS classifies SS into SSCPU and SSGPU based on whether
+may not necessarily be actual CPU-only machines. For exam-
+                                                                      they run on CPU machines or GPU machines.
+ple, our in-house cluster scheduler can allocate CPUs on the
+                                                                         To minimize the communication time, BytePS assigns
+GPU machines that run non-distributed jobs and have spare
+                                                                      MSSCPU bytes summation workload to each SSCPU . MSSCPU
+CPU cores and network bandwidth. This improves the overall
+                                                                      is given in Eq. 1, where k 1 is the number of CPU machines
+cluster resource utilization.
+                                                                      and n 2 is the number of GPU machines, and k  n. Out-
+   Another important property of SS is that it is much simpler
+                                                                      side these constraints, the communication time of BytePS falls
+than common PS server processes, which run full fledged
+                                                                      back to trivial solutions like PS (when k > n) and all-reduce
+DNN algorithm optimizers. In contrast, SS is only responsible
+                                                                      (when k = 0), as §4.1.1 shows.
+for receiving tensors that are sent by CS, summing up the
+tensors and sending them back to CS.                                                                       2(n     1)
+                                                                                           MSSCPU =                     M                   (1)
+   The other module, CS, is responsible for internally syn-                                              n2 + kn     2k
+chronizing the tensors among multiple (if there are) local
+                                                                      Similarly, BytePS assigns MSSGPU bytes to each SSGPU .
+GPUs and externally communicating with SS. Every train-
+ing iteration, each CS must send in total M bytes (the DNN                                                   n     k
+                                                                                           MSSGPU =                         M               (2)
+model size) to and receive M bytes from SS. In synchronous                                               n2 + kn       2k
+distributed training, the tensors are model gradients.
+                                                                         Eq. 1 and Eq. 2 show the workload assignment strategy
+   CS contains several design points of BytePS. First, it de-
+                                                                      that is optimal for minimizing the communication time. The
+cides the traffic volume to each SS (both internal and external).
+                                                                      analysis is in §4.1.1. In practice, the DNN model consists of
+The load assignment strategy is based on our analysis of the
+                                                                      tensors with variable sizes and may not allow us to perfectly
+optimal communication strategy (§4.1). Second, it chooses
+                                                                      assign workloads. BytePS uses an approximation method. It
+the best local tensor aggregation strategy depending on dif-
+                                                                      partitions the tensors into small parts no larger than 4MB.6
+ferent internal GPU and NIC topology (§4.2) of the GPU
+                                                                      Then, all CSs consistently index each part and hash the indices
+machines. Finally, both CS and SS should be optimized for
+                                                                      into the range of [0, n2 + kn 2k). CSs will send and receive
+RDMA in modern high-speed data centers (§6.2).
+                                                                      tensors to SSs based on the hash value and approximate the
+   This architecture enables BytePS to flexibly utilize any
+                                                                      probabilities according to Eq. 1 and Eq. 2. Consistent indexing
+number of additional CPU resources and network bandwidth.
+                                                                      and hashing guarantee that the same part from all GPUs will
+When the number of CPU machines is 0, i.e., k = 0, the com-
+                                                                      be sent to and processed by the same SS.
+munication will fallback to only using SSs on GPU machines.
+When the number of CPU machines is the same as GPU ma-                4.1.1    Communication Efficiency Analysis
+chines, BytePS is as communication optimal as non-colocated
+PS. In other cases, BytePS can leverage SSs on all machines           Next, we present the communication time analysis of BytePS.
+together. In fact, our analytical results will reveal the optimal     To simplify the analysis, we assume that the model size M is
+communication strategy with any number of CPU machines,               much larger than the partition size (4MB in our case). Parti-
+while PS and all-reduce are just two specific points in the           tioning enables BytePS not only to better balance the sum-
+whole problem space.                                                  mation workloads, but also to well utilize the bidirectional
+                                                                      network bandwidth by pipelining sending and receiving, as
+4 BytePS Communication Design                                         shown in [34, 55]. So, we further assume that sending and
+                                                                      receiving the whole M bytes can fully overlap with negligible
+4.1 Inter-machine Communication                                       overhead. We have the following result.
+In BytePS, all networking communication is between CS and             6 While we find that 4MB partition size works reasonably well in our envi-
+
+SS. To prevent a bottleneck node from slowing down the                 ronment, BytePS allow users to tune the partition size value.
+
+
+
+
+USENIX Association                                14th USENIX Symposium on Operating Systems Design and Implementation                    467
+Theorem 1. The SS workload assignment given by Eq. 1 and                                    QPI CPU
+                                                                                     CPU00 QPI   CPU1 1            CPU 0            CPU
+                                                                         NIC
+                                                                         NIC
+                                                                                    CPU                       NIC CPU 0
+                                                                                                             NIC
+                                                                                                                                   CPU 1 1
+Eq. 2 is optimal for minimizing communication time.                                  Mem
+                                                                                    Mem          Mem
+                                                                                                Mem                Mem
+                                                                                                                  Mem               Mem
+                                                                                                                                   Mem
+                                                                                       PP00       PP11               P0P0             P1P1
+Proof. We first consider the network traffic of a GPU machine.
+It runs a CS module and an SS module. CS should send and                      00
+receive M bytes in total. However, when it communicates
+                                                                                                                00
+                                                                                    11 22 33 44 55 66 7 7            11 22 3 3 4 4 5 5 6 6 7 7
+with the SS on the same GPU machine, the traffic does not
+go over the network. So, a CS module will send and receive                         (a) PCIe-only topology        (b) Outgoing data flow
+M MSSGPU bytes. An SS module on a GPU machine must                      Figure 6: PCIe-only machine topology and BytePS data flow. Gray
+receive and send MSSGPU from other n 1 GPU machines, i.e.,              boxes are GPUs. Only the outgoing direction (from GPUs to net-
+                                                                        work) is shown in the data flow figure. Incoming is the opposite.
+(n 1)MSSGPU in total. Adding them together, a GPU machine
+with network bandwidth B requires communication time tg :                  CPU
+                                                                            CPU00         QPI
+                                                                                           QPI    CPU
+                                                                                                   CPU1 1             CPU
+                                                                                                                       CPU0 0             CPU
+                                                                                                                                           CPU1 1
+                                                                  NIC
+                                                                  NIC        When
+                                                                             Mem k = n andMem
+                                                                             Mem                   n ! •, ga NIC
+                                                                                                  Mem        =NIC2. WhenMem
+                                                                                                                         Memk is small, gMemcan
+                                                                                                                                          pMem
+                                                                                                                    P0P0
+                         M + (n     2)MSSGPU                            be quitePPbig,
+                                                                        PP00        11
+                                                                                         asPP2 2the communication
+                                                                                                       PP33                  P1P1
+                                                                                                                       bandwidth   isP2severely
+                                                                                                                                       P2      P3P3
+                  tg =                                     (3)
+                                   B                                    bottlenecked by the CPU machines in non-colocated PS. For
+                                                                        example, when n = 32 and k = 16, we have ga = 1.46 and
+Similarly, if k > 0, we can get that a CPU machine with net-              0       2          44       6              00      22       44      66
+                                                                        g p0 = 1.52,2 respectively.   It6means that BytePS    can theoretically
+work bandwidth B requires communication time tc :
+                                                                        outperform
+                                                                          11      33 all-reduce
+                                                                                             55      and
+                                                                                                      77 PS by 46%   1 1and 52%,
+                                                                                                                             3 3 respectively.
+                                                                                                                                      55      77
+                         tc = MSSCPU /B                    (4)               We note that adding more CPU machines beyond k = n
+In addition, the sum of all the SS workload should be equal             does not help, since the communication bottleneck will be-
+to the total model size.                                                come the NIC bandwidth of the GPU machines.
+
+                   M = kMSSCPU + nMSSGPU                    (5)         4.2         Intra-machine Communication
+From Eq. 5, it is clear that the larger MSSCPU is, the smaller
+MSSGPU is. Consequently, when n 2, the larger tc is, the                In §4.1, we design the optimal inter-machine communication
+smaller tg is (or tg is unchanged if n = 2). In addition, we            strategy. In practice, we find that intra-machine communi-
+know that the final communication time is max (tc ,tg ).                cation is equally important. There are often multiple GPUs
+  To minimize the communication time, tc and tg need to be              in a machine. CS must aggregate/broadcast the tensors be-
+equal. If they are not equal, say tc > tg , it means the commu-         fore/after communicating with SS. This can create congestion
+nication time can be further reduced by decreasing MSSCPU               on the PCIe links and prevent NIC from fully utilizing its
+and thus bring down tc .                                                bandwidth B. Moreover, the GPU machine’s internal topol-
+  We let tc = tg and combine Eq. 3, Eq. 4, and Eq. 5. Solving           ogy can be diverse in data centers. Below, we share the two
+the equations with MSSGPU and MSSCPU as variables, we can               most common machine setups in our environment and our
+get the optimal values as given by Eq. 1 and Eq. 2.                     corresponding solution. We present several principles that can
+                                                                        apply to other machine setups in §4.2.3.
+   Based on Theorem 1, combine Eq. 3 and Eq. 2, we have
+the optimal communication time, which is used in Fig. 12.               4.2.1        PCIe-only Topology
+                              2n(n 1)M                                  Fig. 6(a) shows a setup in our production environment. A GPU
+                   topt =                                  (6)
+                           (n2 + kn 2k)B                                machine has two NUMA CPUs connected via QPI. The eight
+   From Eq. 2, we can see that when the numbers of CPU                  GPUs are split into two groups and connected to two PCIe
+machines and GPU machines are the same, MSSGPU = 0, which               switches, respectively. The NIC is 100Gbps and connected
+means that we do not need any SSGPU . This is because the               to the PCIe of one of the CPUs. All PCIe links in figure are
+CPU machines already provide enough aggregate bandwidth.                3.0 x16 (128Gbps theoretical bandwidth). The CPU memory
+BytePS falls back to non-colcated PS. Similarly, when the               and QPI has > 300Gbps bandwidth, which are less likely the
+number of CPU machines is 0, BytePS falls back to all-reduce            communication bottleneck. We call this PCIe-only topology.
+and colocated PS.                                                       For this machine model, we measure that the throughput of
+   Of course, the more interesting case is the general case             GPU-to-GPU memory copy is ⇡105Gbps within the same
+when 0 < k < n. We use the communication time of the plain              PCIe switch. The throughput of GPU-to-GPU memory copy
+all-reduce and non-colocated PS as the two baselines. We                across PCIe switches, however, is only ⇡80Gbps.
+define the acceleration ratio ga as the communication time                 Unfortunately, many existing training frameworks ignore
+of the plain all-reduce divided by that of the general case.            such details of internal topology. For example, TensorFlow
+Similary, g p is defined as the acceleration ratio compared to          PS, MXNet PS and even the “hierarchical all-reduce” mode of
+the non-colocated PS case. We have                                      Horovod use a straightforward reduce or reduce-scatter across
+                  n2 + kn   2k            n2 + kn 2k                    all GPUs on the same machine. This would lead to cross-PCIe
+           ga =                  , gp =                    (7)          switch memory copy, which is unfortunately slower.
+                       n2                  2k(n 1)
+
+
+
+468   14th USENIX Symposium on Operating Systems Design and Implementation                                             USENIX Association
+                                     QPI                                          the number of switches (p 2), and n as the leaf nodes that
+                        C0                         C p-1
+                                                                                  each switch connects (n 2).
+                 S0                        S p-1
+                                                                                     We assume the following features of G: (1) Each edge
+                                     ...                                          in E is duplex and the bandwidth of both directions are
+                         ...                           ...                        equal. Denote b(vx , vy ) as the bandwidth of e(vx , vy ), then
+                N0 N1        N n-1     N (p-1)n              N pn-1               b(vx , vy ) = b(vy , vx ); (2) We assume G is symmetric. The
+         Figure 7: Notations of the PCIe-only topology.                           bandwidth at the same layer of the tree is equivalent. For ex-
+                                                                                  ample, b(S j ,C j ) = b(Sk ,Ck ) and b(Nx , S j ) = b(Ny , S j ) hold
+   In contrast, BytePS lets GPUs under the same PCIe switch                       for any j, k 2 [0, p 1], x, y 2 [ jn, ( j + 1)n 1]; (3) The mem-
+sum the tensors first, then copy to CPU and let CPU do the                        ory and QPI bandwidth is much higher than the PCIe links
+global summation, and finally broadcast back the global sum.                      and is less likely to be the bottleneck. In the following, we
+We call it CPU-assisted aggregation. Specifically, it consists                    only focus on the PCIe links.
+of the following steps.                                                              The GPUs from N0 to N pn 1 need to sum their data. We
+1. Reduce-Scatter: Suppose each PCIe switch has l GPUs.                           can either use CPU-assisted aggregation mentioned before,
+   These l GPUs perform a reduce-scatter which incurs (l                          or use brute-force copy that needs each GPU to copy its entire
+   1)M/l traffic only inside the PCIe switch. When it finishes,                   data to C directly. In practice, the optimal solution should
+   each GPU should hold M/l aggregated data.                                      be a combination of these two strategies, depending on the
+2. GPU-CPU Copy: Each GPU copies its M/l data to CPU                              value of b(S j ,C j) and b(Ni , S j ). The intuition is that we apply
+   memory, which incurs M/l traffic along the route. Every                        brute-force copy on x of the data, and CPU-assisted aggrega-
+   PCIe switch would generate M aggregated data.                                  tion on y of the data (x + y = 1). Under certain x and y, the
+                                                                                  job completion time J can be minimized. We calculate the
+3. CPU-Reduce: CPU reduces the data from all PCIe
+                                                                                  traffic of two links respectively. On e(S j ,C j ), the traffic is
+   switches and generates the aggregated data across all
+                                                                                  composed of n times brute-force copy plus the traffic of CPU-
+   GPUs. This reduction does not incur any PCIe traffic.
+                                                                                  assisted aggregation. On e(Ni ,C j ), the traffic is composed of
+4. Networking: CS sends the data to SS and receives globally                      one brute-force copy and the complete traffic of CPU-assisted
+   aggregated data from SS.                                                       aggregation.
+5. CPU-GPU Copy: Each GPU copies its M/l partition from
+   CPU memory back to itself. This incurs M/l traffic from                                                                 yM
+                                                                                            t(S j ,C j ) = n ⇤ xM +           ⇤ n = (nx + y)M            (8)
+   the CPU to each GPU.                                                                                                     n
+6. All-Gather: Each GPU performs an all-gather operation
+   with those that are under the same PCIe switch. This incurs                                             2(n       1)    1        2n 1
+                                                                                   t(Ni , S j ) = xM + (                  + )yM = (      y + x)M (9)
+   (l 1)M/l traffic inside the switch.                                                                           n         n          n
+                                                                                                                                   t(N ,S )   t(S ,C )
+   Fig. 6(b) shows the traffic of step 1 to 3. Step 4 to 6 use                       Since J is determined by J = max( b(Nii ,Sjj ) , b(Sjj ,Cjj ) ), the
+the same links but the opposite direction. With CPU-assisted                     optimal J is highly related to the two bandwidth terms. On our
+aggregation, the PCIe switch to CPU link would carry only                        own PCIe machines (Fig. 6(a)), we measure that both b(Ni , S j )
+M traffic in each direction, much lower than doing collective                    and b(S j ,C j ) are 13.1GB/s (105Gbps). Let M=1GB and n = 4,
+operation directly on eight GPUs (7M/4 traffic). Meanwhile,                      combining Equation (8), (9) and x + y = 1, we are trying to
+the traffic on each PCIe switch to GPU link would be (2l                         find a x 2 [0, 1] such that arg minx J(x) = max( 3x+1             7 3x
+                                                                                                                                        13.1 , 52.4 ).
+1)M/l. Let l = 4 (each PCIe has four GPUs), this is 7M/4,                                                                             ⇤
+                                                                                 Solve it and we will get the optimal solution is x = 1/5 and
+remaining the same as the existing approach. Fundamentally,                      J ⇤ = 0.129s. This means the optimal solution works like this:
+BytePS leverages the spare CPUs on the GPU machine to                            each GPU applies brute-force copy on its 1/5 data, and uses
+avoid the slow GPU-to-GPU cross-PCIe switch memory copy.                         CPU-assisted aggregation for the rest 4/5 data. Therefore, we
+Optimality Analysis. We now analyze the communication                            have the following key conclusions:
+optimality of the above strategy. Fig. 7 shows a more generic                    CPU-assisted aggregation is near-optimal. When x = 0, the
+PCIe-only topology with variable number of GPUs and PCIe                         solution is our CPU-assisted aggregation, and the job comple-
+switches. We do not plot the NIC as in Fig. 6(a) because                         tion time is J(0) = 0.141s. As calculated, the optimal time is
+under that topology, the NIC has dedicated PCIe lanes and                        0.129s. Thus, our strategy closely approximates the optimal
+will not compete for the PCIe bandwidth with GPUs. The                           solution, with 9% difference on performance. However, in
+system architecture is modeled as a hierarchical graph G =                       practice, brute-force copy heavily stresses the CPU memory
+(V, E). Denote N as the set of leaf nodes (GPUs), S as the                       – any tensor that uses brute-force copy would consume 4⇥
+set of intermediate nodes (switches), C as the set of CPU                        CPU memory bandwidth compared with CPU-assisted aggre-
+nodes. V = N [ S [C. Each edge e(vx , vy ) in E represents the                   gation. CPU memory does not really have 4⇥ bandwidth of
+bandwidth from vertex vx to vy , and we denote t(vx , vy ) as the                PCIe links, especially for FP16 summation (Fig. 9(b). Conse-
+amount of traffic sent from vx to vy . We further define p as                    quently, we choose not to use brute-force copy at all and stick
+
+
+
+USENIX Association                                            14th USENIX Symposium on Operating Systems Design and Implementation                       469
+to CPU-assisted aggregation.                                                             CPU 0 CPUQPI
+                                                                                                   0     QPI
+                                                                                                          CPU 1 CPU 1                CPU 0 CPU 0      CPU 1 CPU 1
+                                                                                                                           NIC   NIC Mem Mem          Mem Mem
+CPU-assisted aggregation is better than ring-based all-                        NIC     NIC
+                                                                                         Mem Mem
+                                                                                           P         P
+                                                                                                          Mem Mem
+                                                                                                             P2 P3    P3         P0    P 0 P1    P1P2  P2 P3      P3
+                                                                                     P0      0 P 1    P2
+                                                                                                       1
+reduce. We have the job completion time for ring-based
+                     2(np 1)M
+all-reduce as Jar = np⇤b           . Similarly, for CPU-assisted
+                        bottleneck                                                          0 2     2 4      4 6     6            0    0 2      2 4     4 6      6
+                                                                                      0
+aggregation we have Jca = b(SMj ,C j ) ⇤ max(1, 2nkn 1 ), where
+                                                                                            1 3     3 5      5 7     7            1    1 3      3 5     5 7      7
+      b(N ,S )                                                                        1
+k = b(S ji,C jj ) . In our case, k = 1 and bbottleneck < b(S j ,C j ), so it
+is easy prove that Jca < Jar always holds for any n, p 2. For                             (a) NVLink-based topology              (b) Outgoing data flow
+example, using the value from our PCIe machines, let p = 2,                          Figure 8: NVLink-based machine topology and BytePS data flow.
+n = 4, bbottleneck = 80Gbps (bandwidth of memory copy that                           Only the outgoing direction is shown in the data flow figure.
+crosses PCIe switches) and b(S j ,C j ) = 105Gbps we get that
+Jca is 23.7% smaller than Jar .                                                      Consequently, its communication performance is lower than
+                                                                                     our solution in the NVLink-based machines.
+4.2.2 NVLink-based Topology
+Fig. 8(a) shows the other machine model in our data center –                         4.2.3 Discussion
+a GPU machine with NVLinks. There are four PCIe switches,                            The solutions for PCIe-only and NVLink-based topology are
+each connecting two GPU cards. The GPUs are also con-                                quite different. This shows that there is no one-fit-all optimal
+nected via NVLinks. The NVLinks give every GPU in total                              solution. The intra-matchine communication must adapt to
+1.2Tbps GPU-GPU bandwidth, much higher than the PCIe                                 different internal topologies. Admittedly, there are certainly
+link. The NIC is connected to one of the PCIe switches.                              more topologies than the above two used in our environment.
+   With NVLink, GPU-to-GPU communication can com-                                    However, we believe that the above two are representative,
+pletely avoid consuming PCIe bandwidth. So, we no longer                             since they are similar to the reference design recommended
+need CPU-assisted aggregation. However, we find that exist-                          by server vendors [15] and NVIDIA [11], respectively.
+ing framework, including the most popular GPU all-reduce im-                            Despite the difference, we summarize two principles – 1)
+plementation NCCL (used by TensorFlow, PyTorch, MXNet                                always avoid direct GPU-to-GPU memory copy when the two
+and Horovod), is again sub-optimal.                                                  GPUs are not under the same PCIe switch because it is slow
+   The problem is that the topology is not symmetric consid-                         in practice. 2) Always minimize traffic on the PCIe switch to
+ering the NIC, which is connected to only one (out of four)                          CPU link that is shared by GPUs and NIC. We propose the
+PCIe switch. The NIC and the two GPUs under the same PCIe                            following best practice procedure. Let Sn be the number of
+switch have to compete for the PCIe bandwidth of P0 CPU0 .                           PCIe switches with GPUs and NIC, and Sg be the number of
+Remember that not only CS uses this PCIe bandwidth, but also                         PCIe switches with only GPUs.
+the SS runs on this same GPU machine uses it! P0 CPU0
+                                                                                     1. If Sn > 0 and Sg > 0, the topology is asymmetric like
+again becomes the bottleneck in the whole communication.
+                                                                                        our NVLink-based topology. CS should use reduce and
+   Based on the analysis, we should leave as much P0 CPU0                               broadcast, with GPUs that are not competing with NICs
+PCIe bandwidth as possible to the NIC during local aggre-                               as reduce or broadcast roots.
+gation. For this topology, BytePS uses reduce and broadcast
+                                                                                     2. If Sn = 0 or Sg = 0, the topology is symmetric like our
+instead of reduce-scatter and all-gather – tensors from all
+                                                                                        PCIe-only case. CS should use reduce-scatter and all-
+GPUs are first reduced to GPU2 and the result is then copied
+                                                                                        gather to balance traffic on all PCIe switches. CPU-assisted
+to CPU0 memory from GPU2 . Fig. 8(b) shows those steps.
+                                                                                        aggregation (§4.2.1) should be used if no NVLink.
+Later, when CS gets the aggregated results from SS, GPU2
+would copy the data into GPU memory and broadcast them                               Multi-NIC topology. Although the two specific topologies
+to other GPUs. This way, we completely prevent GPUs from                             we discussed have only one NIC, the above principles can
+using the P0 CPU0 bandwidth for communication, so the                                directly extend to multi-NIC topology – it only changes the
+NIC can run to full 100Gbps bandwidth.                                               value of Sn and Sg .
+   This approach seems to create traffic hotspots on GPU2 .                          GPU-direct RDMA (GDR). GDR can potentially reduce the
+However, NVLinks has much larger bandwidth than PCIe                                 PCIe traffic. However, GDR requires the GPU and the RDMA
+links, so inter-GPU communication is never the bottleneck                            NIC to be on the same PCIe switch, otherwise the throughput
+even on the hotspots. Meanwhile, the P1 CPU0 PCIe                                    can be less than 50Gbps even with 100GbE NIC [12], which
+link used for GPU-CPU copy has approximately the same                                is also confirmed by our own measurements. Consequently,
+100Gbps bandwidth as the NIC, so it is not a bottleneck either.                      GDR does not benefit our settings – PCIe-only topology does
+   BytePS has achieved the optimal result – there is no intra-                       not satisfy the requirement, and we already avoided any PCIe
+machine bandwidth bottleneck. Existing solutions like NCCL,                          bottlenecks for NVLink-based topology. In addition, most
+unfortunately, tends to let GPUs use the P0 CPU0 bottleneck                          clouds like AWS do not support GDR. Therefore, BytePS
+link because of the proximity between GPU0 and the NIC.                              does not use GDR for now.
+
+
+
+470     14th USENIX Symposium on Operating Systems Design and Implementation                                                          USENIX Association
+                                                                                  fp
+                                                                                   fp
+                                                                                    fp                       fpfp                    fpfp
+                                                                                                  GPU
+                                                                                                  GPU
+                                                                                                   GPU                 GPU
+                                                                                                                        GPU                    GPU
+                                                                                                                                               GPU
+                                                                                                                                                GPU
+                                                                                  bp
+                                                                                  bp
+                                                                                   bp                        bp
+                                                                                                              bp                     bp
+                                                                                                                                      bp
+                                                                                 sum
+                                                                                 sum
+                                                                                  sum                       sum
+                                                                                                             sum                    sum
+                                                                                                                                     sum
+                                                                                                  CPU
+                                                                                                  CPU
+                                                                                                   CPU                 CPU
+                                                                                                                        CPU                    CPU
+                                                                                                                                               CPU
+                                                                                                                                                CPU
+                                                                                 update
+                                                                                update
+                                                                                  update                   update
+                                                                                                             update                update
+                                                                                                                                     update
+                                                                              optimizer
+                                                                              optimizer
+                                                                               optimizer                 optimizer
+                                                                                                          optimizer              optimizer
+                                                                                                                                  optimizer
+
+                                                                                         (a) PS             (b) All-reduce             (c) BytePS
+                                                                             Figure
+                                                                                 fpfp 10: Component
+                                                                                  fp
+                                                                                            GPU
+                                                                                            GPU
+                                                                                                    placement
+                                                                                                       fpfp   comparison between
+                                                                                                               GPU
+                                                                                                                          fpfp   all-reduce,
+                                                                                                                                   GPU
+                                                                                                                                   GPU
+                                                                                                                                    GPU
+(a) Parameter update on different de- (b) Throughput of CPU summation                             GPU                   GPU
+                                                                             PS and
+                                                                                  bp
+                                                                                  bp
+                                                                                   bp
+                                                                                     BytePS.                  bp
+                                                                                                               bp                    bp
+                                                                                                                                      bp
+vices. (Mtum: Momentum [65])          on different floating point tensors.
+                                                                                comm          Network
+                                                                                              Network                 Network
+                                                                                                                       Network     comm
+                                                                                                                                    comm      Network
+                                                                                                                                              Network
+                                                                                                                                               Network
+                                                                                comm
+                                                                                 comm          Network      comm
+                                                                                                             comm
+    Figure 9: CPU is slow for optimizers but not for summation.              optimizer can be divided into two steps, gradient summation
+                                                                                    sum                                      sum
+                                                                                                                              sum
+                                                                             and sum sum
+                                                                                   parameter  update, assum
+                                                                                            CPU
+                                                                                            CPU
+                                                                                             CPU
+                                                                                                         sum
+                                                                                                          Fig. 10 CPU
+                                                                                                                  shows.
+                                                                                                                   CPU                 CPU
+                                                                                                                                       CPU
+                                                                                                                                        CPU
+                                                                                                                           update
+   We can see that the optimal intra-machine communication                        update
+                                                                                 update
+                                                                                   update
+                                                                                 Fortunately,  modern update
+                                                                                                        update
+                                                                                                        x86    CPUs  are goodupdate
+                                                                                                                                 at
+                                                                                                                         optimizer  summation
+                                                                               optimizer
+                                                                               optimizer
+                                                                                optimizer           optimizer
+                                                                                                     optimizer            optimizer
+strategy is tightly coupled with the internal topology. Build-               thanks to the highly optimized AVX instructions [47]. In
+ing a profiler to automatically detect the topology, probe the               Fig. 9(b), we show the summation throughput on the same
+bandwidth, and generate the best strategy is interesting future              CPUs as above, using synthetic floating point tensors. The
+work.                                                                        throughput is more than 200Gbps for both FP16 and FP32 pre-
+5     Summation Service                                                      cision, higher than the 100Gbps NIC bandwidth. Therefore,
+To get the optimal inter-machine communication time (§4.1),                  summation on CPU will not be a bottleneck.
+BytePS needs a module that can run on the CPU of every                       BytePS’s solution. Based on these observations, BytePS de-
+machine and communicate with CS. The question is, what is                    couples the two steps of optimizer. We move the computation-
+its role in the training algorithm? Our initial attempt was to               intensive parameter update to GPUs and places only sum-
+follow the previous PS design [44], in which the PS processes                mation on CPUs – this is why we name the CPU module
+are responsible for running the optimizer. The optimizer ag-                 Summation Service (SS). SS not only prevents the CPU from
+gregates the gradients from all GPUs and updates the DNN                     being the bottleneck, but also largely reduces the CPU over-
+model parameters using various optimizers.                                   head. With carefully implementation using AVX and OpenMP,
+The CPU bottleneck. Unfortunately, soon we found that the                    SS only consumes fewer than 3 CPU cores when it runs at
+CPUs became a bottleneck in the system. We use an exper-                     100Gbps throughput. Fig. 10 gives a high-level comparison
+iment to demonstrate this. We train the VGG16 DNN [63]                       over PS, all-reduce and BytePS on how they place different
+using a typical non-colocated PS setting: using one Tesla                    components in DNN training onto GPU and CPU resources.
+V100 GPU machine and one CPU machine (Intel Xeon Plat-                           Since Summation Service moves parameter update to GPU
+inum CPU, 32 cores with hyper-threading and Intel MKL [7])                   machines, all the GPU machines need to perform the same pa-
+connected by 100GbE Ethernet. The GPU machine runs the                       rameter update calculation, whereas parameter update needs
+forward and backward propagation, and the CPU machine                        to be done only once in traditional PS. BytePS hence uses
+runs the optimizer using all the 32 CPU cores.                               more computation cycles for parameter update than PS. This
+   Fig. 9(a) shows that, even with 32 cores and MKL-enabled,                 is a tradeoff we made willingly, to accelerate end-to-end train-
+running the optimizer on the CPU machine can slow down the                   ing speed. We define SS overhead ratio as the FLOPs for
+end-to-end training speed. It means the CPU cannot match                     parameter update over the sum of FP and BP FLOPS. The ra-
+the network bandwidth and becomes a bottleneck (§6). As                      tio is 138 MFLOPs / 32 GFLOPs, 26 MFLOPs / 7.8 GFLOPs,
+the optimizer algorithm gets more complicated (from sim-                     387 MFLOPs / 494 GFLOPs for VGG-16, ResNet-50, BERT-
+pler SGD to the more complicated RMSProp), the bottleneck                    large using SGD as the optimizer, all are less than 0.5%. The
+effect becomes more severe.                                                  introduced overhead is negligible, compared to the training
+The root cause. The CPU bottleneck is caused by the lim-                     speedup (Fig. 9(a)). The above ratio definition assumes batch
+ited memory bandwidth. Popular optimizers such as Adam                       size of 1. DNN training typically uses batch size of tens or
+can easily exhaust the memory bandwidth of modern CPUs.                      hundreds. Parameter update is done once per batch, hence the
+For example, the peak transfer rate of a 6-channel DDR4-                     additional overhead is even smaller in practice.
+2666 memory setup is up to 1024 Gbps combining read                              We note that Horovod [60] has the option to move gradient
+and write [8]. It is easy to estimate that, for example, the                 aggregation to CPUs by first copying the tensors to CPU mem-
+Adam optimizer [42] requires more than 10x memory ac-                        ory and then performing CPU-only all-reduce. Since it still
+cess (read+write) for applying every gradient update. Adding                 only relies on the CPUs and bandwidth on GPU machines, it
+that 100Gbps NIC consumes 200 Gbps memory bandwidth                          does not provide communication-wise advantages compared
+(read+write), the 1024 Gbps memory bandwidth is simply not                   with directly all-reduce on GPUs. BytePS is different: it lever-
+sufficient for Adam to process 100 Gbps gradient stream.                     ages additional CPU machines for gradient summation, while
+CPU is good at summation. The above experiment leads us                      keeps parameter update on GPUs.
+to rethink the tasks placed on CPUs.The computation of an                    Support asynchronous training. Although separating the
+
+
+
+USENIX Association                                    14th USENIX Symposium on Operating Systems Design and Implementation                            471
+summation and update brings us performance benefits, it                              bp       fp                 bp      fp
+breaks an important feature of the original PS: the support of                                                          overwrite
+                                                                                    GPU                       update
+asynchronous training like Asynchronous Parallel [25]. Asyn-                                               GPU
+                                                                                                                          "'t+1
+chronous Parallel relies on the PS processes keeping the most                       CPU         !t+1       CPU
+                                                                              gt   sum     update                       sum "t+1
+updated model parameters, which is not directly compatible                                                !"t= "'t+1- "t
+with the design of SS. To bridge this gap, we re-design a new                       (a) PS-async              (b) BytePS-async
+workflow that can enable asynchronous training with SS, as             Figure 11: Asynchronous training workflow comparison between
+shown in Fig. 11(b). In short, GPU updates parameters and              PS and BytePS. g is the gradients. w is the parameters.
+computes the delta parameters first. CS sends them and re-
+ceives latest parameters. SS keeps adding delta parameters to          because the parameter of our algorithm and Asynchronous
+the latest parameters. Next, we prove that this new training           Parallel are equivalent after any T batches.
+workflow is equivalent to Asynchronous Parallel in terms of
+algorithm convergence.                                                 6     Implementation
+                                                                       While the core of BytePS is generic for any training frame-
+Theorem 2. The asynchronous algorithm for BytePS is equiv-             work, BytePS also implements plugins for TensorFlow, Py-
+alent to Asynchronous Parallel [25].                                   Torch and MXNet, for user-friendliness. The core is imple-
+                                                                       mented in C++, while the framework plugins contain both
+Proof. Consider one SS connected with n CSs. We say a                  C++ and Python. In total, BytePS consists of about 7.8K lines
+CS stores the local model parameters, and a SS holds the               of Python code, and 10K lines of C++ code. As a major online
+latest version of parameters. The high level idea of our proof         service provider, we have deployed BytePS internally. BytePS
+is to show that our algorithm generates identical state (i.e.,         has also been open-sourced [4] and attracted thousands of
+same parameter for the SS module and n CS modules) with                users.
+Asynchronous Parallel, given the same communication order
+(push and pull order). We use f as a general representation            6.1    Multi-Stage Pipeline
+of the optimizer. The optimizations thus can be represented            A common way to speed up a multi-step procedure is to build
+as w w + f (gi,t ), where gi,t represents the gradients of CSi         a multi-stage pipeline that overlaps the processing time of
+(i 2 [0, n 1]) at iteration t (t 2 [1, T ]). Denote w ps and wbyteps   each step. We incorporated the idea of tensor partition and
+as the parameter in PS and BytePS, respectively. And denote            pipelining from prior work [34, 55]. For example, for PCIe-
+wi,t as the parameter on each workeri (for PS) or CS (for              only topology, CS has six steps. It maps to a 6-stage pipeline
+BytePS) at iteration t. The parameter is initiated to w0 for all       in BytePS runtime. We implement BytePS to be flexible in
+CSs and the SS. After T iterations, we can obtain the updated          constructing the pipeline without recompiling. Each stage in
+parameter as:                                                          the pipeline is implemented as an independent thread with
+                                                                       a priority queue of tensors. The priority is assigned similar
+                                  T n 1
+                                                                       to [34,55]. As analyzed in §4.1.1, large tensors are partitioned
+                   w ps = w0 + Â Â f (gi,t )                  (10)
+                                                                       to multiple smaller tensors no more than 4MB. Next, each
+                                 t=1 i=0
+                                                                       small tensor is enqueued to the first queue and moves towards
+                                    T n 1
+                                                                       the next queue once a stage finishes processing it, until it is
+                  wbyteps = w0 + Â Â Dwi,t                    (11)
+                                                                       dequeued from the last one.
+                                   t=1 i=0
+
+   Next, we use induction to prove that Dwi,t = f (gi,t ) holds        6.2    Address RDMA Performance Issues
+for any i and t. (1) Base case t = 1: Given initial param-             For inter-machine communication, we use RDMA RoCEv2.
+eter w0 , we obtain the gradient gi,1 from w0 . In Parameter           Each machine has one 100GbE NIC, and the RDMA network
+Server, workeri pushes gi,1 to the server and get updated as           provides full bisection bandwidth. To get the full benefit of
+w ps,1 = w0 + f (gi,1 ). In BytePS, CSi pushes f (gi,1 ) to SS         RDMA, we have gone through a full design and debug journey
+and get updated as wbyteps,1 = w0 + f (gi,1 ). So Dwi,t = f (gi,t )    which we share as follows.
+holds for t = 1. Meanwhile, the parameter on workeri or CSi            RDMA Memory Management. To improve the perfor-
+is the same on both architectures after receiving the response         mance, we aim to avoid unnecessary memory copies [72]
+from the server or SS. (2) Inductive step: If the lemma we             and achieve zero-copy on CPU memory. BytePS is based
+want to prove holds for t = k(k 1), the gradient gi,k+1 is             on RDMA WRITE because it is the most performant among
+computed from the same wk . Similar to the base case, we ob-           common RDMA verbs [39]. Conventional one-sided RDMA
+tain w ps,k+1 = wk + f (gi,k+1 ) and wbyteps,k+1 = wk + f (gi,k+1 ).   operations (WRITE and READ) require at least two round-
+So Dwi,t = f (gi,t ) holds for t = k + 1. By the principle of in-      trips: getting the remote address, and writing (reading) the
+duction, Dwi,t = f (gi,t ) holds for all t 2 N.                        value to (from) that address [39, 40, 50, 70]. We optimize
+   Return to (10) and (11). Since Dwi,t = f (gi,t ) holds for          the process by leveraging the fact that DNN training always
+any i and t, we get w ps = wbyteps . This completes the proof          sends the same set of tensors in every iteration. Only at the
+
+
+
+472    14th USENIX Symposium on Operating Systems Design and Implementation                                        USENIX Association
+Table 2: BytePS throughput with a pair of CPU machine and GPU                  is well-known for creating incast and packet loss in TCP/IP
+machine running microbenchmark.                                                network [66]. But BytePS uses RDMA/RoCEv2 which de-
+                                                 +shm                          pends on a lossless fabric and DCQCN [75] for congestion
+   Solution         baseline       +shm                          all
+                                               +aligned                        control. We do not observe incast issue in BytePS.
+ Throughput                         52             76            89
+                        41
+  in Gbps                         (1.27x)       (1.85x)       (2.17x)          6.3    BytePS Usage
+                                                                               BytePS [4] is easy to use. We provide Python interfaces that
+first iteration, BytePS initializes all the required tensors, reg-             are almost identical to Horovod, PyTorch native API and
+ister the buffer with RDMA NIC and exchange all the remote                     TensorFlow native API. Users can choose either of them and
+addresses. Then BytePS stores the remote buffer information                    migrate to BytePS with minimal efforts. For example, for
+and reuse it directly in the rest iterations.                                  a Horovod-MNIST example [19], we only need to change
+Address Slow Receiver Symptom. We also run into the slow                       one line of Python code, from "import horovod" to "import
+receiver symptom as reported in [30] – the NICs are send-                      byteps". In fact, we are able to convert most of our internal
+ing out many PFCs into the network. Those excessive PFCs                       Horovod-based training tasks to BytePS automatically.
+slow down tensor transmission can cause collateral damage
+to other traffic. Here we report several additional causes of                  7     Evaluation
+such symptom and how we address them.                                          In this section, we show that BytePS not only achieves opti-
+   Our first finding is that internal RDMA loopback traffic                    mal communication performance in microbenchmarks, but
+can cause internal incast, and push the NIC to generate PFC.                   also significantly accelerate training jobs in production envi-
+BytePS runs both CS and SS on each GPU machine. The                            ronment. We list a few highlights regarding the high fidelity
+traffic between them, which we call loopback traffic, does                     of the results.
+not consume NIC’s external Ethernet bandwidth, but does
+                                                                               • All resources used are allocated by the scheduler of produc-
+consume internal CPU-NIC PCIe bandwidth. Initially, we did
+                                                                                 tion clusters. The scheduler uses non-preemptive resource
+not add any special design – we stuck to RDMA verbs [9]
+                                                                                 scheduling – once a training job is scheduled, it will have a
+for loopback traffic and thought the NIC DMA can handle it.
+                                                                                 fixed number of CPU machines that will not change. Even
+However, we realize that it creates a 2:1 incast on the NIC,
+                                                                                 the most large-scale tasks we show use < 5% GPUs of a
+with RX and loopback as two ingress ports and the DMA to
+                                                                                 cluster that runs many production tasks.
+memory engine as one egress port!
+   To solve it, we implement a shared memory (shm) data                        • We use large training batch sizes. Smaller batch sizes mean
+path. When CS detects that SS is on the same machine as                          less GPU memory consumption but more communication,
+itself, CS simply notifies SS that the data is in shared memory.                 so the end-to-end improvement will be more evident. How-
+After SS finishes summation, SS copies the results from its                      ever, all our tasks use almost full GPU memory, so the
+own buffer back to CS’s shared memory. Consequently, the                         speedup numbers against all-reduce and PS are the lower
+loopback RDMA traffic is eliminated.                                             bound of BytePS.
+   Our Second finding is that we need to use page-aligned                      • Although we cannot disclose any specific models that are
+memory for RDMA. Otherwise PFCs may be triggered. Our                            used internally, the tasks and DNN model structures shown
+hypothesis is that hardware DMA aligns the transfer unit                         are highly representative of production workloads. The
+to the page size (e.g., 4096 bytes). Therefore, using a page-                    code is also available publicly for reproducibility [5].
+aligned address is more friendly to DMA engine as it reduces                   • We compare BytePS with the state-of-the-art PS and all-
+the number of pages needed to be written.                                        reduce implementation without modification. For example,
+   Our third finding is that the RDMA NIC RX performance                         we do not apply the RDMA optimizations mentioned in
+can be impacted by how the concurrent send is implemented!                       §6.2 on native-PS and all-reduce.
+In the end, we not only use page-aligned memory, but also en-
+                                                                                  The cluster we use has a RoCEv2 network with full bisec-
+force only one scatter-gather entry (sge) per RDMA WRITE
+                                                                               tion bandwidth. All the machines have one 100GbE NIC. We
+on the sender side.7
+                                                                               note that TensorFlow, PyTorch and MXNet can overlap the
+   After all the optimization, BytePS implementation can run
+                                                                               DNN computation and communication [34, 55], thus even a
+as expected. Table 2 shows the performance improvement
+                                                                               small improvement in end-to-end performance can indicate a
+after each of the above three optimizations is applied. The
+                                                                               large improvement in communication.
+NIC generates negligible PFCs.
+   As we have discussed in §4.1, BytePS creates many many-                     7.1    Inter-machine Microbenchmarks
+to-one communication patterns in the network. Many-to-one                      First, we use microbenchmarks to show the pure inter-
+7 In the whole process, we contacted with the NIC vendor and had lengthy       machine communication performance of different architec-
+ discussion with their software and hardware experts. As of writing, we have   tures. We allocate eight 1-GPU machines from the cluster
+ not got the official root cause of the last two problems.                     scheduler. We run a dummy task in which all GPU workers
+
+
+
+USENIX Association                                    14th USENIX Symposium on Operating Systems Design and Implementation               473
+Figure 12: Communication goodput of 8⇥ 1-GPU machines with
+varying number of additional CPU machines. The point-to-point
+                                                                       (a) PCIe-only GPU machines    (b) NVLink-based GPU machines
+RDMA goodput is ⇡ 90Gbps in our network, so we plot the “optimal”
+line based on B = 90Gbps and the analysis in §4.1.                  Figure 14: Topology-aware intra-machine communication. The
+                                                                    training is run with PyTorch on 8 GPU machines each with 8 GPUs
+                                                                    and no additional CPU machine.
+
+                                                                    size is 2 images for UGATIT, and 80 tokens for GPT-2. We
+                                                                    will evaluate more models, frameworks and machines in §7.4.
+                                                                       Fig. 13 shows that, with more CPU machines, BytePS can
+                                                                    run faster – up to 20% than without CPU machines. The SS
+                   (a) PCIe-only GPU machines
+                                                                    on each CPU machine only consumes no more than 4 CPU
+                                                                    cores. It is usually easy for our scheduler to find sufficient
+                                                                    CPUs that are on machines running non-distributed jobs. It is
+                                                                    free (or << 10% costs compared with the expensive GPUs)
+                                                                    speedup for the cluster. Compared with all-reduce, BytePS is
+                                                                    consistently faster in any cases and can be up to 45% faster in
+                                                                    the best case. On NVLink-based GPU machines, the speedup
+                 (b) NVLink-based GPU machines                      is higher because the communication bottleneck is more on
+Figure 13: End-to-end performance with different number of CPU      the network instead of PCIe links. Finally, models have differ-
+machines. The training is run with PyTorch on 8 GPU machines        ent speedup due to different model sizes and FLOPs. In the
+each with 8 GPUs. Each CPU machine uses < 4 cores.                  examples we show, GAN is more communication intensive,
+                                                                    so the end-to-end gain of BytePS is larger.
+just keep reducing large tensors on GPU and record the com-
+munication goodput. We verify that no other distributed job
+is placed on the same physical machines.                            7.3    Adapt to Intra-machine Topology
+   Fig. 12 shows that BytePS performance is very close to           Next, we show the benefits of BytePS intra-machine commu-
+the theoretical optimum (§4.1), with 1-9% difference for dif-       nication strategy. The software and hardware configurations
+ferent number of CPU machines. All-reduce, as expected, is          are the same as in §7.2. To better compare with the all-reduce
+close to the optimal only if there is no additional CPU ma-         baseline, we run the jobs without any CPU machines. Thus,
+chine, while remain the same even if there are CPU machines.        BytePS does not take any advantages explained in §7.2. For
+The (MXNet) PS does not run optimizer in this case, but is          PCIe-only GPU machines (Fig. 14(a)), we run BytePS with
+mainly bottlenecked by issues described in §6.2. In practice,       1) strawman strategy, the same as common all-reduce or PS
+if PS runs DNN optimizer algorithms, the performance will be        and 2) the optimal solution in §5. We see that the optimal
+worse than all-reduce even with k = n CPU machines (Fig. 4).        intra-machine solution has up to 20% gain as well.
+In contrast, because of the Summation Service design, BytePS
+                                                                       For NVLink-based GPU machines (Fig. 14(b)), we use
+would not be affected in real training tasks shown below.
+                                                                    different sets of GPUs as the local reduce roots. BytePS’s op-
+7.2    Leverage CPU Machines                                        timal solution, as explained in §4.2.2, is root = 2. root = 2, 3
+Next, we show that BytePS can indeed leverage different num-        means CS chooses GPU 2 and 3 as the reduce root in a
+bers of CPU machines to speed up training. In Fig. 13, we use       round robin manner. It has almost the same performance
+8 GPU machines, each with 8 Tesla V100 32GB GPUs, and               because GPU 3 is not competing for PCIe bandwidth with the
+is either PCIe-only or NVLink-based topology. We vary the           NIC, either. It is an alternatively optimal solution. However,
+number of CPU machines from 0 to 8. We compare BytePS               root = all has poorer performance. Communication-wise, it
+end-to-end training performance against state-of-the-art all-       is equivalent to Horovod’s hierarchical mode. root = 0 is
+reduce implementation (Horovod 0.19 and NCCL 2.5.7) as              the worst because it competes hardest with the NIC. Unfor-
+the baseline. We test two DNN models, UGATIT GAN [41]               tunately, it is equivalent to Horovod’s normal mode (plain
+(one of the most popular models for image generation) and           NCCL all-reduce).
+GPT-2 [57] (one of the most popular NLP models for text gen-           One thing to note is that even without any optimization,
+eration), both implemented in PyTorch. The per GPU batch            BytePS still outperforms all-reduce. We discuss this in §8.
+
+
+
+474   14th USENIX Symposium on Operating Systems Design and Implementation                                   USENIX Association
+      (a) TensorFlow, ResNet-50, batch=256 images      (b) MXNet, VGG-16, batch=96 images             (c) PyTorch, UGATIT, batch=2 images
+                                      Figure 15: Computer Vision models. The batch sizes are per GPU.
+
+
+
+
+   (a) TensorFlow, Transformer, batch=3072 tokens (b) MXNet, BERT-Large, batch=8192 tokens            (c) PyTorch, GPT-2, batch=80 tokens
+                                             Figure 16: NLP models. The batch sizes are per GPU.
+7.4     Scalability                                                        GPUs, BytePS will have even larger advantage.
+To demonstrate BytePS’s performance at different scales, we                   We see that models have different system scalability,8
+run six different training jobs using 8 to 256 Tesla V100 32GB             which is determined by the model sizes and FLOPs. The most
+GPUs, i.e., 1 GPU machine to 32 GPU machines. Due to the                   scalable model is ResNet-50. BytePS achieves 97.5% scal-
+constraint of free resources, we only use NVLink-based GPU                 ing efficiency with 256 GPUs. All-reduce also performs well,
+machines. The six different jobs cover three frameworks, Ten-              achieving 88% scaling efficiency. It is not surprising that prior
+sorFlow, PyTorch and MXNet. We have introduced two of the                  work is fond of training ResNet at large scale [49, 73] with
+models, UGATIT and GPT-2 in §7.2. The rest four models are                 all-reduce. Nevertheless, other models are more challenging,
+ResNet-50 [32], VGG-16 [63] (two of the most popular mod-                  with UGATIT as the least scalable one. Even BytePS only
+els for image classification and extraction), Transformer [67]             achieves 74% scaling efficiency. For such communication
+(one of the most popular models for machine translation) and               intensive models, BytePS has the most gain over all-reduce
+BERT [26] (one of the most popular models for natural lan-                 (84% with 256 GPUs). Despite UGATIT, BytePS has at least
+guage understanding). We take the official implementation                  91.6% scaling factor for the rest five 256-GPU training jobs.
+of these models and slightly modify them (no more than 20                     We analyze the breakdown of performance improvement
+lines of code) to use PS, all-reduce and BytePS, respectively.             by comparing native-PS and BytePS, since they both use
+                                                                           the same number of additional CPU machines. For example,
+   For BytePS, we evaluate its performance with and without
+                                                                           BytePS outperforms native-PS by 52% with 256 GPUs on
+CPU machines. When there are CPU machines, the num-
+                                                                           VGG-16 (Fig. 15(b)). Among the 52% improvement, we find
+ber of CPU machines is equal to GPU machines. For all-
+                                                                           that 19% comes from optimal communication design (intra-
+reduce, we use Horovod with NCCL for all cases. For PS, we
+                                                                           server), 18% comes from Summation Service, and the rest
+show the native implementation from TensorFlow and MXNet
+                                                                           15% comes from better implementation mentioned in §6.
+with RDMA support enabled. PS uses the same resources as
+BytePS with CPU machines. PyTorch does not have official                   8    Observations and Discussion
+PS implementation, so it does not have PS results. We also                 In this section, we share several of our observations and dis-
+provide the speed of linear scaling as the upper bound. We use             cussions, with the aim to inspire future research.
+trained images per second as the speed metric for computer                 BytePS outperforms all-reduce even without extra CPU
+vision models, and tokens per second for NLP models.                       machines. Theoretically, the communication time is the same
+   Fig. 15 and Fig. 16 show very consistent results – BytePS               for all-reduce and BytePS when no additional CPU machines
+with CPU machines is always the best and BytePS without                    are available (§4.1). In practice, we observe that BytePS still
+CPU machines is the second. The native PS of both Ten-                     outperforms all-reduce significantly in this case. One reason
+sorFlow or MXNet are always the poorest. All-reduce al-                    is that BytePS has a better intra-machine communication
+ways has a clear advantage over PS, but is inferior to BytePS.             strategy than all-reduce. However, even without intra-machine
+When training with 256 GPUs, the speedup of BytePS over                    optimization, BytePS still outperforms all-reduce (see Fig. 14
+all-reduce is 10% to 84% with CPU machines, and 9% to                      in §7). We hypothesize that BytePS has the advantage of
+53% without CPU machines. From 8 GPUs to 256 GPUs,                         8 We focus on system scalability and do not discuss algorithm scalability, i.e.
+
+the speedup becomes larger. We expect that with even more                   the hyperparameter tuning and convergence speed with more GPUs.
+
+
+
+
+USENIX Association                                  14th USENIX Symposium on Operating Systems Design and Implementation                            475
+allowing more “asynchronicity” than all-reduce. All-reduce          rely on the assumption that resources are homogeneous while
+usually requires additional out-of-band synchronization to          overlooking CPU resources. BytePS can outperform them
+ensure the consistent order across nodes, while BytePS does         by leveraging the heterogeneous resources. In fact, the lat-
+not have this overhead. However, to analyze it, we need a           est NCCL includes hierarchical, tree-based all-reduce, which
+distributed profiler that can build the complete timeline of the    does not differ much from the results in §7.
+execution and communication across all nodes in distributed         Intra-machine optimization: Blink [68] also optimizes mul-
+training.                                                           tiple GPU communication inside a single machine, by lever-
+GPU cluster scheduler should consider dynamic CPU re-               aging hybrid transfers on NVLinks and PCIe links. How-
+sources. By leveraging additional CPU machines, BytePS              ever, Blink does not optimize the distributed training cases,
+can speedup DNN training. Since BytePS can adapt to any             where the main communication bottleneck is the NIC and its
+number of CPU machines, it enables elasticity – the cluster         PCIe connection instead of the much faster NVLinks. BytePS
+scheduler can scale in or out CPU machines for existing jobs        carefully schedules the intra-machine traffic to utilize the
+based on real time conditions. Most existing schedulers keep        bottleneck bandwidth better – the NIC bandwidth. Our intra-
+the number of GPUs of a job static because of convergence           machine design also considers the PCIe bandwidth consumed
+problems [16, 74]. Fortunately, the number of CPU machines          by the NIC, while Blink is only focused on GPU’s PCIe con-
+in BytePS only impacts system performance but not model             nections.
+convergence. We plan to add elasticity support to BytePS,           New hardware chips or architecture for accelerating
+which will enable BytePS to dynamically schedule CPU re-            DNN training: Recently, there are many new chips, like
+sources during the training process.                                TPU [38] and Habana [6], that are specifically designed
+Model-parallelism support. BytePS can accelerate the com-           for DNN training. In fact, the design of BytePS is not
+munication when reducing tensors across GPUs. Some model            GPU-specific, and should apply to them as long as they
+parallelism methods, such as Megatron-LM [62] and Mesh-             are also PCIe devices. Some also propose using Infini-
+TensorFlow [61], also rely on the all-reduce primitive for          Band switch ASIC [28] to accelerate all-reduce, or using P4
+communication. Therefore, BytePS can also accelerate them           switches [58, 59] to accelerate PS. E3 [46] leverages Smart-
+by replacing the all-reduce operations.                             NICs to accelerate network applications, and can potentially
+                                                                    benefit BytePS by offloading the gradient summation from
+9     Related Work                                                  CPUs to SmartNICs. PHub [48] proposes a rack-scale hard-
+Acceleration of computation: To accelerate the forward              ware architecture with customized network configurations,
+propagation and backward propagation, the community has             e.g., 10 NICs on one server. BytePS focuses on using gen-
+worked out many advanced compilers and libraries, includ-           erally available CPU and GPU servers in commodity data
+ing cuDNN [10], MKL [7], TVM [23], XLA [17], Astra [64]             centers.
+and other computation graph optimization, e.g., Tensor Fu-
+                                                                    10    Conclusion
+sion [14] and graph substitution [37]. They focus on speeding
+                                                                    BytePS is a unified distributed DNN training acceleration sys-
+up DNN computation. They are complementary to and can
+                                                                    tem that achieves optimal communication efficiency in hetero-
+be used with BytePS.
+                                                                    geneous GPU/CPU clusters. BytePS handles cases with vary-
+Acceleration of communication: There are several direc-             ing number of CPU machines and makes traditional all-reduce
+tions for accelerating communication: (1) Gradient compres-         and PS as two special cases of its framework. To further accel-
+sion [21, 45] is proposed to reduce the communication traf-         erate DNN training, BytePS proposes Summation Service and
+fic, i.e., using half precision for gradient transmission, at the   splits a DNN optimizer into two parts: gradient summation
+cost of potential degradation of accuracy. (2) Communica-           and parameter update. It keeps the CPU-friendly part, gradi-
+tion scheduling and pipelining: Recent work explores to bet-        ent summation, in CPUs, and moves parameter update, which
+ter overlap the computation and communication by priority-          is more computation heavy, to GPUs. We have implemented
+based scheduling and tensor partition [31, 34, 55]. The ideas       BytePS and addressed numerous implementation issues, in-
+are that tensor partition enables simultaneous bidirectional        cluding those that affect RDMA performance. BytePS has
+communication, and that during communication, the former            been deployed, extensively used and open sourced [4]. Mul-
+layers have higher priority because they are needed sooner          tiple external projects have been developed based on it. The
+for FP of the next iteration. Those ideas are complementary         Artifact Appendix to reproduce the evaluation is at [3].
+to BytePS, and they have been integrated into our implemen-
+tation. Pipedream [51] adds parallelism between multiple            11    Acknowledgement
+batches. BytePS can also potentially accelerate its data paral-     We thank our shepherd Rachit Agarwal and the anony-
+lel stages.                                                         mous reviewers for their valuable comments and sugges-
+Hierarchical all-reduce: Some work proposes to leverage             tions. Yimin Jiang and Yong Cui are supported by NSFC
+the hierarchical topology [24, 49] during all-reduce, in order      (No. 61872211), National Key RD Program of China (No.
+to minimize the traffic at bottleneck links. However, they still    2018YFB1800303).
+
+
+
+476    14th USENIX Symposium on Operating Systems Design and Implementation                                  USENIX Association
+References                                                 [20] Martín Abadi, Paul Barham, Jianmin Chen, Zhifeng
+                                                                Chen, Andy Davis, Jeffrey Dean, Matthieu Devin, San-
+ [1] A Light-weight Parameter Server Interface. https:          jay Ghemawat, Geoffrey Irving, Michael Isard, et al.
+     //github.com/dmlc/ps-lite.                                 Tensorflow: A System for Large-Scale Machine Learn-
+                                                                ing. In OSDI 2016.
+ [2] Amazon EC2 P3 Instances. https://aws.amazon.c
+     om/ec2/instance-types/p3/.                            [21] Chia-Yu Chen, Jungwook Choi, Daniel Brand, Ankur
+                                                                Agrawal, Wei Zhang, and Kailash Gopalakrishnan. Ada-
+ [3] Artifact Appendix. https://github.com/byteps/
+                                                                comp: Adaptive Residual Gradient Compression for
+     examples/blob/master/osdi20ae.pdf.
+                                                                Data-parallel Distributed Training. In AAAI 2018.
+ [4] BytePS. https://github.com/bytedance/byteps.
+                                                           [22] Tianqi Chen, Mu Li, Yutian Li, Min Lin, Naiyan Wang,
+ [5] Evaluation Code. https://github.com/byteps/ex              Minjie Wang, Tianjun Xiao, Bing Xu, Chiyuan Zhang,
+     amples.                                                    and Zheng Zhang. MXNet: A Flexible and Efficient Ma-
+                                                                chine Learning Library for Heterogeneous Distributed
+ [6] Habana. https://habana.ai/.                                Systems. In LearningSys 2015.
+ [7] Intel MKL. https://software.intel.com/en-us           [23] Tianqi Chen, Thierry Moreau, Ziheng Jiang, Lianmin
+     /mkl.                                                      Zheng, Eddie Yan, Haichen Shen, Meghan Cowan,
+                                                                Leyuan Wang, Yuwei Hu, Luis Ceze, et al. TVM: An
+ [8] Intel Xeon Platinum 8168 Processor. https://ark.in
+                                                                Automated End-to-End Optimizing Compiler for Deep
+     tel.com/content/www/us/en/ark/products/120
+                                                                Learning. In OSDI 2018.
+     504/intel-xeon-platinum-8168-processor-33m
+    -cache-2-70-ghz.html.                                  [24] Minsik Cho, Ulrich Finkler, and David Kung. Blue-
+                                                                Connect: Novel Hierarchical All-Reduce on Multi-tired
+ [9] Libibverbs. https://www.rdmamojo.com/2012/05
+                                                                Network for Deep Learning. In SysML 2019.
+     /18/libibverbs/.
+                                                           [25] Jeffrey Dean, Greg Corrado, Rajat Monga, Kai Chen,
+[10] NVIDIA cuDNN. https://developer.nvidia.com
+                                                                Matthieu Devin, Mark Mao, Andrew Senior, Paul
+     /cudnn.
+                                                                Tucker, Ke Yang, Quoc V Le, et al. Large Scale Dis-
+[11] NVIDIA DGX-1. https://www.nvidia.com/data-                 tributed Deep Networks. In NIPS 2012.
+     center/dgx-1/.
+                                                           [26] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and
+[12] NVIDIA GPU Direct RDMA Benchmark. https://                 Kristina Toutanova. BERT: Pre-training of Deep Bidi-
+     devblogs.nvidia.com/benchmarking-gpudirect                 rectional Transformers for Language Understanding.
+    -rdma-on-modern-server-platforms/.                          arXiv preprint arXiv:1810.04805, 2018.
+
+[13] NVIDIA NCCL. https://developer.nvidia.com             [27] Priya Goyal, Piotr Dollár, Ross Girshick, Pieter Noord-
+     /nccl.                                                     huis, Lukasz Wesolowski, Aapo Kyrola, Andrew Tul-
+                                                                loch, Yangqing Jia, and Kaiming He. Accurate, Large
+[14] NVIDIA TensorRT Inference Library. https://devb            Minibatch SGD: Training Imagenet in 1 Hour. arXiv
+     logs.nvidia.com/deploying-deep-learning-nv                 preprint arXiv:1706.02677, 2017.
+     idia-tensorrt/.
+                                                           [28] Richard L Graham, Devendar Bureddy, Pak Lui, Hal
+[15] Supermicro PCIe Root Architectures for GPU Systems.        Rosenstock, Gilad Shainer, Gil Bloch, Dror Goldenerg,
+     https://www.supermicro.org.cn/products/sys                 Mike Dubman, Sasha Kotchubievsky, Vladimir Koush-
+     tem/4U/4029/PCIe-Root-Architecture.cfm.                    nir, et al. Scalable Hierarchical Aggregation Protocol
+[16] Train ImageNet in 18 Minutes. https://www.fast.a           (SHArP): A Hardware Architecture for Efficient Data
+     i/2018/08/10/fastai-diu-imagenet/.                         Reduction. In COMHPC 2016.
+
+[17] XLA. https://www.tensorflow.org/xla.                  [29] Juncheng Gu, Mosharaf Chowdhury, Kang G. Shin,
+                                                                Yibo Zhu, Myeongjae Jeon, Junjie Qian, Hongqiang Liu,
+[18] Amazon EC2 Pricing on demand. https://aws.amaz             and Chuanxiong Guo. Tiresias: A GPU Cluster Manager
+     on.com/ec2/pricing/on-demand/, 2019.                       for Distributed Deep Learning. In NSDI 2019.
+[19] TensorFlow MNIST Example with Horovod. https:         [30] Chuanxiong Guo, Haitao Wu, Zhong Deng, Gaurav Soni,
+     //github.com/horovod/horovod/blob/master/e                 Jianxi Ye, Jitu Padhye, and Marina Lipshteyn. RDMA
+     xamples/tensorflow_mnist.py, 2020.                         Over Commodity Ethernet at Scale. In SIGCOMM 2016.
+
+
+
+USENIX Association                     14th USENIX Symposium on Operating Systems Design and Implementation       477
+[31] Sayed Hadi Hashemi, Sangeetha Abdu Jyothi, and            [42] Diederik P. Kingma and Jimmy Ba. Adam: A Method
+     Roy H Campbell. TicTac: Accelerating Distributed               for Stochastic Optimization. In ICLR, 2015.
+     Deep Learning with Communication Scheduling. In
+                                                               [43] Alex Krizhevsky, Ilya Sutskever, and Geoffrey E Hin-
+     SysML 2019.
+                                                                    ton. ImageNet Classification with Deep Convolutional
+[32] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian              Neural Networks. In NIPS 2012.
+     Sun. Deep Residual Learning for Image Recognition.
+     In CVPR 2016.                                             [44] Mu Li, David G Andersen, Jun Woo Park, Alexander J
+                                                                    Smola, Amr Ahmed, Vanja Josifovski, James Long, Eu-
+[33] Geoffrey Hinton, li Deng, Dong Yu, George Dahl, Abdel-         gene J Shekita, and Bor-Yiing Su. Scaling Distributed
+     rahman Mohamed, Navdeep Jaitly, Andrew Senior, Vin-            Machine Learning with the Parameter Server. In OSDI
+     cent Vanhoucke, Phuongtrang Nguyen, Tara Sainath,              2014.
+     and Brian Kingsbury. Deep Neural Networks for Acous-
+     tic Modeling in Speech Recognition: The Shared Views      [45] Yujun Lin, Song Han, Huizi Mao, Yu Wang, and
+     of Four Research Groups. Signal Processing Magazine,           William J Dally. Deep Gradient Compression: Reducing
+     IEEE, 2012.                                                    the Communication Bandwidth for Distributed Training.
+                                                                    arXiv preprint arXiv:1712.01887, 2017.
+[34] Anand Jayarajan, Jinliang Wei, Garth Gibson, Alexandra
+     Fedorova, and Gennady Pekhimenko. Priority-based          [46] Ming Liu, Simon Peter, Arvind Krishnamurthy, and
+     Parameter Propagation for Distributed DNN Training.            Phitchaya Mangpo Phothilimthana.    E3: Energy-
+     In SysML 2019.                                                 Efficient Microservices on SmartNIC-Accelerated
+                                                                    Servers. In ATC 2019.
+[35] Myeongjae Jeon, Shivaram Venkataraman, Amar Phan-
+     ishayee, Junjie Qian, Wencong Xiao, and Fan Yang.         [47] Chris Lomont. Introduction to Intel Advanced Vector
+     Analysis of Large-Scale Multi-Tenant GPU Clusters              Extensions. Intel white paper, 23, 2011.
+     for DNN Training Workloads. In ATC 2019.                  [48] Liang Luo, Jacob Nelson, Luis Ceze, Amar Phanishayee,
+[36] Xianyan Jia, Shutao Song, Wei He, Yangzihao Wang,              and Arvind Krishnamurthy. Parameter Hub: A Rack-
+     Haidong Rong, Feihu Zhou, Liqiang Xie, Zhenyu Guo,             scale Parameter Server for Distributed Deep Neural Net-
+     Yuanzhou Yang, Liwei Yu, et al. Highly Scalable                work Training. In SoCC 2018.
+     Deep Learning Training System with Mixed-precision:       [49] Hiroaki Mikami, Hisahiro Suganuma, Yoshiki Tanaka,
+     Training Imagenet in Four Minutes. arXiv preprint              and Yuichi Kageyama. Massively Distributed SGD:
+     arXiv:1807.11205, 2018.                                        ImageNet/ResNet-50 Training in a Flash. arXiv preprint
+[37] Zhihao Jia, Oded Padon, James Thomas, Todd Warsza-             arXiv:1811.05233, 2018.
+     wski, Matei Zaharia, and Alex Aiken. TASO: Opti-          [50] Christopher Mitchell, Yifeng Geng, and Jinyang Li. Us-
+     mizing Deep Learning Computation with Automatic                ing One-Sided RDMA Reads to Build a Fast, CPU-
+     Generation of Graph Substitutions. In SOSP 2019.               Efficient Key-Value Store. In ATC 2013.
+[38] Norman P Jouppi, Cliff Young, Nishant Patil, David Pat-
+                                                               [51] Deepak Narayanan, Aaron Harlap, Amar Phanishayee,
+     terson, Gaurav Agrawal, Raminder Bajwa, Sarah Bates,
+                                                                    Vivek Seshadri, Nikhil R Devanur, Gregory R Ganger,
+     Suresh Bhatia, Nan Boden, Al Borchers, et al. In-
+                                                                    Phillip B Gibbons, and Matei Zaharia. PipeDream: Gen-
+     datacenter performance analysis of a tensor processing
+                                                                    eralized Pipeline Parallelism for DNN Training. In
+     unit. In ISCA 2017.
+                                                                    SOSP 2019.
+[39] Anuj Kalia, Michael Kaminsky, and David G. Andersen.
+                                                               [52] Tony Paikeday. Steel for the AI Age: DGX SuperPOD
+     FaSST: Fast, Scalable and Simple Distributed Transac-
+                                                                    Reaches New Heights with NVIDIA DGX A100. http
+     tions with Two-Sided (RDMA) Datagram RPCs. In
+                                                                    s://blogs.nvidia.com/blog/2020/05/14/dgx-s
+     OSDI 2016.
+                                                                    uperpod-a100/, May 2020.
+[40] Anuj Kalia, Michael Kaminsky, and David G Andersen.
+                                                               [53] Adam Paszke, Sam Gross, Francisco Massa, Adam
+     Using RDMA efficiently for Key-value Services. In
+                                                                    Lerer, James Bradbury, Gregory Chanan, Trevor Killeen,
+     SIGCOMM 2014.
+                                                                    Zeming Lin, Natalia Gimelshein, Luca Antiga, Al-
+[41] Junho Kim, Minjae Kim, Hyeonwoo Kang, and                      ban Desmaison, Andreas Kopf, Edward Yang, Zachary
+     Kwanghee Lee. U-GAT-IT: Unsupervised Genera-                   DeVito, Martin Raison, Alykhan Tejani, Sasank Chil-
+     tive Attentional Networks with Adaptive Layer-Instance         amkurthy, Benoit Steiner, Lu Fang, Junjie Bai, and
+     Normalization for Image-to-Image Translation. arXiv            Soumith Chintala. PyTorch: An Imperative Style, High-
+     preprint arXiv:1907.10830, 2019.                               Performance Deep Learning Library. In NIPS 2019.
+
+
+
+478   14th USENIX Symposium on Operating Systems Design and Implementation                            USENIX Association
+[54] Pitch Patarasuk and Xin Yuan. Bandwidth Optimal All-
+                                                               [66] Vijay Vasudevan, Amar Phanishayee, Hiral Shah, Elie
+     reduce Algorithms for Clusters of Workstations. Journal
+                                                                    Krevat, David G. Andersen, Gregory R. Ganger, Garth A.
+     of Parallel and Distributed Computing, 2009.
+                                                                    Gibson, and Brian Mueller. Safe and Effective Fine-
+[55] Yanghua Peng, Yibo Zhu, Yangrui Chen, Yixin Bao,               grained TCP Retransmissions for Datacenter Communi-
+     Bairen Yi, Chang Lan, Chuan Wu, and Chuanxiong Guo.            cation. In SIGCOMM 2009.
+     A Generic Communication Scheduler for Distributed
+     DNN Training Acceleration. In SOSP 2019.                  [67] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob
+                                                                    Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser,
+[56] Raul Puri, Robert Kirby, Nikolai Yakovenko, and Bryan          and Illia Polosukhin. Attention is All You Need. In
+     Catanzaro. Large Scale Language Modeling: Converg-             NIPS 2017.
+     ing on 40GB of Text in Four Hours. In SBAC-PAD
+     2018.                                                     [68] Guanhua Wang, Shivaram Venkataraman, Amar Phan-
+                                                                    ishayee, Jorgen Thelin, Nikhil Devanur, and Ion Stoica.
+[57] Alec Radford, Jeff Wu, Rewon Child, David Luan, Dario          Blink: Fast and Generic Collectives for Distributed ML.
+     Amodei, and Ilya Sutskever. Language Models are Un-            In MLSys 2020.
+     supervised Multitask Learners. OpenAI Blog, 2019.
+                                                               [69] Yuxuan Wang, R. J. Skerry-Ryan, Daisy Stanton,
+[58] Amedeo Sapio, Ibrahim Abdelaziz, Abdulla Aldilaijan,
+                                                                    Yonghui Wu, Ron J. Weiss, Navdeep Jaitly, Zongheng
+     Marco Canini, and Panos Kalnis. In-network Compu-
+                                                                    Yang, Ying Xiao, Zhifeng Chen, Samy Bengio, Quoc V.
+     tation Is A Dumb Idea Whose Time Has Come. In
+                                                                    Le, Yannis Agiomyrgiannakis, Rob Clark, and Rif A.
+     HotNets 2017.
+                                                                    Saurous. Tacotron: A Fully End-to-End Text-To-Speech
+[59] Amedeo Sapio, Marco Canini, Chen-Yu Ho, Jacob                  Synthesis Model. CoRR, abs/1703.10135, 2017.
+     Nelson, Panos Kalnis, Changhoon Kim, Arvind Krish-
+     namurthy, Masoud Moshref, Dan RK Ports, and Pe-           [70] Xingda Wei, Zhiyuan Dong, Rong Chen, and Haibo
+     ter Richtárik. Scaling Distributed Machine Learn-              Chen. Deconstructing RDMA-enabled Distributed
+     ing with In-network Aggregation. arXiv preprint                Transactions: Hybrid is Better! In OSDI 2018.
+     arXiv:1903.06701, 2019.
+                                                               [71] Wencong Xiao, Romil Bhardwaj, Ramachandran Ram-
+[60] Alexander Sergeev and Mike Del Balso. Horovod: Fast            jee, Muthian Sivathanu, Nipun Kwatra, Zhenhua Han,
+     and Easy Distributed Deep Learning in TensorFlow.              Pratyush Patel, Xuan Peng, Hanyu Zhao, Quanlu Zhang,
+     CoRR, 2018.                                                    et al. Gandiva: Introspective Cluster Scheduling for
+                                                                    Deep Learning. In OSDI 2018.
+[61] Noam Shazeer, Youlong Cheng, Niki Parmar, Dustin
+     Tran, Ashish Vaswani, Penporn Koanantakool, Peter         [72] Bairen Yi, Jiacheng Xia, Li Chen, and Kai Chen. To-
+     Hawkins, HyoukJoong Lee, Mingsheng Hong, Cliff                 wards Zero Copy Dataflows Using RDMA. In SIG-
+     Young, Ryan Sepassi, and Blake Hechtman. Mesh-                 COMM 2017 Posters and Demos.
+     TensorFlow: Deep Learning for Supercomputers. arXiv
+     preprint arXiv:1811.02084, 2018.                          [73] Chris Ying, Sameer Kumar, Dehao Chen, Tao Wang, and
+                                                                    Youlong Cheng. Image Classification at Supercomputer
+[62] Mohammad Shoeybi, Mostofa Patwary, Raul Puri,
+                                                                    Scale. arXiv preprint arXiv:1811.06992, 2018.
+     Patrick LeGresley, Jared Casper, and Bryan Catanzaro.
+     Megatron-LM: Training Multi-Billion Parameter Lan-        [74] Yang You, Jing Li, Jonathan Hseu, Xiaodan Song, James
+     guage Models Using Model Parallelism. arXiv preprint           Demmel, and Cho-Jui Hsieh. Reducing BERT Pre-
+     arXiv: 1909.08053, 2019.                                       Training Time from 3 Days to 76 Minutes. arXiv
+[63] Karen Simonyan and Andrew Zisserman. Very Deep                 preprint arXiv:1904.00962, 2019.
+     Convolutional Networks for Large-scale Image Recog-
+     nition. arXiv preprint arXiv:1409.1556, 2014.             [75] Yibo Zhu, Haggai Eran, Daniel Firestone, Chuanxiong
+                                                                    Guo, Marina Lipshteyn, Yehonatan Liron, Jitendra Pad-
+[64] Muthian Sivathanu, Tapan Chugh, Sanjay S Singapuram,           hye, Shachar Raindel, Mohamad Haj Yahia, and Ming
+     and Lidong Zhou. Astra: Exploiting Predictability to           Zhang. Congestion Control for Large-Scale RDMA
+     Optimize Deep Learning. In ASPLOS 2019.                        Deployments. In SIGCOMM 2015.
+
+[65] Ilya Sutskever, James Martens, George Dahl, and Ge-       [76] Martin Zinkevich, Markus Weimer, Lihong Li, and
+     offrey Hinton. On the Importance of Initialization and         Alex J Smola. Parallelized Stochastic Gradient Descent.
+     Momentum in Deep Learning. In ICML 2013.                       In NIPS 2010.
+
+
+
+USENIX Association                        14th USENIX Symposium on Operating Systems Design and Implementation        479
+

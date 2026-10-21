@@ -1,0 +1,1114 @@
+   Capturing and Enhancing In Situ System
+     Observability for Failure Detection
+   Peng Huang, Johns Hopkins University; Chuanxiong Guo, ByteDance Inc.;
+Jacob R. Lorch and Lidong Zhou, Microsoft Research; Yingnong Dang, Microsoft
+            https://www.usenix.org/conference/osdi18/presentation/huang
+
+
+
+
+      This paper is included in the Proceedings of the
+   13th USENIX Symposium on Operating Systems Design
+              and Implementation (OSDI ’18).
+                   October 8–10, 2018 • Carlsbad, CA, USA
+                              ISBN 978-1-939133-08-3
+
+
+
+                                         Open access to the Proceedings of the
+                                     13th USENIX Symposium on Operating Systems
+                                             Design and Implementation
+                                               is sponsored by USENIX.
+                Capturing and Enhancing In Situ System Observability
+                               for Failure Detection
+
+            Peng Huang                       Chuanxiong Guo             Jacob R. Lorch      Lidong Zhou
+      Johns Hopkins University                ByteDance Inc.                   Microsoft Research
+                                                   Yingnong Dang
+                                                      Microsoft
+
+
+                       Abstract                               critical thread of a process might get stuck while its
+Real-world distributed systems suffer unavailability due      other threads including a failure detector keep running.
+to various types of failure. But, despite enormous effort,    Or, a component might experience limplock [19], ran-
+many failures, especially gray failures, still escape de-     dom packet loss [26], fail-slow hardware [11, 25], silent
+tection. In this paper, we argue that the missing piece       hanging, or state corruption. Such complex failures are
+in failure detection is detecting what the requesters of a    the culprits of many real-world production service out-
+failing component see. This insight leads us to the design    ages [1, 3, 4, 6, 10, 23, 30, 36, 38].
+and implementation of Panorama, a system designed to             As an example, ZooKeeper [31] is a widely-used sys-
+enhance system observability by taking advantage of the       tem that provides highly reliable distributed coordina-
+interactions between a system’s components. By pro-           tion. The system is designed to tolerate leader or fol-
+viding a systematic channel and analysis tool, Panorama       lower crashes. Nevertheless, in one production deploy-
+turns a component into a logical observer so that it not      ment [39], an entire cluster went into a near-freeze status
+only handles errors, but also reports them. Furthermore,      (i.e., clients were unable to write data) even though the
+Panorama incorporates techniques for making such ob-          leader was still actively exchanging heartbeat messages
+servations even when indirection exists between compo-        with its followers. That incident was triggered by a tran-
+nents. Panorama can easily integrate with popular dis-        sient network issue in the leader and a software defect
+tributed systems and detect all 15 real-world gray fail-      that performs blocking I/Os in a critical section.
+ures that we reproduced in less than 7 s, whereas existing       Therefore, practitioners suggest that failure detection
+approaches detect only one of them in under 300 s.            should evolve to monitor multi-dimensional signals of a
+                                                              system, aka vital signs [30, 37, 44]. But, defining signals
+1   Introduction                                              that represent the health of a system can be tricky. They
+                                                              can be incomplete or too excessive to reason about. Set-
+Modern cloud systems frequently involve numerous              ting accurate thresholds for these signals is also an art.
+components and massive complexity, so failures are            They may be too low to prevent overreacting to benign
+common in production environments [17, 18, 22]. De-           faults, or too high to reliably detect failures. For exam-
+tecting failures reliably and rapidly is thus critical to     ple, an impactful service outage in AWS was due to a la-
+achieving high availability. While the problem of fail-       tent memory leak, which caused the system to get stuck
+ure detection has been extensively studied [8, 13, 14, 20,    when serving requests and eventually led to a cascading
+24, 29, 33, 34, 47], it remains challenging for practition-   outage [10]. Interestingly, there was a monitor for system
+ers. Indeed, system complexity often makes it hard to         memory consumption, but it triggered no alarm because
+answer the core question of what constitutes a failure.       of “the difficulty in setting accurate alarms for a dynamic
+   A simple answer, as used by most existing detection        system” [10]. These monitoring challenges are further
+mechanisms, is to define failure as complete stoppage         aggravated in a multi-tenant environment where both the
+(crash failure). But, failures in production systems can      system and workloads are constantly changing [44].
+be obscure and complex, in part because many sim-                In this paper, we advocate detecting complex produc-
+ple failures can be eliminated through testing [49] or        tion failures by enhancing observability (a measure of
+gradual roll-out. A component in production may ex-           how well components’ internal states can be inferred
+perience gray failure [30], a failure whose manifesta-        from their external interactions [32]). While defining the
+tion is subtle and difficult to detect. For example, a        absolute health or failure of a system in isolation is tricky,
+
+
+
+USENIX Association                    13th USENIX Symposium on Operating Systems Design and Implementation                1
+void syncWithLeader(long newLeaderZxid) {
+                                                                 Panorama provides unified abstractions and APIs to re-
+    QuorumPacket qp = new QuorumPacket();
+    readPacket(qp);
+                                                                 port observations, and a distributed service to selectively
+    try {                                                        exchange observations. Also, importantly, Panorama
+        if (qp.getType() == Leader.SNAP) {                       keeps the burden on developers low by automatically
+            deserializeSnapshot(leaderIs);
+                                                                 inserting report-generation code based on offline static
+            String sig = leaderIs.read("signature");
+            if (!sig.equals("BenWasHere"))
+                                                                 analysis. In this way, Panorama automatically converts
+              throw new IOException("Bad signature");            every component into an observer of the components it
+        } else {                                                 interacts with. This construction of in-situ observers dif-
+            LOG.error("Unexpected leader packet.");
+                                                                 ferentiates Panorama from traditional distributed crash
+            System.exit(13);
+        }                                                        failure detection services [34, 47], which only measure
+    } catch (IOException e) {                                    superficial failure indicators.
+        LOG.warn("Exception sync with leader", e);                  In applying Panorama to real-world system software,
+        sock.close();
+    }
+                                                                 we find some common design patterns that, if not treated
+}                                                                appropriately, can reduce observability and lead to mis-
+                                                                 leading observations. For example, if a requester submits
+Listing 1: A follower requesting a snapshot from the leader
+                                                                 requests to a provider, but an indirection layer temporar-
+tries to handle or log errors but it does not report errors.
+                                                                 ily buffers the request, the request may appear successful
+                                                                 even though the provider has failed. This can cause the
+modern distributed systems consist of many highly inter-         requester to report positive evidence about the provider.
+active components across layers. So, when a component            We study such common design patterns and character-
+becomes unhealthy, the issue is likely observable through        ize their impact on system observability (§4). Based on
+its effects on the execution of some, if not all, other com-     this, we enhance Panorama to recognize these patterns
+ponents. For example, in the previous ZooKeeper inci-            and avoid their effects on observability.
+dent, even though the simple heartbeat detectors did not            For failure detection, Panorama includes a decision
+detect the partial failure, the Cassandra process experi-        engine to reach a verdict on the status of each component
+enced many request time-outs that caused its own un-             based on reported observations. Because these reports
+served requests to rapidly accumulate. Followers that re-        come from errors and successes in the execution paths
+quested snapshots from the leader also encountered ex-           of requester components instead of artificial, non-service
+ceptions and could not continue. Thus, errors encoun-            signals, our experience suggests that a simple decision
+tered in the execution path of interactive components en-        algorithm suffices to reliably detect complex failures.
+hance the observability of complex failures.                        We have implemented the Panorama system in Go and
+   Even though an interactive component (a requester)            the static analyzer on top of Soot [46] and AspectJ [2].
+is well-placed to observe issues of another component            Our experiences show that Panorama is easy to integrate
+(a provider) when it experiences errors, such a requester        with popular distributed systems including ZooKeeper,
+is often designed to handle that error but not report it         Cassandra, HDFS, and HBase. Panorama significantly
+(e.g., Listing 1). For example, the requester may re-            outperforms existing failure detectors in that: (1) it de-
+lease a resource, retry a few times, reset its state, use        tects crash failures faster; (2) it detects 15 real-world
+a cached result (i.e., be fail-static), or exit. This tendency   gray failures in less than 7 s each, whereas other detectors
+to prioritize error handling over error reporting is possi-      only detect one in 86 s; (3) Panorama not only detects,
+bly due to the modularity principle of “separation of con-       but also locates failures. Our experiments also show that
+cern” [41, 42], which suggests that components should            Panorama is resilient to transient failures and is stable
+hide as much information as they can and that failure de-        in normal operations. Finally, Panorama introduces only
+tection and recovery should be each component’s own              minor overhead (less than 3%) to the systems we evalu-
+job. Even if a component has incentive to report, it may         ate it on.
+not have a convenient systematic mechanism to do so. It
+can write errors in its own logs to be collected and aggre-      2    Problem Statement
+gated by a central service, as is done in current practice.
+The correlation, however, usually happens in an offline          We consider failure detection in the context of a large dis-
+troubleshooting phase, which is too late.                        tributed system S composed of several subsystems. Each
+   We present Panorama, a generic failure detection              subsystem has multiple components. In total, S contains
+framework that leverages and enhances system observ-             n processes P1 , P2 , . . . , Pn , each with one or more threads.
+ability to detect complex production failures. It does so        The whole system lies within a single administrative do-
+by breaking detection boundaries and systematically ex-          main but the code for different system components may
+tracting critical observations from diverse components.          be developed by different teams. For example, a stor-
+
+
+
+2       13th USENIX Symposium on Operating Systems Design and Implementation                              USENIX Association
+age system may consist of a front-end tier, a distributed                           Application                FrontA
+lock service, a caching middleware, a messaging service,
+                                                                                                                             ManageA
+and a persistence layer. The latter subsystem include                                    Verdict
+                                                                                                                LOS
+                                                                                         Server
+metadata servers, structured table servers, and extent data                                                                    LOS
+nodes. An extent data node may be multi-threaded, with
+                                                                                          Thread      Thread      Thread
+threads such as a data receiver, a data block scanner, a                                    A           B           C        CacheA
+                                                                    observability
+block pool manager, and an IPC-socket watcher. We as-                 analysis                           LOS                   LOS
+sume the components trust each other, collectively pro-                       {}
+                                                                  {}
+viding services to external untrusted applications.               Source                        Execution ﬂow
+                                                                                                                             TableA
+                                                                   Code                         Panorama observer
+   The main goal of failure detection is to correctly re-                                       Submit observation
+                                                                                                Local Observation Store       LOS
+port the status of each component; in this work the only                                  LOS
+                                                                                                Observation exchange
+components we consider are processes and threads. Tra-
+                                                                 Oﬄine (Section 5)                  Production (Section 3)
+ditional failure detectors focus on crash failure, i.e., us-
+ing only statuses UP and DOWN. We aim to detect not only
+                                                                Figure 1: Overview of Panorama. Each Panorama instance runs
+crash failure but also gray failure, in which components
+                                                                at the same endpoint with the monitored component.
+experience degraded modes “between” UP and DOWN. The
+quality of a failure detector is commonly characterized
+by two properties: completeness, which requires that if         where the failure happened.
+a component fails, a detector eventually suspects it; and          Figure 1 shows an overview of Panorama. Panorama
+accuracy, which requires that a component is not sus-           is a generic detection service that can be plugged into
+pected by a detector before it fails. Quality is further        any component in a distributed system. It provides uni-
+characterized by timeliness, i.e., how fast true failures are   fied abstractions to represent observations about a com-
+detected. Failure detectors for production systems should       ponent’s status, and a library for reporting and query-
+also have good localization, i.e., ease of pinpointing each     ing detection results. For scalability, we use a decentral-
+failure in a way that enables expedient corrective action.      ized architecture: for each Pi in a monitored system, a
+                                                                co-located Panorama instance (a separate process) main-
+                                                                tains a Local Observation Store (LOS) that stores all the
+3     Panorama System                                           observations that are made either by or about Pi . A local
+                                                                decision engine in the instance analyzes the observations
+3.1    Overview                                                 in that LOS and makes a judgment about the process’s
+                                                                status. A central verdict server allows easy querying of,
+At a high level, Panorama takes a collaborative approach:
+                                                                and arbitration among, these decentralized LOSes.
+It gathers observations about each component from dif-
+ferent sources in real time to detect complex production           The Panorama service depends on many logical ob-
+failures. Collaborative failure detection is not a new idea.    servers within the running components in the monitored
+Many existing crash-failure detectors such as member-           system. Unlike traditional failure detectors, these logi-
+ship services exchange detection results among multi-           cal observers are not dedicated threads running detection
+ple components using protocols like gossip [47]. But,           checks. Rather, they are diverse hooks injected into the
+the scope of where the detection is done is usually lim-        code. These hooks use a thin library to collect and sub-
+ited to component instances with similar functionality or       mit observations to the LOS via local RPC calls. They
+roles in a particular layer. Panorama pushes the detec-         are inserted offline by a tool that leverages static analy-
+tion scope to an extreme by allowing any thread in any          sis (§5). To achieve timeliness, the observations are re-
+process to report evidence, regardless of its role, layer,      ported in real time as Pi executes. Panorama observers
+or subsystem. The resulting diverse sources of evidence         collect evidence not only about the locally attached com-
+enhance the observability of complex failures.                  ponent, but, more importantly, about other components
+   More importantly, instead of writing separate monitor-       that the observer interacts with. However, if Pi never in-
+ing code that measures superficial signals, Panorama’s          teracts with Pj , Pi will not put observations about Pj into
+philosophy is to leverage existing code that lies near the      its LOS. Panorama runs a dissemination protocol to ex-
+boundaries between different components. Examples of            change observations among a clique of LOSes that share
+such code include when one thread calls another, and            common interaction components.
+when one process makes an RPC call to another. This
+captures first-hand observations, especially runtime er-        3.2        Abstractions and APIs
+rors that are generated from the executions of these code
+regions in production. When Panorama reports a failure,         To be usable by arbitrary distributed system components,
+there is concrete evidence and context to help localize         Panorama must provide a unified way to encapsulate ob-
+
+
+
+USENIX Association                     13th USENIX Symposium on Operating Systems Design and Implementation                          3
+Component       a process or thread                                another observer in another Panorama instance makes an
+Subject         a component to be monitored                        observation about a subject in the watch list, that obser-
+Observer        a component monitoring a subject                   vation will be propagated to this instance with a remote
+Status          the health situation of a subject                  RPC LearnObservation. Panorama calls JudgeSubject
+Observation     evidence an observer finds of a subject’s status   each time it collects a new observation, either locally or
+Context         what an observer was doing when it made an         via remote exchange.
+                observation
+Verdict         a decision about a subject’s status, obtained by
+                summarizing a set of observations of it            3.3    Local Observation Store
+                                                                   Each Panorama instance maintains a Local Observation
+     Table 1: Abstractions and terms used in Panorama.             Store (LOS) that stores all observation reports made by
+                                                                   colocated components. The subjects of these reports in-
+servations for reporting. We now describe our core ab-             clude both local and remote components.
+stractions and terms, summarized in Table 1.                          The LOS consists of two main structures: the raw ob-
+    As discussed earlier, the only components we consider          servation store and the verdict table. The LOS partitions
+are processes and threads. A component is an observer              the raw observation store by subject into multiple tables
+if it makes observations and a subject if it is observed;          for efficient concurrent access. Each record in a subject’s
+a component may be both an observer and a subject. A               table corresponds to a single observer; it stores a list of
+status is a categorization of the health of a subject; it can      the n most recent observations of that subject made by
+be only a small pre-determined set of values, including            that observer. The LOS is kept in memory to enable effi-
+HEALTHY, DEAD, and a few levels of UNHEALTHY. Another              cient access; asynchronously, its content is persisted to
+possible value is PENDING, the meaning and use of which            local database to preserve the full observation history,
+we will discuss in §5.4.                                           for facilitating troubleshooting later. The raw observa-
+    When an observer sees evidence of a subject’s status,          tion store is synchronized with that of other Panorama in-
+that constitutes an observation. An observation contains           stances that share common subjects. Therefore, an LOS
+a timestamp of when the observation occurred, the iden-            contains observations made both locally and remotely.
+tities of the observer and subject, and the inferred status           A local decision engine analyzes the raw observation
+of the subject. It also contains a context describing what         store to reach a verdict for each subject. This decision
+the observer was doing when it made the observation, at a          result is stored in the verdict table, keyed by subject. The
+sufficient granularity to allow Panorama to achieve fine-          verdict table is not synchronized among Panorama in-
+grained localization of failures. For instance, the context        stances because it does not have to be: the decision al-
+may include the method the observer was running, or the            gorithm is deterministic. In other words, given synchro-
+method’s class; the API call the observer was making               nized raw observations, the verdict should be the same.
+to the subject; and/or the type of operation, e.g., short-         To enable convenient queries over the distributed ver-
+circuit read, snapshot, or row mutation. A verdict is a            dict tables to, e.g., arbitrate among inconsistent verdicts,
+summary, based on a decision algorithm, of a set of ob-            Panorama uses a central verdict server. Note, though,
+servations of the same subject.                                    that the central verdict server is not on any critical path.
+    Each Panorama instance provides an API based on the               Including old observations in decisions can cause mis-
+above abstractions. It can be invoked by a local compo-            leading verdicts. So, each observation has a Time-to-
+nent, by another Panorama instance, or by an administra-           Live parameter, and a background garbage collection
+tion tool. When a component decides to use Panorama,               (GC) task runs periodically to retire old observations.
+it registers with the local Panorama instance and receives         Whenever GC changes the observations of a subject, the
+a handle to use for reporting. It reports observations us-         decision engine re-computes the subject’s verdict.
+ing a local RPC ReportObservation; when it is done re-
+porting it unregisters. A Panorama instance can register
+                                                                   3.4    Observers
+multiple local observers. If a component does not intend
+to report observations but merely wants to query compo-            Panorama does not employ dedicated failure detectors.
+nent statuses, it need not register.                               Instead, it leverages code logic in existing distributed-
+    Each Panorama instance maintains a watch list: the set         system components to turn them into in-situ logical ob-
+of subjects for which it keeps track of observations. By           servers. Each logical observer’s main task is still to pro-
+default, Panorama automatically updates this list to in-           vide its original functionality. As it executes, if it en-
+clude the components that registered observers interact            counters an error related to another component, in addi-
+with. But, each observer can explicitly select subjects            tion to handling the error it will also report it as an ob-
+for this list using StartObserving and StopObserving. If           servation to Panorama. There are two approaches to turn
+
+
+
+4   13th USENIX Symposium on Operating Systems Design and Implementation                                 USENIX Association
+a component into a Panorama observer. One is to insert         observer, whose negative observation is due to its own
+Panorama API hooks into the component’s source code.           issue, to mislead others.
+Another is to integrate with the component’s logs by con-         We use a bounded-look-back majority algorithm, as
+tinuously parsing and monitoring log entries related to        follows. For a set of observations about a subject, we first
+other components. The latter approach is transparent to        group the observations by the unique observer, and ana-
+components but captures less accurate information. We          lyze each group separately. The observations in a group
+initially adopted the latter approach by adding plug-in        are inspected from latest to earliest and aggregated based
+support in Panorama to manage log-parsing scripts. But,        on their associated contexts. For an observation being
+as we applied Panorama to more systems, maintaining            inspected, if its status is different than the previously
+these scripts became painful because their logging prac-       recorded status for that context, the look-back of obser-
+tices differed significantly. Much information is also un-     vations for that context stops after a few steps to favor
+available in logs [50]. Thus, even though we still sup-        newer statuses. Afterwards, for each recorded context,
+port logging integration, we mainly use the instrumen-         if either the latest status is unhealthy or the healthy sta-
+tation approach. To relieve developers of the burden of        tus does not have the strict majority, the verdict for that
+inserting Panorama hooks, Panorama provides an offline         context is unhealthy with an aggregated severity level.
+analysis tool that does the source-code instrumentation           In this way, we obtain an analysis summary for each
+automatically. §4 describes this offline analysis.             context in each group. To reach a final verdict for each
+                                                               context across all groups, the summaries from different
+                                                               observers are aggregated and decided based on a sim-
+3.5    Observation Exchange
+                                                               ple majority. Using group-based summaries allows in-
+Observations submitted to the LOS by a local observer          cremental update of the verdict and avoids being biased
+only reflect a partial view of the subject. To reduce bias     by one observer or context in the aggregation. The de-
+in observations, Panorama runs a dissemination proto-          cision engine could use more complex algorithms, but
+col to propagate observations to, and learn observations       we find that our simple algorithm works well in practice.
+from, other LOSes. Consequently, for each monitored            This is because most observations collected by Panorama
+subject, the LOS stores observations from multiple ob-         constitute strong evidence rather than superficial signals.
+servers. The observation exchange in Panorama is only             The PENDING status (Section 4.3) needs additional han-
+among cliques of LOSes that share a subject. To achieve        dling: during the look-back for a context, if the current
+selective exchange, each LOS keeps a watch list, which         status is HEALTHY and the older status is PENDING, that
+initially contains only the local observer. When a local       older PENDING status will be skipped because it was only
+observer reports an observation to the LOS, the LOS will       temporary. In other words, that partial observation is now
+add the observation’s subject to the watch list to indicate    complete. Afterwards, a PENDING status with occurrences
+that it is now interested in others’ observations about this   exceeding a threshold is downgraded to UNHEALTHY.
+subject. Each LOS also keeps an ignore list for each sub-
+ject, which lists LOSes to which it should not propagate
+new observations about that subject. When a local ob-          4     Design Pattern and Observability
+servation for a new subject appears for the first time, the
+LOS does a one-time broadcast. LOSes that are not inter-       The effectiveness of Panorama depends on the hooks
+ested in the observation (based on their own watch lists)      in observers. We initially designed a straightforward
+will instruct the broadcasting LOS to include them in its      method to insert these hooks. In testing it on real-world
+ignore list. If an LOS later becomes interested in this        distributed systems, however, we found that component
+subject, the protocol ensures that the clique members re-      interactions in practice can be complex. Certain interac-
+move this LOS from their ignore lists.                         tions, if not treated appropriately, will cause the extracted
+                                                               observations to be misleading. In this section, we first
+                                                               show a gray failure that our original method failed to de-
+3.6    Judging Failure from Observations                       tect, and then investigate the reason behind the challenge.
+With numerous observations collected about a subject,
+Panorama uses a decision engine to reach a verdict and         4.1    A Failed Case
+stores the result in the LOS’s verdict table. A simple
+decision policy is to use the latest observation as the ver-   In one incident of a production ZooKeeper service, ap-
+dict. But, this can be problematic since a subject experi-     plications were experiencing many lock timeouts [23].
+encing intermittent errors may be treated as healthy. An       An engineer investigated the issue by checking metrics
+alternative is to reach an unhealthy verdict if there is any   in the monitoring system and found that the number of
+recent negative observation. This could cause one biased       connections per client had significantly increased. It ini-
+
+
+
+USENIX Association                     13th USENIX Symposium on Operating Systems Design and Implementation               5
+tially looked like a resource leak in the client library, but         request        request
+                                                                                                                 request        request
+
+the root cause turned out to be complicated.                                                                C1             C2   C1
+                                                                 C1             C2   C1                C2                                       C2
+   The production environment used IPSec to secure                     reply                   reply
+                                                                                                                      reply
+                                                                                                                                           reply
+
+inter-host traffic, and a Linux kernel module used Intel                (a)                    (b)                  (c)                   (d)
+AES instructions to provide AES encryption for IPSec.
+But this kernel module could occasionally introduce data        Figure 2: Design patterns of component interactions and their
+corruption with Xen paravirtualization, for reasons still       impact on failure observability.   means that failure is ob-
+                                                                servable to the other component, and    means that failure is
+not known today. Typically the kernel validated packet
+                                                                unobservable to it.
+checksums and dropped corrupt packets. But, in IPSec,
+two checksums exist: one for the IP payload, the other
+for the encrypted TCP payload. For IPSec NAT-T mode,            4.2      Observability Patterns
+the Linux kernel did not validate the TCP payload check-        Although the above case is a unique incident, we extrap-
+sum, thereby permitting corrupt packets. These were de-         olate a deeper implication for failure detection: certain
+livered to the ZooKeeper leader, including a corrupted          design patterns can undermine failure observability in a
+length field for a string. When ZooKeeper used the              system and thereby pose challenges for failure detection.
+length to allocate memory to deserialize the string, it         To reveal this connection, consider two components C1
+raised an out-of-memory (OOM) exception.                        and C2 where C1 makes requests of C2 . We expect that,
+   Surprisingly, when this OOM exception happened,              through this interaction, C1 and C2 should be able to
+ZooKeeper continued to run. Heartbeats were normal              make observations about each other’s status. However,
+and no leader re-election was triggered. When eval-             their style of interaction can have a significant effect on
+uating this incident in Panorama, no failure was re-            this observability.
+ported either. We studied the ZooKeeper source code                We have identified the following four basic patterns of
+to understand why this happened. In ZooKeeper, a re-            interaction (Figure 2), each having a different effect on
+quest is first picked up by the listener thread, which          this observability. Interestingly, we find examples of all
+then calls the ZooKeeperServer thread that further in-          four patterns in real-world system software.
+vokes a chain of XXXRequestProcessor threads to pro-
+cess the request. The OOM exception happens in the              (a) No indirection. Pattern (a) is the most straightfor-
+PrepRequestProcessor thread, the first request proces-
+                                                                ward. C1 makes a request to C2 , then C2 optionally
+sor. The ZooKeeperServer thread invokes the interface           replies to C1 . This pattern has the best degree of ob-
+of the PrepRequestProcessor as follows:                         servability: C1 can observe C2 from errors in its request
+                                                                path; C2 can also observe C1 to some extent in its re-
+1   try {
+                                                                ply path. Listing 1 shows an example of this pattern. In
+2       firstProcessor.processRequest(si);
+3   } catch (RequestProcessorException e) {                     this case, C1 is the follower and C2 is the leader. C1 first
+4       LOG.error("Unable to process request: " + e);           contacts C2 , then C2 sends C1 a snapshot or other infor-
+5   }                                                           mation through an input stream. Failures are observed
+                                                                via errors or timeouts in the connection, I/O through the
+   If the execution passes line 2, it provides positive ev-     input stream, and/or reply contents.
+idence that the PrepRequestProcessor thread is healthy.
+If, instead, the execution reaches line 4, it represents neg-   (b) Request indirection. A level of indirection exists in
+ative evidence about PrepRequestProcessor. But with             the request path: when C1 makes a request to C2 , an inter-
+the Panorama hooks inserted at both places, no negative         mediate layer (e.g., a proxy or a queue) takes the request
+observations are reported. This is because the implemen-        and replies to C1 . C2 will later take the request from the
+tation of the processRequest API involves an indirec-           intermediate layer, process it, and optionally reply to C1
+tion: it simply puts a request in a queue and immedi-           directly. This design pattern has a performance benefit
+ately returns. Asynchronously, the thread polls and pro-        for both C1 and C2 . It also provides decoupling between
+cesses the queue. Because of this design, even though           their two threads. But, because of the indirection, C1 no
+the OOM exception causes the PrepRequestProcessor               longer directly interacts with C2 so C2 ’s observability is
+thread to exit its main loop, the ZooKeeperServer thread        reduced. The immediate observation C1 makes when re-
+is still able to call processRequest and is unable to tell      questing from C2 does not reveal whether C2 is having
+that PrepRequestProcessor has an issue. The hooks are           problems, since usually the request path succeeds as in
+only observing the status of the indirection layer, i.e.,       the case in §4.1.
+the queue, rather than the PrepRequestProcessor thread.         (c) Reply indirection. Pattern (c) is not intuitive. C1
+Thus, negative observations only appear when the re-            makes a request, which is directly handled by C2 , but the
+quest queue cannot insert new items; but, by default, its       reply goes through a layer of indirection (e.g., a queue or
+capacity is Integer.MAX_VALUE!                                  a proxy). Thus, C1 can observe issues in C2 but C1 ’s ob-
+
+
+
+6   13th USENIX Symposium on Operating Systems Design and Implementation                                          USENIX Association
+servability to C2 is reduced. One scenario leading to this     5.1    Locate Observation Boundary
+pattern is when a component makes requests to multiple
+                                                               Runtime errors are useful evidence of failure. Even if
+components and needs to collect more than one of their
+                                                               an error is tolerated by a requester, it may still indi-
+replies to proceed. In this case, replies are queued so that
+                                                               cate a critical issue in the provider. But, not all errors
+they can be processed en masse when a sufficient number
+                                                               should be reported. Panorama only extracts errors gen-
+are available. For example, in Cassandra, when a process
+                                                               erated when crossing component boundaries, because
+sends digest requests to multiple replicas, it must wait for
+                                                               these constitute observations from the requester side. We
+responses from R replicas. So, whenever it gets a reply
+                                                               call such domain-crossing function invocations observa-
+from a replica, it queues the reply for later processing.
+                                                               tion boundaries.
+(d) Full indirection. In pattern (d), neither component            The first step of observability analysis is to locate
+directly interacts with the other so they get the least ob-    observation boundaries. There are two types of such
+servability. This pattern has a performance benefit since      boundaries: inter-process and inter-thread. An inter-
+all operations are asynchronous. But, the code logic can       process boundary typically manifests as a library API in-
+be complex. ZooKeeper contains an example: When a              vocation, a socket I/O call, or a remote procedure call
+follower forwards a request to a leader, the request is pro-   (RPC). Sometimes, it involves calling into custom code
+cessed asynchronously, and when the leader later notifies      that encapsulates one of those three to provide a higher-
+the follower to commit the request, that notification gets     level messaging service. In any case, with some domain
+queued.                                                        knowledge about the communication mechanisms used,
+                                                               the analyzer can locate inter-process observation bound-
+                                                               aries in source code. An inter-thread boundary is a call
+4.3    Implications                                            crossing two threads within a process. The analyzer iden-
+                                                               tifies such boundaries by finding custom public methods
+Pattern (a) has the best failure observability and is eas-
+                                                               in classes that extend the thread class.
+iest for Panorama to leverage. The other three patterns
+are more challenging; placing observation hooks with-
+out considering the effects of indirection can cause in-       5.2    Identify Observer and Observed
+completeness (though not inaccuracy) in failure detec-         At each observation boundary, we must identify the ob-
+tion (§2). That is, a positive observation will not nec-       server and subject. Both identities are specific to the dis-
+essarily mean the monitored component is healthy but a         tributed system being monitored. For thread-level obser-
+negative observation means the component is unhealthy.         vation boundaries, the thread identities are statically ana-
+Pragmatically, this would be an acceptable limitation if       lyzable, e.g., the name of the thread or class that provides
+the three indirection patterns were uncommon. However,         the public interfaces. For process-level boundaries, the
+we checked the cross-thread interaction code in several        observer identity is the process’s own identity in the dis-
+distributed systems and found, empirically, that patterns      tributed system, which is known when the process starts;
+(a) and (b) are both pervasive. We also found that differ-     it only requires one-time registration with Panorama. We
+ent software has different preferences, e.g., ZooKeeper        can also usually identify the subject identity, if the re-
+uses pattern (a) frequently, but Cassandra uses pattern        mote invocations use well-known methods, via either an
+(b) more often.                                                argument of the function invocation or a field in the class.
+   This suggests Panorama should accommodate indirec-          A challenge is that sometimes, due to nested polymor-
+tion in extracting observations. One solution is to instru-    phism, the subject identity may be located deep down in
+ment hooks in the indirection layer. But, we find that in-     the type hierarchy. For example, it is not easy to deter-
+direction layers in practice are implemented with various      mine if OutputStream.write() performs network I/O or
+data structures and are often used for multiple purposes,      local disk I/O. We address this challenge by changing the
+making tracking difficult. We use a simple but robust          constructors of remote types (e.g., socket get I/O stream)
+solution and describe it in §5.4.                              to return a compatible wrapper that extends the return
+                                                               type with a subject field and can be differentiated from
+                                                               other types at runtime by checking if that field is set.
+5     Observability Analysis
+                                                               5.3    Extract Observation
+To systematically identify and extract useful observa-
+tions from a component, Panorama provides an offline           Once we have observation boundaries, the next step is to
+tool that statically analyzes a program’s source code,         search near them for observation points: program points
+finds critical points, and injects hooks for reporting ob-     that can supply critical evidence about observed compo-
+servations.                                                    nents. A typical example of such an observation point is
+
+
+
+USENIX Association                     13th USENIX Symposium on Operating Systems Design and Implementation              7
+    void deserialize(DataTree dt, InputArchive ia)               data flow of responses from a boundary. If an excep-
+    {
+      DataNode node = ia.readRecord("node");                     tion thrown is control-dependent on the response, we
+      if (node.parent == null) {                                 consider it an observation point, and we insert code to
+                                             Ob-Boundary
+        LOG.error("Missing parent.");                            set the subject/context field before throwing the excep-
+        throw new IOException("Invalid Datatree");               tion just as described earlier. This data-flow analysis is
+      }
+      dt.add(node);                       Ob-Point               conservative: e.g., the code if (a + b > 100) {throw
+    }                                                            Exception("unexpected");}, where a comes from a
+    void snapshot() {
+      ia = BinaryInputArchive.getArchive(
+                                          data ﬂow               boundary but b does not, is not considered an observation
+          sock.getInputStream());                                point because the exception could be due to b. In other
+      try {                               control ﬂow
+        deserialize(getDataTree(), ia);
+                                                                 words, our analysis may miss some observation points
+      } catch (IOException e) {                                  but will not locate wrong observation points.
+        sock.close();            Ob-Point
+      }
+                                                                    So far, we have described negative observation points,
+    }                                                            but we also need mechanisms to make positive obser-
+                                                                 vations. Ideally, each successful interaction across a
+    Figure 3: Observation points in direct interaction (§4.2).   boundary is an observation point that can report positive
+                                                                 evidence. But, if these boundaries appear frequently, the
+                                                                 positive observation points can be excessive. So, we co-
+an exception handler invoked when an exception occurs            alesce similar positive observation points that are located
+at an observation boundary.                                      close together.
+   To locate observation points that are exception han-             For each observation point, the analyzer inserts hooks
+dlers, a straightforward approach is to first identify the       to discover evidence and report it. At each negative
+type of exceptions an observation boundary can generate,         observation point, we get the subject identity and con-
+then locate the catch clauses for these types in code re-        text from the modified exception instance. We statically
+gions after the boundary. There are two challenges with          choose the status; if the status is to be some level of
+this approach. First, as shown in Figure 3, an exception         UNHEALTHY then we set this level based on the severity
+could be caught at the caller or caller’s caller. Recur-         of the exception handling. For example, if the exception
+sively walking up the call chain to locate the clause is         handler calls System.exit(), we set the status to a high
+cumbersome and could be inaccurate. Second, the type             level of UNHEALTHY. At each positive observation point,
+of exception thrown by the boundary could be a generic           we get the context from the nearby boundary and also
+exception such as IOException that could be generated            statically choose the status. We immediately report each
+by other non-boundary code in the same try clause.               observation to the Panorama library, but the library will
+These two challenges can be addressed by inserting a try         typically not report it synchronously. The library will
+just before the boundary and a catch right after it. This        buffer excessive observations and send them in one ag-
+works but, if the observation boundaries are frequent, the       gregate message later.
+excessive wrapping can cause non-trivial overhead.
+   The ideal place to instrument is the shared exception
+                                                                 5.4    Handling Indirection
+handler for adjacent invocations. Our solution is to add
+a special field in the base Throwable class to indicate the      As we discussed in §4, observability can be reduced
+subject identity and the context, and to ensure boundary-        when indirection exists at an observation boundary. For
+generated exceptions set this field. Then, when an ex-           instance, extracted observations may report the subject
+ception handler is triggered at runtime, we can check if         as healthy while it is in fact unhealthy. The core issue is
+this field is set, and if so treat it as an observation point.   that indirection splits a single interaction between com-
+We achieve the field setting by wrapping the outermost           ponents among multiple observation boundaries. A suc-
+function body of each boundary method with a try and             cessful result at the first observation boundary may only
+catch, and by rethrowing the exception after the hook.           indicate partial success of the overall interaction; the in-
+Note that this preserves the original program semantics.         teraction may only truly complete later, when, e.g., a
+   Another type of observation point we look for is one          callback is invoked, or a condition variable unblocks, or
+where the program handles a response received from               a timeout occurs. We must ideally wait for an interaction
+across a boundary. For example, the program may                  to complete before making an observation.
+raise an exception for a missing field or wrong signa-              We call the two locations of a split interaction the ob-
+ture in the returned DataNode in Figure 3, indicating            origin and ob-sink, reflecting the order they’re encoun-
+potential partial failure or corrupt state in the remote         tered. Observations at the ob-origin represent positive
+process. To locate these observation points, our ana-            but temporary and weak evidence. For example, in Fig-
+lyzer performs intra-procedural analysis to follow the           ure 4, the return from sendRR is an ob-origin. Where the
+
+
+
+8    13th USENIX Symposium on Operating Systems Design and Implementation                              USENIX Association
+  public List<Row> fetchRows() {                                treat it as an ob-sink for the A-to-B interaction.
+    ReadCommand command = ...;
+                                                                   When our analyzer finds an ob-origin, it inserts a
+    sendRR(command.newMessage(), endPoint, handler);
+    ...                                                         hook that submits an observation with the special sta-
+               Ob-Origin                                        tus PENDING. This means that the observer currently only
+    try {
+      Row row = handler.get();                                  sees weak positive evidence about the subject’s status,
+    }                               Ob-Sink                     but expects to receive stronger evidence shortly. At any
+    catch (ReadTimeoutException ex) {
+      throw ex;                                                 ob-sink indicating positive evidence, our analyzer inserts
+                    Ob-Point
+    }                                                           a hook to report a HEALTHY observation. At any ob-sink
+    catch (DigestMismatchException ex) {
+      logger.error("Digest mismatch: {}", ex);                  indicating negative evidence, the analyzer inserts a hook
+    }
+                     Ob-Point                                   to report a negative observation.
+  }
+  public void response(MessageIn message) {                        To link an ob-sink observation with its corresponding
+    resolver.preprocess(message);                               ob-origin observation, these observations must share the
+    condition.signal();
+                                   Ob-Sink
+                                                                same subject and context. To ensure this, the analyzer
+  }
+             data ﬂow           control ﬂow                     uses a similar technique as in exception tracking. It adds
+                                                                a special field containing the subject identity and context
+ Figure 4: Observation points when indirection exists (§4.2).   to the callback handler, and inserts code to set this field
+                                                                at the ob-origin. If the callback is not instrumentable,
+                                                                e.g., because it is an integer resource handle, then the an-
+callback of handler, response, is invoked, it is an ob-         alyzer inserts a call to the Panorama library to associate
+sink. In addition, when the program later blocks waiting        the handle with an identity and context.
+for the callback, e.g., handler.get, the successful return         Sometimes, the analyzer finds an ob-origin but cannot
+is also an ob-sink. If an ob-origin is properly matched         find the corresponding ob-sink or cannot extract the sub-
+with an ob-sink, the positive observation becomes com-          ject identity or context. This can happen due to either
+plete and strong. Otherwise, an outstanding ob-origin is        lack of knowledge or the developers having forgotten to
+only a weak observation and may degrade to a negative           check for completion in the code. In such a case, the an-
+observation, e.g., when handler.get times out.                  alyzer will not instrument the ob-origin, to avoid making
+    Tracking an interaction split across multiple program       misleading PENDING observations.
+locations is challenging given the variety of indirection          We find that ob-origin and ob-sink separation is useful
+implementations. To properly place hooks when indirec-          in detecting not only issues involving indirection but also
+tion exists, the Panorama analyzer needs to know what           liveness issues. To see why, consider what happens when
+methods are asynchronous and the mechanisms for no-             A invokes a boundary-crossing blocking function of B,
+tification. For instance, a commonly used one is Java           and B gets stuck so the function never returns. When
+FutureTask [40]. For custom methods, this knowledge             this happens, even though A witnesses B’s problem, it
+comes from specifications of the boundary-crossing in-          does not get a chance to report the issue because it never
+terfaces, which only requires moderate annotation. With         reaches the observation point following the blocking call.
+this knowledge, the analyzer considers an ob-origin to be       Inserting an ob-origin before the function call provides
+immediately after any call site of an asynchronous inter-       evidence of the liveness issue: LOSes will see an old
+face. We next discuss how to locate ob-sinks.                   PENDING observation with no subsequent corresponding
+
+    We surveyed the source code of popular distributed          ob-sink observation. Thus, besides asynchronous inter-
+systems and found the majority of ob-sinks fall into four       faces, call sites of synchronous interfaces that may block
+patterns: (1) invoking a callback-setting method; (2) per-      for long should also be included in the ob-origin set.
+forming a blocking wait on a callback method; (3) check-
+ing a completion flag; and (4) reaching another obser-          6   Implementation
+vation boundary with a third component, in cases when
+a request must be passed on further. For the first two          We implemented the Panorama service in ∼ 6, 000 lines
+patterns, the analyzer considers the ob-sink to be before       of Go code, and implemented the observability analyzer
+and after the method invocation, respectively. For the          (§5) using the Soot analysis framework [46] and the As-
+third pattern, the analyzer locates the spin-loop body and      pectJ instrumentation framework [2].
+considers the ob-sink to be immediately after the loop.            We defined Panorama’s interfaces using protocol
+The last pattern resembles SEDA [48]: after A asyn-             buffers [7]. We then used the gRPC framework [5] to
+chronously sends a request to B, B does not notify A of         build the RPC service and to generate clients in different
+the status after it finishes but rather passes on the request   languages. So, the system can be easily used by various
+to C. Therefore, for that observation boundary in B, the        components written in different languages. Panorama
+analyzer needs to not only insert a hook for C but also         provides a thin library that wraps the gRPC client for
+
+
+
+USENIX Association                      13th USENIX Symposium on Operating Systems Design and Implementation              9
+                      (a) number of raw observations in a leader                                  ZooKeeper     Cassandra     HDFS     HBase
+         40
+ Count
+
+
+                                                                               Annotations        24            34            65       16
+         20
+                                                                               Analysis Time      4.2           6.8           9.9      7.5
+          0
+              20:10     20:15     20:20      20:25        20:30     20:35
+                                                                                     Table 2: Annotations and analysis time (in seconds).
+                      (b) number of raw observations in a follower
+         25
+ Count
+
+
+
+
+         22
+                                                                               both process and thread level. The integration is success-
+              20:10      20:15     20:20          20:25     20:30      20:35   ful without significant effort or changes to the system de-
+                                           Time                                sign. Our simple abstractions and APIs (§3.2) naturally
+Figure 5: Number of raw observations in two Panorama ob-                       support various types of failure evidence in each sys-
+servers. Each data point represents one second.                                tem. For instance, we support semantic errors, such as
+                                                                               responses with missing signatures; generic errors, such
+                                                                               as remote I/O exceptions; and liveness issues, such as in-
+efficient observation reporting; each process participat-                      definite blocking or custom time-outs. The integration is
+ing in observation reporting is linked with this library.                      enabled by the observability analyzer (§5). In applying
+The thin library provides features such as asynchronous                        the analyzer to a system, we need annotations about what
+reporting, buffering and aggregation of frequent obser-                        boundary-crossing methods to start with, what methods
+vations, identity resolution, rate limiting, quick cancella-                   involve indirection, and what patterns it uses (§5.4). The
+tion of PENDING statuses, and mapping of ob-sink handles                       annotation effort to support this is moderate (Table 2).
+(§5.4). So, most operations related to observation report-                     HDFS requires the most annotation effort, which took
+ing do not directly trigger local RPC calls to Panorama;                       one author about 1.5 days to understand the HDFS source
+this keeps performance impact low.                                             code, identify the interfaces and write annotation speci-
+                                                                               fication. Fortunately, most of these boundary-crossing
+7         Evaluation                                                           methods remain stable over releases. When running the
+                                                                               observability analysis, Cassandra is more challenging to
+In this section, we evaluate our Panorama prototype to                         analyze compared to the others since it frequently uses
+answer several key questions: (1) Can observations be                          indirection. On the other hand, its mechanisms are also
+systematically captured? (2) Can observation capturing                         well-organized, which makes the analysis systematic.
+detect regular failures? (3) Can Panorama detect produc-                       The observability analysis is mainly intra-procedural and
+tion gray failures? (4) How do transient failures affect                       can finish instrumentation within 10 seconds for each
+Panorama? (5) How much overhead does an observer                               of the four systems (Table 2). Figure 5 shows the ob-
+incur by participating in the Panorama service?                                servations collected from two instrumented processes in
+                                                                               ZooKeeper. The figure also shows that the observations
+                                                                               made change as the observer executes, and depend on the
+7.1            Experiment Setup                                                process’s interaction patterns.
+We run our experiments in a cluster of 20 physical nodes.
+Each machine has a 2.4 GHz 10-core Intel Xeon E5-                              7.3     Detection of Crash Failures
+2640v4 CPU, 64 GB of RAM, and a 480 GB SATA SSD;
+they all connect to a single 10 Gbps Ethernet switch.                          Panorama aims to detect complex failures not limited to
+They run Ubuntu 16.04 with Linux kernel version 4.4.0.                         fail-stop. As a sanity check on the effectiveness of its de-
+We evaluate Panorama with four widely-used distributed                         tection capability, we first evaluate how well Panorama
+systems: ZooKeeper, Hadoop, HBase, and Cassandra.                              detects fail-stop failures. To measure this, we inject vari-
+HBase uses HDFS for storing data and ZooKeeper for                             ous fail-stop faults including process crashes, node shut-
+coordination, so an HBase setup resembles a service with                       downs, and network disconnections. Table 3 shows the
+multiple subsystems. We continuously exercise these                            detection time for ten representative crash-failure cases:
+services with various benchmark workloads to represent                         failures injected into the ZooKeeper leader, ZooKeeper
+an active production environment.                                              follower, Cassandra data node, Cassandra seed node,
+                                                                               HDFS name node, HDFS data node, HBase master and
+                                                                               HBase regionserver. We see that with Panorama the ob-
+7.2            Integration with Several Systems
+                                                                               servers take less than 10 s to detect all ten cases, and
+Panorama provides a generic observation and failure de-                        indeed take less than 10 ms to detect all ZooKeeper
+tection service. To evaluate its generality, we apply it to                    failures. The observers make the observations lead-
+ZooKeeper, HDFS, Hadoop, HBase, and Cassandra, at                              ing to these detections when, while interacting with the
+
+
+
+10            13th USENIX Symposium on Operating Systems Design and Implementation                                     USENIX Association
+USENIX Association   13th USENIX Symposium on Operating Systems Design and Implementation   11
+                                               (a) failure reporting from different detectors                 Unhealthy
+                                                                                                                                                 context1         context4           context6
+                                                     Panorama observer              FALCON                                                       context2         context5           context7
+                                                     Built-in detector              Accrual detector                                             context3
+        Rate of failure reports
+
+
+
+                                  10                                                                            Healthy
+                                                                                                                                 23:44 23:45 23:46 23:47 23:48 23:49 23:50 23:51 23:52
+                                   0
+                                                                                                                                                           Time
+                                   0
+
+                                   0
+                                                                                                                                 Figure 8: Verdict during transient failures.
+                                   0
+                                                     Fault occurs                Fault clears
+                                       :58 2:37:28 2:37:58 2:38:28 2:38:58 2:39:28 2:39:58 2:40:28 2:40:58
+        02:36                            0       0       0       0       0       0       0       0
+                                                                        Time                                                                          unicast            multicast
+                                                                                                                                 8000
+
+
+
+
+                                                                                                                   Propagation
+                                                                                                                    delay (us)
+                                             (b) status of a client running mixed workloads
+                                                                                                                                 6000
+                                                                timeout           success
+         Error
+
+
+
+
+                                  50
+         rate
+
+
+
+
+                                                                                                                                 4000
+
+                             0                                                                                                   2000
+ Latency
+
+
+
+
+                           104
+  (ms)
+
+
+
+
+                           101                                                                                                              10          20         30           40      50
+                                                                                                                                                          Cluster size
+                                       :12   :42   :12   :42   :12   :42   :12    :42
+                                  02:37 02:37 02:38 02:38 02:39 02:39 02:40 02:40
+                                                             Time
+                                                                                                             Figure 9: Scalability of observation propagation latency. “uni-
+                                                                                                             cast”: propagate an observation to a single Panorama in-
+ Figure 7: Timeline in detecting gray failure f1 from Table 4.
+                                                                                                             stance; “multicast”: propagate an observation to all interested
+                                                                                                             Panorama instances.
+dence that clears the failure observation. During the fail-
+ure period, no other baseline reports failure. Figure 7
+also shows the view from a ZooKeeper client that we                                                          noisy observations will lead to many false alarms. But,
+run continuously throughout the experiment as a refer-                                                       empirically, we find that this does not happen. The
+ence. We can see Panorama’s reporting closely matches                                                        Panorama analyzer assigns the context of an observation
+the experience of this client. Interestingly, since the gray                                                 properly to avoid falsely aggregating observations made
+failure mainly impacts write requests but the client exe-                                                    in interacting with different functionalities of a complex
+cutes a mixture of read and write requests, its view is not                                                  process. The simple decision algorithm in §3.6 is robust
+very stable; nevertheless, Panorama consistently reports                                                     enough to prevent a few biased observers or transient
+a verdict of UNHEALTHY during the failure period.                                                            failures from dominating the verdict. Figure 8 shows the
+                                                                                                             verdict for the ZooKeeper leader in an experiment. A
+                                                                                                             few followers report transient faults about the leader in
+7.5                                Fault Localization                                                        one context, so Panorama decides on a negative verdict.
+In addition to detecting the 15 production fail-                                                             But, within a few seconds, the verdict changes due to
+ures quickly, Panorama also pinpoints each failure                                                           positive observations and expiration of negative observa-
+with detailed context and observer (§3.2) informa-                                                           tions. Panorama then judges the leader as healthy for the
+tion.    This localization capability allows adminis-                                                        remainder of the experiment, which matches the truth.
+trators to interpret the detection results with confi-                                                          We deploy Panorama with ZooKeeper and run for 25
+dence and take concrete actions. For example, in de-                                                         hours, during which multiple ZooKeeper clients contin-
+tecting the crash failure in the ZooKeeper follower,                                                         uously run various workloads non-stop to emulate nor-
+the verdict for the leader is based on observations                                                          mal operations in a production environment. In total,
+such as |peer@3,peer@5,peer@8| 2018-03-23T02:28:58.873                                                       Panorama generates 797,219 verdicts, with all but 705
+{Learner: U,RecvWorker: U,QuorumCnxManager: U}, which                                                        (0.08%) of them being HEALTHY; this is a low false alarm
+identify the observer as well as the contexts Learner,                                                       rate. In fact, all of the negative observations are made
+RecvWorker, and QuorumCnxManager.              In detecting                                                  in the first 22 seconds, during which the system is boot-
+gray failure f1, the negative observations of the                                                            strapping and unstable. After the 22 seconds, no negative
+unhealthy leader are associated with three contexts                                                          observations are reported for the remaining 25 hours.
+SerializeUtils, DataTree, and StatPersisted; this lo-                                                           We also inject minor faults including overloaded com-
+calizes the failure to the serialization thread in leader.                                                   ponent, load spike and transient network partition that
+                                                                                                             are modeled after two production ZooKeeper and HDFS
+                                                                                                             traces. These minor faults do not affect the regular ser-
+7.6                                Transient Failure, Normal Operations
+                                                                                                             vice. We find Panorama overall is resilient to these
+Because Panorama can gather observations from any                                                            noises in reaching a verdict. For example, an overloaded
+component in a system, there is a potential concern that                                                     ZooKeeper follower made a series of misleading obser-
+
+
+
+12                                13th USENIX Symposium on Operating Systems Design and Implementation                                                               USENIX Association
+                                                           (a) ZooKeeper Leader                                                                            (b) ZooKeeper Follower
+                                        180                                                                                            180                 zk_follower_recv         zk_follower_sent
+
+
+
+
+                                                                                                          Net Bandwidth Usage (KB/s)
+           Net Bandwidth Usage (KB/s)
+                                        150                                                                                            150
+                                        120                                                                                            120
+                                         90                                                                                             90
+                                         60                                                                                             60
+                                         30               zk_leader_recv        zk_leader_sent                                          30
+                                          0                                                                                              0
+
+                                        15                                                                                             15
+                                                              pano_recv         pano_sent                                                                       pano_recv           pano_sent
+                                        10                                                                                             10
+
+                                         5                                                                                              5
+
+                                         0                                                                                              0
+                                              0    50        100      150      200      250         300                                      0        50        100       150       200      250         300
+                                                                       time                                                                                                time
+
+                                                             (c) HBase Master                                                                              (d) HBase RegionServer
+                                         70            hbase_master_recv        hbase_master_sent                                      240                   hbase_rs_recv          hbase_rs_sent
+           Net Bandwidth Usage (KB/s)
+
+
+
+
+                                                                                                          Net Bandwidth Usage (KB/s)
+                                         60                                                                                            200
+                                         50
+                                         40                                                                                            160
+                                         30                                                                                            120
+                                         20                                                                                             80
+                                         10                                                                                             40
+                                          0                                                                                              0
+                                        2.0                                                                                                                     pano_recv           pano_sent
+                                                              pano_recv         pano_sent                                              2.5
+                                        1.5                                                                                            2.0
+                                                                                                                                       1.5
+                                        1.0
+                                                                                                                                       1.0
+                                        0.5                                                                                            0.5
+                                        0.0                                                                                            0.0
+                                                  50       100      150       200     250        300                                             50          100       150        200     250          300
+                                                                       time                                                                                               time
+
+
+
+                                              Figure 10: Network bandwidth usage of the Panorama instance and its monitored component.
+
+       Report                                 ReportAsync           Judge           Propagate                                                                 Latency                               Throughput
+      114.6 µs                                  0.36 µs            109.0 µs          776.3 µs                                   System
+                                                                                                                                                           Read          Write                         Read      Write
+ Table 5: Average latency of major operations in Panorama.                                                                      ZK                    69.5 µs         1435 µs             14 402 op/s          697 op/s
+                                                                                                                                ZK+                   70.6 µs         1475 µs             14 181 op/s          678 op/s
+
+vations that the leader is UNHEALTHY. But these biased ob-                                                                      C∗                     677 µs           680 µs                  812 op/s       810 op/s
+                                                                                                                                C∗ +                   695 µs           689 µs                  802 op/s       804 op/s
+servations from a single observer did not result in a ver-
+dict of UNHEALTHY status for the leader. When there were                                                                        HDFS                   51.0 s           61.0 s              423 MB/s           88 MB/s
+many such overloaded followers, however, the leader                                                                             HDFS+                  52.5 s           62.2 s              415 MB/s           86 MB/s
+was falsely convicted as UNHEALTHY even though the ac-                                                                          HBase                  746 µs         1682 µs               1172 op/s          549 op/s
+tual issues were within the observers.                                                                                          HBase+                 748 µs         1699 µs               1167 op/s          542 op/s
+
+                                                                                                          Table 6: Performance of the original system versus the perfor-
+7.7    Performance                                                                                        mance of the system instrumented with Panorama hooks (Sys-
+Table 5 shows microbenchmark results: how long four                                                       tem+). ZK stands for ZooKeeper and C∗ stands for Cassandra.
+major operations in Panorama take on average. Report-                                                     The latency results for HDFS are total execution times.
+ing an observation to Panorama only requires a local
+RPC, so the average latency of reporting is fast (around
+100 µs). And, the asynchronous API for reporting takes                                                    exchanging observations is small compared to the band-
+even less time: on average less than 1 µs. Propagation                                                    width usage of the monitored components (Figure 10).
+of an observation to another Panorama instance takes                                                         We test the end-to-end request latency and through-
+around 800 µs. Figure 9 shows how the propagation la-                                                     put impact of integrating with Panorama for HDFS,
+tency changes as the cluster size increases.                                                              ZooKeeper, HBase, and Cassandra, using YCSB [16],
+   When a Panorama instance is active, the CPU utiliza-                                                   DFSIO and a custom benchmark tool. Table 6 shows the
+tion attributable to it is on average 0.7%. For each mon-                                                 results. The latency increase and throughout decrease for
+itored subject, the number of observations kept in LOS                                                    each system is below 3%. We achieve this low overhead
+is bounded so the memory usage is close to a constant.                                                    because the reporting API is fast and because most hooks
+Thus, the total memory usage depends on the number of                                                     are in error-handling code, which is not triggered in nor-
+monitored subjects. When we measure the ZooKeeper                                                         mal operation. The positive-observation hooks lie in the
+deployment with Panorama, and find that the heap mem-                                                     normal execution path, but their cost is reduced by coa-
+ory allocation stabilizes at ∼7 MB for a moderately ac-                                                   lescing the hooks with the analyzer (§5.3) and batching
+tive instance, and at ∼46 MB for a highly active instance.                                                the reporting with the thin client library. Without this op-
+The network bandwidth usage of Panorama instance for                                                      timization, the performance overhead can be up to 18%.
+
+
+
+USENIX Association                                                         13th USENIX Symposium on Operating Systems Design and Implementation                                                                      13
+8    Discussion and Limitations                                  Dapper [45] and Pivot Tracing [35]. The pervasive
+                                                                 metrics collected by these systems enhance system ob-
+Panorama proposes a new way of building failure de-              servability, and their powerful tracing capabilities may
+tection service by constructing in-situ observers. The           help Panorama better deal with the indirection chal-
+evaluation results demonstrate the effectiveness of lever-       lenge (§4). But they are massive and difficult to reason
+aging observability for detecting complex production             about [15, 37, 44]. Panorama, in contrast, leverages er-
+failures. The process of integrating Panorama with               rors and exceptions generated from an observer’s normal
+real-world distributed systems also makes us realize             execution to report complex but serious failures.
+how the diverse programming paradigms affect sys-
+                                                                 Accountability. Accountability is useful for detect-
+tems observability. For example, HDFS has a method
+                                                                 ing Byzantine component behavior in a distributed sys-
+createBlockOutputStream that takes a list of data nodes
+                                                                 tem [28, 51]. PeerReview [27] provides accountabil-
+as argument and creates a pipeline among them; if this
+                                                                 ity by having other nodes collecting evidence about the
+method fails, it indicates one of the data nodes in the pi-
+                                                                 correctness of a node through their message exchanges.
+pleline is problematic. From observability point of view,
+                                                                 Panorama’s approach is inspired by PeerReview in that
+if a negative evidence is observed through this method,
+                                                                 it also leverages evidence about other components in a
+it is associated with multiple possible subjects. Fortu-
+                                                                 system. But Panorama mainly targets production gray
+nately, an errorIndex variable is maintained internally
+                                                                 failures instead of Byzantine faults. Unlike PeerReview,
+to indicate which data node causes the error, which can
+                                                                 Panorama places observability hooks in the existing code
+be used to determine the exact subject. It is valuable to
+                                                                 of a component and does not require a reference imple-
+investigate how to modularize a system and design its in-
+                                                                 mentation or a special protocol.
+terfaces to make it easier to capture failure observability.
+   There are several limitations of Panorama that we plan
+to address in future work. First, Panorama currently fo-
+cuses on failure detection. To improve end-to-end avail-         10    Conclusion
+ability, we plan to integrate the detection results with fail-
+ure recovery actions. Second, Panorama currently does            We present Panorama, a system for detecting produc-
+not track causality. Enhancing observations with causal-         tion failures in distributed systems. The key insight en-
+ity information will be useful for correctly detecting and       abling Panorama is that system observability can be en-
+pinpointing failing components in large-scale cascading          hanced by automatically turning each component into
+failures. Third, we plan to add support for languages            an observer of the other components with which it in-
+other than Java to the Panorama analyzer, and evaluate           teracts. By leveraging these first-hand observations, a
+it with a broader set of distributed systems.                    simple detection algorithm can achieve high detection
+                                                                 accuracy. In building Panorama, we further discover
+                                                                 observability patterns and address the challenge of re-
+9    Related Work                                                duced observability due to indirection. We implement
+                                                                 Panorama and evaluate it, showing that it introduces min-
+Failure Detection. There is an extensive body of work
+                                                                 imal overhead to existing systems. Panorama can detect
+on studying and improving failure detection for dis-
+                                                                 and localize 15 real-world gray failures in less than 7 s,
+tributed systems [8, 13, 14, 20, 29, 47]. A recent promi-
+                                                                 whereas existing detectors only detect one of them in un-
+nent work in this space is Falcon [34], in which the au-
+                                                                 der 300 s. The source code of Panorama system is avail-
+thors argue that a perfect failure detector (PFD) can be
+                                                                 able at https://github.com/ryanphuang/panorama.
+built [9] by replacing end-to-end timeouts with layers of
+spies that can kill slow processes. Panorama is compli-
+mentary to these efforts, which mainly focus on detect-
+ing crash failures. Panorama’s goal is to detect complex         Acknowledgments
+production failures [11, 25, 30]. In terms of approach,
+Panorama is unique in enhancing system observability             We thank the OSDI reviewers and our shepherd, Ding
+by constructing in-situ observers in place of any com-           Yuan, for their valuable comments that improved the
+ponent’s code, instead of using dedicated detectors such         paper. We appreciate the support from CloudLab [43]
+as spies or sensors that are outside components’ normal          for providing a great research experiment platform. We
+execution paths.                                                 also thank Yezhuo Zhu for sharing ZooKeeper produc-
+Monitoring and Tracing. Improving monitoring and                 tion traces and Jinfeng Yang for sharing HDFS produc-
+tracing of production systems is also an active research         tion traces. This work was supported in part by a Mi-
+area. Examples include Magpie [12], X-Trace [21],                crosoft Azure Research Award.
+
+
+
+14   13th USENIX Symposium on Operating Systems Design and Implementation                            USENIX Association
+References                                                              [18] J. Dean and L. A. Barroso. The tail at scale. Communications of
+                                                                             the ACM, 56(2):74–80, Feb. 2013.
+ [1] Asana service outage on September 8th,                    2016.
+     https://blog.asana.com/2016/09/yesterdays-outage/.                 [19] T. Do, M. Hao, T. Leesatapornwongsa, T. Patana-anake, and H. S.
+                                                                             Gunawi. Limplock: Understanding the impact of limpware on
+ [2] AspectJ, aspect-oriented extension to the Java programming lan-         scale-out cloud systems. In Proceedings of the 4th Annual Sym-
+     guage. https://www.eclipse.org/aspectj.                                 posium on Cloud Computing, SOCC ’13, Santa Clara, California,
+                                                                             2013. ACM.
+ [3] GoCardless service outage on October 10th, 2017.
+     https://gocardless.com/blog/incident-review-api-and-dashboard-     [20] C. Fetzer. Perfect failure detection in timed asynchronous sys-
+     outage-on-10th-october.                                                 tems. IEEE Transactions on Computing, 52(2):99–112, Feb.
+                                                                             2003.
+ [4] Google          Compute       Engine       incident     16007.
+     https://status.cloud.google.com/incident/compute/16007.            [21] R. Fonseca, G. Porter, R. H. Katz, S. Shenker, and I. Stoica. X-
+                                                                             Trace: A pervasive network tracing framework. In Proceedings
+ [5] gRPC, a high performance, open-source universal RPC frame-              of the 4th USENIX Conference on Networked Systems Design &
+     work. https://grpc.io.                                                  Implementation, NSDI ’07, Cambridge, MA, 2007. USENIX As-
+                                                                             sociation.
+ [6] Microsoft Azure status history. https://azure.microsoft.com/en-
+     us/status/history.                                                 [22] S. Ghemawat, H. Gobioff, and S.-T. Leung. The Google File
+                                                                             System. In Proceedings of the Nineteenth ACM Symposium on
+ [7] Protocol    buffers.         https://developers.google.com/
+                                                                             Operating Systems Principles, SOSP ’03, pages 29–43, Bolton
+     protocol-buffers/.
+                                                                             Landing, NY, USA, 2003. ACM.
+ [8] M. K. Aguilera, W. Chen, and S. Toueg. Failure detection and
+                                                                        [23] E. Gilman. PagerDuty production ZooKeeper service incident in
+     consensus in the crash-recovery model. Distributed Computing,
+                                                                             2014. https://www.pagerduty.com/blog/the-discovery-of-apache-
+     13(2):99–125, Apr. 2000.
+                                                                             zookeepers-poison-packet/.
+ [9] M. K. Aguilera and M. Walfish. No time for asynchrony. In Pro-
+                                                                        [24] C. Gray and D. Cheriton. Leases: An efficient fault-tolerant
+     ceedings of the 12th Conference on Hot Topics in Operating Sys-
+                                                                             mechanism for distributed file cache consistency. In Proceedings
+     tems, HotOS’09, Monte Verità, Switzerland, May 2009. USENIX
+                                                                             of the Twelfth ACM Symposium on Operating Systems Principles,
+     Association.
+                                                                             SOSP ’89, pages 202–210. ACM, 1989.
+[10] Amazon. AWS service outage on October 22nd, 2012. https:
+     //aws.amazon.com/message/680342.
+                                                                        [25] H. S. Gunawi, R. O. Suminto, R. Sears, C. Golliher, S. Sundarara-
+                                                                             man, X. Lin, T. Emami, W. Sheng, N. Bidokhti, C. McCaffrey,
+[11] R. H. Arpaci-Dusseau and A. C. Arpaci-Dusseau. Fail-stutter             G. Grider, P. M. Fields, K. Harms, R. B. Ross, A. Jacobson,
+     fault tolerance. In Proceedings of the Eighth Workshop on Hot           R. Ricci, K. Webb, P. Alvaro, H. B. Runesha, M. Hao, and H. Li.
+     Topics in Operating Systems, HotOS ’01. IEEE Computer Soci-             Fail-slow at scale: Evidence of hardware performance faults in
+     ety, 2001.                                                              large production systems. In Proceedings of the 16th USENIX
+                                                                             Conference on File and Storage Technologies, FAST ’18, pages
+[12] P. Barham, A. Donnelly, R. Isaacs, and R. Mortier. Using Magpie         1–14, Oakland, CA, USA, 2018. USENIX Association.
+     for request extraction and workload modelling. In Proceedings of
+     the 6th Conference on Symposium on Opearting Systems Design        [26] C. Guo, L. Yuan, D. Xiang, Y. Dang, R. Huang, D. Maltz, Z. Liu,
+     & Implementation - Volume 6, OSDI ’04, San Francisco, CA,               V. Wang, B. Pang, H. Chen, Z.-W. Lin, and V. Kurien. Pingmesh:
+     2004. USENIX Association.                                               A large-scale system for data center network latency measure-
+                                                                             ment and analysis. In Proceedings of the 2015 ACM SIGCOMM
+[13] T. D. Chandra and S. Toueg. Unreliable failure detectors for re-        Conference, SIGCOMM ’15, pages 139–152, London, United
+     liable distributed systems. Journal of the ACM, 43(2):225–267,          Kingdom, 2015. ACM.
+     Mar. 1996.
+                                                                        [27] A. Haeberlen, P. Kouznetsov, and P. Druschel. PeerReview: Prac-
+[14] W. Chen, S. Toueg, and M. K. Aguilera. On the quality of                tical accountability for distributed systems. In Proceedings of
+     service of failure detectors. IEEE Transactions on Computing,           the Twenty-first ACM SIGOPS Symposium on Operating Systems
+     51(5):561–580, May 2002.                                                Principles, SOSP ’07, pages 175–188, Stevenson, Washington,
+                                                                             USA, 2007. ACM.
+[15] M. Chow, D. Meisner, J. Flinn, D. Peek, and T. F. Wenisch. The
+     Mystery Machine: End-to-end performance analysis of large-         [28] A. Haeberlen and P. Kuznetsov. The fault detection problem.
+     scale Internet services. In Proceedings of the 11th USENIX Con-         In Proceedings of the 13th International Conference on Princi-
+     ference on Operating Systems Design and Implementation, OSDI            ples of Distributed Systems, OPODIS ’09, pages 99–114, Nîmes,
+     ’14, pages 217–231, Broomfield, CO, 2014. USENIX Associa-               France, 2009. Springer-Verlag.
+     tion.
+                                                                        [29] N. Hayashibara, X. Defago, R. Yared, and T. Katayama. The ϕ
+[16] B. F. Cooper, A. Silberstein, E. Tam, R. Ramakrishnan, and              accrual failure detector. In Proceedings of the 23rd IEEE Inter-
+     R. Sears. Benchmarking cloud serving systems with ycsb. In Pro-         national Symposium on Reliable Distributed Systems, SRDS ’04,
+     ceedings of the 1st ACM Symposium on Cloud Computing, SoCC              pages 66–78. IEEE Computer Society, 2004.
+     ’10, pages 143–154, Indianapolis, Indiana, USA, 2010. ACM.
+                                                                        [30] P. Huang, C. Guo, L. Zhou, J. R. Lorch, Y. Dang, M. Chintalap-
+[17] J. Dean. Designs, lessons and advice from building large dis-           ati, and R. Yao. Gray failure: The Achilles’ heel of cloud-scale
+     tributed systems, 2009. Keynote at The 3rd ACM SIGOPS Inter-            systems. In Proceedings of the 16th Workshop on Hot Topics in
+     national Workshop on Large Scale Distributed Systems and Mid-           Operating Systems, HotOS ’17, pages 150–155, Whistler, BC,
+     dleware (LADIS).                                                        Canada, 2017. ACM.
+
+
+
+
+USENIX Association                         13th USENIX Symposium on Operating Systems Design and Implementation                           15
+[31] P. Hunt, M. Konar, F. P. Junqueira, and B. Reed. ZooKeeper:           [47] R. van Renesse, Y. Minsky, and M. Hayden. A gossip-style failure
+     Wait-free coordination for Internet-scale systems. In Proceed-             detection service. In Proceedings of the IFIP International Con-
+     ings of the 2010 USENIX Conference on USENIX Annual Techni-                ference on Distributed Systems Platforms and Open Distributed
+     cal Conference, USENIX ATC ’10, Boston, MA, 2010. USENIX                   Processing, Middleware ’98, pages 55–70, The Lake District,
+     Association.                                                               United Kingdom, 1998. Springer-Verlag.
+
+[32] R. E. Kalman. On the general theory of control systems. IRE           [48] M. Welsh, D. Culler, and E. Brewer. SEDA: An architecture for
+     Transactions on Automatic Control, 4(3):110–110, December                  well-conditioned, scalable Internet services. In Proceedings of
+     1959.                                                                      the Eighteenth ACM Symposium on Operating Systems Princi-
+                                                                                ples, SOSP ’01, pages 230–243, Banff, Alberta, Canada, 2001.
+[33] J. B. Leners, T. Gupta, M. K. Aguilera, and M. Walfish. Im-                ACM.
+     proving availability in distributed systems with failure informers.
+     In Proceedings of the 10th USENIX Conference on Networked             [49] D. Yuan, Y. Luo, X. Zhuang, G. R. Rodrigues, X. Zhao, Y. Zhang,
+     Systems Design and Implementation, NSDI ’13, pages 427–442,                P. U. Jain, and M. Stumm. Simple testing can prevent most crit-
+     Lombard, IL, 2013. USENIX Association.                                     ical failures: An analysis of production failures in distributed
+                                                                                data-intensive systems. In Proceedings of the 11th USENIX
+[34] J. B. Leners, H. Wu, W.-L. Hung, M. K. Aguilera, and M. Wal-               Conference on Operating Systems Design and Implementation,
+     fish. Detecting failures in distributed systems with the Falcon spy        OSDI’14, pages 249–265, Broomfield, CO, 2014. USENIX As-
+     network. In Proceedings of the Twenty-third ACM Symposium on               sociation.
+     Operating Systems Principles, SOSP ’11, pages 279–294, Cas-
+     cais, Portugal, 2011. ACM.                                            [50] D. Yuan, S. Park, P. Huang, Y. Liu, M. M. Lee, X. Tang, Y. Zhou,
+                                                                                and S. Savage. Be conservative: Enhancing failure diagnosis with
+[35] J. Mace, R. Roelke, and R. Fonseca. Pivot tracing: Dynamic                 proactive logging. In Proceedings of the 10th USENIX Confer-
+     causal monitoring for distributed systems. In Proceedings of the           ence on Operating Systems Design and Implementation, OSDI
+     25th Symposium on Operating Systems Principles, SOSP ’15,                  ’12, pages 293–306, Hollywood, CA, USA, 2012. USENIX As-
+     pages 378–393, Monterey, California, 2015. ACM.                            sociation.
+
+[36] Microsoft.    Office 365 service incident on November                 [51] A. R. Yumerefendi and J. S. Chase. The role of accountability
+     13th, 2013.         https://blogs.office.com/2012/11/13/                   in dependable distributed systems. In Proceedings of the First
+     update-on-recent-customer-issues/.                                         Conference on Hot Topics in System Dependability, HotDep ’05,
+                                                                                Yokohama, Japan, 2005. USENIX Association.
+[37] J. C. Mogul, R. Isaacs, and B. Welch. Thinking about availabil-
+     ity in large service infrastructures. In Proceedings of the 16th
+     Workshop on Hot Topics in Operating Systems, HotOS ’17, pages
+     12–17, Whistler, BC, Canada, 2017. ACM.
+
+[38] D. Nadolny. Network issues can cause cluster to hang due to near-
+     deadlock. https://issues.apache.org/jira/browse/ZOOKEEPER-
+     2201.
+
+[39] D. Nadolny. Debugging distributed systems. In SREcon 2016,
+     Santa Clara, CA, Apr. 2016.
+
+[40] Oracle. Java Future and FutureTask. https://docs.oracle.com/
+     javase/7/docs/api/java/util/concurrent/Future.html.
+
+[41] D. L. Parnas. On the criteria to be used in decomposing systems
+     into modules. Communications of the ACM, 15(12):1053–1058,
+     Dec. 1972.
+
+[42] J. Postel. DoD Standard Transmission Control Protocol, January
+     1980. RFC 761.
+
+[43] R. Ricci, E. Eide, and the CloudLab Team. Introducing Cloud-
+     Lab: Scientific infrastructure for advancing cloud architectures
+     and applications. USENIX ;login:, 39(6), December 2014.
+
+[44] T. Schlossnagle. Monitoring in a DevOps world. Communica-
+     tions of the ACM, 61(3):58–61, Feb. 2018.
+
+[45] B. H. Sigelman, L. A. Barroso, M. Burrows, P. Stephenson,
+     M. Plakal, D. Beaver, S. Jaspan, and C. Shanbhag. Dapper, a
+     large-scale distributed systems tracing infrastructure. Technical
+     report, Google, Inc., 2010.
+
+[46] R. Vallée-Rai, P. Co, E. Gagnon, L. Hendren, P. Lam, and V. Sun-
+     daresan. Soot - a Java bytecode optimization framework. In
+     Proceedings of the 1999 Conference of the Centre for Advanced
+     Studies on Collaborative Research, CASCON ’99, Mississauga,
+     Ontario, Canada, 1999. IBM Press.
+
+
+
+
+16    13th USENIX Symposium on Operating Systems Design and Implementation                                            USENIX Association
+

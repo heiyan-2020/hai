@@ -1,0 +1,1227 @@
+       Graviton: Trusted Execution
+         Environments on GPUs
+      Stavros Volos and Kapil Vaswani, Microsoft Research;
+        Rodrigo Bruno, INESC-ID / IST, University of Lisbon
+      https://www.usenix.org/conference/osdi18/presentation/volos
+
+
+
+
+   This paper is included in the Proceedings of the
+13th USENIX Symposium on Operating Systems Design
+           and Implementation (OSDI ’18).
+             October 8–10, 2018 • Carlsbad, CA, USA
+                        ISBN 978-1-939133-08-3
+
+
+
+                                   Open access to the Proceedings of the
+                               13th USENIX Symposium on Operating Systems
+                                       Design and Implementation
+                                         is sponsored by USENIX.
+                  Graviton: Trusted Execution Environments on GPUs
+
+        Stavros Volos                 Kapil Vaswani                         Rodrigo Bruno
+      Microsoft Research             Microsoft Research            INESC-ID / IST, University of Lisbon
+
+
+                       Abstract                               tors. This limitation gives rise to an undesirable trade-off
+                                                              between security and performance.
+We propose Graviton, an architecture for supporting
+                                                                 There are several reasons why adding TEE support
+trusted execution environments on GPUs. Graviton en-
+                                                              to accelerators is challenging. With most accelerators,
+ables applications to offload security- and performance-
+                                                              a device driver is responsible for managing device re-
+sensitive kernels and data to a GPU, and execute kernels
+                                                              sources (e.g., device memory) and has complete control
+in isolation from other code running on the GPU and all
+                                                              over the device. Furthermore, high-throughput accelera-
+software on the host, including the device driver, the op-
+                                                              tors (e.g., GPUs) achieve high performance by integrat-
+erating system, and the hypervisor. Graviton can be in-
+                                                              ing a large number of cores, and using high bandwidth
+tegrated into existing GPUs with relatively low hardware
+                                                              memory to satisfy their massive bandwidth requirements
+complexity; all changes are restricted to peripheral com-
+                                                              [4, 11]. Any major change in the cores, memory man-
+ponents, such as the GPU’s command processor, with
+                                                              agement unit, or the memory controller can result in
+no changes to existing CPUs, GPU cores, or the GPU’s
+                                                              unacceptably large overheads. For instance, providing
+MMU and memory controller. We also propose exten-
+                                                              memory confidentiality and integrity via an encryption
+sions to the CUDA runtime for securely copying data
+                                                              engine and Merkle tree will significantly impact avail-
+and executing kernels on the GPU. We have implemented
+                                                              able memory capacity and bandwidth, already a precious
+Graviton on off-the-shelf NVIDIA GPUs, using emula-
+                                                              commodity on accelerators. Similarly, enforcing mem-
+tion for new hardware features. Our evaluation shows
+                                                              ory isolation through SGX-like checks during address
+that overheads are low (17-33%) with encryption and de-
+                                                              translation would severely under-utilize accelerators due
+cryption of traffic to and from the GPU being the main
+                                                              to their sensitivity to address translation latency [35].
+source of overheads.
+                                                                 In this paper, we investigate the problem of supporting
+                                                              TEEs on GPUs. We characterize the attack surface of
+1   Introduction                                              applications that offload computation to GPUs, and find
+                                                              that delegating resource management to a device driver
+Recent trends such as the explosion in volume of data         creates a large attack surface [26, 36] leading to attacks
+being collected and processed, declining yields from          as page aliasing that are hard to defend without hardware
+Moore’s Law [16], growing use of cloud computing,             support. Interestingly, we also find that architectural dif-
+and applications, such as deep learning have fueled the       ferences between GPUs and CPUs reduce the attack sur-
+widespread use of accelerators such as GPUs, FPGAs            face in some dimensions. For instance, all recent server-
+[37], and TPUs [20]. In a few years, it is expected that a    class GPUs use 3D-IC designs with stacked memory
+majority of compute cycles in public clouds will be con-      connected to GPU cores via silicon interposers [4, 11].
+tributed by accelerators.                                     Unlike off-package memory connected to the CPU using
+   At the same time, the increasing frequency and so-         copper-based traces on the PCB, which are easy to snoop
+phistication of data breaches has led to a realization that   and tamper, it is extremely hard for an attacker to open
+we need stronger security mechanisms to protect sensi-        a GPU package and snoop on the silicon interconnect
+tive code and data. To address this concern, hardware         between GPU and stacked memory, even with physical
+manufacturers have started integrating trusted hardware       access to the GPU. Thus, it is a reasonable assumption to
+in CPUs in the form of trusted execution environments         include on-package memory within the trust boundary.
+(TEE). A TEE, such as Intel SGX [28] and ARM Trust-              Based on these insights, we propose Graviton, an ar-
+zone [1], protects sensitive code and data from system        chitecture for supporting TEEs on GPUs. In Graviton,
+administrators and from attackers who may exploit ker-        a TEE takes the form of a secure context, a collec-
+nel vulnerabilities and control the entire software stack,    tion of GPU resources (e.g., device memory, command
+including the operating system and the hypervisor. How-       queues, registers) that are cryptographically bound to a
+ever, existing TEEs are restricted to CPUs and cannot be      public/private key pair and isolated from untrusted soft-
+used in applications that offload computation to accelera-    ware on the host (including the driver) and all other GPU
+
+
+
+USENIX Association                 13th USENIX Symposium on Operating Systems Design and Implementation              681
+contexts. Graviton guarantees that once a secure context                                                                                      SM SM
+                                                                                                                                                      GPC
+                                                               User application                                                               SM SM
+
+has been created, its resources can only be accessed by a         User runtime                                                                  L2 Cache
+
+user application/runtime in possession of the correspond-          GPU driver                                                                 GPC     GPC
+
+ing private key. As long as the key is protected from the           Host OS                  Code & data
+                                                                                                                                                Compute
+
+
+
+
+                                                                                                                                                            Mem Ctrl.
+adversary (e.g., the key is hosted in a CPU TEE), the ad-                                                                   Command
+
+
+
+
+                                                                                                               PCI Ctrl.
+                                                                  Hypervisor                μ-ctrl. firmware                                     Engine
+
+
+
+
+                                                                                                                                                                        Memory
+                                                                                                                            Processor
+versary cannot access the context’s address space. Gravi-                                                                  (channel engine)   Copy Engine
+                                                                     CPU          PCI Bus        GPU
+                                                                                                                                    Internal Bus
+ton supports two additional primitives: measurement for
+generating remotely verifiable summaries of a context’s
+state and the platform, and secure memory allocation and
+deallocation for letting a device driver dynamically allo-    Figure 1: System stack (left) and hardware stack (right).
+cate and free memory without compromising security.
+   Graviton achieves strong security by redefining the                versary that might control the entire software stack
+interface between the GPU driver and the hardware.                    on the host, including the accelerator driver.
+Specifically, we prevent the driver from directly access-
+ing security sensitive resources, such as page directories,       • We define a threat model that places trust in the
+page tables, and other memory containing sensitive code             GPU hardware, including on-package memory.
+and data. Instead, we require that the driver route all re-
+source allocation requests through the GPU’s command              • We propose a minimal set of extensions to the GPU
+processor. The command processor tracks ownership of                hardware for implementing Graviton and show how
+resources, and ensures that no resource owned by a se-              these extensions can be used to design applications
+cure context can be accessed by the adversary. The com-             with end-to-end security guarantees. The design
+mand processor also ensures that the resources are cor-             requires no changes to the GPU cores, MMU, or
+rectly initialized on allocation to a secure context, and           memory controller, resulting in low hardware com-
+cleaned up on destruction, preventing attacks that exploit          plexity and low performance overheads.
+improper initialization [23, 36, 52].
+   Our design has several key attributes including low
+                                                              2      Background
+hardware complexity, low performance overheads and
+crypto-agility. Graviton requires no changes to the GPU       2.1      GPU
+cores, MMU, or the memory controller. All changes
+are limited to peripheral components, such as the GPU         We review the NVIDIA GPU architecture and the CUDA
+command processor and the PCIe control engine; this is        programming model to illustrate how a compute task is
+largely due to the assumption that on-package memory          offloaded and executed on the GPU. We focus on the se-
+can be trusted. Graviton places no restrictions on the        curity critical parts of the architecture.
+instruction set available within the TEE. We also show        Software stack. A user-space application uses an API
+that a GPU runtime can use Graviton to build secure ver-      provided by the user-space GPU runtime (e.g., CUDA
+sions of higher-level APIs, such as memory copy, kernel       runtime), to program the GPU execution units with a
+launch, and streams, which can be used to build applica-      piece of code known as the kernel, and transfer data be-
+tions with end-to-end confidentiality and integrity.          tween host and device memory. The GPU runtime con-
+   We have evaluated our design on NVIDIA Titan               verts each API call to a set of GPU commands for con-
+GPUs, gdev [21], an open-source CUDA runtime, and             figuring the device and controlling kernel launches and
+nouveau [29], an open source GPU driver. In the ab-           data transfers. A GPU driver is responsible for submit-
+sence of hardware that implements the proposed exten-         ting these commands to the GPU via the PCI bus and for
+sions, we implement and emulate the extensions using          managing device memory.
+interrupts delivered to the host. Our evaluation using a      Hardware. The GPU (Figure 1) interfaces with the host
+set of representative machine learning benchmarks sug-        CPU via the PCI control engine, which is connected with
+gests that the overheads of running compute-bound GPU         the rest of the GPU components via an internal bus. The
+applications using secure contexts are low (17-33%) for       key components are a command processor, compute and
+the level of security we provide. The overheads are dom-      copy (DMA) engines, and the memory system, including
+inated by the cost of authenticated encryption/decryption     the memory controller and memory chips.
+of kernel launch commands and user data.                         The PCI control engine consists of (a) a PCI controller
+   In summary, we make the following contributions.           that receives incoming and outgoing PCI transactions,
+  • We propose Graviton, an architecture for supporting       and (b) a master control engine, which exposes a set of
+    TEEs on accelerators, such as GPUs. Graviton pro-         memory-mapped-IO (MMIO) registers that are accessed
+    vides strong security properties even against an ad-      by the host CPU to enable and disable the GPU engines.
+
+
+
+682   13th USENIX Symposium on Operating Systems Design and Implementation                                                  USENIX Association
+                   User-space                        Kernel-space                                            Channel        Channel            Page                Page
+                                                                                                                                                                                Memory
+                                                                                                            control area   descriptors       directory            tables
+     Host Memory
+                                                      DMA Buffer
+
+
+
+
+                                GPU Kernel
+                                  Object
+                     Data
+                                               Command                          Ring
+                                                 Buffer                        Buffer
+     GPU Memory
+
+
+
+
+                                                                           Comp.Eng. Ctx.
+                                             Ch. Desc.
+
+
+
+
+                                                                                            Misc. Buffers
+                                                            Ch.Eng. Ctx.
+                                GPU Kernel
+                                               PGD
+
+
+                                  Object
+                     Data
+                                               PGTs
+                                                                                                              Figure 3: Channel-level address space management.
+
+   Figure 2: Host memory and GPU memory spaces.                                                                                                                    Memory-mapped
+                                                                                                                                    Ring buffer
+                                                                                                              Command                                             user command buffer
+                                                                                                               pusher
+                                                                                                                                                                    Command group
+The command processor (aka channel engine) receives
+                                                                                                                             size         offset         offset
+commands submitted by the device driver over as set of
+
+
+
+
+                                                                                                                                                                                         size
+                                                                                                              GET                                                   Command group
+command queues known as channels and forwards them
+                                                                                                             PUT
+to the corresponding engines once they are idle. Chan-
+nels are configured through a set of memory locations
+known as the channel control area which is mapped over
+                                                                                                                        Figure 4: GPU command submission.
+the MMIO and serviced by the command processor.
+   The compute engine consists of a set of graph pro-
+cessing clusters (GPCs) and a shared L2 cache. Each                                                         and the page directory address in the channel descrip-
+GPC consists of a number of streaming multiproces-                                                          tor. The page directory consists of entries that point to
+sors (SMs), which are used to run GPU kernels. Each                                                         leaf page tables, and leaf page tables contain virtual-to-
+SM consists of multiple cores and a private memory                                                          physical mappings. Page tables typically support small
+hierarchy, including a read-only cache, L1 cache, and                                                       (4KB) and big pages (128KB). The device driver updates
+application-managed memory. GPU kernels specify the                                                         all these data structures over the PCI bus via BARs.
+number of threads to be created, organized into thread
+                                                                                                               Once the channel has been created, the device driver
+blocks and grids. Thread blocks are divided into warps,
+                                                                                                            allocates device memory for a few channel-specific data
+where each warp is a unit of scheduling on each SM.
+                                                                                                            structures, including (a) the internal context of the chan-
+Threads belonging to the same thread block share the
+                                                                                                            nel and compute engines, (b) a fence buffer used for syn-
+caches and the application-managed memory.
+                                                                                                            chronization between the host CPU and GPU, and (c) an
+   Modern GPUs support virtual memory via a mem-
+                                                                                                            interrupt buffer for notifying the host with interrupts gen-
+ory controller with page table walkers for address trans-
+                                                                                                            erated by the GPU engines.
+action, and a hierarchy of TLBs. For example, in the
+NVIDIA Volta, the L1 cache is virtually addressed and                                                       Command submission. The command processor is re-
+the L2 is physically addressed. The GPU has a shared                                                        sponsible for fetching commands submitted by the soft-
+two-level TLB used while accessing the L2 cache [19].                                                       ware stack and relaying them to the appropriate GPU en-
+                                                                                                            gines. Figure 4 shows the data structures used for com-
+Context and channel management. Execution on
+                                                                                                            mand submission. The driver allocates two buffers in
+GPUs is context-based. A CUDA context represent the
+                                                                                                            kernel space, a command and a ring buffer. The com-
+collection of resources and state (memory, data, etc.) that
+                                                                                                            mand buffer is memory-mapped to the user space. The
+are required to execute a CUDA kernel. Resources are
+                                                                                                            runtime pushes groups of commands to the command
+allocated to contexts to run a compute task and are freed
+                                                                                                            buffer, updates the channel’s ring buffer with the size
+when a context is destroyed. Each context has its own
+                                                                                                            and offset of each group, and then updates over MMIO
+address space. GPUs use channels to isolate a context’s
+                                                                                                            a register called the PUT register with a pointer to the
+address space from other contexts. A channel is the only
+                                                                                                            command group. When the PUT register is updated, the
+way to submit commands to the GPU. Therefore, every
+                                                                                                            command processor fetches a command group from the
+GPU context allocates at least one GPU channel.
+                                                                                                            buffers, and updates the GET register to notify the run-
+   To create a channel, the device driver allocates a
+                                                                                                            time that the commands have been fetched.
+channel descriptor and multi-level page tables in device
+memory (Figure 2 and 3). For example, a simple two-                                                         Programming model. Next, we present an overview of
+level page table consists of the page directory (PGD) and                                                   the main stages of dispatching kernels to the GPU.
+a number of leaf page tables (PGT). The driver writes the                                                      Initialization. An application wishing to use the GPU
+channel descriptor address to the channel control area,                                                     first creates a CUDA context. During context creation,
+
+
+
+USENIX Association                                13th USENIX Symposium on Operating Systems Design and Implementation                                                                  683
+the runtime allocates a DMA buffer for data transfers be-    Cache (EPC), which resides in a pre-configured por-
+tween host memory and device memory (Figure 2). Sub-         tion of DRAM called the Processor Reserved Memory
+sequently, the application loads one or more CUDA mod-       (PRM). The processor ensures that any software out-
+ules into the context. For each kernel defined in the mod-   side the enclave cannot access the PRM. However, code
+ule, the runtime creates a corresponding kernel object on    hosted inside an enclave can access both non-PRM mem-
+the GPU by allocating device memory for (a) the ker-         ory and PRM memory that belongs to the enclave. SGX
+nel’s code, (b) constant memory used by the kernel, and      includes a memory encryption engine that encrypts and
+(c) local memory used by each thread associated with the     authenticates enclave data evicted to memory, and en-
+kernel. The runtime then copies code and constant mem-       sures integrity and freshness.
+ory to device memory via DMA.                                   In addition to isolation, enclaves also support remote
+   Memory allocation. The application allocates device       attestation. Remote attestation allows a remote chal-
+memory for storing inputs and outputs of a kernel using      lenger to establish trust in an enclave. In Intel SGX, code
+a memory allocation API (cudaMalloc and cudaFree).           hosted in an enclave can request a quote, which contains
+Memory allocations are serviced by the driver, which up-     a number of enclave attributes including a measurement
+dates the page directory and page tables.                    of the enclave’s initial state. The quote is signed by a
+   Host-GPU transfers. When the application issues           processor-specific attestation key. A remote challenger
+a host-to-device copy, the runtime pushes a command          can use Intel’s attestation verification service to verify
+group to the context’s channel, passing the virtual ad-      that a given quote has been signed by a valid attestation
+dresses of source and destination to the copy engine.        key. The challenger can also verify that the enclave has
+Once the engine is configured, it translates virtual ad-     been initialized in an expected state. Once an enclave has
+dresses to physical ones and initiates DMA transfers.        been verified, the challenger can set up a secure channel
+   Kernel dispatch. When the application executes a ker-     with the enclave (using a secure key exchange protocol)
+nel, the runtime passes a command group to the com-          and provision secrets such as encrypted code or data en-
+mand processor that includes the kernel’s context, the       cryption keys to the enclave.
+base address of the code segment, the entry program
+counter, the grid configuration, and the kernel’s environ-
+                                                             3   Threat Model
+ment, which includes the stack and parameters values.
+The command processor uses these parameters to initial-      We consider a strong adversary who controls the entire
+ize compute engines, which in turn initialize and sched-     system software, including the device drivers, the guest
+ule the computation on GPU cores.                            operating system, and the hypervisor, and has physi-
+Sharing. A GPU can be used to execute multiple kernels       cal access to all server hardware, including the GPU.
+from multiple host processes using techniques such as        Clearly, such an adversary can read and tamper with
+pre-emptive multi-tasking [33, 42], spatial multi-tasking    code or data of any victim process. The adversary can
+[2, 34], simultaneous execution [47], multi-process ser-     also access or tamper with user data in DMA buffers or
+vice [30], or virtualization [25]. In such scenarios, it     with commands submitted by the victim application to
+is the responsibility of the host (driver) to isolate ker-   the GPU. This gives the adversary control over attributes,
+nels using the channel abstraction and virtual memory.       such as the address of kernels being executed and param-
+While spatial multi-tasking advocates for SM partition-      eters passed to the kernel. The adversary may also access
+ing, it still shares memory resources and relies on vir-     device memory directly over MMIO, or map a user’s
+tual memory for isolation. Even in devices that support      GPU context memory space to a channel controlled by
+SR-IOV and partition resources in hardware (e.g., AMD        the adversary. In multi-tasking GPUs, malicious kernels
+MxGPU), system software is still responsible for assign-     can be dispatched to the GPU, thereby accessing mem-
+ing virtual devices to virtual machines.                     ory belonging to a victim’s context. These attacks are
+                                                             possible even in a virtualized environment (e.g., even if a
+2.2   Intel SGX                                              device supports SR-IOV) because the mapping between
+Trusted execution environments, or enclaves (e.g., In-       VMs and virtual devices is controlled by the hypervisor.
+tel SGX) protect code and data from all other software          An adversary with physical access to the server can
+in a system. With OS support, an untrusted hosting           mount snooping attacks on the host memory bus and the
+application can create an enclave in its virtual address     PCIe bus. However, we do trust the GPU and CPU pack-
+space. Once an enclave has been initialized, code and        ages and firmware, and assume that the adversary can-
+data within the enclave is isolated from the rest of the     not extract secrets or corrupt state within the packages.
+system, including privileged software.                       This implies that we trust CPUs to protect code and data
+   Intel SGX enforces isolation by storing enclave code      hosted inside TEEs. Side-channel attacks (e.g., based on
+and data in a data structure called the Enclave Page         speculative execution, access patterns and timing) and
+
+
+
+684   13th USENIX Symposium on Operating Systems Design and Implementation                        USENIX Association
+denial-of-service attacks are also outside the scope of this   int main () {
+paper. Side channels are a serious concern with trusted          ...
+hardware [10, 12, 22, 38, 45, 50] and building efficient         float * h_A = malloc ( M * N * sizeof ( float ) ) ;
+                                                                 float * h_B = malloc ( N * K * sizeof ( float ) ) ;
+counter measures remains an open problem. In Gravi-              float * h_C = malloc ( M * K * sizeof ( float ) ) ;
+ton, we use TEEs to host the user application and the            float * d_A , d_B , d_C ;
+GPU runtime.                                                     ...
+   Unlike host memory, which is untrusted, we trust on-          cudaMalloc (( void **) & d_A , M * N * sizeof ( float )
+                                                                        );
+package GPU memory as GPU cores are attached to                  ...
+memory using silicon interposers, which make it ex-              p o p u l a t e _ m a t r i c e s ( h_A , h_B ) ;
+tremely difficult for an attacker to mount snooping or           cudaMemcpy ( d_A , h_A , M * N * sizeof ( float ) ,
+tampering attacks. There is an emerging class of at-                     cudaMemcpyHostToDevice );
+                                                                 cudaMemcpy ( d_B , h_B , N * K * sizeof ( float ) ,
+tacks on stacked integrated circuits (ICs), such as attacks              cudaMemcpyHostToDevice );
+where the package assembler inserts a trojan die between         ...
+the GPU and memory dies [49]. Developing mitigations             matrixMul < < < grid , threads > > >( d_C , d_A , d_B ,M ,
+for these attacks is ongoing work [3] and outside the                   N,K);
+                                                                 ...
+scope of this paper.                                             cudaMemcpy ( d_C , h_C , M * K * sizeof ( float ) ,
+   Even under this threat model, we wish to guaran-                      cudaMemcpyDeviceToHost );
+tee confidentiality and integrity for applications that use      cudaFree ( d_A ) ;
+                                                                 ...
+GPUs. Specifically, we wish to guarantee that the adver-
+                                                               }
+sary cannot observe or tamper with code, data, and com-
+mands transferred to/from the GPU by a trusted applica-
+tion that runs in a CPU TEE or an on-premise machine.                    Figure 5: Sample CUDA application.
+Finally, we wish to guarantee that the GPU computation
+proceeds without interference from the adversary.
+                                                               sures that all transfers between host and the GPU, in-
+                                                               cluding code and data, are encrypted and authenticated
+4   Overview                                                   using keys inaccessible to the attacker. The implementa-
+                                                               tion of cudaLaunch sends encrypted launch commands
+Consider a CUDA application (Figure 5) that performs           to the GPU’s command processor over a secure session.
+matrix multiplication, which is a key building block in        Finally, the implementation of cudaFree authorizes the
+machine learning algorithms. The application creates a         GPU’s command processor to unmap previously allo-
+new CUDA context (implicitly on the first CUDA API             cated pages from page tables, and scrubs their content,
+call), allocates memory for input and output matrices          enabling the driver to reuse the pages without leaking
+in host and device memory, populates the matrices, and         sensitive data.
+then invokes the matrix multiplication kernel on the GPU
+(not shown), passing pointers to device memory and
+other kernel’s parameters. After the kernel has com-           5     Graviton Architecture
+pleted, the application copies the results into host mem-
+ory and releases memory allocated on the GPU.                  In this section, we describe extensions to existing GPU
+   As described earlier, an attacker with privileged ac-       architectures for supporting secure contexts.
+cess to the server can easily recover the contents of the
+matrices and the result even if this application is hosted     5.1   Remote Attestation
+in a CPU enclave. We can harden this application against       A Graviton-enabled GPU supports remote attestation for
+such attacks simply by linking it against Graviton’s ver-      establishing trust between a secure context and a remote
+sion of the CUDA runtime. Graviton’s version of the            challenger. Hardware support for attestation is similar
+runtime creates a secure context (instead of a default con-    to TPMs; we require (a) a secret, known as the root en-
+text) on a Graviton-enabled GPU. In this process, the          dorsement key (EK), to be burned into the device’s e-
+runtime authenticates the GPU and establishes a secure         fuses during manufacturing and (b) a cryptographic en-
+session with the GPU’s command processor, with session         gine for asymmetric key generation and signing. The EK
+keys stored in CPU enclave memory.                             is the root of trust for attestation and never leaves the
+   The runtime also provides a custom implementation           GPU package. During boot, the GPU generates a fresh
+of cudaMalloc, which invokes the device driver to allo-        attestation key (AK) pair and stores the private key se-
+cate GPU memory and additionally verifies that allocated       curely within the command processor. The GPU also
+memory is not accessible from any other context or from        signs the public part of the AK with the EK and makes
+the host. The secure implementation of cudaMemcpy en-          it available to the device driver, which in turn sends the
+
+
+
+USENIX Association                  13th USENIX Symposium on Operating Systems Design and Implementation               685
+signed AK to a trusted CA. The CA validates the signa-        5.3   Secure Context Isolation
+ture using a repository of public endorsement keys pro-       In existing GPUs, the responsibility of managing re-
+visioned by the manufacturer and generates a signed AK        sources (e.g., device memory) lies with the device driver.
+certificate. The certificate is stored by the device driver   For example, when allocating memory for an applica-
+and used during secure context creation to prove to a         tion object, the driver determines the virtual address at
+challenger that the GPU holds and protects the private        which to allocate the object, then determines physical
+attestation key.                                              pages to map to the virtual pages, and finally updates
+                                                              virtual-physical mappings in the channel’s page tables
+                                                              over MMIO. This mechanism creates a large attack vec-
+5.2   Secure Context Management                               tor. A compromised driver can easily violate channel-
+                                                              level isolation—e.g., by mapping a victim’s page to the
+In Graviton, a secure context consists of one or more se-
+                                                              address space of a malicious channel.
+cure channels. We extend the GPU’s command proces-
+                                                                 One way of preventing such attacks and achieving
+sor with new commands for creation, management, and
+                                                              isolation is to statically partition resources in hardware
+destruction of secure channels (Figure 6).
+                                                              between channels. However, this will lead to under-
+   A secure channel is created using the command              utilization of resources. Moreover, it prohibits low-cost
+CH CREATE, which requires as parameters a channel             sharing of resources between channels, which is required
+identifier and a public key UK pub . On receiving the re-     to implement features, such as streams. Instead, Gravi-
+quest, the command processor generates a fresh channel        ton guarantees isolation by imposing a strict ownership
+encryption key (CEK) for encrypting commands posted           discipline over resources in hardware, while allowing the
+to this channel. The public key UK pub , CEK, and a           driver to dynamically partition resources.
+counter are stored in a region of device memory accessi-         More formally, consider a physical page P that is
+ble only to the command processor. CH CREATE may be           mapped to a secure channel associated with a secure
+used to create multiple channels associated with the same     context C and a channel encryption key CEK, and
+secure context by passing the same UK pub , in which case     contains sensitive data. We consider any object (code
+all such channels will use the same CEK.                      and data) allocated by the application in a secure context
+   After generating the CEK, the command processor es-        and all address space management structures (i.e.,
+tablishes a session by securely transferring the CEK to       channel descriptor, page directory and page tables) of
+the trusted user-space runtime. The command proces-           all channels as sensitive. We propose hardware changes
+sor encrypts the CEK with UK pub and generates a quote        to a GPU that enforce the following invariants, which
+containing the encrypted CEK and a hash of UK pub . The       together imply isolation.
+quote contains the channel identifier and security criti-
+cal platform-specific attributes, such as the firmware ver-   Invariant 5.1 P cannot be mapped to a channel associ-
+sion, and flags indicating whether preemption and debug-      ated with a context C0 6= C.
+ging are enabled. The quote is signed using AK. The
+device driver passes this quote and the AK certificate        Invariant 5.2 P cannot be unmapped without authoriza-
+(obtained during initialization) to the user-space runtime.   tion from the user in possession of CEK.
+The runtime authenticates the response by (a) verifying
+the AK certificate, (b) verifying the quote using the pub-    Invariant 5.3 P is not accessible over MMIO to un-
+lic AK embedded in the certificate, and (c) checking that     trusted software on the host CPU.
+the public key in the quote matches UK pub . The runtime
+can then decrypt the CEK and use it for encrypting all        Invariant 5.4 P is cleared before being mapped to an-
+commands sent to the GPU.                                     other channel associated with a context C0 6= C.
+   Once a session has been established, the command
+processor authenticates and decrypts all commands it re-         In the rest of this section, we describe hardware ex-
+ceives over the channel using the CEK. This guarantees        tensions for enforcing these invariants, and discuss their
+that only the user in possession of the CEK can execute       implications on the driver-GPU interface.
+tasks that access the context’s address space. We use au-
+thenticated encryption (AES in GCM mode) and the per-         Memory regions. Our first extension is to partition de-
+channel counter as IV to protect commands from drop-          vice memory into three regions: unprotected, protected
+ping, replay, and re-ordering attacks. This ensures that      and hidden, each with different access permissions.
+all commands generated by the GPU runtime are deliv-             The unprotected region is a region in memory that is
+ered to the command processor without tampering.              both visible from and accessible by the host via PCI BAR
+
+
+
+686   13th USENIX Symposium on Operating Systems Design and Implementation                        USENIX Association
+                                          Command      Attributes                          Description
+                       Protected Memory
+                                                       chid, pgd_address, public_key       Sets page directory address within channel descriptor
+                                          CH_CREATE
+                                                       → quote                             Returns quote for secure channels
+  GPU driver               Ch. Desc.
+               MMIO                                                                        Unsets channel descriptor and page directory
+                                          CH_DESTROY   chid, MAC
+                             PGD                                                           Expects a keyed MAC of command for secure channels
+
+                                          CH_PDE       chid, pgd_index, PDE                Sets page table address in a page directory entry
+                             PGTs                                                          Sets VA-PA mapping in page table entry
+                                                       chid, pgd_index, pgt_index, size,
+                                          CH_PTE                                           Expects keyed MAC for user-authorized deallocation
+                                                       PTE[], MAC → summary, MAC
+                                                                                           Returns a summary along with a MAC for secure allocations
+
+   Bootstrap channel      Command         CH_MEASURE   chid, address, size →               Returns a measurement of a range of virtual addresses
+ command submission       processor                    measurement, MAC                    mapped in a secure channel along with a MAC
+
+
+
+
+Figure 6: Commands for configuring a channel’s address space and measuring the address space. PDE and PTE refer
+to page directory and page table entries respectively, and a MAC is a keyed message authentication code.
+
+
+registers. The driver can use this region to allocate non-                     physical pages in the protected region in a data structure
+sensitive memory objects (e.g., synchronization and in-                        called the Protected Memory Metadata (PMM). We first
+terrupt buffers) that are accessed over MMIO. This re-                         describe PMM and then the commands.
+gion can also be accessed from the GPU engines.
+   The protected region is visible to but not accessible                       Tracking ownership. The PMM is a data structure lo-
+from the host. The driver can allocate objects within                          cated in hidden memory, making it invisible to the host.
+the region (by creating page mappings), but cannot ac-                         It is indexed using the physical address of a memory
+cess the region directly over MMIO. Thus, this region                          page. Pages are tracked at the granularity of a small page
+can only be accessed from the GPU engines.                                     (i.e., 4 KB). The PMM maintains the following attributes
+   The hidden region is not visible or accessible to host                      for each physical page.
+CPU or to the GPU engines. Memory in this region are                             • The attribute owner id is the identifier of the chan-
+not accessible over PCI and are not mapped into any                                nel that owns the page.
+channel’s virtual address space. This region is exclu-
+sively reserved for use by the command processor for                             • The attribute state ∈ {FREE, MAPPED} represents
+maintaining metadata, such as ownership state of pro-                              whether the page is free or already mapped to some
+tected memory pages and per-channel encryption keys.                               channel. The initial value is FREE.
+   Regions can be implemented using simple range
+                                                                                 • The attribute refcnt tracks the number of channels
+checks on MMIO accesses in the PCI controller and on
+                                                                                   a physical page has been mapped to.
+commands that update address-space management struc-
+tures in the command processor. The size of each region                          • The attribute lock ∈ {UNLOCKED, LOCKED} repre-
+can be configured during initialization by untrusted host                          sents whether the page requires explicit authoriza-
+software. The size does not affect security; only avail-                           tion to be unmapped.
+ability as the system administrator could block creation
+of secure contexts by allocating a small protected region.                       • The attribute pgd index is an index into the page
+                                                                                   directory that points to the page table containing
+Address-space management. The next set of exten-                                   the mapping for the current page. Using this at-
+sions are designed to enforce Invariant 5.1 and Invari-                            tribute, the command processor can reconstruct the
+ant 5.2. We achieve this by decoupling the task of al-                             virtual address of a physical page. In that sense, the
+locating and deallocating virtual and physical memory                              PMM acts as an inverted page table for the protected
+from the task of managing device-memory-resident ad-                               region—i.e., stores PA → VA mappings.
+dress translation data structures (i.e., page directories and
+                                                                                 • The attribute pgt entrycnt is a 2-byte value that
+page tables) and delegating the latter to the GPU’s com-
+                                                                                   tracks the number of pages table entries allocated
+mand processor. In particular, we allow the driver to de-
+                                                                                   within a page table. Using this attribute, the com-
+cide where in virtual and physical memory an object will
+                                                                                   mand processor can know if a locked page table is
+reside, but require that the driver route requests to update
+                                                                                   empty and hence may be unmapped.
+page directories and page tables through the command
+processor using the API described in Figure 6.                                    Assuming each PMM entry requires 64-bits, the total
+   The implementation of the API in the command pro-                           size of the PMM for a GPU with 6GB of physical mem-
+cessor enforces these invariants by tracking ownership of                      ory is 12MB, which is ∼ 0.2% of total memory.
+
+
+
+USENIX Association                        13th USENIX Symposium on Operating Systems Design and Implementation                                         687
+Commands. The new commands for context and ad-                tiguous range of virtual addresses of size size starting
+dress space management use the PMM to enforce Invari-         at VA, where VA is the virtual address mapped at in-
+ant 5.1 and Invariant 5.2 as follows:                         dex pgt index by the page table at index pgd index in
+                                                              the channel chid’s page directory. Before clearing exist-
+CH CREATE. This command takes as a parameter the              ing page table entries, the command checks if the physi-
+address of the page directory (pgd address) for the           cal pages are LOCKED. To remove mappings for LOCKED
+newly created channel chid. It checks whether the chan-       physical pages, the command requires explicit authoriza-
+nel descriptor and page directory are allocated on pages      tion by the user runtime in the form of a MAC over the
+in the protected region, and that the pages are FREE. The     tuple {chid,VA, size} using the CEK and a per-channel
+former constraint ensures that after channel creation, the    counter as the initialization vector (IV). The unforgeabil-
+driver does not bypass the API and access the channel         ity of the MAC coupled with the use of a counter for IV
+descriptor and page directory directly over MMIO.             ensures that a malicious driver cannot forge a command
+    If the checks succeed, the pages become MAPPED and        that unmaps physical pages allocated to secure channels,
+the owner id attribute of the pages is updated to the iden-   and then remapping them to other channels. If the checks
+tifier of the channel being created. If a secure channel      and MAC verification succeed, the pages transition to
+is being created (using a public key), the pages become       FREE, and the page table entries are cleared.
+LOCKED. The command processor then updates the ad-               Similarly, before creating new mappings, the com-
+dress of the page directory in the channel descriptor, and    mand checks if the pages are FREE. Additionally, if the
+clears the contents of pages storing the page directory       channel is secure, the command checks if the pages are
+to prevent an attacker from injecting stale translations.     located in the protected region (for sensitive code and
+CH CREATE fails if any of the pages containing the chan-      data, discussed in Section 6). If the checks succeed, the
+nel descriptor or the page directory is already LOCKED or     page become MAPPED and if the page is being mapped
+MAPPED to an existing channel.                                to a secure channel, the pages become LOCKED.1 If pages
+                                                              are already MAPPED, the command checks if the chan-
+CH PDE. This command unmaps an existing page ta-
+                                                              nel that owns the page (the current owner id) and the
+ble if one exists and maps a new page table at the index
+                                                              channel that the page is being mapped to belong to the
+pgd index in the page directory of the channel.
+                                                              same context by comparing the corresponding public
+   Before unmapping, the command checks if the phys-
+                                                              key hashes. On success, the command increments the
+ical pages of the page table are UNLOCKED or the
+                                                              pgt entrycnt of the page table, updates the page table,
+pgt entrycnt attribute is zero. In either case, the com-
+                                                              and issues a TLB flush to remove any stale translations.
+mand decrements refcnt. If refcnt reaches zero, the
+                                                              While conventionally the latter is the responsibility of the
+pages become FREE. The command fails if the driver at-
+                                                              device driver, in our design, the flush is implicit. The
+tempts to unmap a LOCKED page table or a page table
+                                                              command fails if any of the pages are mapped to a chan-
+with valid entries.
+                                                              nel associated with a different context.
+   Before mapping a new page table, the command
+                                                                 When the command succeeds, it generates a summary
+checks whether the page table is allocated on FREE pages
+                                                              structure, which encodes all VA → PA mappings created
+in the protected region. If the checks succeed, the pages
+                                                              during the invocation of CH PTE. The summary is a tu-
+become MAPPED. Additionally, if the channel is secure,
+                                                              ple {chid,VA, n, k, HASH(p 1, ..., p n)}, where VA is the
+the pages become LOCKED. However, if these pages are
+                                                              starting virtual address of the memory being allocated, n
+already MAPPED, the command checks if the channel that
+                                                              is the number of pages allocated in the protected region,
+owns the page (the current owner id) and the channel
+                                                              k is the number of total pages allocated, and p 1, ...p n
+that the page table is being mapped to belong to the
+                                                              are addresses of protected physical pages. The command
+same context by comparing the corresponding public key
+                                                              processor also generates a keyed MAC over this sum-
+hashes. If the hashes match, the page’s reference count is
+                                                              mary using the CEK. As described later, this summary is
+incremented. This allows physical page tables and hence
+                                                              used by the runtime to verify that sensitive code and data
+physical pages to be shared between channels as long as
+                                                              are allocated in protected region.
+they share the same context; this is required for support-
+ing features such as CUDA streams [31]. If either of the
+checks succeed, the command creates a new entry in the        CH DESTROY. This command frees memory allocated
+page directory and clears the contents of the pages stor-     to a channel by walking the page directory, finding phys-
+ing the page table. The command fails if the page table is    ical pages owned by the channel, and resetting their en-
+mapped to a channel associated with a different context.          1 Note that CH PTE also permits pages in the unprotected region
+
+                                                              to be mapped to a secure channel; these pages can be accessed over
+CH PTE. This command removes existing mappings                MMIO and are used to store objects, such as fence buffers required by
+and creates new mappings (specified by PT E) for a con-       the driver for synchronization.
+
+
+
+
+688   13th USENIX Symposium on Operating Systems Design and Implementation                               USENIX Association
+tries in the PMM. It then unmaps physical pages of the            To ensure that the driver does not use a bootstrap
+channel descriptor and the page directory, decrements          channel to violate isolation of secure channels, the com-
+refcnt for pages used for page tables, and pages be-           mand processor prohibits a bootstrap channel from issu-
+come FREE if their refcnt reduces to 0.                        ing commands to the copy and compute engines since
+   For secure channels, the command requires explicit          such commands can be used to access sensitive state.
+authorization in the form of a MAC over chid using             The command processor also checks that all commands
+the CEK and a per-channel counter as IV. However, the          executed from a bootstrap channel are used to configure
+command processor also accepts unauthorized instances          non-bootstrap channels. This prevents an adversary from
+of this command; this enables the device driver to re-         allocating protected memory pages of a secure context as
+claim resources in scenarios where the user runtime is         page directory and/or page tables for a bootstrap channel
+no longer able to issue an authorized command—e.g.,            and then leveraging the CH PDE and CH PTE commands
+due to a process crash.                                        to tamper with the memory of the secure context.
+   In such a scenario, the command processor walks
+PMM to find physical pages mapped exclusively to the           Big page support. The virtual memory subsystem on
+channel’s address space, unmaps them, decrements their         modern GPUs employ multiple page sizes. For example,
+refcnt and clears their contents if their refcnt reduces       in NVIDIA GPUs, each page directory entry consists of
+to 0. The command processor also flushes all caches be-        two entries, one pointing to a small page (4KB) table,
+cause memory accesses of the command processor do not          and another to a big page (128KB) table. Our design re-
+go through the memory hierarchy of compute engines.            quires minor extensions to support large pages. In the
+   A malicious driver may misuse this mechanism to re-         PMM, we continue to track page metadata at the small
+claim resources of a channel which is still in use, result-    page granularity, but we add a bit to each entry to indi-
+ing in denial of service; there is not violation of confi-     cate if the corresponding physical page was mapped to a
+dentiality or integrity as pages containing sensitive infor-   small or big virtual page. In addition, we require an addi-
+mation, including the channel descriptor, are scrubbed.        tional parameter in the CH PDE and CH PTE commands to
+                                                               specify whether the updates are to a small or big page ta-
+CH MEASURE We extend the command processor with                ble. Finally, these commands check that the same virtual
+a command CH MEASURE for generating a verifiable ar-           page is not mapped to two different physical pages.
+tifact that summarizes the contents of a secure channel.
+The artifact can be used to prove to a challenger (e.g., a     Error handling. When a command fails, the command
+GPU runtime) that a channel exists in a certain state on       processor writes the error in an SRAM register that is ac-
+hardware that guarantees channel isolation. In our im-         cessible by the device driver over MMIO. This allows the
+plementation, CH MEASURE takes as parameters a range           device driver to take necessary actions so as to guarantee
+of virtual pages that should be included in the measure-       consistent view of a channel’s address space between the
+ment. It generates a measurement, which contains a             command processor and the device driver.
+digest (HMAC) of the content of pages within the re-
+quested range, and a keyed MAC of the measurement              6   Software Stack
+using the CEK.
+                                                               We now describe new CUDA primitives supported by the
+Bootstrapping. Introducing a command-based API for             Graviton runtime that use secure contexts and enable de-
+address-space management raises the following issue:           sign of applications with strong security properties.
+How does the driver send commands for managing the
+address space of secure channels without having access         Secure memory management. The Graviton run-
+to the channel-specific CEK? We overcome this by re-           time supports two primitives cudaSecureMalloc and
+quiring the driver to use separate channels, which we re-      cudaSecureFree for allocating and deallocating device
+fer to as bootstrap channels, for routing address-space        memory in the protected region.
+management commands for all other channels. We allow              cudaSecureMalloc guarantees that allocated GPU
+the driver to create and configure one or more bootstrap       memory is owned by the current context (Invari-
+channels over MMIO and allocate their address-space            ant 5.1) and lies within the protected region (Invariant
+management structures in the unprotected region.               5.3). Much like the implementation of cudaMalloc,
+   The command processor identifies a channel as a boot-       cudaSecureMalloc relies on the device driver to iden-
+strap channel by intercepting MMIO writes to the chan-         tify unused virtual memory and physical pages in de-
+nel descriptor attribute in the channel control area. If       vice memory, and update page directory and page tables
+the address being written to this attribute is in the unpro-   using the commands CH PDE and CH PTE. As described
+tected region, the corresponding channel is marked as a        above, these commands implement checks to enforce In-
+bootstrap channel.                                             variant 5.1. The runtime enforces Invariant 5.3 using the
+
+
+
+USENIX Association                  13th USENIX Symposium on Operating Systems Design and Implementation              689
+                             Module Load                                                                                  Memory Copy
+CPU
+                                                                                                                                                                                  2. The implementation of cudaSecureMemcpy first
+                                                                                                                                                                                     encrypts data to be copied using a fresh symmet-
+Copy authenticated
+
+
+
+
+                                                                                                          Authenticated encryption
+                     containing kernel
+encryption kernel
+
+
+
+
+                                                       Measurement
+                                                                                                                                                                                     ric key within the host TEE, and copies encrypted
+
+
+
+
+                                                                     Encrypt data
+                     Measure pages
+
+
+
+
+                                                                                    Copy encrypted data
+                                         Measurement
+                                                                                                                                                                                     data to untrusted memory.
+
+
+
+
+                                                                                                                                     encrypted data
+                                                       Check
+
+
+
+
+                                                                                                          Kernel Launch
+
+
+
+
+                                                                                                                                                                  Decrypt data
+                                                                                                                                     Authenticate
+
+
+
+                                                                                                                                                      Check MAC
+                                                                                                                                                                                  3. The runtime initiates a DMA to transfer encrypted
+                                                                                                                                                                                     data to target memory region. The command group
+GPU                                                                                                                                                                                  that initiates the DMA is encrypted and integrity
+                                                                                                                                                                                     protected using the CEK.
+
+Figure 7: Secure memory copy protocol. The kernel is                                                                                                                              4. The runtime uses the AuthDec kernel to decrypt data
+copied to the GPU during module creation.                                                                                                                                            in device memory. It issues a command group to
+                                                                                                                                                                                     launch the kernel, passing the data’s virtual address,
+                                                                                                                                                                                     the data encryption key, and the expected authenti-
+summary structure generated by the CH PTE command.                                                                                                                                   cation tag as the kernel’s parameters.
+In particular, the runtime uses the CEK and channel-
+specific counter to authenticate the summary structure(s)                                                                                                                          5. AuthDec authenticates encrypted data and generates
+returned by the driver. The driver may return multiple                                                                                                                                 an authentication tag which is checked against the
+summary structures in case the allocation spans multiple                                                                                                                               expected authentication tag. If the check succeeds,
+page tables. After authentication, the runtime can ver-                                                                                                                                the kernel decrypts the data in device memory, over-
+ify that memory objects are allocated in protected region                                                                                                                              writing the encrypted data in the process.
+using the attribute n in the summary.                                                                                                                                               A key attribute of secure memory copy is crypto-
+   cudaSecureFree first clears all allocated pages us-                                                                                                                           agility. Since the primitive is implemented fully in soft-
+ing a memset kernel. It then generates a MAC over the                                                                                                                            ware, the runtime may support various encryption and
+starting virtual address and size of the object using the                                                                                                                        authentication schemes without hardware changes.
+CEK, and passes the MAC to the driver, which gener-
+ates CH PTE commands to remove entries from the page                                                                                                                             Secure kernel launch. cudaSecureKernelLaunch
+table. The MAC serves as an authorization to remove                                                                                                                              uses secure memory copy to transfer the kernel’s code
+entries from the page table (Invariant 5.2). In the case                                                                                                                         and constant memory to the GPU, and then issues a com-
+where an object spans multiple page tables, the runtime                                                                                                                          mand group to launch the kernel.
+generates one MAC per page table.                                                                                                                                                   Recent GPUs have introduced preemption at in-
+   An implication of the redefined interface between the                                                                                                                         struction and/or thread-block boundaries. Extending
+driver and the hardware is the inability of the driver to                                                                                                                        our design to support preemption at the boundary of
+compact pages allocated to secure channels. Conven-                                                                                                                              thread blocks is relatively straightforward because thread
+tionally, the driver is responsible for compacting live                                                                                                                          blocks are independent units of computation [42] and all
+objects and reducing fragmentation in the physical ad-                                                                                                                           ephemeral state, such as registers, application-managed
+dress space. However, Graviton prohibits the driver from                                                                                                                         memory, caches and TLBs can be flushed on preemp-
+accessing these objects. This can cause fragmentation                                                                                                                            tion. Instruction-level preemption can also be supported
+in the protected region. We leave hardware support for                                                                                                                           by saving and restoring ephemeral state to and from a
+compaction for future work.                                                                                                                                                      part of hidden memory reserved for each channel.
+
+Secure memory copy. The Graviton runtime supports                                                                                                                                Secure streams. CUDA streams is a primitive used
+the primitive cudaSecureMemcpy for securely copying                                                                                                                              to overlap host and GPU computation, and I/O trans-
+code and data from the host TEE to device memory and                                                                                                                             fers.    Each stream is assigned a separate chan-
+vice versa. The protocol (Figure 7) works as follows.                                                                                                                            nel, with each channel sharing the same address
+  1. After a secure context is created, the runtime al-                                                                                                                          space, to enable concurrent and asynchronous submis-
+     locates device memory using cudaSecureMalloc                                                                                                                                sion of independent tasks. Our design supports se-
+     and copies a kernel that performs authenticated de-                                                                                                                         cure streams (cudaSecureStreamCreate) by allowing
+     cryption (in clear text) into allocated memory, re-                                                                                                                         channels within the same context to share page tables
+     ferred to as AuthDec. To ensure that the kernel                                                                                                                             and pages. In particular, the runtime can remap a mem-
+     was copied correctly without tampering, the run-                                                                                                                            ory object to the stream’s address space. Much like
+     time measures the region in device memory that                                                                                                                              allocation requests, the driver uses CH PTE command
+     contains the kernel (using CH MEASURE), and checks                                                                                                                          to update page tables. The runtime verifies that the
+     the the returned digest matches the digest of the ker-                                                                                                                      HASH(p 1, ..., p n) generated by the CH PTE command
+     nel computed inside the host TEE.                                                                                                                                           matches with the hash of the requested memory object.
+
+
+
+690                  13th USENIX Symposium on Operating Systems Design and Implementation                                                                                                                            USENIX Association
+7     Evaluation                                            u32 * ring_buf ; /* ring buffer for context */
+                                                            void push_ring ( val ) {
+7.1   Implementation                                          * ring_buf = val ;
+                                                              ring_buf ++;
+We implemented Graviton using an open-source GPU            }
+stack consisting of ocelot, an implementation of the
+                                                            void push_ring_emu ( u32 value ) {
+CUDA runtime API [14], gdev, which implements the
+                                                              push_ring ( REF_CNT ) ;
+CUDA driver API [21], and libdrm and nouveau, which           push_ring ( value ) ;
+implement the user- and kernel-space GPU device driver        push_ring ( SERIALIZE ) ;
+[29]. Due to gdev’s limitations (e.g., inability to use       push_ring ( i n t e r r u p t _ b u f f e r _ a d d r >> 32) ;
+                                                              push_ring ( i n t e r r u p t _ b u f f e r _ a d d r ) ;
+textures), we could not use some operations in cuBLAS         push_ring ( NOTIFY ) ;
+(NVIDIA’s linear algebra library) such as matrix-matrix       push_ring ( NOP ) ;
+(GEMM) and matrix-vector multiply (GEMV). Instead,          }
+we used implementations from Magma, an open-source
+                                                            void cmd_emu ( u32 cmd , u32 param [] , u32 size )
+implementation of cuBLAS with competitive perfor-                 {
+mance [43]. Our implementation does not yet use               ...
+SGX for hosting the user application and GPU run-             push_ring_emu ( cmd ) ;
+time—porting the stack to SGX can be achieved using           for ( int i =0; i < size ; i ++)
+                                                                push_ring_emu ( param [ i ]) ;
+SGX-specific containers [5, 39, 44], and is outside the       ...
+scope of this work.                                         }
+
+Command-based API emulation. Since command                  u32 chcreate ( ctx_t * ctx , void * chan_base ,
+                                                                void * pgd , u8 * pub_key ) {
+processors in modern GPUs are not programmable, we            ...
+emulate the proposed commands in software. Our em-            cmd_emu ( CMD_CHCREATE , param , 6) ;
+ulator consists of (a) a runtime component which trans-       ...
+lates each new command and its parameters into a se-        }
+quence of existing commands that triggers interrupts dur-   void i n t e r r u p t _ h a n d l e r ( device_t * dev ) {
+ing execution, and (b) a kernel component, which han-         ...
+dles interrupts, reconstructs the original command in the     u32 val = mmio_rd32 ( dev ) ;
+                                                              if ( val != 0 || dev - > cmd != 0) {
+interrupt handler, and implements the command’s se-
+                                                                if ( dev - > cmd == 0)
+mantics. The emulator uses the following commands:                 dev - > cmd = val ;
+REFCNT sets the value of a 32-bit register in the channel       else {
+control area which is readable from the host, SERIALIZE            dev - > param [ dev - > size ++] = val ;
+                                                                   switch ( dev - > cmd ) {
+waits until previous commands are executed, NOP and                      ...
+NOTIFY triggers an interrupt when a subsequent NOP                       case CMD_CHCREATE : {
+command completes.                                                           if ( dev - > size == 6) {
+   Figure 8 shows the pseudo-code of the emulator along                          chcreate_emu ( dev ) ;
+                                                                                 dev - > size = 0;
+with an example for the CH CREATE command. When                                  dev - > cmd = 0;
+a command is submitted, the runtime invokes the func-                        }
+tion cmd emu, which translates each 32-bit value v in                    } break ;
+the command’s original bit stream into the following se-      ...
+                                                            }
+quence of commands: REFCNT with v as the parameter,
+SERIALIZE, NOTIFY, and NOP. This sequence is pushed              Figure 8: Pseudo code for command emulation.
+into the ring buffer (using push ring emu), from where it
+is read by the command processor. When the command          to run the software stack as if we had hardware support.
+processor executes this sequence, it raises an interrupt,   Furthermore, it gives us a conservative approximation of
+and an interrupt handler (interrupt handler) is called on   performance because every command processor access
+the host. The handler implements a state machine that       to the PMM and memory mapping data structures in de-
+reads the register in the channel control area and recon-   vice memory translates into an access from the host to
+structs the original command one value at a time. After     device memory over PCIe.
+reconstructing the entire command, the emulator imple-
+ments its semantics (in this case using chcreate emu) us-   Command group authentication emulation. We also
+ing reads and writes to device memory over MMIO (not        emulate the command processor logic for authenticated
+shown in the figure).                                       decryption of command groups. Our emulator intercepts
+   We choose this emulation strategy because it allows us   encrypted command groups before they are copied to de-
+
+
+
+USENIX Association                13th USENIX Symposium on Operating Systems Design and Implementation                         691
+vice memory and decrypts them. As we show later, this
+                                                                                   Table 1: Command execution latency (µs)
+gives us a conservative approximation of performance
+since we decrypt command groups in software (aided by                   Command             Base         Inv.    Init   Crypto   Intr
+AES-NI) instead of a hardware encryption engine.                        CH CREATE               2        13     2246       11     58
+   To estimate performance that can be achieved using                   CH DESTROY              1     10592      N/A       23     68
+a hardware encryption engine, we added a mode in our                    CH PDE (S)              1       104     3783      N/A     62
+emulator which encrypts command groups on the host,                     CH PDE (B)              1        62       57      N/A     63
+but sends command groups in cleartext to the device,                    CH PTE (S-8)            8        14      N/A       21     82
+                                                                        CH PTE (B-8)            8       297      N/A       21     78
+and adds a delay equal to the latency of decrypting the
+command group using a hardware engine. We compute
+the latency of decryption using the published latency of                256
+                                                                                       AES256/ParallelHash256
+decrypting a block in hardware [40] and the size of the                       64       AES256/Marsupilami14
+
+
+
+
+                                                             Latency (msec)
+command group (in blocks).                                                             AES128/Kangaroo12
+                                                                              16
+Secure memory copy. Our implementation of secure
+                                                                              4
+memory copy combines AES and SHA-3 for authen-
+ticated encryption. We choose SHA-3 as its parallel                           1
+tree-based hashing scheme is a good fit for GPUs. It
+                                                                     0.25
+also provides means for configuration (e.g., the num-
+ber of rounds) allowing developers to explore different                                          Transfer size (KB)
+performance-security trade-offs [6, 7].
+7.2   Performance Overheads
+                                                              Figure 9: Secure memory copy performance for various
+Testbed setup. For our evaluation, we used an Intel           sizes and configurations.
+Xeon E5-1620-v3 server with 8 cores operating at 3.5
+GHz, and two different NVIDIA GPUs: GTX 780 with
+2304 CUDA cores operating at 863 MHz and GTX Ti-              a higher latency because the command needs to reset a
+tan Black with 2880 CUDA cores operating at 889 MHz.          larger number of entries. Finally, we measure the la-
+The general performance trends were similar with both         tency of CH PTE for allocating an object spanning eight
+GPUs. Therefore, we present results only for Titan            entries of a small page table or a big page table. Here,
+Black. The host CPU runs Linux kernel 4.11 and uses           the latency is higher for big page tables because a larger
+CUDA toolkit v5.0 for GPU kernel compilation.                 number of invariant checks using the PMM, which tracks
+                                                              ownership at small page granularity.
+Command-based API. First, we quantify the over-
+head of using the command-based API using a matrix-           Secure memory copy. Figure 9 plots the latency of se-
+matrix addition microbenchmark. Table 1 shows a break-        cure copy for three AES/SHA3 variants and transfer sizes.
+down of latency of command execution into five com-           The variants ParallelHash256 and Marsupilami14
+ponents: Base, which is the cumulative latency of all         provide 256-bit hashing strength while Kangaroo12 pro-
+MMIO operations performed during command execu-               vides 128-bit hashing strength. We find that latency re-
+tion without any security extensions; Inv. which is the       mains flat for small transfer sizes and scales almost lin-
+additional latency of invariant checks including PMM          early for larger transfer sizes. Unless stated otherwise,
+maintenance; Init which is the latency for initialization     we utilize the AES256/Marsupilami14 configuration
+of page directory and page tables; Crypto which in-           for the rest of the evaluation.
+cludes all required cryptographic operations; and inter-         Table 2 shows a breakdown of the latency for
+rupt handling, labeled as Intr. Note that the measured la-    AES256/Marsupilami14 configuration. Base refers to
+tency is obtained based on emulation, and therefore over-     the latency of normal (insecure) copy, and the other four
+estimates the latency that can be achieved with dedicated     components refer to the latency of executing AES and
+hardware support.                                             SHA-3 on the CPU and GPU. We find that as the trans-
+   We find that the latency of CH CREATE is dominated         fer size increases, SHA3-CPU and AES-GPU account for
+by the cost of initializing the page directory, and that      a majority of the overheads (over 75% of the latency
+of CH DESTROY is dominated by the cost of walking the         for 64MB transfers). For small data sizes, the AES-GPU
+page directory to remove pages of locked page tables          phase, which is compute bound, under-utilizes the GPU
+from PMM. For CH PDE, we measure the latency for al-          cores and hence the execution time remains flat. In con-
+locating a page directory entry for a small and big page      trast, the SHA3-GPU kernel scales better due to lower al-
+tables. Allocating an entry for a small page table incurs     gorithmic complexity. More generally, we attribute both
+
+
+
+692   13th USENIX Symposium on Operating Systems Design and Implementation                                        USENIX Association
+                                                                                               Baseline      Isolation      Secure Copy
+                                                                          8
+Table 2:  Secure memory copy breakdown for
+AES256/Marsupilami14. Latency is reported in ms.
+                                                                          6
+
+
+
+
+                                                             Time (sec)
+ Size          4KB     64KB   256KB       4MB      64MB                   4
+ Base          0.02    0.03     0.08      1.07     11.05
+ AES-CPU       0.01    0.05     0.10      1.46     25.45                  2
+ SHA3-CPU      0.02    0.11     0.34      3.19     51.79
+ SHA3-GPU      0.12    0.13     0.12      0.31      0.58                  0
+                                                                              w/o HW          w/ HW       w/o HW         w/ HW    w/o HW    w/ HW
+ AES-GPU       0.31    0.38     0.79      6.54     87.98
+                                                                                       Init                    Testing                Training
+ Total         0.46    0.70     1.43    12.57     176.87
+
+                                                             Figure 10: Cifar-10 performance. For training, time is
+          Table 3: CUDA driver API latency (ms)              reported for 25 batches averaged across all epochs. HW
+      API                      Normal         Secure         refers to a hypothetical hardware encryption engine used
+      cuCtxCreate              77.65        252.63           for command group authenticated decryption.
+      cuCtxDestroy             17.00         29.43
+      cuModuleLoad              1.72         85.27
+      cuMemAlloc (S|B)     0.02|0.03     0.19|0.43           training and inference of artificial neural networks [18],
+      cuMemFree (S|B)      0.03|0.05     0.28|0.66           and BlackScholes, an option pricing application [8].
+
+                                                             Cifar-10. We use Caffe to train a convolutional neural
+                                                             network on the Cifar-10 dataset, which consists of 60000
+these costs to the lack of ISA support for SHA-3 on the      32x32 images spanning 10 classes. The network con-
+CPU and for AES on the GPU.                                  sists of 11 layers: 3 layers of convolution, pooling, recti-
+                                                             fied linear unit non-linearities (RELU) followed by local
+CUDA driver API. Our implementation of secure ex-            contrast normalization and a linear classifier. We run 40
+tensions to the CUDA runtime API are based on exten-         epochs (each epoch is a sweep over 50000 images) with
+sions to the CUDA driver API. Table 3 shows the im-          a batch size of 200 and test the model at the end of ev-
+pact of adding security on latency of these APIs. As ex-     ery epoch using 10000 images with a batch size of 400.
+pected, all driver APIs incur higher latencies. The rela-    Both the baseline system and Graviton achieve the same
+tively high latency of secure version of context creation    training accuracy.
+cuCtxCreate is dominated by the latency of creating             Figure 10 shows Graviton’s impact on execution time
+an RSA key (75% of latency). The secure version of           for three phases of execution—i.e. initialization, test-
+module load cuModuleLoad is more expensive because           ing (which is similar to inference), and training. For
+it (a) bootstraps secure copy, which measures the au-        training, execution time is reported for 25 batches aver-
+thenticated encryption kernels and (b) uses secure copy      aged across all epochs. We also breakdown the overhead
+to transfer the application kernels to device memory.        into two buckets, isolation (i.e., using the secure CUDA
+These APIs are typically used infrequently, and there-       driver API and command group authentication) and se-
+fore these latencies do not have a large impact on overall   cure memory copy. In the emulated environment, our
+execution time in most applications. On the other hand,      security extensions cause a slowdown of 73%, 57% and
+cuMemAlloc and cuMemFree can be on the critical path         53% respectively in each of these phases.
+for applications that use a large number of short-lived         The overheads during initialization are due to secure
+objects. The increased latency of these operations is pre-   context and module creation (22% of the overhead), se-
+dominantly due to emulation (interrupts and MMIO ac-         cure copy of the model and data used for the initial
+cesses). We expect an actual implementation of these op-     test (31%), and command authentication during an ini-
+erations on real Graviton hardware to incur much lower       tial testing phase (47%).
+overheads with no involved interrupts and reduced mem-          A breakdown of testing and training overheads shows
+ory access latency.                                          that that command group authentication accounts for
+                                                             66% and 77% of the overhead, respectively. This is be-
+7.3     Applications                                         cause this workload executes a large number of relatively
+Finally, we quantify the impact of using secure CUDA         short kernels (one for each batch and layer). We pro-
+APIs on end-to-end application performance using a set       filed the time spent on kernel launches, and find that a
+of GPU benchmarks. We use two benchmarks with dif-           large fraction of the overhead is due to the cost of em-
+ferent characteristics, namely Caffe, a framework for        ulating authenticated decryption of commands. In par-
+
+
+
+USENIX Association                 13th USENIX Symposium on Operating Systems Design and Implementation                                          693
+                                  Baseline   Isolation   Secure Copy
+                     150%                                                         Trusted execution on GPUs. A number of researchers
+                                                                                  have identified the need for mechanisms that allow an ap-
+System performance
+
+                     125%
+                                                                                  plication hosted in a TEE to securely communicate with
+                     100%
+                                                                                  I/O devices over a trusted path. Yu et al. [51] propose an
+                     75%                                                          approach for using the trusted path approach for GPUs.
+                     50%                                                          Their approach relies on a privileged host component to
+                     25%
+                                                                                  enforce isolation between virtual machines and display,
+                                                                                  whereas our attacker model precludes trust in any host
+                      0%
+                              Cifar10              MNIST           BlackScholes   component.
+                                                                                     PixelVault proposed an architecture for securely of-
+Figure 11: System performance for various benchmarks.                             floading cryptographic operations to a GPU [46]. Sub-
+                                                                                  sequent work has demonstrated that such design suffers
+                                                                                  from security vulnerabilities due to lack of page initial-
+ticular, each secure kernel launch incurs a 9.2µs latency,
+                                                                                  ization upon allocations and module creation, lack of
+with 0.8µs on encryption in the runtime, and 3.0µs on
+                                                                                  kernel-level isolation, and information leakage of reg-
+decryption in the emulator.
+                                                                                  isters by either attaching a debugger to a running ker-
+   The figure also shows the estimated overhead assum-
+                                                                                  nel (and the GPU runtime) or invoking a kernel on
+ing we extend the command processor with a hardware
+                                                                                  the same channel [23, 52]. In contrast, Graviton en-
+encryption engine. The overhead reduces from 35-41%
+                                                                                  ables a general-purpose trusted execution environment
+to 5-7% for testing and training phases due to a reduc-
+                                                                                  on GPUs. Information leakage via kernel debugging is
+tion in time spent on authenticated decryption from 3µs
+                                                                                  prevented as the user hosts its GPU runtime inside a
+to around 30ns. Adding a hardware encryption engine
+                                                                                  CPU TEE, guaranteeing that debugging cannot be en-
+reduces the overall overhead to 17% (Figure 11).
+                                                                                  abled during execution.
+MNIST. We use Caffe to train an autoencoder on the
+MNIST dataset, which consists of 60000 28x28 hand-
+written digits. The network consists of six encoding lay-                         9   Conclusion
+ers and six decoding layers. We run 10000 batches (with
+a batch size of 128) and test the model every 500 batches                         Unlike recent CPUs, GPUs provide no support for
+using 8192 images with a batch size of 256. Both base-                            trusted execution environments (TEE), creating a trade-
+line and Graviton achieve same accuracy.                                          off between security and performance. In this paper,
+   As shown in Figure 11, Graviton introduces 33% per-                            we introduce Graviton, an architecture for supporting
+formance overhead. The overhead is higher than in Cifar-                          TEEs on GPUs. Our proof-of-concept on NVIDIA GPUs
+10 as the complexity of encoding and decoding layers is                           shows that hardware complexity and performance over-
+lower than convolutional layers, and hence each iteration                         heads of the proposed architecture are low.
+spends higher fraction time on secure memory copy.                                   An interesting avenue for future work is to extend
+                                                                                  Graviton to secure kernel execution and communication
+BlackScholes. We run BlackScholes with 10 batches                                 across multiple GPUs and to investigate support for ad-
+of four million options and 2500 iterations each. As                              vanced features, such as on-demand paging and dynamic
+shown in Figure 11, the overall overhead is 26%. Un-                              thread creation. In addition, we would like to investigate
+like Cifar-10, command authentication is not a factor in                          whether it is possible to remove the dependency on CPU
+BlackScholes as it executes one long-running kernel per                           TEEs, such as Intel SGX, and if so to quantify the impli-
+batch; thus, the overhead for enforcing isolation is at-                          cations on system performance. Finally, we would like
+tributed mainly to secure context and module creation.                            to validate whether the proposed architecture extends to
+                                                                                  other accelerators, such as FPGAs.
+8                     Related Work
+Trusted hardware. There is a history of work [9, 13,                              Acknowledgements
+15, 17, 24, 27, 32, 41, 48] on trusted hardware that iso-
+lates code and data from the rest of the system. Intel                            We would like to thank our shepherd, Andrew Warfield,
+SGX [28] is the latest in this line of work, but stands                           and the anonymous reviewers for their insightful com-
+out because it provides comprehensive protection and is                           ments and feedback on our work. Istvan Haller provided
+already available in client CPUs and public cloud plat-                           input during the early stages of this work. We thank
+forms. Graviton effectively extends the trust boundary                            Dushyanth Narayanan and Jay Lorch for comments on
+of TEEs on the CPU to rich devices, such as GPUs.                                 earlier drafts of the work.
+
+
+
+694                     13th USENIX Symposium on Operating Systems Design and Implementation                          USENIX Association
+References                                                        [16] N. Hardavellas, M. Ferdman, B. Falsafi, and A. Ailamaki.
+                                                                       Toward dark silicon in servers. IEEE Micro, 31:6–15,
+ [1] Security on ARM Trustzone. https://www.arm.com/                   2011.
+     products/security-on-arm/trustzone.                          [17] O. S. Hofmann, S. M. Kim, A. M. Dunn, M. Z. Lee, and
+ [2] J. T. Adriaens, K. Compton, N. S. Kim, and M. J. Schulte.         E. Witchel. InkTag: Secure applications on an untrusted
+     The case for GPGPU spatial multitasking. In Interan-              operating system. In International Conference on Archi-
+     tional Symposium on High Performance Computer Archi-              tectural Support for Programming Languages and Oper-
+     tecture, 2012.                                                    ating Systems, 2013.
+ [3] S. Alhelaly, J. Dworak, T. Manikas, P. Gui, K. Nepal, and    [18] Y. Jia, E. Shelhamer, J. Donahue, S. Karayev, J. Long,
+     A. L. Crouch. Detecting a trojan die in 3D stacked inte-          R. Girshick, S. Guadarrama, and T. Darrell. Caffe: Con-
+     grated circuits. In 2017 IEEE North Atlantic Test Work-           volutional architecture for fast feature embedding. In In-
+     shop, 2017.                                                       ternational Conference on Multimedia, 2014.
+ [4] AMD. AMD Radeon RX 300 series. https://en.                   [19] Z. Jia, M. Maggioni, B. Staiger, and D. P. Scarpazza.
+     wikipedia.org/wiki/AMD_Radeon_Rx_300_series.                      Dissecting the NVIDIA Volta GPU architecture via mi-
+                                                                       crobenchmarking. CoRR, abs/1804.06826, 2018.
+ [5] S. Arnautov, B. Trach, F. Gregor, T. Knauth, A. Mar-
+     tin, C. Priebe, J. Lind, D. Muthukumaran, D. O’Keeffe,       [20] N. P. Jouppi, C. Young, N. Patil, D. Patterson,
+     M. Stillwell, D. Goltzsche, D. M. Eyer, R. Kapitza, P. R.         G. Agrawal, R. Bajwa, S. Bates, S. Bhatia, N. Boden,
+     Pietzuch, and C. Fetzer. SCONE: Secure Linux contain-             A. Borchers, R. Boyle, P.-l. Cantin, C. Chao, C. Clark,
+     ers with Intel SGX. In USENIX Symposium on Operating              J. Coriell, M. Daley, M. Dau, J. Dean, B. Gelb, T. V.
+     Systems Design and Implementation, 2016.                          Ghaemmaghami, R. Gottipati, W. Gulland, R. Hagmann,
+                                                                       C. R. Ho, D. Hogberg, J. Hu, R. Hundt, D. Hurt,
+ [6] G. Bertoni, J. Daemen1, M. Peeters, G. V. Assche1, and
+                                                                       J. Ibarz, A. Jaffey, A. Jaworski, A. Kaplan, H. Khaitan,
+     R. V. Keer. Keccak and the SHA-3 standardization.
+                                                                       D. Killebrew, A. Koch, N. Kumar, S. Lacy, J. Laudon,
+     https://keccak.team/index.html.
+                                                                       J. Law, D. Le, C. Leary, Z. Liu, K. Lucke, A. Lundin,
+ [7] G. Bertoni, J. Daemen1, M. Peeters, G. V. Assche1, R. V.          G. MacKean, A. Maggiore, M. Mahony, K. Miller, R. Na-
+     Keer, and B. Viguier. KangarooTwelve: Fast hashing                garajan, R. Narayanaswami, R. Ni, K. Nix, T. Norrie,
+     based on Keccak-p . In Cryptology ePrint Archive: Re-             M. Omernick, N. Penukonda, A. Phelps, J. Ross, M. Ross,
+     port 2016/770.                                                    A. Salek, E. Samadiani, C. Severn, G. Sizikov, M. Snel-
+ [8] F. Black and M. Scholes. The pricing of options and cor-          ham, J. Souter, D. Steinberg, A. Swing, M. Tan, G. Thor-
+     porate liabilities. Journal of Political Economy, 81:637–         son, B. Tian, H. Toma, E. Tuttle, V. Vasudevan, R. Wal-
+     654, 1973.                                                        ter, W. Wang, E. Wilcox, and D. H. Yoon. In-datacenter
+                                                                       performance analysis of a tensor processing unit. In In-
+ [9] R. Boivie. SecureBlue++: CPU support for secure execu-
+                                                                       ternational Symposium on Computer Architecture, 2017.
+     tion. In IBM Research Report RC25287, 2012.
+                                                                  [21] S. Kato, M. McThrow, C. Maltzahn, and S. Brandt. Gdev:
+[10] F. Brasser, U. Müller, A. Dmitrienko, K. Kostiainen,
+                                                                       First-class GPU resource management in the operating
+     S. Capkun, and A. Sadeghi. Software Grand Exposure:
+                                                                       system. In USENIX Conference on Annual Technical
+     SGX cache attacks are practical. CoRR, abs/1702.07521,
+                                                                       Conference, 2012.
+     2017.
+                                                                  [22] P. Kocher, D. Genkin, D. Gruss, W. Haas, M. Ham-
+[11] I. Buck. NVIDIAs next-gen Pascal GPU architecture to              burg, M. Lipp, S. Mangard, T. Prescher, M. Schwarz, and
+     provide 10X speedup for deep learning apps. https://              Y. Yarom. Spectre attacks: Exploiting speculative execu-
+     blogs.nvidia.com/blog/2015/03/17/pascal.                          tion. arXiv preprint arXiv:1801.01203, 2018.
+[12] S. Chen, X. Zhang, M. K. Reiter, and Y. Zhang. Detect-       [23] S. Lee, Y. Kim, J. Kim, and J. Kim. Stealing webpages
+     ing privileged side-channel attacks in shielded execution         rendered on your browser by exploiting GPU vulnerabil-
+     with DéJà Vu. In ACM Asia Conference on Computer and            ities. In IEEE Symposium on Security and Privacy, 2014.
+     Communications Security, 2017.
+                                                                  [24] D. Lie, C. A. Thekkath, M. Mitchell, P. Lincoln,
+[13] V. Costan, I. A. Lebedev, and S. Devadas. Sanctum: Min-           D. Boneh, J. C. Mitchell, and M. Horowitz. Architectural
+     imal hardware extensions for strong software isolation. In        support for copy and tamper resistant software. In In-
+     USENIX Security Symposium, 2016.                                  ternational Conference on Architectural Support for Pro-
+[14] G. F. Diamos, A. R. Kerr, S. Yalamanchili, and N. Clark.          gramming Languages and Operating Systems, 2000.
+     Ocelot: A dynamic optimization framework for bulk-           [25] B. Madden.               NVIDIA, AMD, and In-
+     synchronous applications in heterogeneous systems. In             tel:      How they do their GPU virtualization.
+     International Conference on Parallel Architectures and            http://www.brianmadden.com/opinion/
+     Compilation Techniques, 2010.                                     NVIDIA-AMD-and-Intel-How-they-do-their-GPU-
+[15] D. Evtyushkin, J. Elwell, M. Ozsoy, D. V. Ponomarev,              virtualization.
+     N. B. Abu-Ghazaleh, and R. Riley. Iso-X: A flexible ar-      [26] C. Maurice, C. Neumann, and A. Heen, Olivier andFran-
+     chitecture for hardware-managed isolated execution. In            cillon. Confidentiality issues on a GPU in a virtualized
+     International Symposium on Microarchitecture, 2014.               environment. In Financial Cryptography, 2014.
+
+
+
+USENIX Association                    13th USENIX Symposium on Operating Systems Design and Implementation                  695
+[27] J. M. McCune, N. Qu, Y. Li, A. Datta, V. D. Gligor, and
+                                                                  [40] Synopsys.   DesignWare pipelined AES-GCM/CTR
+     A. Perrig. Efficient TCB reduction and attestation. In
+                                                                       core. https://www.synopsys.com/dw/ipdir.php?
+     IEEE Symposium on Security and Privacy, 2009.
+                                                                       ds=security-aes-gcm-ctr.
+[28] F. McKeen, I. Alexandrovich, A. Berenzon, C. V. Rozas,
+     H. Shafi, V. Shanbhogue, and U. R. Savagaonkar. Inno-        [41] R. Ta-Min, L. Litty, and D. Lie. Splitting Interfaces: Mak-
+     vative instructions and software model for isolated execu-        ing trust between applications and operating systems con-
+     tion. In International Workshop on Hardware and Archi-            figurable. In USENIX Symposium on Operating Systems
+     tectural Support for Security and Privacy, 2013.                  Design and Implementation, 2006.
+[29] Nouveau. Accelerated open source driver for NVIDIA           [42] I. Tanasic, I. Gelado, J. Cabezas, A. Ramirez, N. Navarro,
+     cards. https://nouveau.freedesktop.org/wiki.                      and M. Valero. Enabling preemptive multiprogramming
+[30] NVIDIA.    CUDA multi process service overview.                   on GPUs. In International Symposium on Computer Ar-
+     https://docs.nvidia.com/deploy/pdf/CUDA_                          chitecture, 2014.
+     Multi_Process_Service_Overview.pdf.
+                                                                  [43] S. Tomov, J. Dongarra, I. Yamazaki, A. Haidar, M. Gates,
+[31] NVIDIA.    Cuda streams.  http://on-demand.                       S. Donfack, P. Luszczek, A. Yarkhan, J. Kurzak,
+     gputechconf.com/gtc/2014/presentations/                           H. Anzt, and T. Dong. MAGMA: Development of high-
+     S4158-cuda-streams-best-practices-common-                         performance linear algebra for GPUs. In GPU Technol-
+     pitfalls.pdf.                                                     ogy Conference, 2014.
+[32] E. Owusu, J. Guajardo, J. M. McCune, J. Newsome,
+     A. Perrig, and A. Vasudevan. OASIS: On achieving             [44] C.-C. Tsai, D. E. Porter, and M. Vij. Graphene-SGX: A
+     a sanctuary for integrity and secrecy on untrusted plat-          practical library os for unmodified applications on SGX.
+     forms. In ACM Conference on Computer and Communi-                 In USENIX Annual Technical Conference, 2017.
+     cations Security, 2013.                                      [45] J. Van Bulck, M. Minkin, O. Weisse, D. Genkin,
+[33] J. J. K. Park, Y. Park, and S. Mahkle. Chimera: Col-              B. Kasikci, F. Piessens, M. Silberstein, T. F. Wenisch,
+     laborative preemption for multitasking on a shared GPU.           Y. Yarom, and R. Strackx. Foreshadow: Extracting the
+     In International Conference on Architectural Support for          keys to the Intel SGX kingdom with transient out-of-order
+     Programming Languages and Operating Systems, 2015.                execution. In USENIX Security Symposium, 2018.
+[34] J. J. K. Park, Y. Park, and S. Mahkle. Dynamic resource
+                                                                  [46] G. Vasiliadis, E. Athanasopoulos, M. Polychronakis, and
+     management for efcient utilization of multitasking GPUs.
+                                                                       S. Ioannidis. PixelVault: Using GPUs for securing cryp-
+     In International Conference on Architectural Support for
+                                                                       tographic operations. In ACM Conference on Computer
+     Programming Languages and Operating Systems, 2017.
+                                                                       and Communications Security, 2014.
+[35] B. Pichai, L. Hsu, and A. Bhattacharjee. Architec-
+     tural support for address translation on GPUs: Designing     [47] Z. Wang, J. Yang, R. Melhem, B. Childers, Y. Zhang, and
+     memory management units for CPU/GPUs with unified                 M. Guo. Simultaneous multikernel GPU: Multi-tasking
+     address spaces. In International Conference on Architec-          throughput processors via fine-grained sharing. In Inter-
+     tural Support for Programming Languages and Operat-               national Conference on High-Performance Computer Ar-
+     ing Systems, 2014.                                                chitecture, 2016.
+[36] R. D. Pietro, F. Lombardi, and A. Villani. CUDA Leaks:       [48] S. Weiser and M. Werner. SGXIO: Generic trusted I/O
+     A detailed hack for CUDA and a (partial) fix. ACM Trans-          path for Intel SGX. In ACM Conference on Data and
+     actions on Embedded Computing Systems, 15(1), 2016.               Application Security and Privacy, 2017.
+[37] A. Putnam, A. M. Caulfield, E. S. Chung, D. Chiou,
+                                                                  [49] E.   Worthman.       Designing   for              security.
+     K. Constantinides, J. Demme, H. Esmaeilzadeh, J. Fow-
+                                                                       https://www.semiengineering.com/
+     ers, G. P. Gopal, J. Gray, M. Haselman, S. Hauck, S. Heil,
+                                                                       designing-for-security-2.
+     A. Hormati, J.-Y. Kim, S. Lanka, J. Larus, E. Peterson,
+     S. Pope, A. Smith, J. Thong, P. Y. Xiao, and D. Burger.      [50] Y. Xu, W. Cui, and M. Peinado. Controlled-Channel At-
+     A reconfigurable fabric for accelerating large-scale data-        tacks: Deterministic side channels for untrusted operating
+     center services. In International Symposium on Computer           systems. In IEEE Symposium on Security and Privacy,
+     Architecuture, 2014.                                              2015.
+[38] S. Shinde, Z. L. Chua, V. Narayanan, and P. Saxena. Pre-
+     venting page faults from telling your secrets. In ACM Asia   [51] M. Yu, V. D. Gligor, and Z. Zhou. Trusted display on
+     Conference on Computer and Communications Security,               untrusted commodity platforms. In ACM Conference on
+     2016.                                                             Computer and Communications Security, 2015.
+
+[39] S. Shinde, D. L. Tien, S. Tople, and P. Saxena. Panoply:     [52] Z. Zhu, S. Kim, Y. Rozhanski, Y. Hu, E. Witchel, and
+     Low-TCB Linux applications with SGX enclaves. In Net-             M. Silberstein. Understanding the security of discrete
+     work and Distributed System Security Symposium, 2017.             GPUs. In Workshop on General Purpose GPUs, 2017.
+
+
+
+
+696    13th USENIX Symposium on Operating Systems Design and Implementation                               USENIX Association
+

@@ -1,0 +1,1627 @@
+XRP: In-Kernel Storage Functions with eBPF
+    Yuhong Zhong, Haoyu Li, Yu Jian Wu, Ioannis Zarkadas, Jeffrey Tao,
+ Evan Mesterhazy, Michael Makris, and Junfeng Yang, Columbia University;
+           Amy Tai, Google; Ryan Stutsman, University of Utah;
+                     Asaf Cidon, Columbia University
+          https://www.usenix.org/conference/osdi22/presentation/zhong
+
+
+
+
+      This paper is included in the Proceedings of the
+      16th USENIX Symposium on Operating Systems
+               Design and Implementation.
+                   July 11–13, 2022 • Carlsbad, CA, USA
+                               978-1-939133-28-1
+
+                                         Open access to the Proceedings of the
+                                         16th USENIX Symposium on Operating
+                                          Systems Design and Implementation
+                                                   is sponsored by
+                             XRP: In-Kernel Storage Functions with eBPF
+
+       Yuhong Zhong1 , Haoyu Li1 , Yu Jian Wu1 , Ioannis Zarkadas1 , Jeffrey Tao1 , Evan Mesterhazy1 ,
+             Michael Makris1 , Junfeng Yang1 , Amy Tai2 , Ryan Stutsman3 , and Asaf Cidon1
+                                 1 Columbia University, 2 Google, 3 University of Utah
+
+
+
+
+                         Abstract                                     In contrast to these approaches, we seek a readily-
+   With the emergence of microsecond-scale NVMe storage            deployable mechanism that can provide fast access to emerg-
+devices, the Linux kernel storage stack overhead has become        ing fast storage devices that requires no specialized hardware
+significant, almost doubling access times. We present XRP,         and no significant changes to the application while working
+a framework that allows applications to execute user-defined       with existing kernels and file systems. To this end, we rely on
+storage functions, such as index lookups or aggregations, from     BPF (Berkeley Packet Filter [67, 68]) which lets applications
+an eBPF hook in the NVMe driver, safely bypassing most             offload simple functions to the Linux kernel [8]. Similar to
+of the kernel’s storage stack. To preserve file system seman-      kernel bypass, by embedding application-logic deep in the
+tics, XRP propagates a small amount of kernel state to its         kernel stack, BPF can eliminate overheads associated with
+NVMe driver hook where the user-registered eBPF functions          kernel-user crossings and the associated context switches. Un-
+are called. We show how two key-value stores, BPF-KV, a            like kernel bypass, BPF is an OS-supported mechanism that
+simple B+ -tree key-value store, and WiredTiger, a popular         ensures isolation, does not lead to low utilization due to busy-
+log-structured merge tree storage engine, can leverage XRP         waiting, and allows a large number of threads or processes to
+to significantly improve throughput and latency.                   share the same core, leading to better overall utilization.
+                                                                      The support of BPF in the Linux kernel makes it an attrac-
+1   Introduction                                                   tive interface for allowing applications to speed up storage
+With the rise of new high performance memory technologies,         I/O. However, using BPF to speed up storage introduces sev-
+such as 3D XPoint and low latency NAND, new NVMe stor-             eral unique challenges. Unlike existing packet filtering and
+age devices can now achieve up to 7 GB/s bandwidth and             tracing use cases, where each BPF function can operate in a
+latencies as low as 3 µs [11, 19, 24, 26]. At such high per-       self-contained manner on a particular packet or system trace
+formance, the kernel storage stack becomes a major source          — for example, network packet headers specify which flow
+of overhead impeding both application-observed latency and         they below to — a storage BPF function may need to syn-
+IOPS. For the latest 3D XPoint devices, the kernel’s storage       chronize with other concurrent application-level operations or
+stack doubles the I/O latency, and it incurs an even greater       require multiple function calls to traverse a large on-disk data
+overhead for throughput (§2.1). As storage devices become          structure, a workload pattern we call “resubmission” of I/Os
+even faster, the kernel’s relative overhead is poised to worsen.   (§2.3). Unfortunately the state required for resubmission such
+   Existing approaches to tackle this problem tend to be           as access-control information or metadata on how individual
+radical, requiring intrusive application-level changes or new      storage blocks fit in the larger data structure they belong to is
+hardware. Complete kernel bypass through libraries such as         not available at lower layers.
+SPDK [82] allows applications to directly access underlying           To tackle these challenges, we design and implement XRP
+devices, but such libraries also force applications to imple-      (eXpress Resubmission Path), a high-performance storage
+ment their own file systems, to forgo isolation and safety, and    data path using Linux eBPF. XRP is inspired by XDP, the
+to poll for I/O completion which wastes CPU cycles when I/O        recent efficient Linux eBPF networking hook [28]. In order
+utilization is low. Others have shown that applications using      to maximize its performance benefit, XRP uses a hook in
+SPDK suffer from high average and tail latencies and severely      the NVMe driver’s interrupt handler, thereby bypassing the
+reduced throughput when the schedulable thread count ex-           kernel’s block, file system and system call layers. This allows
+ceeds the number of available cores [54]; we confirm this in       XRP to trigger BPF functions directly from the NVMe driver
+§6, showing that in such cases applications indeed suffer a        as each I/O completes, enabling quick resubmission of I/Os
+3× throughput loss with SPDK.                                      that traverse other blocks on the storage device.
+
+
+
+USENIX Association                           16th USENIX Symposium on Operating Systems Design and Implementation              375
+                                                                       100
+   The key challenge in XRP is that the low-level NVMe                  75
+driver lacks the context that the higher levels provide. Those          50                                              hardware
+                                                                                                                        software
+                                                                        25
+layers contain information such as who owns a block (file                0
+system layer), how to interpret the block’s data, and how to                  HDD        NAND      NVM−1   NVM−2
+traverse the on-disk data structure (application layer).         Figure 1: Kernel’s latency overhead with 512 B random reads. HDD
+   Our insight is that many storage-optimized data structures    is Seagate Exos X16, NAND is Intel Optane 750 TLC NAND, NVM-
+that power real-world databases [10, 12, 20, 27, 44, 66, 70,     1 is first generation Intel Optane SSD (900P), and NVM-2 is second
+80] – such as on-disk B-trees, log-structured merge trees, and   generation Intel Optane SSD (P5800X).
+log segments – are typically implemented on a small set of
+large files, and they are updated orders of magnitude less                       kernel crossing      351 ns    5.6%
+                                                                                 read syscall         199 ns    3.2%
+frequently than they are read; we validate this in §3. Hence,                    ext4                2006 ns   32.0%
+we exclusively focus XRP on operations contained within                          bio                  379 ns    6.0%
+one file and on data structures that have a fixed layout on                      NVMe driver          113 ns    1.8%
+disk. Consequently, the NVMe driver only requires a minimal                      storage device      3224 ns   51.4%
+amount of the file system mapping state, which we term the                       total               6.27 µs   100.0%
+metadata digest; this information is small enough that it can
+be passed from the file system to the NVMe driver so it can      Table 1: Average latency breakdown of a 512 B random read()
+                                                                 syscall using Intel Optane P5800X.
+safely perform I/O resubmissions. This allows XRP to safely
+support some of the most popular on-disk data structures.
+   We present a design and implementation of XRP on Linux,       primer on BPF.
+with support for ext4, which can easily be extended to other     2.1    Software is Now the Storage Bottleneck
+file systems. XRP enables the NVMe interrupt handler to
+resubmit storage I/Os based on user-defined BPF functions.       New media like 3D Xpoint [1] and low-latency NAND [26],
+   We augment two key-value stores with XRP: BPF-KV, a           have led to new NVMe storage devices that exhibit single-
+B+ -tree based key-value store that is custom-designed for       digit µs latencies and millions of IOPS [11, 19, 24, 26]. The
+supporting BPF functions, and WiredTiger’s log-structured        kernel storage stack is becoming a major performance bot-
+merge tree, which is used as one of MongoDB’s storage en-        tleneck when accessing these devices. Figure 1 shows the
+gines [27]. With random 512 B object reads on BPF-KV             percentage of time spent in the Linux stack when issuing a
+with multiple threads using a B+ -tree that has three index      512 B random read I/O on different storage devices. While
+levels on disk, XRP has 47%–94% higher throughput and            the software overhead for the first generation of fast NVMe
+20%–34% lower p99 latency than read(). XRP also en-              devices (first generation Intel Optane or Z-NAND) was non-
+ables more efficient sharing of cores among applications than    negligible (~15%), with the latest generation of devices (Intel
+kernel bypass: it is able to provide 56% better p99 latency      Optane SSD P5800X) the software overhead accounts for
+than SPDK with two threads sharing the same core. In ad-         about half of the latency of each read request. The kernel’s
+dition, XRP is able to consistently improve WiredTiger’s         relative overhead will only get worse as storage devices be-
+performance by up to 24% under YCSB [41]. We open                come even faster.
+source XRP and our changes to BPF-KV and WiredTiger              Where is the time going? Table 1 shows the time spent in
+at https://github.com/xrp-project/XRP.                           the different storage layers when issuing a random 512 B read
+   We make the following contributions.                          with O_DIRECT on Optane P5800X. The experimental setup,
+                                                                 which is used throughout this section, is a server with 6-core
+1. New Datapath. XRP is the first datapath that enables the
+                                                                 i5-8500 3 GHz with 16 GB of memory, using Ubuntu 20.04,
+   use of BPF to offload storage functions to the kernel.
+                                                                 and Linux 5.8.0. We also disable processor C-states and turbo
+2. Performance. XRP improves the throughput of a B-tree          boost, use the maximum performance governor, and disable
+   lookup by up to 2.5× compared to normal system calls.         KPTI [30]. The experiment shows that the most expensive
+3. Utilization. XRP provides latencies that approach kernel      layer is the file system (ext4), followed by the block layer (bio)
+   bypass, but unlike kernel bypass, it allows cores to be       and the kernel crossing, and that the total software overhead
+   efficiently shared by the same threads and processes.         accounts for 48.6% of the average latency.
+4. Extensibility. XRP supports different storage use cases,      Why not just bypass the kernel? One approach to elimi-
+   including different data structures and storage operations    nate kernel overhead is to bypass it altogether [7, 65, 82, 83],
+   (e.g., index traversals, range queries, aggregations).        leaving just the cost to post a request to the NVMe driver and
+                                                                 the device’s latency. However, kernel bypass is no panacea:
+2     Background and Motivation
+                                                                 each user is entrusted with full access to the device; they must
+In this section we show why the Linux kernel is becoming         also construct their own user space file systems [73, 74]. This
+a primary bottleneck with fast NVMe devices and provide a        means that there is no mechanism to enforce fine-grained
+
+
+
+376    16th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+                                                                                                           Latency    Speedup    Throughput    Speedup
+                              Application
+                                                                                           User Space         78 µs        1×    109K IOPS          1×
+                                                                      Kernel Boundary      Syscall Layer      68 µs     1.15×    130K IOPS        1.2×
+                                                                                           NVMe Driver        40 µs     1.95×    276K IOPS        2.5×
+           Syscall Function (e.g., read() / io_uring_enter())         Syscall Layer
+
+                                                                                        Table 2: Average latency and throughput improvement with respect
+      File System - Submission         File System - Completion       File System
+                                                                                        to user space when resubmitting I/O from the given layer; for kernel
+                                                                                        layers, resubmission is executed with a BPF function. Results shown
+                                                                                        for lookups on an on-disk B-tree of depth 10 [85].
+                                        bio Layer - Completion        bio Layer
+       bio Layer - Submission
+                                           Interrupt Handler
+
+                                                                                        as in pointer-chasing workloads. For example, to traverse a
+                                        NVMe Driver - Completion      NVMe Driver       B-tree index, a lookup at each level traverses the kernel’s en-
+      NVMe Driver - Submission
+                                           Interrupt Handler
+                                                                                        tire storage stack only to be thrown away by the application
+                                                                                        once it obtains the pointer to the next child node in the tree.
+                            NVMe Device                                                 Instead of a sequence of system calls from user space, each
+                           Dispatch Location                                            of the intermediate pointer lookups could be executed by a
+             Application             Syscall            NVMe Driver                     BPF function, which would parse the B-tree node to find the
+                                                                                        pointer to the relevant child node. The kernel would then sub-
+Figure 2: Dispatch paths for the application and two kernel hooks.                      mit the I/O to fetch the next node. Chaining a sequence of
+                                                                                        such BPF functions could avoid the cost of traversing kernel
+                                                                                        layers and moving data to user space.
+isolation or to share capacity among different applications ac-                            Other popular on-disk data structures, such as log-
+cessing the same device. In addition, there is no efficient way                         structured merge trees (LSM trees) [70], also have such aux-
+for user space applications to receive interrupts on I/O comple-                        iliary pointer lookups which can be accelerated using BPF
+tions, so applications must directly poll on device completion                          functions. Other types of operations that would benefit from
+queues to obtain high performance. Consequently, when I/O                               such an approach include range queries, iterators, and other
+is not the bottleneck, cores cannot be shared among processes,                          types of aggregations (e.g., obtain the maximum or average
+which results in significant under-utilization and wasted CPU.                          value in a range of key-value pairs). In all of these cases, only
+Furthermore, when more than one polling thread shares the                               a single result or a small subset of the objects that might be
+same processor, the CPU contention between them coupled                                 accessed by the storage system ultimately need to be returned
+with the lack of synchronization lead all polling threads to ex-                        to the application.
+perience degraded tail latency and significantly lower overall
+                                                                                           The BPF function that resubmits (dispatches) I/O in auxil-
+throughput. Recent work has highlighted this issue [54] and
+                                                                                        iary I/O workloads could be placed at any layer of the kernel.
+we reproduce it in §6.2.
+                                                                                        Figure 2 shows the I/O paths for both normal user space dis-
+2.2      BPF Primer                                                                     patch and for two possible locations of BPF resubmission
+                                                                                        hooks: in the syscall layer and in the NVMe driver. Zhong
+BPF (Berkeley Packet Filter) is an interface that allows
+                                                                                        et al. [85] compared the performance improvement from a
+users to offload a simple function to be executed by the ker-
+                                                                                        resubmission hook in both locations on workloads with auxil-
+nel. Linux’s framework for BPF is called eBPF (extended
+                                                                                        iary I/O by measuring the speedup of lookup queries on an
+BPF) [23]. Linux eBPF is commonly used for filtering pack-
+                                                                                        on-disk B-tree of depth 10. The baseline for comparison is
+ets (e.g., TCPdump) [5, 6, 28, 52], load balancing and packet
+                                                                                        reading I/O through the read system call. Table 2 summarizes
+forwarding [5,18,25,60], tracing [2,4,50], packet steering [46],
+                                                                                        the results.
+network scheduling [53,58] and network security checks [15].
+Functions are verified by the kernel at install-time to ensure                          Best Case Acceleration. Dispatching the I/O requests from
+they are safe; for example, they are checked to make sure                               the NVMe driver provides a significant latency reduction (up
+they do not contain too many instructions, unbounded loops,                             to 49%) and corresponding speedup (up to 2.5×), since it
+or accesses to out-of-bounds memory addresses [29]. After                               bypasses almost the entire kernel software stack. On the other
+verification, which typically takes a few seconds or less, the                          hand, as expected, issuing the BPF functions from the syscall
+eBPF functions can be called normally.                                                  dispatch layer only provides a maximum speedup of 1.25×,
+                                                                                        since the requests only benefit from eliminating kernel bound-
+2.3      The Potential Benefit of BPF                                                   ary crossings, which only account for 5-6% of the kernel
+BPF can be a mechanism for avoiding data movement be-                                   overhead (Table 1). After reaching CPU saturation, the com-
+tween the kernel and user space in cases when a logical lookup                          putation savings of reissuing the submissions from the NVMe
+requires a sequence of “auxiliary” I/O requests that generate                           driver translate into throughput improvements of 1.8-2.5×,
+intermediate data not needed directly by the application, such                          depending on the number of threads in the workload [85].
+
+
+
+USENIX Association                                              16th USENIX Symposium on Operating Systems Design and Implementation                     377
+                          3.0                                                having access to the file’s metadata and extents. Even if the ap-
+       IOPS Improvement             batch size:8
+                                    batch size:4                             plication developer made the effort to embed physical block
+                          2.5       batch size:2                             addresses to avoid the translation of the file system offset,
+                                    batch size:1
+                                                                             which would be burdensome, the BPF function could access
+                          2.0
+                                                                             any block on the device, including blocks that belong to a file
+                                                                             that the user does not have permissions to access.
+                          1.5
+                                                                             Challenge 2: concurrency and caching. It is challenging
+                          1.0                                                to enable concurrent reads and writes issued from the file
+                                1   2   3     4   5    6   7    8   9   10
+                                             I/O Chain Length                system with XRP. A write issued from the file system will
+                                                                             only be reflected in the page cache, which is not visible to
+Figure 3: Single-threaded lookups with io_uring syscall, using               XRP. In addition, any writes that modify the layout of the
+NVMe driver hook.
+                                                                             data structure (e.g., modify the pointers to the next block)
+                                                                             that are issued concurrently to read requests could lead XRP
+   Placing an eBPF hook anywhere in the kernel may im-                       to accidentally fetch the wrong data. Both of these could be
+prove throughput between 1.2–2.5×. However, pushing the                      addressed by locking, but accessing locks from within the
+I/O dispatching as close as possible to the storage device                   NVMe interrupt handler may be expensive.
+dramatically improves the performance of a traversal. Hence
+to obtain the highest possible speedup, XRP’s resubmission                   Observation: most on-disk data structures are stable.
+hook should reside in the NVMe driver.                                       Both of these challenges would make it difficult to imple-
+What about io_uring? io_uring is a new Linux system                          ment arbitrary concurrent BPF storage functions. However,
+call framework [9] that allows processes to submit batches                   we make the observation that the files of many storage engines
+of asynchronous I/O requests, which amortizes user-kernel                    (e.g., LSM trees and B-trees) remain relatively stable. Some
+crossings. However, each I/O submitted with io_uring still                   data structures simply do not modify on-disk storage struc-
+passes through all the layers shown in Table 1, so each in-                  tures in-place. For example, once an LSM tree writes its index
+dividual I/O still incurs the full storage stack overhead. In                files (called SSTables) to disk, they are immutable until they
+fact, BPF I/O resubmissions are largely complementary to                     are deleted [12, 27, 44]. Accessing these immutable on-disk
+io_uring: io_uring can efficiently submit batches of I/Os that               storage structures requires less synchronization effort. Simi-
+trigger different I/O chains managed by BPF in the kernel.                   larly, even though some on-disk B-tree index implementations
+   Figure 3 shows throughput improvements when using io_-                    support in-place updates, their file extents remain stable for
+uring with a BPF hook in the NVMe driver. I/O Chain Length                   long periods of time. We verify this in a 24-hour YCSB [41]
+denotes the total number of I/Os, including the initial I/O and              (40% reads, 40% updates, 20% inserts, Zipfian 0.7) experi-
+the resubmitted I/Os. Figure 3 shows that BPF can increase                   ment on MariaDB running TokuDB [20], which uses a fractal
+throughput with respect to io_uring by up to 1.5× for small                  tree (an on-disk B-tree variant) as its lookup index. We found
+batch sizes and up to 2.5× as batch sizes increase.                          the index file’s extents only changed every 159 seconds on
+                                                                             average, with only 5 extent changes in 24 hours unmapping
+   In summary, BPF can benefit both legacy read and io_-                     any blocks, making it possible to cache file system metadata
+uring system calls. By placing the hook in the kernel NVMe                   in the NVMe driver without the overhead of frequent updates.
+driver, BPF may increase throughput of both legacy I/O and                   We also make the observation that in all of these storage en-
+single-threaded io_uring by up to 2.5×.                                      gines, the indices are stored on a small number of large files,
+3     Design Challenges and Principles                                       and each index does not span multiple files.
+
+As shown in the previous section, I/O resubmission must oc-                  Design principles. These observations and experiments in-
+cur as close to the device as possible in order to reap the great-           form the following design principles.
+est benefits. In the NVMe software stack, this is the NVMe                    • One file at a time. We initially restrict XRP to only is-
+interrupt handler. However, executing the resubmissions from                    sue chained resubmissions on a single file. This greatly
+within the NVMe interrupt handler, which lacks the context                      simplifies address translation and access control, and it
+of the file system layer, introduces two major challenges.                      minimizes the metadata that we need to push down to the
+Challenge 1: address translation and security. The                              NVMe driver (the metadata digest, §4.1.3).
+NVMe driver has no access to file system metadata. In the                     • Stable data structures. XRP targets data structures,
+example of an index traversal, XRP issues a read I/O to a par-                  whose layout (i.e. pointers) remain immutable for a long
+ticular block and executes a BPF function that would extract                    period of time (i.e. seconds or more). Such data structures
+the offset of the next block it would like to query. However,                   include the indices used in many popular commercial
+this offset is meaningless to the NVMe layer, since it cannot                   storage engines, such as RocksDB [44], LevelDB [12],
+tell which physical block the offset corresponds to without                     TokuDB [12] and WiredTiger [27]. Since the cost of im-
+
+
+
+378     16th USENIX Symposium on Operating Systems Design and Implementation                                           USENIX Association
+      plementing locks in the NVMe layer is high, we also                                                       Application
+                                                                                                                                                          Kernel
+      initially do not plan to support operations that require                                                                                           Boundary
+                                                                                                              Syscall Function
+      locks during the traversal or iteration of data structures.
+                                                                                                                File System
+    • User-managed caches. XRP does not interface with the
+      page cache, so XRP functions cannot safely be run concur-                                                 Block Layer
+
+      rently if blocks are buffered in the kernel page cache. This                                              NVMe Driver
+      constraint is acceptable since popular storage engines of-                     Completion                   Completion            Completion
+                                                                                  Interrupt Handler            Interrupt Handler     Interrupt Handler
+      ten implement their own user space caches [20,27,39,44];                  Per-Request Context          Per-Request Context   Per-Request Context
+      Commonly they do this to fine-tune their caching and                       bpf_func_0,
+                                                                                 scratch_buff_0,
+                                                                                                              bpf_func_1,
+                                                                                                              scratch_buff_1,
+                                                                                                                                    bpf_func_n,
+                                                                                                                                    scratch_buff_n,
+      prefetching policies and to cache data in an application-
+      meaningful way (e.g., cache key-value pairs or database                     Prepare NVMe
+                                                                                    command
+                                                                                                                Prepare NVMe
+                                                                                                                  command
+                                                                                                                                        Prepare NVMe
+                                                                                                                                          command
+      rows instead of physical blocks).
+                                                                                                               Metadata Digest
+    • Slow path fallback. XRP is best-effort; if a traversal fails
+      for some reason (e.g., the extent mappings become stale),                      Call BPF                      Call BPF               Call BPF
+                                                                                     Function                      Function               Function
+      the application must retry or fall back to dispatching the
+      I/O requests using user space system calls.
+                                                                                                       Call Interrupt Handler
+4      XRP Design and Implementation                                         Resubmit
+                                                                               NVMe          Core 0
+                                                                                                             for Each Irq
+                                                                                                                                        Core 1
+                                                                             Command                       Completion
+This section presents XRP’s design and implementation with                                                  Interrupt
+                                                                                                                NVMe Device
+Linux eBPF and ext4. We describe the kernel modifications
+                                                                                        SQ            CQ                           SQ            CQ
+that enable XRP’s resubmission logic in the interrupt han-
+dler, and how applications are modified to use XRP. We also                             NVMe Queue 0                               NVMe Queue 1
+
+discuss XRP’s synchronization and scheduling limitations.
+                                                                                                      Figure 4: XRP architecture.
+4.1      Resubmission Logic
+The core of XRP augments the NVMe interrupt handler with             struct bpf_xrp {
+resubmission logic that consists of a BPF hook, a file system          // Fields inspected outside BPF
+translation step, and the construction and resubmission of the         char *data;
+next NVMe request at the new physical offsets (Figure 4).              int done;
+Our modifications to the Linux kernel consist of ~900 lines            uint64_t next_addr[16];
+of code: ~500 lines for the BPF hook and the changes to the            uint64_t size[16];
+NVMe driver, ~400 lines for the file system translation step.          // Field for BPF function use only
+   When an NVMe request completes, the device generates                char *scratch;
+an interrupt that causes the kernel to context switch into the       };
+interrupt handler. For each NVMe request that is completed           uint32_t BPF_PROG_TYPE_XRP(struct bpf_xrp *ctxt);
+in the interrupt context, XRP calls its associated BPF function      Listing 1: Signature of BPF programs that can be loaded by XRP.
+(bpf_func_0 in Figure 4), the pointer of which is stored in a
+field in the kernel I/O request struct (i.e. struct bio). After      prevent unbounded execution. A hard limit can be enforced
+calling the BPF function, XRP invokes the metadata digest,           by maintaining a resubmission counter in each I/O request
+which is usually a digest of file system state that enables          descriptor. Since I/O request descriptors cannot be accessed
+XRP to translate the logical address of the next resubmission.       from user space or from XRP’s BPF programs, their hard
+Finally, XRP prepares the next NVMe command resubmission             resubmission limits cannot be overridden by users even if
+by setting the corresponding fields in the NVMe request, and         XRP has multiple BPF functions that execute request resub-
+it appends the request to the NVMe submission queue (SQ)             missions. BPF function contexts are per-request, while the
+for that core.                                                       metadata digest is shared across all invocations of the inter-
+   For a particular NVMe request, the resubmission logic is          rupt handler across all cores. Safe concurrent access to the
+called as many times as necessary for subsequent completions         metadata digest relies on read-copy-update (RCU) (§4.1.3).
+as determined by the specific BPF function registered with
+the NVMe request. For example, for traversing a tree-like            4.1.1      BPF Hook
+data structure, the BPF function would resubmit I/O requests         XRP introduces a new BPF type (BPF_PROG_TYPE_XRP) with
+for branch nodes and end resubmission whenever a leaf node           the signature shown in Listing 1 – any BPF function that
+is found. In our current prototype there is no hard limit on         matches the signature can be called from the hook. §5 presents
+the number of resubmissions before the completion returns            one concrete BPF function matching this signature that is used
+control to the application; such a limit would be necessary to       in our application. For example, for on-disk data structure
+
+
+
+USENIX Association                             16th USENIX Symposium on Operating Systems Design and Implementation                                                 379
+traversal, the BPF function typically contains logic to extract     void update_mapping(struct inode *inode);
+the next offset to fetch from the block.                            void lookup_mapping(struct inode *inode,
+    BPF_PROG_TYPE_XRP programs require a context with five                              off_t offset, size_t len,
+fields, categorized into fields that are inspected or modified by                            struct mapping *result);
+the BPF caller (resubmission logic in the interrupt handler),
+                                                                    Listing 2: Metadata digest: XRP exposes an interface to share
+and fields that should be private to the BPF function. Fields
+                                                                    logical-to-physical-block mappings between the file system and
+that are accessed externally include data, which buffers data       the IRQ handler.
+read from the disk (e.g., a B-tree page waiting to be parsed
+by the BPF function). done is a boolean that notifies the
+resubmission logic whether to return to the user or continue        accesses. Each BPF function type also defines a callback
+resubmitting I/O requests. next_addr and size are arrays of         function is_valid_access() to perform additional checks
+logical addresses and their corresponding sizes that indicate       on context accesses and to return the value type of the context
+the next logical addresses for resubmission.                        field. PTR_TO_MEM describes a pointer referring to a fixed-size
+    In order to support data structures with fanout, multiple       memory region. It supports dereferencing using a variable
+next_addr values can be supplied. By default we limit fanout        offset as long as the access is always within bounds. The
+to 16; on-disk data structures align their components to small      data and scratch fields of the BPF_PROG_TYPE_XRP context
+multiples of device pages, so we have not encountered a need        are PTR_TO_MEM and the rest are SCALAR_TYPE. We augment
+for higher fanout per completion. For example, chained hash         the verifier to allow the BPF_PROG_TYPE_XRP’s is_valid_ac-
+table buckets are likely implemented as a chain of individual       cess() callback to pass the size of the data buffer or scratch
+physical pages and the elements of an on-disk linked list           buffer to the verifier so that it can perform the boundary check.
+are likely implemented at the granularity of physical pages.        We discussed our proposed modification to the verifier with
+Setting a corresponding size field to zero issues no I/O.           the Linux eBPF maintainers, and they think it is sensible.
+    scratch is a scratch space that is private to the user and
+                                                                    4.1.3   The Metadata Digest
+the BPF function. It can be used to pass the parameters from
+the user to the BPF function. Also, the BPF function can use        In the conventional storage stack, the logical block offsets
+it to store intermediate data in between I/O resubmissions          in on-disk data structures are translated by the file system in
+and to return data to the user. For example, in the first BPF       order to identify the next physical block to read. This transla-
+invocation, the application can store a search key in the scratch   tion step also enforces access control and security, preventing
+buffer so that the BPF function can compare it with the keys        reading in regions that are not mapped to the open file. In
+in the disk block in order to find the next offset. When the I/O    XRP, the next logical address for a lookup is given by the
+chain reaches the leaf node of the B-tree, the BPF function         next_addr field after the BPF call. However, translating this
+then places the key-value pair in the scratch buffer to return      logical address to a physical address is challenging since the
+it back to the application. For simplicity, we assume that the      interrupt handler has no notion of a file and does not perform
+size of the scratch buffer is always 4 KB. We find that a 4 KB      physical address translation.
+scratch buffer is sufficient to support a BPF function for a           To solve this, we implement the metadata digest, a thin in-
+production key-value store (§5). BPF functions can also use         terface between the file system and the interrupt handler that
+BPF maps to store more data if their intermediate data cannot       lets the file system share its logical-to-physical-block map-
+fit into the scratch buffer. Each BPF context is private to one     pings with the interrupt handler, enabling safe eBPF-based
+NVMe request, so no locking is needed when working with             on-disk resubmissions. The metadata digest consists of two
+BPF context state. Letting the user supply a scratch buffer         functions (Listing 2). The update function is called within the
+(instead of using BPF map) avoids the overhead of processes         file system when the logical-to-physical mapping is updated.
+and functions having to call bpf_map_lookup_elem to access          The lookup function is called within the interrupt handler; it
+the scratch buffer.                                                 returns the mapping for a given offset and length. The lookup
+                                                                    function also enforces access control by preventing BPF func-
+4.1.2    BPF Verifier                                               tions from requesting resubmissions for blocks outside of the
+The BPF verifier ensures memory safety by tracking the se-          open file. The inode address of the open file is passed to the
+mantics of the value stored in each register [14]. A valid value    interrupt handler in order to query the metadata digest. If an
+can either be a scalar or a pointer. SCALAR_TYPE represents a       invalid logical address is detected, XRP returns to user space
+value that cannot be dereferenced. The verifier defines var-        immediately with an error code. The application can then fall
+ious pointer types; most of them include extra constraints          back to normal system calls to attempt its request again.
+beyond the no out-of-bound access requirement. For exam-               These two functions are specific to each file system, and
+ple, PTR_TO_CTX is the type for the pointer to a BPF context.       even for a particular file system, there may be multiple ways to
+It can only be dereferenced using a constant offset so the          implement the metadata digest, presenting a tradeoff between
+verifier can identify which context field a memory operation        ease of implementation and performance. For example, in
+
+
+
+380     16th USENIX Symposium on Operating Systems Design and Implementation                                  USENIX Association
+our implementation for ext4, the metadata digest consists            resubmission chain, if the BPF call returns multiple valid
+of a cached version of the extent status tree, which stores          addresses in next_addr, XRP will abort the request. This
+the physical-to-logical block mappings. This cached tree is          limitation can be worked around by allocating and setting up
+accessed by the update and lookup function of the interface,         16 dummy NVMe commands in the first I/O request so that
+and it uses read-copy-update (RCU) for concurrency control.          subsequent resubmissions can express fanout if necessary.
+RCU enables the lookup function to be lockless and fast (96 ns
+on average).
+                                                                     4.2    Synchronization Limitations
+   To keep the cached tree up-to-date with the extents in ext4,      BPF currently only supports a limited spinlock for synchro-
+the update function is called in two places in ext4: whenever        nization. The verifier only allows BPF programs to acquire
+extents are inserted or removed from the main extent tree. To        one lock at a time, and they must release the lock before
+prevent a race condition where an extent is modified while           returning. Also, user space applications do not have direct
+there is an inflight read on it, we maintain a version number        access to these BPF spinlocks. Instead, they must invoke the
+for each extent to track its changes. After data is read, but        bpf() syscall; the syscall can read or write the lock-protected
+before it is passed to the BPF function, a second metadata           structure while holding the lock for the duration of that oper-
+digest lookup is performed. If the corresponding extent no           ation. Hence, complex modifications that require synchroniz-
+longer exists or its version number has changed, XRP will            ing across multiple reads and writes cannot be accomplished
+abort the operation. Since application-level synchronization         in user space.
+usually prevents concurrent modifications and lookups on the            Users can implement custom spinlocks using BPF atomic
+same region of a file at the same time, version mismatches           operations. This allows both BPF functions and user space
+should only occur if the application is buggy or malicious.          programs to acquire any spinlock directly. However, the ter-
+   An alternative, simpler implementation of the metadata            mination constraint prohibits BPF functions from spinning to
+digest for ext4 could simply pass through to existing update         wait for a spinlock infinitely. Another option for synchroniza-
+and access functions of the extent tree in ext4. In this case, the   tion is RCU. Since XRP BPF programs are run in the NVMe
+update function would be a no-op, because ext4 already keeps         interrupt handler, which cannot be preempted, de-facto they
+its extent tree up-to-date. However, such an implementation          are already in an RCU read-side critical section.
+would be much slower on the lookup path, because the extent
+                                                                     4.3    Interaction with Linux Schedulers
+lookup function in ext4 acquires a spinlock, which would be
+prohibitively expensive in the interrupt handler.                    Process scheduler. Interestingly, we observed that a
+   For now, XRP only supports the ext4 file system, but the          microsecond-scale storage device like Optane SSD interferes
+metadata digest can be easily implemented for other file sys-        with Linux’s CFS when multiple processes share the same
+tems. For example, in f2fs [64], logical-to-physical-block           core, even when all I/O is issued from user space. For ex-
+mappings are stored in the node address table (NAT). Similar         ample, in the case where an I/O-heavy and compute-heavy
+to the ext4 implementation, an implementation of its metadata        process share the same core, the I/O interrupts generated by
+digest could cache a local copy of the NAT, which would be           the I/O-heavy process will be handled in the timeslice of
+consulted in lookup_mapping. Then update_mapping would               the compute-heavy process. This may cause the compute-
+need to be called anywhere in f2fs where the NAT is updated.         heavy process to be starved of CPU; in the worst case in
+                                                                     our experiments, the compute-heavy process only received
+4.1.4   Resubmitting NVMe Requests                                   about 34% of what would be a “fair” allocation of CPU time.
+After looking up the physical block offsets, XRP prepares the        We experimentally verified this does not occur when using a
+next NVMe request. Because this logic occurs in the interrupt        slower storage device, which generates interrupts much less
+handler, to avoid the (slow) kmalloc calls needed to prepare         frequently. While XRP exarcerbates this problem by gener-
+NVMe requests, XRP reuses the existing NVMe request struct           ating chains of interrupts, this issue is not specific to eBPF,
+(i.e. struct nvme_command) of the just-completed request.            and can also be caused by network-driven interrupts [59]. We
+XRP simply updates the physical sector and block addresses           leave this problem for future work.
+of the existing NVMe request to the new offsets derived from         I/O scheduler. XRP bypasses Linux’s I/O scheduler, which
+the mapping lookup. Reusing NVMe request structs for im-             sits at the block layer. However, the noop scheduler is already
+mediate resubmission is safe because neither user space nor          the default I/O scheduler for NVMe devices, and the NVMe
+XRP BPF programs can access the raw NVMe request structs.            standard supports arbitration at hardware queues if fairness is
+   While struct bpf_xrp supports a maximum fanout of 16,             a requirement [17].
+in the current implementation a resubmitted I/O request can
+only fetch as many physical segments as the initial NVMe             5     Case Studies
+request. For example, if an initial NVMe request only fetches        To use XRP, applications use the interface shown in Listing 3.
+a single block, then all subsequent resubmissions for that           Applications call libbpf [13] function bpf_prog_load to load
+request can only fetch a single physical segment. During a           a BPF function of type BPF_PROG_TYPE_XRP to be offloaded
+
+
+
+USENIX Association                             16th USENIX Symposium on Operating Systems Design and Implementation            381
+int bpf_prog_load(const char *file,
+                                                                         has a fanout of 31 (i.e. each internal node can store pointers
+                  enum bpf_prog_type type,
+                                                                         to 31 children). Therefore, 10 billion objects would require
+                  struct bpf_object **pobj,
+                                                                         an index with 8 levels. Fitting 6 index levels in DRAM is
+                  int *prog_fd);
+                                                                         expensive and would require 14 GB, while fitting 7 levels or
+int read_xrp(int fd, void *buf, size_t count,
+                                                                         more becomes prohibitively expensive (437 GB of DRAM or
+             off_t offset, int bpf_fd,
+                                                                         more). So, to support a large number of keys, BPF-KV would
+                  void *scratch);
+                                                                         require at the minimum 3-4 I/Os from storage for each lookup,
+                                                                         including a final I/O to fetch the actual key-value pair from
+Listing 3: The XRP application interface consists of a libbpf            disk. Also note that having a hard memory budget for caching
+function to load BPF functions into the kernel and a read syscall that
+                                                                         the index is common in many real-world key-value stores
+requests that a BPF function be used. bpf_prog_load is an existing
+function in libbpf. bpf_prog_load returns a file descriptor for the
+                                                                         (e.g., RocksDB [45], DocumentDB [78], SplinterDB [40],
+loaded function, which must be passed to read_xrp. read_xrp adds         TokuDB [20]), since the index cache often competes with
+two arguments to the standard pread [21] syscall: this file descriptor   other parts of the system that need memory, such as filters
+and a pointer to a 4 KB scratch space that is passed to the BPF          and the object cache.
+context.                                                                    BPF-KV also maintains a least recently used (LRU) object
+                                                                         cache of the most popular key-value pairs. Before looking up
+                                                                         an object on disk, BPF-KV first checks whether it is stored
+in the driver and call read_xrp to apply a specific BPF func-
+                                                                         in the object cache. If not, it checks whether it is indexed
+tion to the read request. Applications can load multiple BPF
+                                                                         in the in-memory hash table. If the item is not found in the
+functions with XRP. For example, a database can load a func-
+                                                                         in-memory hash table, it looks up the object by accessing the
+tion for filtering and calculating aggregations from values
+                                                                         first k cached levels of the index. Once it encounters an index
+on-disk and a function for GET point lookups. XRP allows the
+                                                                         node that is not cached, it completes the index and the final
+application to load multiple BPF functions into the kernel and
+                                                                         lookup on disk.
+to specify the BPF function to use in each read_xrp syscall.
+                                                                            To find an object without XRP, BPF-KV traverses the B-
+We present two case studies on how applications should be
+                                                                         tree until the desired value is found using an I/O request per
+modified to use XRP.
+                                                                         level. For example, if the index contains 7 levels and the first
+5.1    BPF-KV                                                            3 are cached and read from DRAM, then the traversal will
+                                                                         issue 4 I/Os to navigate the rest of the tree, followed by a final
+We built a simple key-value store, called BPF-KV, with which             I/O to fetch the object from the log.
+we can evaluate XRP against other baselines: Linux’s syn-
+chronous and asynchronous system calls and kernel bypass                 BPF function. Listing 4 shows the BPF function used in
+(SPDK [82]). BPF-KV is designed to store a large number                  BPF-KV to lookup a key-value pair. We omit the code to
+of small objects and to provide good read performance even               handle the final lookup in the log for simplicity. struct
+under uniform access patterns. BPF-KV uses a B+ -tree index              node defines the layout of B+ -tree index nodes whose size is
+to find the location of objects, and the objects themselves              512 B. The BPF function bpfkv_bpf first extracts the target
+are stored in an unsorted log. For simplicity, BPF-KV uses               key stored in the scratch buffer, and then it linearly searches
+fixed-sized keys (8 B) and values (64 B). The index and the              the slots in the current node to find the next node to read.
+log are both stored in one large file. The index nodes use a             Interface modifications. We replace read calls with
+simple page format with a header followed by keys followed               read_xrp. Before calling into read_xrp, BPF-KV first al-
+by values. Leaf nodes contain a file offset pointing to the next         locates a buffer for the scratch space and calculates the offset
+leaf node, enabling efficient index traversal for range queries          at which to start the lookup.
+and aggregation. Object sizes are fixed, so updates occur in-
+place in the unsorted log. Newly inserted items are appended             Range queries. BPF-KV supports range queries returning
+to the log; their index is initially stored in an in-memory hash         a variable number of objects. We implement a BPF function
+table. Once the hash table fills, BPF-KV merges it with the              that runs as a state machine, allowing the operation to be
+on-disk B+ -tree file.                                                   suspended and resumed when objects are returned to the ap-
+                                                                         plication for processing. The BPF function state, including the
+Caching. BPF-KV implements a user space DRAM cache                       beginning and end of the range, and the retrieved objects, are
+for index blocks and objects. To reduce the number of I/Os it            stored in the scratch space (up to 32 72-byte key-value pairs).
+needs to issue for lookups, BPF-KV caches the top k levels of            On the initial invocation, the function traverses to the leaf
+the B+ -tree index. With a sufficiently large number of objects,         node that contains the starting key. Once the first key in the
+it is not possible to fit the entire index in the cache. Consider        range is found, the function stores the leaf node in the scratch
+the case where BPF-KV is used to store 10 billion 64 B                   space and requests the block containing the corresponding
+objects. In BPF-KV’s index, each node is 512 B (matching                 value. On the next BPF invocation, the function stores the
+the access granularity of the Optane SSD); hence, the tree               value in the scratch space and it continues the index scan
+
+
+
+382    16th USENIX Symposium on Operating Systems Design and Implementation                                         USENIX Association
+struct node {
+                                                                     allocation, extending function signatures and wrapping the
+  uint64_t num; uint64_t type;
+                                                                     XRP syscall. XRP helps accelerate reads that are serviced
+  uint64_t key[31]; uint64_t ptr[31];
+                                                                     from disk, and it does not affect updates or inserts, which are
+};
+                                                                     always absorbed by WiredTiger’s in-memory buffer.
+uint32_t bpfkv_bpf(struct bpf_xrp *ctxt) {                           BPF function. To use XRP, WiredTiger installs a BPF func-
+  uint64_t key = *((uint64_t*)ctxt->scratch);                        tion similar to the one shown in Listing 4. The difference is
+  struct node *n = (struct node *)ctxt->data;                        in order to find the next lookup address from the current page,
+  if (n->type == LEAF_NODE) {                                        the BPF function contains a port of WiredTiger’s B-tree page
+      ctxt->done = true;                                             parsing code. This parsing logic replaces the for loop in
+      return 0;                                                      Listing 4.
+    }                                                                   The WiredTiger BPF function also makes several modi-
+    int i;                                                           fications to make the BPF program compile correctly and
+    for (i = 1; i < n->num; i++)                                     pass the BPF verifier. The modifications mainly consist of
+      if (key < n->key[i]) break;                                    adding bounds on loops to avoid infinite loops, masking point-
+    ctxt->done = false;                                              ers to eliminate out-of-bound access, and initializing local
+    ctxt->next_addr[0] = n->ptr[i - 1];                              variables to prevent access to uninitialized registers. We also
+    ctxt->size[0] = 512;                                             use the BPF function-by-function verification feature [3] to
+    return 0;                                                        break a complex function into several simple sub-functions.
+}                                                                    This allows BPF functions to be verified independently, so
+              Listing 4: BPF function for BPF-KV.                    the functions that have been verified do not need another
+                                                                     round of verification when being called by other functions.
+                                                                     The function-by-function verification feature also supports
+on the cached leaf node. When the leaf node has been read
+                                                                     more complex BPF programs without exceeding the verifier’s
+completely, the function submits a request for the next leaf
+                                                                     restrictions on function length.
+node using the node’s next-leaf file offset. The function re-
+turns to the application in three cases: 1) the function reaches     Caching. WiredTiger maintains a least recently used (LRU)
+a key past the end of the range; 2) the function reaches the         cache for its B-tree internal pages and leaf pages. When look-
+end of the index; 3) the function fills the scratch space with       ing up a new key-value pair, WiredTiger caches the entire
+values read from the log. In the last case, the application can      lookup path including the leaf page in the cache. In order to
+process the values and re-invoke the BPF function with the           comply with WiredTiger caching semantics, the BPF function
+range query state, allowing the range query to resume from           described in the previous section also returns all traversed
+where it left off.                                                   pages so that WiredTiger can cache them. The BPF func-
+                                                                     tion stores traversed pages in the scratch buffer of its context.
+Aggregations. BPF-KV also supports aggregation opera-
+                                                                     When the scratch buffer is exhausted, the BPF function will
+tions, such as SUM, MAX and MIN. We implement these oper-
+                                                                     stop resubmitting requests and return to user space imme-
+ations on top of the BPF range query function by setting a
+                                                                     diately. After WiredTiger adds those pages into its cache, it
+bit that causes the function to perform the corresponding ag-
+                                                                     will call read_xrp again to continue the lookup starting at
+gregation instead of returning the individual values. Since
+                                                                     the previous page. Since we set the size of the scratch buffer
+aggregation queries return a single answer, storing values in
+                                                                     to 4 KB, a BPF function can store up to 6 traversed 512 B
+the scratch space does not limit the number of I/O resubmits
+                                                                     pages in the scratch buffer, which leaves room for necessary
+the BPF function can request.
+                                                                     metadata such as the search key.
+5.2    WiredTiger                                                    Interface modifications. To integrate WiredTiger with
+WiredTiger is a popular key-value store that is the default          XRP, we replace normal read calls with read_xrp. read_-
+backend for MongoDB [27]. We use it as a case study since it         xrp is called when the next page is not in the cache and needs
+is a relatively simple and open key-value store that is used in      to be read from disk. The eviction policy of WiredTiger en-
+production. WiredTiger provides an option to use an LSM tree         forces that only the pages without any cached children pages
+where data is split into different levels; each level contains a     can be evicted, so any uncached page will not have cached
+single file. Each file uses a B-tree index with the key-value        descendants. Therefore, it is safe to call read_xrp to read
+pairs embedded in the tree’s leaf nodes. The files are read-         all of the remaining path from disk without checking the
+only; updates and inserts are written into a buffer in memory.       application-level cache again. If read_xrp fails for any rea-
+When the buffer is full, the data is written out in a new file. We   son, WiredTiger falls back to the normal lookup path. We
+configure the B-tree page size to be the same as our Optane          allocate a data and scratch buffer for each WiredTiger session
+SSD’s block size (512 B). Our modification to WiredTiger             to avoid the overhead of allocating and freeing buffers for
+is around 500 lines of code, which mainly consist of buffer          every request. WiredTiger sessions synchronously process
+
+
+
+USENIX Association                             16th USENIX Symposium on Operating Systems Design and Implementation              383
+                    Average Lookup Latency (µs)                        latency for resubmitted requests. The same is true for io_-
+            # Ops   SPDK      io_uring   read()   XRP                  uring: in the case of submitting I/O requests synchronously
+                                                                       without batching, read() and io_uring are almost equivalent.
+              1        5.2       13.6      13.4    10.7
+              2        7.8       20.2      20.6    14.2                Second, SPDK exhibits better latency than XRP since XRP
+              3       11.2       28.0      27.4    18.0                must pass through the kernel’s storage stack once to initiate
+              4       14.3       35.0      34.0    21.7                the index traversal, while SPDK completely bypasses the
+              5       17.2       42.4      41.5    25.4
+                                                                       kernel. Nonetheless, XRP’s marginal added latency when the
+              6       20.2       49.3      48.8    29.3
+                                                                       depth of the B+ -tree is increased is close to SPDK’s (2.6 µs-
+Table 3: Average latency of a random key lookup with BPF-KV as         3.4 µs). For this reason, in the case of a 6-level index, XRP is
+a function of the depth of the B+ -tree stored on-disk. # ops is the   only 45% slower than SPDK while read() is 142% slower
+number of index I/Os per lookup.                                       than SPDK. Importantly, XRP achieves this without resorting
+                                                                       to polling. This means that, unlike with SPDK, processes can
+one request at a time, which avoids concurrency issues.                continue to use CPU cores efficiently for other work; XRP’s
+                                                                       use of CPU time is limited to what is specifically needed
+6     Evaluation                                                       to resubmit I/Os in the background and to keep I/O device
+                                                                       utilization high.
+In this section we seek to answer the following questions:                Figure 5a and Figure 5b present the 99th -percentile latency
+ 1. What are the overheads of using BPF for storage (§6.1)?            and 99.9th -percentile latency of XRP, respectively. When run-
+ 2. How does XRP scale to multiple threads (§6.2)?                     ning with a single thread, similar to the average latency re-
+ 3. What types of operations can XRP support (§6.3)?                   sults, XRP reduces both 99th -percentile latency and 99.9th -
+ 4. Can XRP accelerate a real-world key-value store (§6.4)?            percentile latency by up to 30% compared to read() and
+                                                                       io_uring. Note that our experiment runs as a closed loop, so
+Experimental setup. All experiments are conducted on a                 XRP is running at a higher throughput than read() and io_-
+6-core i5-8500 3 GHz server with 16 GB of memory, using                uring. At identical throughput XRP would show additional
+Ubuntu 20.04, and Linux 5.12.0 with an Intel Optane 5800X              improvement over these baselines. Interestingly, when the
+prototype. All experiments use O_DIRECT, turn off hyper-               number of threads exceeds the number of cores (6) by more
+threading, disable processor C-states and turbo boost, use the         than 3, SPDK’s 99.9th -percentile latency increases signifi-
+maximum performance governor, and enable KPTI [30]. We                 cantly. This is due to the fact that with SPDK all threads are
+use WiredTiger 4.4.0 in the experiments.                               busy-polling, and cannot effectively share the same core with
+Baselines. We compare the following configurations: (a)                other threads. To this end, we measure the percentage of re-
+XRP, (b) SPDK (a popular kernel-bypass library), (c) standard          quests whose latencies are greater than or equal to 1 ms and
+read() system calls, and (d) standard io_uring system calls.           present the data in Figure 5c. The results show that SPDK has
+                                                                       0.03% of such requests with 7 threads, and this percentage
+6.1    BPF-KV                                                          increases to 0.28% when the number of threads reaches 24. In
+Latency. To answer the first evaluation question, we mea-              contrast, io_uring, read(), and XRP always have fewer than
+sure the performance of BPF-KV on a benchmark that per-                0.01% of such requests.
+forms a million read operations with keys drawn randomly               Throughput. Figure 6a shows the throughput of XRP. As
+with uniform probability. The experiment varies the number             expected, as the index depth increases, XRP’s speedup is
+of levels of the tree that are stored on-disk. In this subsection,     higher compared to standard system calls. Figures 6b and 6c
+we disable caching of data objects and index nodes to focus            show the throughput speedups with a varying number of
+on the overhead of looking up on-disk items. The measured              threads with an index of depth 3 and 6, respectively. Both
+average latency is shown in Table 3. The leftmost column rep-          figures show the speedup of XRP relative to issuing standard
+resents the number of chained I/Os that are required to lookup         system calls does not decrease even as I/O and XRP BPF
+the key in the index (not including the final data lookup). For        functions are scaled across several cores. Once again, XRP
+example, if the number of operations is 4, then BPF-KV is              provides equal to or higher throughput compared to SPDK
+configured with an on-disk tree of depth 4, and it also needs          once the number of threads is 9 or higher.
+to issue one more I/O to fetch the key-value pair from the log.
+   There are a few takeaways from this experiment. First,              6.2    Thread Scaling
+XRP improves latency over read(), because XRP saves one                Since storage applications often use a large number of con-
+or more storage layer traversals when it traverses the index           current threads that access I/O devices, for example in order
+or moves from the index to the log. Indeed, one can see                to process concurrent requests and to perform background
+that XRP’s latency increases by about 3.5-3.9 µs for each              garbage collection [12, 20, 27, 44], XRP needs to be able to
+additional I/O operation, which is close to the device’s latency       provide good tail latency and throughput under a large number
+(Table 1). This means that XRP achieves close to optimal               threads. We analyze how XRP scales as a function of the num-
+
+
+
+384    16th USENIX Symposium on Operating Systems Design and Implementation                                     USENIX Association
+                                                                                                                                                                                                                                      0.30
+                          150                                                                                                     104
+
+
+
+
+                                                                                                                                                                                                        with Latency ≥ 1ms (%)
+                                                                                                                                                                                                                                                              SPDK
+
+
+
+
+                                                                                                                                                                                                        Percentage of Requests
+                                       SPDK                                                                                                                    SPDK
+                                                                                                                                                                                                                                      0.25
+
+
+
+
+                                                                                                           99.9th Latency (µs)
+                                       io_uring                                                                                                                io_uring                                                                                       io_uring
+  99th Latency (µs)
+
+
+
+
+                                       read                                                                                                                    read                                                                   0.20                    read
+                          100
+                                       XRP                                                                                        103                          XRP                                                                                            XRP
+                                                                                                                                                                                                                                      0.15
+
+                           50                                                                                                                                                                                                         0.10
+                                                                                                                                  102                                                                                                 0.05
+
+                            0                                                                                                                                                                                                         0.00
+                                1       3      5      7      9                              11                                                         1           3         5      7      9    11                                                    1   3     6     9  12 15 18       21   24
+                                             Number of Threads                                                                                                             Number of Threads                                                                        Number of Threads
+
+                                    (a) 99th -percentile latency.                                                                           (b) (Log scale) 99.9th -percentile latency.                          (c) Percentage of requests with latency ≥ 1 ms.
+
+Figure 5: Tail latency and percentage of requests with extreme latency of XRP and SPDK against read and io_uring with BPF-KV with index
+depth 6, random key lookups, and closed-loop load generator.
+                                                                                                                                                 500                                                                                            500
+                                                                               SPDK                                                                                SPDK                                                                                       SPDK
+  Throughput (kOps/Sec)
+
+
+
+
+                                                                                                                         Throughput (kOps/Sec)
+
+
+
+
+                                                                                                                                                                                                                        Throughput (kOps/Sec)
+                          150                                                  io_uring                                                          400               io_uring                                                                     400           io_uring
+                                                                               read                                                                                read                                                                                       read
+                                                                               XRP                                                               300               XRP                                                                          300           XRP
+                          100
+                                                                                                                                                 200                                                                                            200
+                           50
+                                                                                                                                                 100                                                                                            100
+
+                            0                                                                                                                      0                                                                                              0
+                                1        2          3     4            5                          6                                                        1   2       3    4 5 6 7 8 9 10 11 12                                                      1   2    3    4 5 6 7 8 9 10 11 12
+                                                  Index Depth                                                                                                               Number of Threads                                                                       Number of Threads
+
+                          (a) Single thread with varying index depth.                                                                             (b) Multiple threads with index depth 3.                                                       (c) Multiple threads with index depth 6.
+
+Figure 6: Throughput of XRP and SPDK against read and io_uring with BPF-KV with random key lookups and closed-loop load generator.
+Throughput (kOps/Sec)
+
+
+
+
+                                                                                                         avg (SPDK)                                                                  with io_uring) to SPDK with BPF-KV using 6 on-disk index
+                          600                                                               40
+                                                                                                         99% (SPDK)                                                                  levels, where each thread represents a different tenant. Two
+                                                                       Latency (ms)
+
+
+
+
+                                                                                            30           avg (XRP)
+                          400                                                                            99% (XRP)
+                                                                                                                                                                                     major observations are: 1) when using 6 working threads (the
+                                       Hardware Limit                                       20                                                                                       number of CPU cores on the machine) both SPDK and XRP
+                          200          SPDK
+                                                                                            10
+                                                                                                                                                                                     can achieve a throughput close to the hardware limit (the grey
+                                       XRP                                                                                                                                           dashed line); 2) once the thread count exceeds the CPU cores,
+                            0                                                                0
+                                6     10  14    18    22                                      0          200   400      600                                                          SPDK’s throughput steadily decreases while XRP still pro-
+                                     Number of Threads                                                Throughput (kOps/Sec)
+                                                                                                                                                                                     vides stable throughput. SPDK’s throughput collapse stems
+             (a) Scalability of XRP and SPDK. (b) Latency-throughput graph of                                                                                                        from its polling-based approach; SPDK threads never yield,
+                                              XRP and SPDK with 12 threads.
+                                                                                                                                                                                     leaving scheduling up to Linux’s CFS which works in coarse
+                            Figure 7: XRP vs. SPDK with open-loop load generator.                                                                                                    6 ms timeslices. However, idle XRP threads will voluntarily
+                                                                                                                                                                                     yield the CPU to busy threads, so more CPU cycles are spent
+                                                                                            40                                                                                       on actual work. Figure 7b presents the throughput-latency
+                                                                    Throughput (kOps/Sec)
+Average Latency (µs)
+
+
+
+
+                                       read                                                                                                                        read
+                          600
+                                                                                            30                                                                     XRP
+                                                                                                                                                                                     relationship under 12 working threads as a function of the
+                                       XRP
+                                                                                                                                                                                     load. With more threads than CPU cores, both average and
+                          400                                                               20                                                                                       tail latencies also increase more significantly in SPDK, as
+                          200                                                               10
+                                                                                                                                                                                     each thread waits longer to be scheduled than in XRP.
+
+                            0                                                                0                                                                                       6.3       Range Query
+                                1    20   40   60   80                                           1     20   40   60   80
+                                       Range Length                                                      Range Length
+                                                                                                                                                                                     Figure 8 compares the average latency and the throughput
+                                (a) Average Latency                                                   (b) Throughput                                                                 of running a range query with XRP against performing the
+                                                                                                                                                                                     query with read() system calls. In both cases the range query
+Figure 8: Average read latency and throughput of BPF-KV with
+XRP vs. read() when performing a range query over a varying
+                                                                                                                                                                                     performs a single index traversal to find the first object, and
+number of objects.                                                                                                                                                                   traverses the leaf nodes of the index to find the address of
+                                                                                                                                                                                     subsequent objects. The index depth is 6 in this experiment.
+                                                                                                                                                                                     Even though the XRP range query can only retrieve 32 objects
+ber of threads and compare it to SPDK. We run an open loop                                                                                                                           per syscall, the results show this adds negligible overhead.
+experiment, where the amount of load matches the maximum                                                                                                                             XRP’s performance speedup remains relatively constant as a
+bandwidth of the Intel device (5M IOPS for 512 B random                                                                                                                              function of the length of the aggregation, since XRP performs
+reads). Figure 7a compares the throughput of XRP (integrated                                                                                                                         only one storage stack traversal for every 32 values retrieved.
+
+
+
+USENIX Association                                                                                                 16th USENIX Symposium on Operating Systems Design and Implementation                                                                                                      385
+                                       250
+                                                                  1 Thread (Baseline)                 2 Threads (Baseline)                                                       512MB Cache (Baseline)                  2GB Cache (Baseline)
+                                                                                                                                                           150
+
+
+
+
+                                                                                                                                    KV Operations/Second
+                                                                                                                                                                                 512MB Cache (XRP)                       2GB Cache (XRP)
+           KV Operations/Second
+                                                                  1 Thread (XRP)                      2 Threads (XRP)
+                                       200                                                                                                                                       1GB Cache (Baseline)                    4GB Cache (Baseline)
+
+
+
+
+                                                      178
+                                                                                                      3 Threads (Baseline)
+                                                                                                                                                                                 1GB Cache (XRP)                         4GB Cache (XRP)
+
+
+
+
+                                                   158
+                                                                                                      3 Threads (XRP)
+
+
+
+
+                                                                                                                                        (Thousands)
+               (Thousands)
+
+
+
+
+                                                                                                                                                                                               192
+                                                                                                                                                                                               194
+                                                                                                                                                                                               194
+                                                                                                                                                                                               193
+                                                                                                                                                                                               194
+                                                                                                                                                                                               193
+                                                                                                                                                                                               193
+                                                                                                                                                                                               194
+                                                                                                                                                                           90
+                                                                                                                                                           100
+
+
+
+
+                                                                                             192
+                                                                                             194
+                                                                                             310
+                                                                                             305
+                                                                                             424
+                                                                                             424
+                                       150
+
+
+
+
+                                                                      125
+                                                 123
+
+
+
+
+                                                                                                                                                                         83
+                                                                                                                                                                        78
+
+
+
+
+                                                                                                                                                                                             75
+                                                                                       112
+
+
+
+
+                                                                                                                                                                      72
+                                               107
+
+
+
+
+                                                                                                                          106
+
+
+
+
+                                                                                                                                                                      71
+                                                                   104
+
+
+
+
+                                                                                                                                                                                            68
+                                                                                                                                                                                           68
+                                                                                                                                                                     67
+                                                                                                                                                                    62
+                                                                                     98
+
+
+
+
+                                                                                                                                                                                          60
+
+
+
+
+                                                                                                                                                                                          60
+                                                                                                                                                                   58
+
+
+
+
+                                                                                                                                                                                         58
+                                                                                                                        91
+                                                                87
+                                       100
+
+
+
+
+                                                                                                                                                                                       52
+                                                                                                                                                                                       51
+
+
+
+
+                                                                                                                                                                                       50
+                                                                                                                                                                                       49
+                                                                                 79
+
+
+
+
+                                                                                                                                                                                                                                               49
+                                                                                                                                                                                      45
+                                                              72
+
+
+
+
+                                                                                                                                                                                                                                              44
+                                                                                                                                                                                                                                             43
+                                                                                                                      70
+
+
+
+
+                                                                                                                                                                                     42
+
+
+
+
+                                                                                                                                                                                     42
+                                                                                                                                                                                     42
+                                              67
+
+
+
+
+                                                                               66
+
+
+
+
+                                                                                                                                                                                                                                            39
+                                                                                                                                                                                                                                            38
+                                                                                                                                                            50
+
+
+
+
+                                                                                                                                                                                                                                            37
+                                                                                                                                                                                    37
+                                                                                                                     60
+                                             58
+
+
+
+
+                                                                                                                                                                                                                                           34
+                                                                                                                                                                                   34
+
+
+
+
+                                                                                                                                                                                                                                          31
+                                                             45
+
+
+
+
+                                                                              42
+
+
+
+
+                                                                                                                   37
+                                                            37
+                                        50
+
+
+
+
+                                                                             34
+
+
+
+
+                                                                                                                  31
+
+
+
+
+                                                                                                                                                                                                                             12
+                                                                                                                                                                                                                             12
+                                                                                                                                                                                                                            11
+                                                                                                                                                                                                                            11
+                                                                                                         20
+
+
+
+
+                                                                                                                                                                                                                            10
+                                                                                                         20
+                                                                                                        16
+                                                                                                        15
+
+
+
+
+                                                                                                                                                                                                                            9
+                                                                                                                                                                                                                            9
+                                                                                                                                                                                                                            8
+                                                                                                       9
+                                                                                                       8
+                                         0 YCSB A           YCSB B           YCSB C          YCSB D    YCSB E     YCSB F                                     0 YCSB A YCSB B YCSB C YCSB D YCSB E                                           YCSB F
+
+                                                                                   (a)                                                                                                                      (b)
+
+      Figure 9: Throughput of reads/scans in WiredTiger with (a) varying client threads with a 512 MB cache and (b) varying cache size.
+                                       1.3                                                                                                        200
+                  Throughput Speedup
+
+
+
+
+                                                                                                                                                                                1 Thread (Baseline)                2 Threads (Baseline)
+                                                                                                                                                                                1 Thread (XRP)                     2 Threads (XRP)
+                                                                                                                                                                                                                   3 Threads (Baseline)
+                                                                                                                                                  150
+
+
+
+
+                                                                                                                                P99 Read/Scan
+
+
+
+
+                                                                                                                                                                                                                                                      132
+                                                                                                                                                                         129
+                                       1.2                                                                                                                                                                         3 Threads (XRP)
+
+
+
+
+                                                                                                                                 Latency (us)
+
+
+
+
+                                                                                                                                                                                                                                                121
+                                                                                                                                                             118
+
+
+
+
+                                                                                                                                                                                                                                          116
+                                                                                                                                                                   114
+
+
+
+
+                                                                                                                                                                                                                            236
+                                                                                                                                                                                                                            223
+                                                                                                                                                                                                                            229
+                                                                                                                                                                                                                            223
+                                                                                                                                                                                                                            250
+                                                                                                                                                                                                                            243
+                                                                                                                                                                                 101
+
+
+
+
+                                                                                                                                                                                                  98
+                                                                                                                                                  100
+
+
+
+
+                                                                                                                                                                           91
+
+
+
+
+                                                                                                                                                                                                                                                        91
+                                                                                                                                                                                       88
+                                                                                                                                                                                            85
+
+
+
+
+                                                                                                                                                                                                                                                  84
+                                                                                                                                                                 83
+
+
+
+
+                                                                                                                                                                                                                                            82
+                                                                                                                                                                      82
+
+
+
+
+                                                                                                                                                                                                       81
+                                                                                                                                                                                                            76
+                                       1.1
+
+
+
+
+                                                                                                                                                                                                   67
+                                                                                                                                                                                   66
+
+
+                                                                                                                                                                                             59
+                                                        Uniform
+
+
+
+
+                                                                                                                                                                                        56
+
+
+
+
+                                                                                                                                                                                                        53
+                                                                                                                                                                                                             51
+                                                        Zipfian                                                                                        50
+                                       1.0
+
+
+
+
+                                                                                                                                                                                                                  13
+                                                                                                                                                                                                                  13
+                                                                                                                                                                                                                  13
+                                                                                                                                                                                                                  13
+                                                                                                                                                                                                                  13
+                                                                                                                                                                                                                  13
+                                             0.6            0.8               1.0      1.2              1.4         1.6
+                                                                            Zipfian Constant                                                               0 YCSB A              YCSB B           YCSB C          YCSB D    YCSB E        YCSB F
+
+                                                                                   (a)                                                                                                                 (b)
+
+Figure 10: (a) Throughput speedup of WiredTiger on YCSB C with a varying Zipfian constant and with a uniform distribution. (b) 99th -
+percentile latency of reads/scans in WiredTiger with varying number of threads with 512 MB cache.
+
+6.4      WiredTiger                                                                                                                             YCSB D and YCSB E. This is because YCSB D follows a
+                                                                                                                                                latest distribution where the newly inserted items are the most
+To understand whether XRP can benefit a real-world database,                                                                                    popular ones. Since new inserts are always written into in-
+we evaluate the performance of WiredTiger with and without                                                                                      memory buffers, most read operations read from those buffers
+XRP on YCSB [41]. We run the different YCSB workloads so                                                                                        in YCSB D. On the other hand, YCSB E only has inserts
+that their runtime takes more or less the same time: YCSB A,                                                                                    and scans. WiredTiger supports scans via an iterator interface,
+B, C and E use 10M operations, D uses 50M operations and                                                                                        which only looks up one key-value pair at a time. XRP can
+E uses 3M. The baseline WiredTiger uses pread() to read B-                                                                                      only benefit the lookup of the first key-value pair of a scan
+tree pages, while the WiredTiger with XRP uses read_xrp().                                                                                      operation, since the rest of the key-value pairs mostly either
+We populate the database with 1 billion key-value pairs and                                                                                     reside on the same leaf node or require only one additional
+set the size of both key and value to 16 B. The total size of                                                                                   I/O to fetch the next leaf node.
+the database is 46 GB. WiredTiger runs eviction threads to                                                                                         To study the effect of access distribution on XRP, we run
+evict pages when its cache usage is close to full, and we set                                                                                   YCSB C with a varying Zipfian constant and with a uniform
+the number of eviction threads to 2.                                                                                                            distribution. Figure 10a shows that XRP’s benefit decreases
+                                                                                                                                                when the Zipfian constant becomes larger (i.e. , the distribu-
+Throughput. Figure 9 shows the total throughput of
+                                                                                                                                                tion is more skewed) because of the increased cache hit ratio.
+WiredTiger with different cache sizes and different numbers
+                                                                                                                                                Note that skews greater than 0.99 represent very high skew
+of client threads. We configure WiredTiger with 512 MB,
+                                                                                                                                                levels. We also see that the throughput gain on WiredTiger is
+1 GB, 2 GB, and 4 GB cache sizes to ensure that WiredTiger
+                                                                                                                                                lower than that on BPF-KV with the uniform YCSB C. This
+can cache at least 1% of its database while not exhausting
+                                                                                                                                                is again because WiredTiger spends 37% of its total time on
+all the available memory on the machine. We run up to 3
+                                                                                                                                                non-I/O operations.
+client threads to avoid context switches. The results show
+that XRP speeds up most workloads consistently by up to                                                                                         Tail latency. We measure the tail read latency of
+1.25×. The throughput improvements are mostly affected by                                                                                       WiredTiger with and without XRP under a fixed load: 20 kop/s
+the cache size. The speedup generally goes down when the                                                                                        per client thread for YCSB A, B, C, D, F, and 5 kops/s per
+cache size becomes larger. In general, XRP provides a lower                                                                                     client thread for YCSB E. Since YCSB E has scans instead
+speedup on WiredTiger than on BPF-KV, because WiredTiger                                                                                        of reads, we set a lower load for it and measure the tail scan
+is less optimized than BPF-KV for reading from fast NVM                                                                                         latency instead of the tail read latency. Figure 10b shows
+storage, and only spends 63% of its total time on I/O. In par-                                                                                  that XRP can reduce the 99th -percentile latency by up to 40%.
+ticular, XRP does not provide significant improvements on                                                                                       Similar to the throughput, the 99th -percentile latency improve-
+
+
+
+386     16th USENIX Symposium on Operating Systems Design and Implementation                                                                                                                                                       USENIX Association
+ment mostly decreases with a larger cache size, and XRP does       Extensible operating systems and library file systems.
+not have significant effect on YCSB D and E.                       Our approach is reminiscent of extensible operating systems
+                                                                   and library file systems from the 1990s. Extensible operating
+7   Related Work                                                   systems (e.g., SPIN [35] and VINO [76, 79]) allow exten-
+There are four areas of related work: (a) using BPF to acceler-    sion of kernel functionality via user-defined functions. For
+ate I/O (typically networking), (b) kernel-bypass systems, (c)     example, a client can write kernel extensions that read and de-
+near-storage compute, and (d) extensible operating systems         compress video frames from disk. Another related approach is
+and library file systems.                                          library file systems, such as XN [48, 56]. Similar to XRP, XN
+                                                                   allows userspace library file systems to load untrusted meta-
+BPF for I/O. There is a large number of systems and frame-         data translation functions into the kernel, while guaranteeing
+works that use BPF to accelerate I/O processing, primarily         disk block protection without understanding file systems’ data
+focused on networking and tracing use cases [2,4–6,15,18,25,       structures. These approaches required using dedicated operat-
+28, 37, 46, 49, 50, 52]. Most closely related to XRP, XDP [28]     ing and file systems, while XRP is compatible with Linux and
+accelerates networking I/O by adding a hook in the NIC             its standard file systems. ExtOS [32], a more recent extensible
+driver’s RX path. It then provides an interface for eBPF pro-      OS, minimizes data movements in read() and splice() by
+grams that either filter, redirect, or bounce the packet.          using BPF functions to filter data before copying them to user
+   There are no existing systems that use BPF to resubmit          space or another file, but it still incurs the full storage stack
+storage requests from within the kernel. Kourtis et al. [62]       overhead and does not allow I/O request resubmissions.
+propose a system that uses eBPF functions as an interface to
+submit disaggregated storage requests in order to avoid cross-     8   Conclusions and Future Work
+ing the network. In their system, resubmissions occur from
+                                                                   BPF has the potential to accelerate applications using fast
+a user space service sitting at the host and are not serviced
+                                                                   NVMe devices by moving computation closer to the device.
+by the kernel itself, since the network is the primary bottle-
+                                                                   XRP lets applications write functions that can resubmit de-
+neck (not the kernel software stack). ExtFUSE [36] allows
+                                                                   pendent storage requests to achieve speedups close to kernel-
+user space file systems on Linux to load BPF functions into
+                                                                   bypass while retaining the advantages of being OS-integrated.
+the kernel to serve low-level file system requests and thus
+                                                                   Beyond fast lookups, we envision XRP can be used for many
+eliminates unnecessary context switches. While ExtFUSE ac-
+                                                                   types of functions such as compaction, compression and dedu-
+celerates user space file systems, it provides no performance
+                                                                   plication. In addition, XRP in the future can be developed as
+benefits for an application that already uses a standard kernel
+                                                                   a common interface for other use cases where computation
+file system (e.g., ext4), since it does not allow applications
+                                                                   needs to be moved closer to storage, such as programmable
+to bypass the kernel’s storage stack. BMC [49] uses BPF to
+                                                                   storage devices and networked storage systems. For example,
+accelerate memcached by intercepting packets on the network
+                                                                   XRP could be used as an interface that can dynamically sup-
+path at the host. The BPF functions can then access a separate
+                                                                   port both in-kernel offloading, as well as offloading functions
+small kernel-based cache, which serves as a first-level cache
+                                                                   to a smart storage device or an FPGA. Another direction we
+and is not synchronized with the user space memcached ap-
+                                                                   plan to explore is networked storage. XRP storage functions
+plication. Zhong et al. [85] provide motivation for using BPF
+                                                                   could be chained with XDP networking functions to create
+for accelerating storage from within the kernel, but do not
+                                                                   a datapath that bypasses both the kernel’s networking and
+provide a concrete design, implementation or evaluation.
+                                                                   storage paths.
+Kernel bypass. In order to reduce the kernel’s overhead
+when processing I/O, several libraries and operating systems       9   Acknowledgments
+have been designed to let users directly access I/O devices [7,    We would like to thank our shepherd, Ymir Vigfusson, and
+33, 34, 42, 47, 57, 65, 69, 71, 72, 82–84]. Most relevant to our   the anonymous reviewers for their helpful comments. We
+work, Intel’s SPDK [82] is a popular kernel-bypass library for     also thank Kostis Kaffes and Tom Anderson for providing
+storage. In general, the downside of allowing users to access      valuable feedback on earlier versions of our work. This work
+I/O directly is that applications must directly poll for I/O to    was supported by NSF grants CNS-2143868, CNS-2104292,
+obtain high performance. This means that cores cannot be           and CNS-1750558, and an equipment gift from Intel.
+shared among processes, which leads to significant under-
+utilization when I/O is not the bottleneck.                        References
+Near-storage compute. There are several systems that al-            [1] 3D Xpoint: A Breakthrough in Non-Volatile Mem-
+low applications to offload their storage functions to the              ory Technology. https://www.intel.com/content/
+processor embedded within or attached to a storage de-                  www/us/en/architecture-and-technology/intel-
+vice [16, 22, 31, 38, 43, 51, 55, 61, 63, 74, 75, 77, 81]. The          micron-3d-xpoint-webcast.html.
+downside of this approach is that it requires specialized stor-
+age devices, dedicated hardware, or both.                           [2] bcc. https://github.com/iovisor/bcc.
+
+
+
+USENIX Association                           16th USENIX Symposium on Operating Systems Design and Implementation              387
+ [3] bpf: Introduce function-by-function verification. https:   [21] pread(2) - Linux manual page. https://man7.org/
+     //lore.kernel.org/bpf/20200109063745.3154913-4-                 linux/man-pages/man2/pread.2.html.
+     ast@kernel.org/.
+                                                                [22] SmartSSD computational storage drive.    https:
+ [4] bpftrace. https://github.com/iovisor/bpftrace.                  //www.xilinx.com/applications/data-center/
+                                                                     computational-storage/smartssd.html.
+ [5] Cilium. https://github.com/cilium/cilium.
+                                                                [23] A thorough introduction to eBPF. https://lwn.net/
+ [6] Cloudflare architecture and how BPF eats the                    Articles/740157/.
+     world. https://blog.cloudflare.com/cloudflare-
+     architecture-and-how-bpf-eats-the-world/.                  [24] Toshiba memory introduces XL-FLASH storage class
+                                                                     memory solution. https://business.kioxia.com/en-
+ [7] DPDK Data Plane Development Kit.              https://          us/news/2019/memory-20190805-1.html.
+     www.dpdk.org/.
+                                                                [25] udplb. https://github.com/moolen/udplb.
+ [8] eBPF. https://ebpf.io/.
+                                                                [26] Ultra-Low Latency            with      Samsung       Z-
+ [9] Efficient io with io_uring.        https://kernel.dk/           NAND SSD.              https://www.samsung.com/
+     io_uring.pdf.                                                   semiconductor/global.semi.static/Ultra-
+                                                                     Low_Latency_with_Samsung_Z-NAND_SSD-0.pdf.
+[10] HDFS      Architecture  Guide.          https://
+      hadoop.apache.org/docs/r1.2.1/hdfs_design.html.           [27] WiredTiger storage    engine.          https://
+                                                                     docs.mongodb.com/manual/core/wiredtiger/.
+[11] Intel®      Optane™   SSD     DC     P5800X     Series.
+      https://ark.intel.com/content/www/us/en/ark/              [28] XDP. https://www.iovisor.org/technology/xdp.
+      products/201859/intel-optane-ssd-dc-p5800x-               [29] Nadav Amit and Michael Wei. The design and imple-
+      series-1-6tb-2-5in-pcie-x4-3d-xpoint.html.                     mentation of hyperupcalls. In 2018 USENIX Annual
+[12] LevelDB. https://github.com/google/leveldb.                     Technical Conference (USENIX ATC 18), pages 97–112,
+                                                                     2018.
+[13] libbpf. https://github.com/libbpf/libbpf.
+                                                                [30] Nadav Amit, Michael Wei, and Dan Tsafrir. Dealing
+[14] Linux Socket Filtering Documentation.    https:                 with (some of) the fallout from meltdown. In Proceed-
+     //www.kernel.org/doc/Documentation/networking/                  ings of the 14th ACM International Conference on Sys-
+     filter.txt.                                                     tems and Storage, pages 1–6, 2021.
+
+[15] MAC and Audit policy using eBPF. https://lkml.org/         [31] Antonio Barbalace, Anthony Iliopoulos, Holm Rauch-
+     lkml/2020/3/28/479.                                             fuss, and Goetz Brasche. It’s time to think about an
+                                                                     operating system for near data processing architectures.
+[16] NGD      systems newport platform.        https:                In Proceedings of the 16th Workshop on Hot Topics in
+      //www.ngdsystems.com/technology/computational-                 Operating Systems, HotOS ’17, page 56–61, New York,
+      storage.                                                       NY, USA, 2017. Association for Computing Machinery.
+
+[17] NVMe base specification. https://nvmexpress.org/           [32] Antonio Barbalace, Javier Picorel, and Pramod Bhatotia.
+      wp-content/uploads/NVM-Express-1_4b-                           Extos: Data-centric extensible os. In Proceedings of the
+      2020.09.21-Ratified.pdf.                                       10th ACM SIGOPS Asia-Pacific Workshop on Systems,
+                                                                     APSys ’19, page 31–39, New York, NY, USA, 2019.
+[18] Open-sourcing katran, a scalable network load bal-              Association for Computing Machinery.
+     ancer.   https://engineering.fb.com/2018/05/22/
+      open-source/open-sourcing-katran-a-scalable-              [33] Adam Belay, Andrea Bittau, Ali Mashtizadeh, David
+      network-load-balancer/.                                        Terei, David Mazières, and Christos Kozyrakis. Dune:
+                                                                     Safe user-level access to privileged CPU features. In
+[19] Optimizing Software for the Next Gen Intel Optane               10th USENIX Symposium on Operating Systems Design
+     SSD P5800X. https://www.intel.com/content/www/                  and Implementation (OSDI 12), pages 335–348, Holly-
+     us/en/events/memory-and-storage.html?videoId=                   wood, CA, October 2012. USENIX Association.
+     6215534787001.
+                                                                [34] Adam Belay, George Prekas, Ana Klimovic, Samuel
+[20] Percona TokuDB.        https://www.percona.com/                 Grossman, Christos Kozyrakis, and Edouard Bugnion.
+      software/mysql-database/percona-tokudb.                        IX: A protected dataplane operating system for high
+
+
+
+388   16th USENIX Symposium on Operating Systems Design and Implementation                               USENIX Association
+     throughput and low latency. In 11th USENIX Sympo-         [42] Henri Maxime Demoulin, Joshua Fried, Isaac Pedisich,
+     sium on Operating Systems Design and Implementation            Marios Kogias, Boon Thau Loo, Linh Thi Xuan Phan,
+     (OSDI 14), pages 49–65, Broomfield, CO, October 2014.          and Irene Zhang. When idling is ideal: Optimizing
+     USENIX Association.                                            tail-latency for heavy-tailed datacenter workloads with
+                                                                    perséphone. In Proceedings of the ACM SIGOPS 28th
+[35] Brian N Bershad, Stefan Savage, Przemyslaw Pardyak,            Symposium on Operating Systems Principles, SOSP ’21,
+     Emin Gün Sirer, Marc E Fiuczynski, David Becker,               page 621–637, New York, NY, USA, 2021. Association
+     Craig Chambers, and Susan Eggers. Extensibility safety         for Computing Machinery.
+     and performance in the SPIN operating system. In Pro-
+     ceedings of the fifteenth ACM symposium on Operating      [43] Jaeyoung Do, Sudipta Sengupta, and Steven Swanson.
+     systems principles, pages 267–283, 1995.                       Programmable solid-state storage in future cloud dat-
+                                                                    acenters. Communications of the ACM, 62(6):54–62,
+[36] Ashish Bijlani and Umakishore Ramachandran. Exten-             2019.
+     sion framework for file systems in user space. In 2019
+     USENIX Annual Technical Conference (USENIX ATC            [44] Siying Dong, Mark Callaghan, Leonidas Galanis,
+     19), pages 121–134, Renton, WA, July 2019. USENIX              Dhruba Borthakur, Tony Savor, and Michael Strum. Op-
+     Association.                                                   timizing space amplification in RocksDB. In CIDR,
+                                                                    volume 3, page 3, 2017.
+[37] Marco Spaziani Brunella, Giacomo Belocchi, Marco
+                                                               [45] Assaf Eisenman, Darryl Gardner, Islam AbdelRahman,
+     Bonola, Salvatore Pontarelli, Giuseppe Siracusano,
+                                                                    Jens Axboe, Siying Dong, Kim Hazelwood, Chris Pe-
+     Giuseppe Bianchi, Aniello Cammarano, Alessandro
+                                                                    tersen, Asaf Cidon, and Sachin Katti. Reducing DRAM
+     Palumbo, Luca Petrucci, and Roberto Bifulco. hXDP:
+                                                                    footprint with NVM in Facebook. In Proceedings of the
+     Efficient software packet processing on FPGA NICs.
+                                                                    Thirteenth EuroSys Conference, pages 1–13, 2018.
+     In 14th USENIX Symposium on Operating Systems De-
+     sign and Implementation (OSDI 20), pages 973–990.         [46] Pekka Enberg, Ashwin Rao, and Sasu Tarkoma.
+     USENIX Association, November 2020.                             Partition-aware packet steering using XDP and eBPF for
+                                                                    improving application-level parallelism. In Proceedings
+[38] Wei Cao, Yang Liu, Zhushi Cheng, Ning Zheng, Wei Li,           of the 1st ACM CoNEXT Workshop on Emerging In-
+     Wenjie Wu, Linqiang Ouyang, Peng Wang, Yijing Wang,            Network Computing Paradigms, ENCP ’19, page 27–33,
+     Ray Kuan, Zhenjun Liu, Feng Zhu, and Tong Zhang.               New York, NY, USA, 2019. Association for Computing
+     POLARDB meets computational storage: Efficiently               Machinery.
+     support analytical workloads in cloud-native relational
+     database. In 18th USENIX Conference on File and           [47] Joshua Fried, Zhenyuan Ruan, Amy Ousterhout, and
+     Storage Technologies (FAST 20), pages 29–41, Santa             Adam Belay. Caladan: Mitigating interference at mi-
+     Clara, CA, February 2020. USENIX Association.                  crosecond timescales. In 14th USENIX Symposium on
+                                                                    Operating Systems Design and Implementation (OSDI
+[39] Badrish Chandramouli, Guna Prasaad, Donald Koss-               20), pages 281–297. USENIX Association, November
+     mann, Justin Levandoski, James Hunter, and Mike Bar-           2020.
+     nett. FASTER: A concurrent key-value store with in-
+     place updates. In Proceedings of the 2018 Interna-        [48] Gregory R Ganger and M Frans Kaashoek. Embedded
+     tional Conference on Management of Data, SIGMOD                inodes and explicit grouping: Exploiting disk bandwidth
+     ’18, page 275–290, New York, NY, USA, 2018. Associ-            for small files. In USENIX Annual Technical Conference,
+     ation for Computing Machinery.                                 pages 1–17, 1997.
+                                                               [49] Yoann Ghigoff, Julien Sopena, Kahina Lazri, Antoine
+[40] Alexander Conway, Abhishek Gupta, Vijay Chi-
+                                                                    Blin, and Gilles Muller. BMC: Accelerating memcached
+     dambaram, Martin Farach-Colton, Richard Spillane,
+                                                                    using safe in-kernel caching and pre-stack processing.
+     Amy Tai, and Rob Johnson. SplinterDB: Closing the
+                                                                    In 18th USENIX Symposium on Networked Systems De-
+     bandwidth gap for NVMe key-value stores. In 2020
+                                                                    sign and Implementation (NSDI 21), pages 487–501.
+     USENIX Annual Technical Conference (USENIX ATC
+                                                                    USENIX Association, April 2021.
+     20), pages 49–63, 2020.
+                                                               [50] Brendan Gregg. BPF Performance Tools. Addison-
+[41] Brian F Cooper, Adam Silberstein, Erwin Tam, Raghu             Wesley Professional, 2019.
+     Ramakrishnan, and Russell Sears. Benchmarking cloud
+     serving systems with YCSB. In Proceedings of the 1st      [51] Boncheol Gu, Andre S. Yoon, Duck-Ho Bae, Insoon Jo,
+     ACM symposium on Cloud computing, pages 143–154,               Jinyoung Lee, Jonghyun Yoon, Jeong-Uk Kang, Moon-
+     2010.                                                          sang Kwon, Chanho Yoon, Sangyeun Cho, Jaeheon
+
+
+
+USENIX Association                        16th USENIX Symposium on Operating Systems Design and Implementation        389
+      Jeong, and Duckhyun Chang. Biscuit: A framework for      [59] Junaid Khalid, Eric Rozner, Wesley Felter, Cong Xu,
+      near-data processing of big data workloads. SIGARCH           Karthick Rajamani, Alexandre Ferreira, and Aditya
+      Comput. Archit. News, 44(3):153–165, jun 2016.                Akella. Iron: Isolating network-based CPU in container
+                                                                    environments. In 15th USENIX Symposium on Net-
+[52] Toke Høiland-Jørgensen, Jesper Dangaard Brouer,                worked Systems Design and Implementation (NSDI 18),
+     Daniel Borkmann, John Fastabend, Tom Herbert, David            pages 313–328, Renton, WA, April 2018. USENIX As-
+     Ahern, and David Miller. The express data path: Fast           sociation.
+     programmable packet processing in the operating sys-
+     tem kernel. In Proceedings of the 14th international      [60] Marios Kogias, Rishabh Iyer, and Edouard Bugnion. By-
+     conference on emerging networking experiments and              passing the load balancer without regrets. In Proceed-
+     technologies, pages 54–66, 2018.                               ings of the 11th ACM Symposium on Cloud Computing,
+                                                                    pages 193–207, 2020.
+[53] Jack Tigar Humphries, Neel Natu, Ashwin Chaugule,
+     Ofir Weisse, Barret Rhoden, Josh Don, Luigi Rizzo, Oleg   [61] Gunjae Koo, Kiran Kumar Matam, I Te, HV Krishna Giri
+     Rombakh, Paul Turner, and Christos Kozyrakis. GhOSt:           Narra, Jing Li, Hung-Wei Tseng, Steven Swanson, and
+     Fast & flexible user-space delegation of Linux schedul-        Murali Annavaram. Summarizer: trading communica-
+     ing. In Proceedings of the ACM SIGOPS 28th Sympo-              tion with computing near storage. In 2017 50th Annual
+     sium on Operating Systems Principles, SOSP ’21, page           IEEE/ACM International Symposium on Microarchitec-
+     588–604, New York, NY, USA, 2021. Association for              ture (MICRO), pages 219–231. IEEE, 2017.
+     Computing Machinery.
+                                                               [62] Kornilios Kourtis, Animesh Trivedi, and Nikolas Ioan-
+[54] Jaehyun Hwang, Midhul Vuppalapati, Simon Peter, and            nou. Safe and efficient remote application code execu-
+     Rachit Agarwal. Rearchitecting linux storage stack for         tion on disaggregated NVM storage with eBPF. arXiv
+     µs latency and high throughput. In 15th USENIX Sympo-          preprint arXiv:2002.11528, 2020.
+     sium on Operating Systems Design and Implementation       [63] Jaewook Kwak, Sangjin Lee, Kibin Park, Jinwoo Jeong,
+     (OSDI 21), pages 113–128. USENIX Association, July             and Yong Ho Song. Cosmos+ OpenSSD: Rapid proto-
+     2021.                                                          type for flash storage systems. ACM Transactions on
+[55] Yanqin Jin, Hung-Wei Tseng, Yannis Papakonstanti-              Storage (TOS), 16(3):1–35, 2020.
+     nou, and Steven Swanson. KAML: A flexible, high-          [64] Changman Lee, Dongho Sim, Jooyoung Hwang, and
+     performance key-value SSD. In 2017 IEEE Interna-               Sangyeun Cho. F2FS: A new file system for flash stor-
+     tional Symposium on High Performance Computer Ar-              age. In 13th USENIX Conference on File and Storage
+     chitecture (HPCA), pages 373–384. IEEE, 2017.                  Technologies (FAST 15), pages 273–286, 2015.
+[56] M. Frans Kaashoek, Dawson R. Engler, Gregory R.           [65] Michael Marty, Marc de Kruijf, Jacob Adriaens, Christo-
+     Ganger, Hector M. Briceño, Russell Hunt, David Maz-            pher Alfeld, Sean Bauer, Carlo Contavalli, Michael Dal-
+     ières, Thomas Pinckney, Robert Grimm, John Jannotti,           ton, Nandita Dukkipati, William C. Evans, Steve Grib-
+     and Kenneth Mackenzie. Application Performance and             ble, Nicholas Kidd, Roman Kononov, Gautam Kumar,
+     Flexibility on Exokernel Systems. In Proceedings of            Carl Mauer, Emily Musick, Lena Olson, Erik Rubow,
+     the Sixteenth ACM Symposium on Operating Systems               Michael Ryan, Kevin Springborn, Paul Turner, Valas
+     Principles, SOSP ’97, page 52–65, New York, NY, USA,           Valancius, Xi Wang, and Amin Vahdat. Snap: A micro-
+     1997. Association for Computing Machinery.                     kernel approach to host networking. In Proceedings of
+                                                                    the 27th ACM Symposium on Operating Systems Prin-
+[57] Kostis Kaffes, Timothy Chong, Jack Tigar Humphries,
+                                                                    ciples, SOSP ’19, page 399–413, New York, NY, USA,
+     Adam Belay, David Mazières, and Christos Kozyrakis.
+                                                                    2019. Association for Computing Machinery.
+     Shinjuku: Preemptive scheduling for µsecond-scale tail
+     latency. In 16th USENIX Symposium on Networked            [66] Yoshinori Matsunobu, Siying Dong, and Herman Lee.
+     Systems Design and Implementation (NSDI 19), pages             MyRocks: LSM-tree database storage engine serving
+     345–360, 2019.                                                 Facebook’s social graph. Proceedings of the VLDB
+                                                                    Endowment, 13(12):3217–3230, 2020.
+[58] Kostis Kaffes, Jack Tigar Humphries, David Mazières,
+     and Christos Kozyrakis. Syrup: User-defined schedul-      [67] Steven McCanne and Van Jacobson. The BSD packet fil-
+     ing across the stack. In Proceedings of the ACM                ter: A new architecture for user-level packet capture. In
+     SIGOPS 28th Symposium on Operating Systems Prin-               USENIX Winter 1993 Conference (USENIX Winter 1993
+     ciples, SOSP ’21, page 605–620, New York, NY, USA,             Conference), San Diego, CA, January 1993. USENIX
+     2021. Association for Computing Machinery.                     Association.
+
+
+
+390   16th USENIX Symposium on Operating Systems Design and Implementation                             USENIX Association
+[68] J. Mogul, R. Rashid, and M. Accetta. The packer filter:        USENIX Symposium on Operating Systems Design and
+     An efficient mechanism for user-level network code.            Implementation, OSDI ’96, page 213–227, New York,
+     In Proceedings of the Eleventh ACM Symposium on                NY, USA, 1996. Association for Computing Machinery.
+     Operating Systems Principles, SOSP ’87, page 39–51,
+     New York, NY, USA, 1987. Association for Computing        [77] Sudharsan Seshadri, Mark Gahagan, Sundaram
+     Machinery.                                                     Bhaskaran, Trevor Bunker, Arup De, Yanqin Jin,
+                                                                    Yang Liu, and Steven Swanson. Willow: A user-
+[69] Amy Ousterhout, Joshua Fried, Jonathan Behrens, Adam           programmable SSD. In 11th USENIX Symposium on
+     Belay, and Hari Balakrishnan. Shenango: Achieving              Operating Systems Design and Implementation (OSDI
+     high CPU efficiency for latency-sensitive datacenter           14), pages 67–80, Broomfield, CO, October 2014.
+     workloads. In 16th USENIX Symposium on Networked               USENIX Association.
+     Systems Design and Implementation (NSDI 19), pages
+     361–378, Boston, MA, February 2019. USENIX Asso-          [78] Dharma Shukla, Shireesh Thota, Karthik Raman, Mad-
+     ciation.                                                       han Gajendran, Ankur Shah, Sergii Ziuzin, Krishnan
+                                                                    Sundaram, Miguel Gonzalez Guajardo, Anna Wawrzy-
+[70] Patrick O’Neil, Edward Cheng, Dieter Gawlick, and Eliz-        niak, Samer Boshra, et al. Schema-agnostic indexing
+     abeth O’Neil. The log-structured merge-tree (LSM-tree).        with Azure DocumentDB. Proceedings of the VLDB
+     Acta Informatica, 33(4):351–385, 1996.                         Endowment, 8(12):1668–1679, 2015.
+
+[71] Simon Peter, Jialin Li, Irene Zhang, Dan R. K. Ports,     [79] Christopher A Small and Margo I Seltzer. Vino: An
+     Doug Woos, Arvind Krishnamurthy, Thomas Anderson,              integrated platform for operating system and database
+     and Timothy Roscoe. Arrakis: The operating system is           research. 1994.
+     the control plane. In 11th USENIX Symposium on Oper-
+     ating Systems Design and Implementation (OSDI 14),        [80] Rebecca Taft, Irfan Sharif, Andrei Matei, Nathan Van-
+     pages 1–16, Broomfield, CO, October 2014. USENIX               Benschoten, Jordan Lewis, Tobias Grieger, Kai Niemi,
+     Association.                                                   Andy Woods, Anne Birzin, Raphael Poss, et al. Cock-
+                                                                    roachDB: The resilient geo-distributed SQL database. In
+[72] George Prekas, Marios Kogias, and Edouard Bugnion.             Proceedings of the 2020 ACM SIGMOD International
+     Zygos: Achieving low tail latency for microsecond-scale        Conference on Management of Data, pages 1493–1509,
+     networked tasks. In Proceedings of the 26th Sympo-             2020.
+     sium on Operating Systems Principles, SOSP ’17, page
+     325–341, New York, NY, USA, 2017. Association for         [81] Mark Wilkening, Udit Gupta, Samuel Hsia, Caroline
+     Computing Machinery.                                           Trippel, Carole-Jean Wu, David Brooks, and Gu-Yeon
+                                                                    Wei. Recssd: Near data processing for solid state drive
+[73] Weikang Qiao, Jieqiong Du, Zhenman Fang, Michael               based recommendation inference. In Proceedings of the
+     Lo, Mau-Chung Frank Chang, and Jason Cong. High-               26th ACM International Conference on Architectural
+     throughput lossless compression on tightly coupled             Support for Programming Languages and Operating
+     CPU-FPGA platforms. In 2018 IEEE 26th Annual In-               Systems, ASPLOS 2021, page 717–729, New York, NY,
+     ternational Symposium on Field-Programmable Cus-               USA, 2021. Association for Computing Machinery.
+     tom Computing Machines (FCCM), pages 37–44. IEEE,
+     2018.                                                     [82] Ziye Yang, James R Harris, Benjamin Walker, Daniel
+                                                                    Verkamp, Changpeng Liu, Cunyin Chang, Gang Cao,
+[74] Zhenyuan Ruan, Tong He, and Jason Cong. INSIDER:               Jonathan Stern, Vishal Verma, and Luse E Paul. SPDK:
+     Designing in-storage computing system for emerging             A development kit to build high performance storage
+     high-performance drive. In 2019 USENIX Annual Tech-            applications. In 2017 IEEE International Conference on
+     nical Conference (USENIX ATC 19), pages 379–394,               Cloud Computing Technology and Science (CloudCom),
+     2019.                                                          pages 154–161. IEEE, 2017.
+
+[75] Robert Schmid, Max Plauth, Lukas Wenzel, Felix Eber-      [83] Irene Zhang, Jing Liu, Amanda Austin, Michael Lowell
+     hardt, and Andreas Polze. Accessible near-storage com-         Roberts, and Anirudh Badam. I’m not dead yet! the
+     puting with FPGAs. In Proceedings of the Fifteenth             role of the operating system in a kernel-bypass era. In
+     European Conference on Computer Systems, pages 1–              Proceedings of the Workshop on Hot Topics in Operating
+     12, 2020.                                                      Systems, pages 73–80, 2019.
+
+[76] Margo I. Seltzer, Yasuhiro Endo, Christopher Small, and   [84] Irene Zhang, Amanda Raybuck, Pratyush Patel, Kirk
+     Keith A. Smith. Dealing with disaster: Surviving misbe-        Olynyk, Jacob Nelson, Omar S. Navarro Leija, Ash-
+     haved kernel extensions. In Proceedings of the Second          lie Martinez, Jing Liu, Anna Kornfeld Simpson, Sujay
+
+
+
+USENIX Association                        16th USENIX Symposium on Operating Systems Design and Implementation         391
+      Jayakar, Pedro Henrique Penna, Max Demoulin, Piali
+      Choudhury, and Anirudh Badam. The demikernel dat-
+      apath os architecture for microsecond-scale datacenter
+      systems. In Proceedings of the ACM SIGOPS 28th Sym-
+      posium on Operating Systems Principles, SOSP ’21,
+      page 195–211, New York, NY, USA, 2021. Association
+      for Computing Machinery.
+[85] Yuhong Zhong, Hongyi Wang, Yu Jian Wu, Asaf Cidon,
+     Ryan Stutsman, Amy Tai, and Junfeng Yang. BPF for
+     storage: An exokernel-inspired approach. In Proceed-
+     ings of the Workshop on Hot Topics in Operating Sys-
+     tems, HotOS ’21, page 128–135, New York, NY, USA,
+     2021. Association for Computing Machinery.
+
+
+
+
+392   16th USENIX Symposium on Operating Systems Design and Implementation   USENIX Association
+A    Artifact Appendix
+Abstract
+We open-source XRP, a high-performance storage data path
+using Linux eBPF. The artifact includes the implementation
+of XRP in the Linux kernel and two key-value stores that
+leverage XRP to significantly improve throughput and latency.
+Scope
+The artifact allows readers to run all the experiments in §6
+and generate Table 3, Figure 5, Figure 6, Figure 7, Figure 8,
+Figure 9, and Figure 10.
+Contents
+The artifact provides the following parts.
+ 1. XRP: the implementation of XRP in the Linux kernel
+    v5.12.0.
+ 2. BPF-KV: a simple key-value store that uses XRP to accel-
+    erate both point and range lookups.
+ 3. WiredTiger: a modified WiredTiger (based on v4.4.0) that
+    integrates with XRP to speed up index lookups.
+ 4. My-YCSB: an efficient YCSB benchmark written in C++
+    for WiredTiger.
+   Test scripts and drawing scripts are also provided for all
+the experiments and results in §6.
+Hosting
+The artifact is hosted on the main branch (commit fae90c5) of
+the Github repository https://github.com/xrp-project/
+XRP.
+
+Requirements
+XRP requires a low latency NVMe SSD on which the over-
+head of the Linux storage stack is significant. We use Intel
+Optane SSD P5800X in all the experiments. In the test scripts,
+we assume that the operating system is Ubuntu 20.04, and
+there are 6 physical CPU cores on the machine. Other config-
+urations may require changing the scripts accordingly.
+
+
+
+
+USENIX Association                          16th USENIX Symposium on Operating Systems Design and Implementation   393
+

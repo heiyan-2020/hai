@@ -1,0 +1,1193 @@
+Performance-Optimal Read-Only Transactions
+ Haonan Lu, Princeton University; Siddhartha Sen, Microsoft Research;
+                  Wyatt Lloyd, Princeton University
+          https://www.usenix.org/conference/osdi20/presentation/lu
+
+
+
+
+    This paper is included in the Proceedings of the
+    14th USENIX Symposium on Operating Systems
+             Design and Implementation
+                          November 4–6, 2020
+                             978-1-939133-19-9
+
+
+
+                                    Open access to the Proceedings of the
+                                    14th USENIX Symposium on Operating
+                                     Systems Design and Implementation
+                                           is sponsored by USENIX
+                    Performance-Optimal Read-Only Transactions
+                                      Haonan Lu? , Siddhartha Sen† , Wyatt Lloyd?
+                                      ? Princeton University, † Microsoft Research
+
+
+                         Abstract                                     The dominance of reads in real-world workloads makes
+                                                                  their performance the primary determinant of end-user
+Read-only transactions are critical for consistently reading      latency and overall system throughput. Unfortunately,
+data spread across a distributed storage system but have          read-only transactions perform worse than simple, non-
+worse performance than simple, non-transactional reads. We        transactional reads due to the coordination required to
+identify three properties of simple reads that are necessary      present a consistent view across shards. Whether a view is
+for read-only transactions to be performance-optimal, i.e.,       consistent is determined by a system’s consistency model:
+come as close as possible to simple reads. We demonstrate         stronger consistency provides an abstraction closer to a
+a fundamental tradeoff in the design of read-only transac-        single-threaded environment, greatly simplifying application
+tions by proving that performance optimality is impossible to     code [33]. Thus, ideal read-only transactions would provide
+achieve with strict serializability, the strongest consistency.   the strongest consistency and have optimal performance.
+   Guided by this result, we present PORT, a performance-             What is the “optimal” performance? Although recent
+optimal design with the strongest consistency to date. Cen-       work has studied optimality through the lens of latency [34],
+tral to PORT are version clocks, a specialized logical clock      it did not consider throughput, which adds a fundamentally
+that concisely captures the necessary ordering constraints.       new dimension to this question. In this paper, we formalize
+We show the generality of PORT with two applications.             the notion of optimality for read-only transactions and use
+Scylla-PORT provides process-ordered serializability with         it to explore the tradeoff between their consistency and per-
+simple writes and shows performance comparable to its non-        formance. We posit that optimality should be defined by the
+transactional base system. Eiger-PORT provides causal con-        algorithmic properties of simple reads that comprise a read-
+sistency with write transactions and significantly improves       only transaction. Simple reads do not provide transactional
+the performance of its transactional base system.                 isolation and thus capture the minimum work required to
+                                                                  read data in a distributed storage system: One round of Non-
+1   Introduction                                                  blocking communication with a Constant amount of meta-
+Large-scale web services are built on distributed storage sys-    data. As we elaborate in §3, these algorithmic properties (N,
+tems. Sharding data across machines enables distributed           O, and C) precisely capture the additional coordination in-
+storage systems to scale capacity and throughput. Sharding,       curred by read-only transactions to present a consistent view.
+however, complicates building correct applications because        Thus, we define performance-optimal read-only transactions
+read requests sent to different shards may arrive at different    to be those with the same NOC properties as simple reads.
+times and thus return an inconsistent view of the data.               Our main theoretical result is that performance optimality
+   Consistently interacting with data in a distributed storage    is impossible in a system that provides Strict serializability—
+system thus requires transactional isolation, which unifies       the strongest type of consistency. Specifically, our NOCS
+the view of data across shards. While general transactions        Theorem states that no read-only transaction algorithm can
+provide isolation for reading and writing across shards, this     be performance optimal and provide strict serializability.
+paper focuses on read-only transactions that only read data.      This result holds even in systems that only support non-
+Read-only transactions are prevalent: they are used in sys-       transactional writes, and thus applies to systems with and
+tems without general transactions [4, 14, 31, 32, 34] and,        without more general types of transactions. It shows there
+even for systems with general transactions, they are often        is a fundamental choice in the design of distributed storage
+implemented with a specialized algorithm [10, 11, 34, 37,         systems: they can either provide the strongest consistency or
+38, 39, 51]. Read-only transactions are practically important     the best performance for read-only transactions, not both.
+because reads dominate real-world workloads: Facebook re-             Guided by our impossibility result, we present the PORT
+ported 99.8% reads for TAO [8] and Google reported three          design, which enables performance-optimal read-only trans-
+orders of magnitude more reads than general transactions          actions with the strongest consistency to date: process-
+for the ads workload (F1) that runs on Spanner [10]. They         ordered serializability. Previous performance-optimal trans-
+are also theoretically important because they provide a lower     actions only provided relatively weak consistency (§5.1).
+bound for other classes of transactions: anything impossible      PORT provides performance-optimal read-only transactions
+for read-only transactions is also impossible for any class of    without harming either the latency or throughput of writes.
+transactions that includes reads.                                 The main mechanism enabling our design is a new special-
+
+
+
+USENIX Association                           14th USENIX Symposium on Operating Systems Design and Implementation            333
+ized logical clock, called version clocks, that concisely cap-   2     Background
+ture the ordering constraints imposed by process-ordered se-
+                                                                 Web service architecture. Web services are typically built
+rializability on read and write operations. PORT uses version
+                                                                 using two tiers of machines: a stateless frontend tier and a
+clocks to tightly co-design its components. Version clock
+                                                                 stateful storage tier. The frontends handle end user requests
+values index its multi-versioning framework, control what
+                                                                 by executing application logic that generates sub-requests to
+read-only transactions see, and control where writes are ap-
+                                                                 read or write data in the storage tier. We refer to the frontends
+plied. They also enable optimizations that avoid the work of
+                                                                 as clients and the storage machines as servers, as is common.
+applying some concurrent writes (write omission) and limit
+                                                                 Web services are often replicated across multiple datacen-
+the staleness of reads (data freshness).
+                                                                 ters. For simplicity, we focus on a single datacenter setting,
+    We use the PORT design with the write omission
+                                                                 but our results also apply to multi-datacenter settings.
+and data freshness optimizations to build a new stor-
+age system, Scylla-PORT, that adds performance-optimal           Read-only transactions. Read-only transactions provide a
+read-only transactions to ScyllaDB [47] while providing          consistent, unified view of data spread across servers in a
+process-ordered serializability. As a single-versioned, non-     storage tier. They consist of one or more logical rounds of
+transactional system, ScyllaDB provides a clean slate for im-    simple read requests issued in parallel to the servers, which
+plementing PORT and allows us to quantify the overhead           collectively return a view satisfying the consistency model
+of our performance-optimal read-only transactions relative       of the system. One-shot transactions [23] know the data
+to simple reads. ScyllaDB’s simple reads are a challeng-         locations of all reads prior to the transaction start. In con-
+ing baseline as the system is aggressively engineered for        trast, multi-shot transactions may include key dependencies,
+high performance, including core-level sharding and custom       where the data read in one shot determines what data to read
+lock-free data structures. Our evaluation shows that PORT’s      in later shots. We study one-shot transactions for simplicity,
+read-only transactions introduce low overhead, achieving         because they are common, and because what is impossible
+throughput and latency within 3% of ScyllaDB on most of          for them is also necessarily impossible for multi-shot trans-
+the workloads we test, and within 8% in the worst case. Our      actions. The NOCS Theorem thus also applies to multi-shot
+evaluation also compares PORT to a variant of OCC that           transactions. The PORT design for read-only transactions
+is optimized for read-only transactions. PORT significantly      can be easily extended to support multi-shot transactions.
+outperforms OCC with at least double the throughput and at
+                                                                 3     Performance-Optimal Read Transactions
+most half the latency because Scylla-PORT always finishes
+in one round while OCC’s best case is two rounds.                This section explains the challenges of reasoning about per-
+    We also applied PORT with data freshness optimizations       formance, the rationale of our approach, and the set of algo-
+to Eiger [32] to make its read-only transactions performance     rithmic properties that define optimal performance.
+optimal while preserving the system’s causal consistency and
+write transactions. Eiger is a challenging baseline because it
+                                                                 3.1    Reasoning About Performance
+can complete read-only transactions in a single round. Our       The key challenges to reasoning about performance are iden-
+evaluation shows that Eiger-PORT significantly improves          tifying the fundamental overhead of read-only transactions
+performance with throughput up to 3× higher and latency          and modeling it in a way that connects with practical designs.
+up to 60% lower than Eiger. These improvements do come           Capturing the fundamental overhead. As a layer built
+with some staleness relative to strongly consistent systems,     upon simple reads, the performance of a read-only transac-
+but our data freshness optimizations keep the staleness low.     tion is impacted by both the engineering factors in executing
+    In summary, this work makes the following contributions:     simple reads and the algorithmic properties of coordinating
+• A fundamental understanding of the tradeoff between per-       simple reads to find a consistent view. Engineering factors,
+   formance and consistency for read-only transactions. This     such as load balancing, batching, and networking, equally
+   includes a precise definition of performance optimality       affect simple reads and the read-only transactions built on
+   (§3) and the NOCS Theorem that proves optimality is im-       them. In contrast, the algorithmic properties, such as rounds
+   possible with strict serializability (§4).                    of communication, only affect read-only transactions. For
+• The PORT design that achieves performance-optimal read-        instance, a read-only transaction protocol that requires mul-
+   only transactions with the strongest consistency to date by   tiple round trips incurs overhead due to those extra rounds
+   leveraging version clocks, a new type of logical clock that   of messages, while the read requests in each round are engi-
+   concisely captures the necessary ordering constraints (§6).   neered the same as simple reads.
+• The implementation and evaluation of two new systems              Thus, this work focuses on the algorithmic properties that
+   based on the PORT design. Scylla-PORT is a clean-slate        capture the fundamental overhead of read-only transactions.
+   application of PORT to a non-transactional system, Scyl-      These properties capture the additional overhead to coordi-
+   laDB (§7). Eiger-PORT makes the read-only transaction         nate a consistent view and are orthogonal to underlying en-
+   algorithm of Eiger performance optimal (§8, §9).              gineering factors. More specifically, we answer the question,
+
+
+
+334   14th USENIX Symposium on Operating Systems Design and Implementation                                 USENIX Association
+“given a system, how low can we make the performance            reads: the client sends a single request to each server holding
+overhead of read-only transactions relative to the system’s     relevant data, and each server sends a single response back.
+simple reads?”                                                  It excludes algorithms that use extra messages, such as those
+Being useful in practice. Our goal is to model optimal per-     that require multiple rounds of on-path communication, e.g.,
+formance in a way that is both theoretically insightful and     to abort/retry. It also disallows coordinating through off-path
+practically useful. Theoretical insights help clarify funda-    messages, i.e., messages that are necessary for the read-only
+mental tradeoffs between performance and guarantees. Prac-      transactions but lie off the critical path of reads.
+tically useful guidance helps us design better systems. Our        A message is an off-path message for read-only transac-
+NOCS Theorem (§4.1) and properties yield theoretical in-        tions if its removal affects only the correctness of read-only
+sights that lead to a better design, PORT (§6), that achieves   transactions. For example, COPS-SNOW [34] adds extra
+better performance in practice. This shows that our modeling    messages to writes. These messages are used for read-only
+is practically useful (§5).                                     transactions to find a consistent snapshot and are not neces-
+                                                                sary for processing writes. Because only the correctness of
+3.2   Approach Overview                                         read-only transactions is affected if these messages are re-
+To reason about optimal performance in a practically use-       moved, they are off-path messages.
+ful way, we examine the mechanisms used in existing sys-           Additional rounds of on-path messages increase the la-
+tems to coordinate a consistent view across shards. These       tency of read-only transactions. Both extra on-path and off-
+coordination mechanisms include blocking, extra messages,       path messages decrease system throughput because trans-
+and metadata. Some systems block read operations until a        mitting and processing them consume network and CPU re-
+consistent view is ready—e.g., systems that use two-phase       sources that could otherwise be used to service requests.
+locking. Almost all systems use extra messages to deter-
+                                                                C: Constant metadata. Metadata is the information re-
+mine a consistent view, such as multiple round trips on the
+                                                                quired by a read-only transaction algorithm to coordinate
+critical path of reads—e.g., OCC [24]—or approaches that
+                                                                consistent values. It is information a server needs to find
+asynchronously coordinate a consistent view—e.g., COPS-
+                                                                the specific version of the data that will produce a consistent
+SNOW [34], GentleRain [15], Cure [3]. Finally, all systems
+                                                                cross-shard view across reads in the same transaction. Ex-
+we are aware of use metadata to help compute a consistent
+                                                                amples of metadata include timestamps [2, 10], transaction
+view for read-only transactions to return—e.g., timestamps,
+                                                                ids [34, 41], and identifiers of participating servers [5].
+transaction ids. Figure 9 in Section 10 shows representative
+                                                                    A read-only transaction algorithm has constant metadata
+systems that use these mechanisms.
+                                                                if the amount of metadata required to process each of its read
+   These coordination mechanisms cause read-only transac-
+                                                                requests is constant, i.e., it does not increase with the size
+tions to have worse performance than simple reads, as they
+                                                                of the system, the size of the transaction, or the number of
+consume additional system resources. Therefore, we define
+                                                                concurrent operations. An example of constant metadata is
+performance-optimal read-only transactions to be those that
+                                                                one timestamp per read request for snapshot reads in Span-
+require the least amount of each coordination mechanism,
+                                                                ner [10]. An example of non-constant metadata is COPS-
+making their performance closest to that of simple reads.
+                                                                SNOW [34], which requires information about many con-
+3.3   NOC: Optimal Performance                                  current read-only transactions to process each read request.
+We now explain the NOC properties, which we use to define           Transmitting and/or processing extra metadata consumes
+optimal performance for read-only transactions.                 more resources, increasing latency and decreasing through-
+                                                                put. Its negative impact on performance has been reported in
+N: Non-blocking. A read-only transaction algorithm is non-
+                                                                recent work [13, 14, 15]. We use Big-O notation, i.e., “con-
+blocking if servers process each read request without waiting
+                                                                stant,” to capture the algorithmic complexity of metadata re-
+for any external event, such as a lock to become available, a
+                                                                quired for coordination. In practice, system designers should
+message to arrive, or a timer to expire.
+                                                                aim for as low a constant as possible. We realize this in our
+   Blocking for a read request increases the latency of the
+                                                                PORT design, which uses a single integer per read request.
+read-only transaction: the more time spent blocking, the
+longer the transaction takes to complete. It also decreases     Performance optimality. We deem an algorithm perfor-
+throughput due to the overhead of context switches. In prac-    mance optimal if it satisfies the N+O+C properties because
+tice, blocking can incur more serious performance issues,       they capture the least coordination overhead and thus enable
+e.g., CPU underutilization and deadlocks, which are increas-    performance as close as possible to simple reads.
+ingly pronounced in modern services [44, 52].
+                                                                4   The NOCS Theorem
+O: One-round communication. A read-only transaction al-
+gorithm has one-round communication if it uses exactly one      An ideal system would have performance-optimal read-only
+parallel round of on-path messages and does not have any        transactions that provide the strongest consistency. Our
+off-path messages. This matches the messages of simple          NOCS Theorem proves this ideal is impossible.
+
+
+
+USENIX Association                         14th USENIX Symposium on Operating Systems Design and Implementation            335
+S: Strict serializability. Strict serializability is the strongest   of history that precedes the unstable region, where all writes
+form of consistency, equivalent to linearizability [22] with         have committed and system states are finalized. Reading in
+the addition of transactional isolation. It requires that there      the stable region is easy as there are no conflicting writes.
+exists a legal total order of transactions that respects the real-   However, we show that the real-time order requirement of S
+time order between transactions [42]. A legal total order en-        requires read-only transactions that are N+O to interact with
+sures that the results of transactions are equivalent to a single    the most recent writes in the unstable region (Lemma 1). Do-
+entity processing them one by one. The real-time order en-           ing this while ensuring a legal total order requires transfer-
+sures that if transaction T2 starts after transaction T1 ends,       ring metadata between the servers (Lemma 2), either proac-
+then T1 must appear before T2 in the total order. If T1 and T2       tively through read requests or through the write protocol.
+have overlapping lifetimes, then they are concurrent and can         By extending this construction, we show that processing a set
+be placed in either order. Strict serializability gives applica-     of read-only transactions requires metadata that is asymptot-
+tion programmers the powerful abstraction of programming             ically larger than the total size of the transactions, regardless
+in a single-threaded, transactionally isolated environment.          of how the metadata is transferred (Lemma 3). This violates
+                                                                     C, proving the theorem.
+4.1    NOCS is Impossible
+                                                                     Proof. Suppose the system has two servers, S1 and S2 , and
+Our main result is that performance-optimal read-only trans-         multiple clients. Let ALG be any read-only transaction algo-
+actions (N+O+C) cannot provide strict serializability (S).           rithm that satisfies N+O+S. Let R = {r1 , r2 } be a read-only
+This section present a condensed version of the proof. The           transaction that executes ALG, issued by client CR . Let w1 and
+full proof appears in our accompanying technical report [35].        w2 be simple write requests issued by client Cw 6= CR , where
+The NOCS Theorem. No read-only transaction algorithm                 w1 → w2 in real-time, i.e., w2 is sent after the response for
+satisfies all NOCS properties.                                       w1 is received. We place no restrictions on the write protocol
+                                                                     (beyond assumption A-0). Consider the execution e1 :
+System model. We model a distributed system as a set of              S1 : r1 , w1
+processes that communicate by sending and receiving mes-             S2 :         w2 , r2
+sages. This model is similar to that used in FLP [17]. A set
+of client processes (clients) issue requests to server processes       Suppose there is no metadata in the system, i.e., no infor-
+(servers) that store the data. Processes are modeled as deter-       mation for coordinating consistent values between requests.
+ministic automata: in each atomic step, they may receive a           Lemma 1. Without metadata, a read-only transaction that is
+message, perform deterministic local computation, and send           N+O+S must observe any write that precedes it at a server.
+one or more messages to other processes.                             Proof Summary. Without metadata, S2 cannot distinguish be-
+   A transaction (operation) starts when a client sends the re-      tween an execution where w2 and R are concurrent and one
+quest messages to servers and ends when the client receives          with w2 → R in real-time. The latter requires r2 ∈R to observe
+the last necessary server response. Two transactions (oper-          w2 to satisfy S’s real-time order.                           
+ations) are concurrent if their lifetimes overlap, i.e., neither
+begins after the other ends. If concurrent transactions (oper-       Lemma 2. Processing e1 while satisfying N+O+S requires
+ations) access the same data item, then they conflict.               dependency R → w1 to be transferred from S1 to S2 .
+Assumptions. We make the following assumptions:                      Proof Summary. Lemma 1 states that, without metadata, r2
+   (A-0) There are ≥ 2 servers and ≥ 2 clients. Otherwise,           must observe w2 , implying w2 → R. But r1 must be pro-
+optimal performance and strict serializability are trivial. All      cessed before w1 to satisfy N+O, implying R → w1 . Since
+reads and writes eventually complete.                                w1 → w2 by construction, this creates a cycle, violating the
+   (A-1) The network and processors are reliable. Every              legal total order of S. Using basic two-party communication
+message is eventually delivered and processed by the des-            complexity, we show that legalizing the total order requires
+tination process. Processes are correct and never crash. By          transferring R → w1 from S1 to S2 .                        
+proving our impossibility result under these favorable condi-           We now extend e1 with more read-only transactions,
+tions, it will necessarily hold when the system can fail.            servers, and write requests, and apply the structure above to
+   (A-2) The network is either asynchronous [20], i.e.,              force more dependency metadata to transfer between servers.
+messages can be arbitrarily delayed, or partially syn-               We then quantify this metadata and show that it violates C.
+chronous [16], i.e., physical clocks ensure bounded delays.
+Proof intuition. Due to network asynchrony, it is always             Proof of the NOCS Theorem. Suppose the system has
+possible for a read-only transaction to conflict with write op-      M 2 + 1 servers S1 , S2 , . . . , SM2 +1 . Let R1 , R2 , . . . , RN be N
+erations and other concurrent read-only transactions. These          read-only transactions that execute ALG, where each Ri sends
+requests occupy an unstable region in the system’s history,          a read request to S1 and M − 1 other servers, such that every
+where conflicts are possible and a total order has not yet           server other than S1 receives N/M read requests. (In practice
+been established. In contrast, the stable region is the part         M 2  N, but our construction works for any N, M ≥ 1.) The
+
+
+
+336   14th USENIX Symposium on Operating Systems Design and Implementation                                          USENIX Association
+specific mapping of read requests to servers is unimportant;               setting that is more general is also subject to the impossibility
+we lay them out sequentially by transaction index below. Let               result (the general setting includes the restricted setting as a
+ri, j be a read request of Ri assigned to S j . We assign one              special case). Thus, the NOCS Theorem also applies to more
+read request from each of R1 to RN/M to S2 , one read request              general settings, such as those with read-write transactions,
+from each of RN/M+1 to R2N/M to S3 , and so on, restarting at              multi-shot transactions, and/or failures.
+R1 after reaching RN . Let w1 , w2 , . . . , wM2 +1 be M 2 + 1 sim-
+                                                                           4.3    NOCS Is Tight
+ple writes issued to each server by a distinct client Cw that
+does not issue any read-only transactions. Suppose w1 pre-                 While all properties are impossible to achieve together, we
+cedes all other writes, i.e., w1 → w j for j = 2, . . . , M 2 + 1,         find that NOCS is “tight” in the sense that any combina-
+and all read-only transactions are concurrent with all writes.             tion of three properties is possible. Spanner’s [10] read-only
+Consider the execution e∗ :                                                transactions are one-round, use constant metadata, but block
+S1 : r1,1 , . . . , rN,1 , w1                                              reads in order to return strictly serializable results (O+C+S).
+S2 :                          w2 , r1,2 , . . . , rN/M,2                   Many systems use multiple non-blocking round trips to coor-
+S3 :                          w3 , rN/M+1,3 , . . . , r2N/M,3              dinate strongly consistent results (N+C+S), e.g., DrTM [49],
+..                                                                         RIFL [29]. To the best of our knowledge, no existing system
+ .                                                                         provides strict serializability in one round of non-blocking
+ SM+1 :                       wM+1 , rN−N/M+1,M+1 , . . . , rN,M+1         communication (N+O+S). We present the design of such a
+ SM+2 :                       wM+2 , r1,M+2 , . . . , rN/M,M+1             system, PORT-SEQ, and a proof of its correctness in our
+ ..                                                                        technical report [35]. The design uses a centralized write se-
+  .                                                                        quencer to totally order writes, and requires a linear amount
+  SM2 +1 :                    wM2 +1 , rN−N/M+1,M2 +1 , . . . , rN,M2 +1   of metadata for read-only transactions. We are aware of two
+                                                                           systems that have performance-optimal read-only transac-
+   By decomposing this execution into layers, we can induc-                tions (N+O+C): MySQL Cluster [39] and the snapshot read
+tively quantify the metadata required to process it. Let e1 be             API of Spanner. These systems provide weak consistency,
+the execution fragment containing all write requests and only              however, as we discuss below.
+the read requests of R1 . Let ei contain the requests of ei−1
+plus all read requests of Ri , for i = 2, . . . , N. Thus eN = e∗ .        5     NOCS Connects Theory with Practice
+                                                                           This section discusses the value of the NOCS Theorem in un-
+Lemma 3. Processing ek while satisfying N+O+S requires
+                                                                           derstanding the design space and in guiding system designs.
+Ω(kM 2 ) metadata, for k = 1, . . . , N.
+Proof Summary. The proof is by induction. For the base                     5.1    Theoretical Insights
+case of e1 , Lemma 2 requires us to transfer R1 → w1 from                  Proving the impossible. NOCS is philosophically similar
+S1 to all M − 1 servers targeted by R1 . We show that the                  to other impossibility results like CAP and SNOW, in that it
+write protocol cannot efficiently transfer this metadata, since            helps system designers avoid attempting the impossible and
+it does not know which servers R1 targets, and hence must                  instead identifies a fundamental choice they must make: their
+send R1 → w1 to all M 2 servers, or Ω(M 2 ) metadata. Al-                  system can either have performance-optimal read-only trans-
+ternatively, r1,1 can convey the list of target servers, but               actions or provide strict serializability, but not both.
+due to asynchrony, a different execution could cause a dif-                Identifying the possible. The crux of NOCS’s impossibil-
+ferent target server S j to play the role of S1 , making it                ity is that the real-time requirement of strict serializability
+impossible to know which r1, j will appear before a write.                 forces read-only transactions to confront conflicting requests
+Thus, every r1, j must include the list of M servers, requir-              (Lemma 1). This suggests optimal performance could be
+ing Ω(M ∗ M) = Ω(M 2 ) metadata. In the inductive step, we                 possible with even slightly relaxed consistency models that
+show that ek cannot rely on previous metadata transferred in               do not require real-time ordering, and thus can avoid the
+ek−1 , and thus requires an additional Ω(M 2 ) metadata.      
+                                                                           unstable region. In particular, the second strongest consis-
+Completion of the proof. By Lemma 3, e∗ = eN requires                      tency model we are aware of—process-ordered serializabil-
+Ω(NM 2 ) metadata. Since R1 , . . . , RN issue NM read requests            ity [34]—does not require real-time ordering.
+total, the amortized metadata required per read request is                    Yet, there is a large gap in the current design space. The
+       2
+Ω( NM
+    NM ) = Ω(M), which is not constant, violating C.                      only two existing systems whose read-only transactions are
+                                                                           performance optimal provide weak consistency. MySQL
+4.2     The Broad Scope of NOCS                                            Cluster’s read-committed consistency does not isolate trans-
+We prove NOCS is impossible in the specific setting of one-                actions. Spanner’s snapshot read API can be used to get
+shot read-only transactions in failure-free systems. When                  performance optimality, but it does not ensure clients see
+it comes to an impossibility result, the more restricted the               their own recent writes when used in this way (§10). Be-
+setting it is proved in, the stronger the result, because any              tween these weak guarantees and strict serializability are
+
+
+
+USENIX Association                                  14th USENIX Symposium on Operating Systems Design and Implementation               337
+many stronger consistency models, such as read-atomic [5],             The need for multi-versioning to support efficient reads is
+causal consistency [31], and process-ordered serializabil-         not new. The existing performance-optimal systems, Span-
+ity [34]. We bridge this gap by presenting the PORT de-            ner and MySQL Cluster, are multi-versioned. In fact, all ex-
+sign that provides performance-optimal read-only transac-          isting systems whose read-only transactions are guaranteed
+tions and the strongest consistency to date: PORT provides         to terminate—i.e., have a bounded number of retries and/or
+process-ordered serializability in systems with only simple        bounded blocking—are multi-versioned (Table 9). On the
+writes (§6), and it provides causal consistency in systems         other hand, multi-versioning alone does not ensure optimal
+with write transactions (§8). (We conjecture causal consis-        performance: most MVCC protocols require either extra on-
+tency is the upper bound for performance-optimal read-only         path messages to query a timestamp oracle [6, 43], off-path
+transactions when transactional writes are present.)               messages to compute stable snapshots [3, 15], or blocking
+                                                                   reads if the client-provided timestamp in MVTSO-based pro-
+5.2    Guiding System Designs                                      tocols points to the future [30, 45]. PORT’s novelty is in how
+NOCS is also useful in guiding system designs. First,              it uses version clocks to explicitly control ordering by manip-
+to make a design performance-optimal, it must satisfy the          ulating the multi-versioning framework in order to achieve
+NOC properties: each transaction must succeed using a sin-         optimal performance.
+gle round of non-blocking messages with constant meta-
+data. Therefore, the NOC properties indicate we must avoid         6     PORT Design
+validation-based and stabilization-based techniques to sat-        PORT is a new system design that enables performance-
+isfy O, avoid techniques based on distributed lock manage-         optimal read-only transactions with process-ordered serial-
+ment to satisfy N, and ensure the complexity of processing         izability, the strongest consistency to date.
+a read does not depend on the level of contention—i.e., the        Process-ordered serializability. Process-ordered serializ-
+number of conflicting reads and/or writes—to satisfy C. Sec-       ability guarantees there exists a legal total order of transac-
+ond, the NOCS Theorem suggests a path towards designing            tions that respects the ordering of transactions within each
+NOC protocols by avoiding how it derives its impossibil-           process [34]. It is equivalent to sequential consistency [27]
+ity: read-only transactions should always execute on system        with the addition of transactional isolation. It preserves all
+states outside the unstable region. These implications of the      the properties of strict serializability (§4) except for the real-
+NOC properties and the NOCS proof significantly reduced            time order across processes (clients). That is, it preserves the
+the design space of algorithm we needed to explore and led         real-time order within each process, i.e., process order, and
+us to two high-level techniques for PORT: explicit ordering        a total order across processes, but a client may not see the
+control and multi-versioning.                                      most recent updates of other clients. Process order ensures
+Explicit ordering control. There are two methods for en-           that each client interacts with the system monotonically, e.g.,
+suring reads avoid the unstable region by explicitly control-      sees her own recent writes. Total order ensures that concur-
+ling the ordering of concurrent operations. First, reads can       rent transactions are observed by all clients in the same order.
+request versions of the data that lie before the unstable region
+                                                                   6.1    Version Clocks
+begins, which orders a read-only transaction before ongoing
+writes. Second, servers can reorder operations when a read         This section describes version clocks (§6.1), a new special-
+requests data in the unstable region.                              ized logical clock that tightly couples all the components of
+   Explicitly controlling ordering is not compatible with          PORT (§6.2). Version clocks also allow us to avoid the work
+strict serializability because the real-time requirement forces    of applying some writes (write omission, §6.3) and limit the
+a specific ordering of operations (Lemma 1) that cannot be         staleness of reads (data freshness, §6.4).
+communicated in a performance-optimal system (Lemma 3).               Version clocks are designed in the context of distributed
+Consistency models without the real-time requirement, how-         storage systems and have two features: they ensure pro-
+ever, might be compatible with an explicitly controlled or-        cess order by concisely capturing the ordering constraints be-
+dering while satisfying NOC. PORT confirms this, by using          tween requests and enable optimal performance by reading
+versions clocks to capture this explicit ordering. PORT uses       at the most recent snapshot in the stable region.
+both types of explicit control on top of multi-versioning to       Enforcing process order. Version clocks take advantage of
+provide its consistency guarantees and optimal performance.        two observations. First, process order is a per-client order,
+Multi-versioning. Enabling reads to control what version           and thus can be explicitly controlled by clients. Second, read
+of data they request requires multi-versioning on servers.         and write requests have different semantics, i.e., writes mod-
+Multi-versioning introduces storage overhead to temporarily        ify system state while reads do not. Therefore, they should
+keep additional version around, but this overhead is minor as      be treated differently: it is unnecessary to enforce an order
+storage is inexpensive and extra versions are not kept long.       among the read requests that observe the same system state.
+It also introduces some processing overhead to look up the         Capturing the stable frontier. Version clocks follow the
+correct version of data to return, reflected by our C property.    practical guidance of the NOCS Theorem (§5.2) to avoid the
+
+
+
+338   14th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+ 1 Client   Side                                                    1 Client  Side
+ 2 versionstamp    = 0 # clock value                                2 function  read_only_txn(<keys>):
+ 3 view[]              # max known versionstamp per server          3    vs = VersionClock.get_vs_read()
+ 4                                                                  4    for k in keys # in parallel
+ 5 # Sending requests                                               5      vals[k], maxVS = read(k, vs)
+ 6 function get_vs_read():                                          6      VersionClock.recv_response(maxVS)
+ 7   versionstamp = tick(min{view[]}) # stable frontier             7    return vals   # replies to end user
+ 8   return versionstamp                                            8
+ 9                                                                  9 function  write(key, val):
+10 function   get_vs_write():                                      10    vs = VersionClock.get_vs_write()
+11     versionstamp++                                              11    maxVS = write(key, val, vs)
+12     return versionstamp                                         12    VersionClock.recv_response(maxVS)
+13                                                                 13    return        # replies to end user
+14 # Receiving a response msg from server svr                      14
+15 function recv_response(maxVS):                                  15 Server   Side
+16   view[svr] = max{view[svr], maxVS}                             16 vers[keys][]  # multi-versioned storage
+17   if msg.for_write is true                                      17 function  read(key, vs):
+18     versionstamp = tick(maxVS)                                  18    if vers[key][vs] exists
+19   return                                                        19      return vers[key][vs], VersionClock.maxVS
+20                                                                 20    else # return nearest version to not block
+21 function   tick(vs):                                            21      near_vs = find_nearest_earlier(ver)
+22     return max{vs, versionstamp}                                22      # ensure future writes have higher vs
+23                                                                 23      vers[key].max_r_vs = max(vers[key].max_r_vs, vs)
+24 Server Side                                                     24      return vers[key][near_vs], VersionClock.maxVS
+25 maxVS = 0 # max seeen versionstamp                              25
+26 # ... return maxVS when sending response msg                    26 function  write(key, val, vs):
+                                                                   27    if vs <= vers[key].max_w_vs
+                                                                   28      return VersionClock.maxVS # omit write
+            Figure 1: Pseudocode for version clocks.               29    if vers[key].max_r_vs >= vs
+                                                                   30      vs = max_r_vs + 1 # commit after promoted versions
+                                                                   31    vers[key][vs] = val
+unstable region by capturing the stable frontier. The stable       32    vers[key].max_w_vs = vs
+frontier is the most recent snapshot in which all writes are       33    if vs > VersionClock.maxVS
+                                                                   34      VersionClock.maxVS = vs
+in the stable region. Each server tracks the final version-        35    return VersionClock.maxVS
+stamp of its most recent write. A version clock tracks the
+minimum of such versionstamps across all servers the client                      Figure 2: Pseudocode for PORT.
+has contacted, which is exactly the stable frontier the client
+knows. Version clocks direct read messages to the stable           non-smaller versionstamps than earlier writes, version clocks
+frontier when possible. PORT takes care of the cases when          preserve process ordering.
+reads have to confront conflicting requests beyond the stable
+frontier. “Promotion” is used in systems with simple writes        6.2     Basic PORT Design
+to advance the stable frontier beyond the versionstamp of an
+                                                                   The basic PORT design includes a multi-versioning frame-
+incoming read to ensure a total order. “Per-client ordering”
+                                                                   work, a read-only transaction algorithm, and a write algo-
+is used in systems with write transactions to logically move a
+                                                                   rithm. We co-design these components tightly by leveraging
+client’s own writes before the stable frontier so the client can
+                                                                   version clocks. Figure 2 shows PORT’s pseudocode.
+always safely read at the stable frontier (§8.2). Both tech-
+niques enforce the necessary order between concurrent reads        Client library. The read-only transaction and write algo-
+and writes without blocking either reads or writes.                rithms are executed by a client library. For each read-only
+Clock structure. Figure 1 shows the pseudocode of version          transaction or write, the client obtains a versionstamp from
+clocks. versionstamp stores the current clock value (line 2),      its version clock and embeds it in the request message(s).
+which is embedded in every read/write message to explicitly        This per-client versionstamp decides which system version
+control their ordering. When versionstamps are the same for        on the servers the operation must read (or write) to ensure the
+two operations of the same type, the server orders them ar-        client’s process order (lines 3, 10). The server-side logic en-
+bitrarily. When versionstamps for a read and a write are the       sures a total order on top of the process order on each client
+same, the server orders the read after the write. A server re-     to guarantee process-ordered serializability.
+sponds with the highest versionstamp it has seen (line 26).        Multi-versioning framework. Servers store written values
+A client uses view to track the highest versionstamps of the       in a multi-versioning framework (line 16). Since PORT
+servers it has contacted (line 3) and uses them to find the sta-   uses version clocks to track the ordering between operations,
+ble frontier (line 7) before sending a read message (lines 6–      it is natural and efficient to index the historical values of
+8). view is updated upon receiving a response (line 16). If the    each data item with versionstamps. In this way, the multi-
+response is for a write message, then the clock is advanced        versioning framework and transaction layer are nicely cou-
+so that future read messages will have greater versionstamps       pled via versionstamps. We omit a detailed discussion of
+than the write (lines 17–18), ensuring read-your-writes. Be-       garbage collection, which uses standard mechanisms similar
+cause versionstamps increase monotonically and reads have          to those used to provide at-most-once semantics.
+
+
+
+USENIX Association                           14th USENIX Symposium on Operating Systems Design and Implementation             339
+           P1!       Sx!   P2!                            P1!      Sx!     P2!                             P1!       Sx!   P2!
+             w1 =1                                                        2                                  w1 =1
+                     0!                                            0 w 2=
+                                                                     !                                               0!
+                     1!                                            2!                                                1!
+                     2!                                            1!
+
+
+(a) orders w 1 before w 2 by arrival.          (b) orders w 2 before w 1 by arrival.            (c) orders w 2 before w 1 by omission.
+Figure 3: Space-time diagrams showing three executions of writes w 1 and w 2 that are concurrent and conflicting. The
+value underneath Sx indicates the value stored by the server. Process-ordered serializability allows w1 , w2 to be ordered
+either way. This enables us to omit w2 in (c) because it is equivalent to the ordering in (b), i.e., (w
+                                                                                                      w2 , w1 ).
+
+
+Read-only transactions. To process a read request, a server              they arrive, e.g., w1 then w2 . But if instead we use the oppo-
+executes it against the system version specified by its ver-             site order, then this is equivalent to omitting w2 , as shown in
+sionstamp. Executing a read is thus equivalent to returning              Figure 3: skipping the later write is equivalent to ordering it
+the value indexed at versionstamp. If the server has the re-             before the earlier write and immediately overwriting it with
+quested version, then the read is inside the stable region and           the latter. Write omission does not affect the total order re-
+it returns the version directly (lines 18, 19). Otherwise, it            quirement: all clients observe concurrent writes in the same
+uses promotion to ensure a total order between the read and              order, because omitted writes are never seen by any client.
+any concurrent writes at the specified versionstamp, without             Knowing a write is concurrent. Version clocks enable
+blocking either the read or write (lines 20–24).                         PORT to identify when writes are concurrent, allowing a
+   Promotion logically copies the value of the nearest earlier           later concurrent write to be omitted. PORT omits an incom-
+version to all empty positions between that version and the              ing write if its versionstamp, vsomit , is less than or equal to
+one requested by versionstamp. Logical versions are used                 the highest committed versionstamp of the data item, vshighest
+as placeholders to ensure a total order: once a version has              (lines 27–29). The write with the highest committed version-
+been read by any client, no earlier versions can be modified             stamp cannot have happened-before [26] the omitted write
+to ensure different clients observe them in the same order.              because vshighest ≥ vsomit . More specifically, version clocks
+For example, if a read request has vs = 4 and the data item              guarantee the invariant: if write x happens-before write y,
+has committed values at vs = 1, 2, the version at vs = 2 is              then vsx < vsy . The omitted write cannot have happened-
+the nearest earlier version and is promoted to positions 3, 4.           before the write with the highest committed versionstamp
+A conflicting write at vs = 3, 4 will be “bumped up” to vs =             because it has not happened yet. Therefore, the two writes
+5 when it arrives. We implement promotion with a single                  are concurrent, and it is safe to omit the incoming write.
+variable (line 23) that marks earlier positions as immutable.               Omitting a write is equivalent to applying it immediately
+Writes. When receiving a write request, a server finds the               before the write with the highest versionstamp. A client’s
+position specified by the write’s versionstamp in the multi-             future reads must observe the “higher” write if its own write
+versioning framework. If the position is empty, then the write           was overwritten in this way. Therefore, the server returns the
+is applied at the versionstamp (line 31). If the position has            versionstamp of its highest applied write to the client (line
+been marked immutable by read promotion, the server finds                29), which uses it to update its versionstamp as normal.
+the next available position to write the version at (lines 29–
+31). The write protocol also includes a mechanism for safely
+                                                                         6.4     Keeping Reads Fresh
+skipping concurrent writes (lines 27–28), discussed next.                To avoid the unstable region, we must sometimes return val-
+                                                                         ues staler than what strict serializability would return (§5.2).
+6.3    Write Omission                                                    PORT limits data staleness in two ways, neither of which
+Write omission is a special conflict resolution mechanism                incurs extra messages, blocking, or non-constant metadata.
+that skips an incoming write if it is concurrent with an al-             That is, they do not forfeit optimal performance (NOC).
+ready applied write. Omitting a write is desirable because it            Reducing staleness with version clocks. Instead of naively
+saves the computation needed to apply it, reduces the number             returning versions far behind the stable frontier, version
+of stored versions, and saves the work of replicating it.                clocks try to track the stable frontier precisely. They use view
+Write omission is safe. Consistency models in general, and               to track the most recent versionstamp on each server a client
+process-ordered serializability specifically, allow conflict-            has contacted, so a client’s version clock never ticks slower
+ing writes to be ordered either way. For instance, if two                than the servers it is aware of. This significantly improves
+processes concurrently issue w1 : write(x = 1) and w2 :                  the freshness of data requested by read-only transactions.
+write(x = 2), then they can be ordered as either (w1 , w2 )              Reducing staleness via co-location. Many storage systems
+or (w2 , w1 ). Typically, systems apply writes in the order that         co-locate “end users” on the same client machine [12, 18,
+
+
+
+340   14th USENIX Symposium on Operating Systems Design and Implementation                                         USENIX Association
+40], i.e., each client (machine) has many sessions (threads),     throughput, latency, scalability, and quantify data staleness.
+one per end user. We leverage co-location to help user ses-       Scylla-OCC. We implemented a variant of OCC optimized
+sions keep each other fresh by sharing one version clock          for read-only transactions, similar to Rococo’s read-only
+among them on the same client, which ensures no user ses-         transaction algorithm [37]. It includes an initial round of
+sion is staler than the freshest session it is co-located with.   optimistic reads and then a validation round. If the values
+6.5    Correctness and Generality                                 read in the optimistic round match the values in the valida-
+                                                                  tion round the transaction succeeds. If not, the read-only
+The only technique PORT relies on is version clocks, which        transaction is aborted and retried. This variant has strictly
+can easily be added to systems with existing physical/logical     better performance than traditional distributed OCC because
+clocks, or implemented from scratch. We demonstrate both          it avoids the need for distributed commit: its best case is two
+by applying PORT to a system without transactions (shown          rounds compared to traditional distributed OCC’s best case
+by Scylla-PORT) and a system with existing sub-optimal            of three rounds (read, validate/prepare, commit).
+read-only transactions (shown by Eiger-PORT). We present
+                                                                  Code. We implemented our server-side logic in ScyllaDB’s
+a proof of correctness for PORT in our technical report [35].
+                                                                  codebase (release 2.1-RC3) in C++14 and our client-side
+Failures. PORT can tolerate server failures using typical         logic in the Java Thrift client of the YCSB benchmark (re-
+techniques such as state machine replication [46]. To tol-        lease 0.10.0) [9]. Version clocks are implemented on both
+erate client—i.e., frontend—failures, clients can send ver-       servers and clients. Scylla-PORT adds ~1,300 LOC.
+sionstamps back to end-user machines that then include the
+                                                                  Experimental setting. We run experiments on Emulab [50].
+versionstamp in subsequent requests to the application (e.g.,
+                                                                  Each machine has two 2.4 GHz 8-Core Xeon CPUs, 64 GB
+via cookies). This ensures process ordering is maintained
+                                                                  RAM, and a 10 Gbps network interface. We use a single
+even if an end user’s later requests go to a different frontend
+                                                                  datacenter setting. All experiments, except for scalability
+due to load-balancing or frontend failure.
+                                                                  tests, use 8 servers loaded by 8 client machines. The scal-
+7     PORT Implementation and Evaluation                          ability tests use up to 64 machines. Each client issues 10
+This section discusses Scylla-PORT, the implementation of         million requests in each experiment, which takes 5–10 min-
+PORT on a clean slate base system.                                utes to complete, sufficiently long to minimize warm-up and
+                                                                  cool-down effects and provide stable results. Experiments
+7.1    Implementation                                             are CPU-bound on servers.
+We build PORT on ScyllaDB [47], a clean slate, non-               Configuration and workloads. We use YCSB’s standard
+transactional base system that supports only simple reads         workloads B (read-heavy, 95% reads) and C (read-only) with
+and simple writes. ScyllaDB is a production system that           customized read-to-write ratios of up to 25% writes. We use
+serves as a drop-in replacement for Cassandra [25] and pro-       YCSB’s default parameters: 1 million records, 10 fields per
+vides an order-of-magnitude better performance. It is well-       record, 100 B values per field, and Zipf constant of 0.99.
+engineered and aggressively-optimized for performance, in-        Each request (a read-only transaction or a group of simple
+cluding a new implementation in C++14, core-level sharding        writes) accesses 5 records and all fields in each record.
+that avoids cross-core locking and context switches, and cus-     Results summary. Transactional overhead is generally evi-
+tomized lock-free data structures.                                dent with read-write conflicts and under skewed workloads,
+Rationale and takeaways. We chose to implement PORT               so we focus our evaluation in such scenarios to amplify
+on ScyllaDB for three reasons. First, it stresses the effi-       Scylla-PORT’s cost. Our results show that Scylla-PORT can
+ciency of PORT: as a highly efficient baseline system, it is      almost match its performance to that of non-transactional
+sensitive to any additional overheads, and thus amplifies any     ScyllaDB: 1–3% overhead in throughput and latency in most
+performance cost introduced by PORT. Second, ScyllaDB             settings and less than 8% even in the worst case. Scylla-
+is single-versioned. The negligible performance overhead          PORT outperforms OCC by an order-of-magnitude in such
+shown in our evaluation includes the cost of making it multi-     contended scenarios due to OCC’s retries, and outperforms
+versioned (§5.2), which shows the efficiency of co-designing      OCC under low contention (OCC’s best case) by at least two
+the multi-versioning framework and the transaction layer en-      times. Scylla-PORT scales as well as ScyllaDB and scales
+abled by version clocks. Third, PORT is compatible with           better under contention. More than 40% of its reads return
+all the customized engineering decisions of ScyllaDB, which       fresh values.
+demonstrates the generality of the design of PORT.
+                                                                  7.3    Throughput and Latency
+7.2    Evaluation Overview                                        Figure 4a shows the overall performance of the systems as
+We evaluate Scylla-PORT against ScyllaDB (the clean slate,        we gradually increase the system load by using more closed-
+non-transactional base system) and Scylla-OCC (an im-             loop client threads. Scylla-PORT has similar performance to
+plementation of OCC atop ScyllaDB). We compare their              the baseline ScyllaDB. Their largest difference before Scyl-
+
+
+
+USENIX Association                           14th USENIX Symposium on Operating Systems Design and Implementation            341
+                                                                                                     250                                                                 16           ScyllaDB
+
+
+
+
+                                                                                                                                                  Average Latency (ms)
+      Average Latency (ms)    3.5
+
+
+
+
+                                                                              Throughput (K Txn/s)
+                                                           Scylla-OCC                                         ScyllaDB        Scylla-OCC
+                                                          Scylla-PORT                                                                                                              Scylla-PORT
+                                3                                                                          Scylla-PORT
+                                                             ScyllaDB                                200                                                                 12         Scylla-OCC
+                              2.5
+                                2                                                                    150                                                                  8
+                              1.5                                                                    100                                                                  2
+                                1
+                                                                                                      50                                                                  1
+                              0.5
+                                0                                                                      0                                                                  0
+                                    0          50     100     150       200                                    0% 5% 10% 15% 20% 25%                                               0%    5% 10% 15% 20% 25%
+                                               Throughput (K Txn/s)                                               Write Percentage                                                        Write Percentage
+                               (a) Overall performance                                                 (b) System throughput                                                        (c) Read latency
+                             800               ScyllaDB                                              300          ScyllaDB                                                 1
+      Throughput (K Txn/s)
+
+
+
+
+                                                                              Throughput (K Txn/s)
+
+
+
+
+                                                                                                                                                  Read Staleness CDF
+                             700            Scylla-PORT                                                        Scylla-PORT                                               0.9
+                                                                                                     250
+                             600             Scylla-OCC                                                         Scylla-OCC                                               0.8
+                                                                                                     200                                                                 0.7
+                             500                                                                                                                                         0.6                     25% writes
+                             400                                                                     150                                                                 0.5                     20% writes
+                             300                                                                                                                                         0.4                     15% writes
+                                                                                                     100                                                                 0.3
+                             200                                                                                                                                                                 10% writes
+                                                                                                      50                                                                 0.2                      5% writes
+                             100                                                                                                                                         0.1
+                               0                                                                       0                                                                   0
+                                        1      2    4      8     16      32                                1      2    4      8     16     32                                  0           500       1000     1500
+                                             Number of servers (log)                                            Number of servers (log)                                                     Staleness (ms)
+                               (d) Scalability (uniform)                                              (e) Scalability (Zipf=0.99)                                 (f) Scylla-PORT data staleness
+Figure 4: The performance of Scylla-PORT closely matches non-transactional ScyllaDB and is significantly better than
+OCC, Scylla-PORT scales even better than ScyllaDB with skewed workloads, and half of its reads return fresh data.
+
+laDB becomes overloaded is evident with 32 client threads:                                                                   ers.) Scylla-PORT scales better than ScyllaDB under skewed
+5.6% in throughput and 5% in latency. All later experi-                                                                      workloads because it can avoid the work of some writes to
+ments report throughput and latency at this operating point,                                                                 the hottest keys due to write omission. Since write omis-
+i.e., with 32 client threads. OCC initially has latency that                                                                 sion only applies to conflicting writes, this rarely occurs un-
+is twice that of ScyllaDB and Scylla-PORT because it takes                                                                   der a uniform workload. OCC initially shows a similar scal-
+at least two rounds to complete instead of one. As load in-                                                                  ing pattern starting from its lower throughput. OCC’s scal-
+creases, OCC’s latency increases quickly and its throughput                                                                  ing stops, however, as more concurrent clients accessing the
+decreases slightly because contention forces it to retry.                                                                    same keys lead to higher contention and thus more retries.
+Varying write percentage. Figure 4b and 4c show the                                                                          7.5    Data Staleness
+throughput and latency as we vary the read-to-write ratio.
+Scylla-PORT’s throughput is within 4% of ScyllaDB’s for                                                                      Figure 4f shows the staleness of Scylla-PORT under a
+five of the experiments and within 7% for the remaining one.                                                                 skewed workload with varying write percentages. Staleness
+Similarly, its latency is within 2% (20 µs) of ScyllaDB’s                                                                    is measured relative to strict serializability, which always has
+for two of the experiments and within 7% (107 µs) for the                                                                    a staleness of 0: it is the amount of time since a newer version
+other four. As the write percentage increases, the overhead                                                                  has been committed. For example, if v0 , v1 are consecutive
+disappears because of write omission: doing slightly more                                                                    versions, v0 is returned at 0:05, and v1 committed at 0:00,
+work during reads is offset by doing less work during writes.                                                                then the staleness of v0 is 5 seconds.
+When there are only reads, Scylla-PORT has double the                                                                           Scylla-PORT returns the most recent data ~40% of the
+throughput and half the latency of OCC because OCC’s read-                                                                   time, and 90% of reads return values no staler than 500 ms.
+only transactions require at least two rounds. With writes,                                                                  Scylla-PORT returns fresher data as the write percentage in-
+OCC’s performance drops quickly due to retries.                                                                              creases because version clocks advance versionstamps more
+                                                                                                                             frequently when there are more writes. Scylla-PORT lever-
+7.4                          Scalability                                                                                     ages version clocks to precisely capture the stable frontier,
+Figure 4d compares the scalability of the three systems                                                                      but does not utilize client co-location. Sharing one clock
+under a uniform workload as we increase the number of                                                                        among co-located user sessions would further decrease stal-
+servers while increasing the number of clients to keep the                                                                   eness, but also decreases the rate at which write omission can
+servers CPU-bound. Scylla-PORT scales as well as Scyl-                                                                       be used. We leave investigating this tradeoff to future work.
+laDB; the differences in throughput are negligible. Interest-
+                                                                                                                             7.6    Low Contention Evaluation
+ingly, Scylla-PORT outperforms ScyllaDB under a skewed
+workload, as shown in Figure 4e. ScyllaDB stops scaling                                                                      We focused here on high contention workloads because those
+at 16 servers because the server holding the hottest keys be-                                                                are where any differences between Scylla-PORT and Scyl-
+comes the bottleneck, and adding more servers does not help.                                                                 laDB would appear. Scylla-OCC did poorly in this setting as
+(We have confirmed this finding with ScyllaDB’s develop-                                                                     is expected because OCC is better suited to low contention
+
+
+
+342                          14th USENIX Symposium on Operating Systems Design and Implementation                                                                                                 USENIX Association
+settings. We present the results of evaluating the three sys-
+                                                                     1 Client   Side
+tems under low contention in our accompanying technical              2 lst_map[][]     # maps server to its local safe time
+report [35]. Even in that setting, Scylla-PORT significantly         3 gst             # global safe time
+                                                                     4
+outperforms Scylla-OCC with at least double the throughput           5 function   read_only_txn(<keys>):
+and at most half the latency because Scylla-PORT always              6     gst = get_read_ts(min{lst_map.valueSet()})
+                                                                     7     for k in keys # messages in parallel
+finishes in one round while OCC’s best case is two rounds.           8       vals[k], lst = read(k, gst, cl_id)
+                                                                     9       lst_map[k.server] = lst # lst is monotonic
+8     Improving an Existing System                                  10     return vals
+                                                                    11
+This section adapts PORT to improve Eiger, an existing sys-         12 function   write_txn(<keys, vals>):
+                                                                    13     for k, v in <keys, vals> # in parallel
+tem that has both read-only and write transactions.                 14       if k.server is coord # the coordinator
+                                                                    15         lst = write_coord(k, v, cl_id, gst)
+8.1    Eiger Overview and Rationale                                 16       else # a cohort
+                                                                    17         lst = write_cohort(k, v, cl_id, gst)
+Eiger is a geo-replicated, causally consistent system that          18       lst_map[k.server] = lst # lst is monotonic
+                                                                    19     return
+has read-only transactions and write transactions. Each ma-         20
+
+chine implements a Lamport clock and attaches a Lamport             21 function   get_read_ts(ts):
+                                                                    22     return max{ts, gst}
+timestamp to each committed write that is guaranteed to be
+larger than any earlier write it causally depends on. Eiger’s
+write transaction protocol is a variant of two-phase com-                  Figure 5: Client-side pseudocode for Eiger-PORT.
+mit [21, 28] that always commits. Eiger’s read-only trans-
+action protocol takes between one and three non-blocking
+                                                                     1 Server   Side (Read-Only Txn)
+rounds of communication. If there are no concurrent write            2 lst               # local safe time, updated upon writes
+transactions, it completes in a single round. Otherwise, it re-      3
+                                                                     4 function   read(k, rts, cl_id):
+quires a second round of messages to a subset of the servers,        5     ver = DS[k].at(rts) # vers are sorted by commit_t
+followed by a third round if the concurrent write transactions       6     for v in DS[k].newer_than(ver.commit_t)
+                                                                     7       # ensure read-your-writes, from newer ver to old
+are still pending when the second-round requests arrive. In          8       if v.cl_id == cl_id
+the third round, each read request needs to query the states         9         return v.val, lst
+                                                                    10     if ver.cl_id != cl_id
+of all write transactions it conflicts with, and thus the re-       11       return ver.val, lst
+quired metadata increases linearly with respect to the num-         12     else # ensure write isolation
+                                                                    13       v = find_isolated(ver)
+ber of conflicting write transactions.                              14       return v.val, lst
+                                                                    15
+Rationale. We choose Eiger as a base system because of its          16 function   find_isolated(ver):
+guarantees and the efficiency of its read-only transactions.        17     # iterate from newer version to old
+                                                                    18     while v in DS[k].newer_than(ver.gst)
+First, it provides causal consistency, not strict serializabil-     19       and v in DS[k].older_than(ver.commit_t)
+ity, so it may be possible to add performance-optimal read-         20       if v.cl_id != ver.cl_id
+                                                                    21         return v
+only transactions to it. Second, it includes write transactions,    22       else
+which present a new challenge for the PORT design. Third,           23         return find_isolated(v)
+                                                                    24     return ver
+it is the only system with write transactions and causal (or
+stronger) consistency that completes read-only transactions
+                                                                         Figure 6: Read-only transaction logic for Eiger-PORT.
+in a bounded number of non-blocking rounds of communica-
+tion (Figure 9). Finally, its read-only transactions often com-
+plete in a single non-blocking round, making them a more            ever, promotion does not work for Eiger because it cannot
+difficult baseline than other algorithms such as OCC.               ensure that all writes in the same write transaction are pro-
+                                                                    moted at the same time since they can be on different servers.
+8.2    Eiger-PORT                                                   Our solution, per-client ordering, enables clients to observe
+Eiger’s read-only transactions are non-blocking, require            conflicting writes in different orders, as allowed by causal
+up to three rounds of on-path communication, and use                consistency. Specifically, it pulls back any of a client’s re-
+linear-sized metadata in the third round. We make them              cent writes that are beyond the stable frontier. This allows the
+performance-optimal by making them always finish in one             client to read at the stable frontier while also always seeing
+round using only constant metadata. The major challenge             their own writes. Figures 5, 6, and 7 show the pseudocode,
+is to ensure write isolation, i.e., return a system state that is   written in a way that favors clarity over efficiency.
+either before all updates in a write transaction or after.          Client-side logic. Figure 5 shows the client-side logic. Each
+   More specifically, when a read-only transaction must read        client maintains two variables (lines 2, 3). lst map tracks the
+beyond the stable frontier, e.g., to ensure read-your-writes,       local safe time, lst, of each server. Global safe time, gst,
+PORT reorders the read-only transaction and the conflicting         is the minimum lst across all servers (line 6) and advances
+writes without blocking by using “promotion” (§6.2). How-           monotonically. gst is used as the read timestamp for each
+
+
+
+USENIX Association                            14th USENIX Symposium on Operating Systems Design and Implementation              343
+                                                                    tion, removal, and fetching the minimum of pending wtxns
+ 1 Server Side (Write Txn)
+ 2 lst             # local safe time                                have a cost of O(1). At the end of the “prepare” phase of
+ 3 pending_wtxns   # uncommitted write txns                         2PC, each cohort sends a yes-vote message to the coordina-
+ 4 DS[][]  # multi-versioned k-v data store
+ 5                                                                  tor, which includes the prepared time of this pending write
+ 6 function write_coord(k, v, cl_id, gst): # coordinator            transaction. prepared time is guaranteed to be greater than
+ 7   # PREPARE
+ 8   ver, prepared_t = prepare_write(k, v, cl_id, gst)              pending time by clock ticking (line 31).
+ 9   # ... get yes-vote-msgs from all cohorts                          To commit a write transaction, the coordinator calcu-
+10   # COMMIT
+11   commit_t = max{yes-vote-msgs.prepared_t, prepared_t}           lates the commit time by taking the maximum across all
+12   commit-msg = {"commit", commit_t}                              prepared times (line 11) and then sends a commit message to
+13   # ... send commit-msg to all cohorts
+14   commit_write(ver, commit_t)                                    the cohorts and commits its local pending version (lines 13,
+15   return lst                                                     14). When a cohort receives the commit message, it com-
+16
+17 function write_cohort(k, v, cl_id, gst): # cohort                mits its local pending version (lines 25, 38) with the commit
+18   # PREPARE                                                      time (lines 24, 37). It then removes this write transaction’s
+19   ver, prepared_t = prepare_write(k, v, cl_id, gst)
+20   yes-vote-msg = {"yes", prepared_t}                             pending time from pending wtxns and updates lst (lines 39–
+21   # ... send yes-vote-msg to coordinator                         43). The server returns its lst to the client upon commit.
+22   # ... wait for commit-msg
+23   # COMMIT                                                       Eiger-PORT made minimum changes to Eiger’s write trans-
+24   commit_t = commit-msg.commit_t                                 actions, i.e., the management of pending wtxns.
+25   commit_write(ver, commit_t)
+26   return lst                                                     Read-only transactions. Figure 6 shows the server-side
+27
+28 function prepare_write(k, v, cl_id, gst):                        logic of read-only transactions. When a server receives a
+29   pending_t = LamportClock.current()                             read request, it finds the version at the read timestamp, rts
+30   pending_wtxns.append(pending_t)
+31   LamportClock.advance()                                         (line 5), and checks if the same client has made a recent write
+32   ver = DS[k].create_new_ver(v, cl_id, gst, pending_t)           later than rts. It returns the most recent write by the same
+33   ver.is_pending = true
+34   return ver, LamportClock.current()                             client to ensure read-your-writes (lines 6–9). If the version
+35                                                                  at rts was written by the same client, then we need to ensure
+36 function commit_write(ver, commit_t):
+37   ver.commit_t = commit_t                                        write isolation by checking whether there exist any versions
+38   ver.is_pending = false                                         between the version’s gst, which is the snapshot time the ver-
+39   pending_wtxns.remove(ver.pending_t)
+40   if pending_wtxns is empty                                      sion depends on, and the version’s commit t (lines 18, 19). If
+41     lst = LamportClock.current()                                 there exists such a version written by a different client, then
+42   else
+43     lst = pending_wtxns.head() # min of pending_wtxns            that version is returned to satisfy write isolation (lines 20,
+44   return                                                         21). We need to do this recursively, but our implementation
+                                                                    uses a loop instead for better performance. To ensure write
+     Figure 7: Write transaction logic for Eiger-PORT.              isolation (lines 16–24), we go through the multi-versioned
+                                                                    data store once, which has the same cost as finding a partic-
+read-only transaction. Both lst and gst are Lamport times-          ular version by timestamp in other algorithms, e.g., MVCC.
+tamps as used in Eiger. A client sends all read requests in a
+                                                                    Correctness. We show the correctness of Eiger-PORT by
+read-only transaction in parallel. Each read request includes
+                                                                    proving that any execution in Eiger-PORT satisfies the causal
+the key, the read timestamp gst, and the unique identifier of
+                                                                    (“happened before”) relation [26] and write isolation for
+this client (line 8). The server responds with the requested
+                                                                    write transactions. We present the full proof in the techni-
+value and lst on that server. A client issues a write transac-
+                                                                    cal report [35].
+tion by sending the write requests in parallel (lines 12–19).
+One server is randomly chosen as the coordinator (line 14)          9   Eiger-PORT Evaluation
+for 2PC with the others as cohorts. Each write request con-
+tains the key, the value, the client ID, and the client’s current   We evaluate Eiger-PORT against Eiger, showing its through-
+gst (lines 15, 17). gst specifies the stable frontier this write    put and latency improvement as well as its data staleness.
+transaction causally depends on. The client updates lst map         Implementation. We implemented Eiger-PORT as a modi-
+after each read/write request (lines 9, 18).                        fication to Eiger’s code base, which is built on top of Cassan-
+Write transactions. Figure 7 shows the server-side logic of         dra [25] and written in Java. Eiger-PORT adds ~1000 LOC.
+write transactions. When a server receives a write request,         Experimental setting. We try to match Eiger’s original ex-
+it records the current Lamport time (line 29) and creates a         perimental setup. We run all experiments on Emulab [50],
+new pending version (lines 8, 19, 32, 33). pending wtxns            similar to the now-decommissioned PRObE testbed [19]
+tracks ongoing write transactions by keeping an ordered list        Eiger used. Each machine has one 2.4 GHz Quad-Core Xeon
+of pending times. The running minimum of pending wtxns              CPU, 12 GB RAM, and a 1 Gbps network interface. We run
+is the lst on this server, i.e., no pending writes exist before     5 trials for each data point, each lasting 65 seconds, and re-
+lst. Because Lamport clocks advance monotonically, inser-           port the median. We exclude the first and last 15 seconds to
+
+
+
+344    14th USENIX Symposium on Operating Systems Design and Implementation                                  USENIX Association
+                                                                            Normalized Throughput
+                           160                                                                         4                                                           100
+
+
+
+
+                                                                                                                                            Throughput (K Txn/s)
+                                     Eiger           Eiger-PORT                                                Eiger     Eiger-PORT
+      Read Latency (ms)
+                           140                                                                       3.5                                                                          Eiger-PORT
+                           120                                                                         3                                                            80                  Eiger
+                           100                                                                       2.5                                                            60
+                            80                                                                         2
+                            60                                                                       1.5                                                            40
+                            40                                                                         1
+                                                                                                                                                                    20
+                            20                                      O.P.                             0.5
+                             0                                                                         0                                                             0
+                                 0   5 10 15 20 25 30 35 40 45                                             0   0.7 0.8 0.9 0.99 1.1 1.2                                       1      2     4     8     16    32
+                                       Throughput (K Txn/s)                                                       Zipf Constant                                                   Number of Servers/DC (log)
+   (a) Median latency and throughput                                                                (b) Throughput varying skew                                      (c) Scalability (Zipf=0.8)
+                           1.4                                                                       1.4                                                              1
+      Normalized Latency
+
+
+
+
+                                                                            Normalized Latency
+
+
+
+
+                                                                                                                                            Read Staleness CDF
+                                          Eiger        Eiger-PORT                                              Eiger     Eiger-PORT
+                           1.2                                                                       1.2                                                            0.9
+                                                                                                                                                                    0.8
+                             1                                                                         1                                                            0.7
+                           0.8                                                                       0.8                                                            0.6
+                                                                                                                                                                    0.5        uniform          zipf=0.99
+                           0.6                                                                       0.6                                                            0.4       zipf=0.7           zipf=1.1
+                           0.4                                                                       0.4                                                            0.3       zipf=0.8           zipf=1.2
+                           0.2                                                                       0.2                                                            0.2
+                                                                                                                                                                              zipf=0.9
+                                                                                                                                                                    0.1
+                             0                                                                         0                                                              0
+                                      0      0.7 0.8 0.9 0.99 1.1 1.2                                      0   0.7 0.8 0.9 0.99 1.1 1.2                                   0          500    1000    1500    2000
+                                                Zipf Constant                                                     Zipf Constant                                                         Staleness (ms)
+                      (d) Read latency varying skew                                          (e) Write latency varying skew                                        (f) Eiger-PORT data staleness
+Figure 8: Throughput, latency, scalability, and staleness of Eiger-PORT: up to 3× throughput improvement and 60%
+latency reduction compared to Eiger, better scalability, and low data staleness. All latencies are median latencies.
+
+avoid artifacts due to warm-up, cool-down, and imperfectly                                                             found at higher loads. Figure 8b shows normalized through-
+synchronized clients. All experiments are CPU-bound.                                                                   put with different skew; the improvement stops increasing
+Configuration and workloads. We use the same setting                                                                   after Zipf value 1.1, where a single server becomes the bot-
+as Eiger: two logical datacenters co-located in the testbed.                                                           tleneck. Figure 8c shows Eiger-PORT scales better than
+Each datacenter has eight server machines, and uses eight                                                              Eiger due to fewer messages in the system.
+client machines to load the servers. The second datacenter                                                             Latency improvement. Figure 8d shows the normalized
+is used as a replica, which applies updates replicated from                                                            median read latency as we vary skew. Eiger-PORT achieves
+the first datacenter. We use the dynamic workload generator                                                            20% lower latency under uniform workloads and up to 60%
+from Eiger with the same default values: 1 million keys, 128-                                                          lower latency under contended workloads. Figure 8e shows
+byte values, 5 columns per key, 5 keys per operation, and a                                                            that Eiger-PORT achieves lower write latency even though
+write percentage of 10% unless otherwise specified. We also                                                            we did not intentionally improve writes. The lower latency
+use a Zipf traffic generator with a default value of 0.8.                                                              comes from less queuing delay for writes because reads are
+                                                                                                                       faster and there are fewer messages in the system. This
+9.1                        Performance Improvement                                                                     demonstrates that PORT can make read-only transactions
+Results summary. Eiger-PORT significantly improves the                                                                 performance-optimal without making writes more costly.
+performance of Eiger under different workloads, without de-
+grading write performance: 2× and 3× throughput improve-
+                                                                                                                       9.2     Data Staleness
+ment under mild and high skew, respectively, and 20%–60%                                                               Figure 8f quantifies the read staleness in Eiger-PORT. Stale-
+latency reduction. The performance improvement comes                                                                   ness is measured relative to strict serializability as in Scylla-
+from Eiger-PORT’s fewer on-path messages and less meta-                                                                PORT’s evaluation. Even with high skew, over 40% of Eiger-
+data to process. The improvement is larger in contended                                                                PORT’s read-only transactions return up-to-date values, and
+workloads because Eiger is more likely to require more than                                                            over 90% of reads experience less than 1 s staleness. Eiger-
+one round and more metadata in the third round when there                                                              PORT tends to return staler data than Scylla-PORT because
+are more conflicting write transactions.                                                                               the stable frontier moves more slowly in Eiger/Eiger-PORT:
+Throughput improvement. Figure 8a shows the median                                                                     write transactions take longer to commit than simple writes.
+read latency and system throughput as we double the number                                                             10      Related Work
+of closed-loop client threads loading the system (from 2 to
+512). It shows that Eiger-PORT performs strictly better than                                                           This section examines existing read-only transactions with
+Eiger: it achieves higher throughput with the same latency                                                             the NOCS Theorem, reviews impossibility results, and dis-
+and lower latency with the same throughput. We run all other                                                           cusses the move from latency to performance optimality.
+experiments in Figure 8 with 32 threads, representing an op-                                                           Bridging the gap in the design space. We use the NOCS
+erating point with reasonably low latency (< 20 ms), i.e., at                                                          Theorem as a lens to better understand existing systems and
+line “O.P.” in Figure 8a. The improvements are more pro-                                                               show a set of representative systems in Figure 9. We find
+
+
+
+USENIX Association                                                         14th USENIX Symposium on Operating Systems Design and Implementation                                                                    345
+System                 N          O              C          S      W   proved by our PORT design.
+                      Performance-optimal
+                                                                       Impossibility results. Our NOCS Theorem is philosophi-
+Scylla-PORT *          X           X              X        POS     ×
+Eiger-PORT *           X           X              X       Causal   X   cally similar to other impossibility results, e.g., FLP [17],
+Spanner-Snap [10]*     X           X              X         SR     X   CAP [7, 20], and SNOW [34], in that it saves system de-
+MySQL Cluster [39]* X              X              X        RC      X   signers’ effort from trying the impossible. The most relevant
+      One fewer performance property for stronger guarantees           result is the SNOW Theorem, which we discuss next.
+Spanner-RO [10]*        ×          X            X          X       X
+DrTM [49]*              X          ≥1           X          X       X   The move from latency to performance. SNOW [34]
+RIFL [29]               X          ≥2           X          X       X   showed tradeoffs in the design space of read-only transac-
+Sinfonia [1]            X          ≥2           X          X       X
+                                                                       tions with a focus only on latency. It proved optimal latency
+   Candidates for improvement in performance and/or guarantees
+                                                                       is impossible if the system is strictly serializable and has
+TAPIR [51]*             ×           X            X        Ser      X
+Pileus-Strong [48]      ×           2            X         X       X   write transactions. This work aims for a more complete un-
+Rococo-SNOW [34]*       ×           X          Linear      X       X   derstanding of the tradeoffs in the design of read-only trans-
+COPS-SNOW [34]*         X       Off-path       Linear    Causal    ×   actions by considering latency and throughput. The move
+COPS [31]*              X          ≤2          Linear    Causal    ×   from latency to performance has two takeaways.
+RAMP-F|H [5]*           X          ≤2          Linear     RA       X
+RAMP-S [5]*             X           2            X        RA       X      First, optimal latency neither translates to nor forfeits op-
+Eiger [32]*             X          ≤3          Linear    Causal    X   timal throughput. The former is shown by the two systems
+Janus [38]              ×          ≤2          Linear      X       X   built with SNOW, which provided lower latency at the cost of
+Callinicos [41]         ×           2          Linear      X       X
+                                                                       lowering throughput. The latter is shown by our new designs
+Occult [36]             X          ≥1            X       PC-PSI    X
+Rococo [37]*            ×          ≥2            X         X       X   that achieve both optimal latency and optimal throughput.
+Contrarian [13]*        X           2            X       Causal    ×   What really matters is a complete understanding of the trade-
+GentleRain [15]*        ×     ≤ 2 + off-path     X       Causal    ×   off between performance and consistency and its insights for
+Cure [3]                ×       Off-path         X       Causal    X
+MVTSO [30, 45]          ×           X            X        Ser      X
+                                                                       designs—the major contributions of this work.
+                                                                          Second, higher demand for performance, e.g., the move
+Figure 9: A review of existing systems through the lens                from latency only to both latency and throughput, suggests
+of NOCS. Asterisks denote specialized read-only trans-                 higher difficulty in providing stronger guarantees. Optimal
+action algorithms. W denotes write transactions.                       latency is possible in strictly serializable systems without
+                                                                       write transactions, but optimal performance is not.
+a large gap in the design space. The only existing systems
+that have performance-optimal read-only transactions pro-              11    Conclusion
+vide weak consistency (§4.3). MySQL Cluster [39] provides
+read-committed, which does not isolate transactions. Span-             Distributed storage systems are a fundamental building block
+ner’s snapshot reads API [10] cannot always guarantee non-             of large-scale web services. They rely on read-only trans-
+blocking read-your-writes. Suppose a client updates key k              actions to provide consistent views of sharded data. Our
+in a read-write transaction with commit timestamp ts, and              NOCS Theorem proves that read-only transactions cannot
+then immediately performs a read-only transaction involving            have optimal performance in strictly serializable systems.
+a set S of keys that includes k. To ensure read-your-writes,           We presented PORT, a performance-optimal read-only trans-
+the client must use a timestamp greater than or equal to ts for        action design that provides the strongest consistency to date.
+its read-only transaction. But doing so may block since other          We applied PORT to design Scylla-PORT and Eiger-PORT.
+keys in S may be involved in a read-write transaction that is          Scylla-PORT has minimal performance overhead compared
+in the midst of two-phase-commit with a commit timestamp               to its non-transactional baseline. Eiger-PORT significantly
+less than ts. That is, Spanner must use its externally con-            improves the performance of its transactional base system.
+sistent read-only transaction API, which may block reads in
+such cases to ensure read-your-writes.                                 Acknowledgments
+   We bridge this gap in the design space with PORT, the first         We would like to thank our shepherd, Jinyang Li, for her in-
+design that provides performance-optimal read-only transac-            valuable feedback that improved this work. We thank the
+tions and the strongest consistency to date.                           anonymous reviewers for their careful reading of our paper
+Other read-only transactions. Some systems choose to                   and their many insightful comments and suggestions. We
+trade one performance property for stronger guarantees [1,             are also grateful to Christopher Hodsdon, Theano Stavrinos,
+10, 29, 49] but still reside on the “tight boundary” of the            and Jeffrey Helt for their feedback on earlier stages of this
+NOCS Theorem. Many systems neither are performance-                    work. Our evaluation at scale was made possible by the Em-
+optimal nor provide the strongest possible guarantees [3, 5,           ulab testbed. This work was supported by NSF award CNS-
+13, 15, 31, 32, 34, 36], and thus could potentially be im-             1824130 as well as a gift from Microsoft Research.
+
+
+
+346   14th USENIX Symposium on Operating Systems Design and Implementation                                       USENIX Association
+References                                                      [11] J. Cowling and B. Liskov. Granola: Low-overhead dis-
+ [1] M. K. Aguilera, A. Merchant, M. Shah, A. Veitch, and            tributed transaction coordination. In USENIX Annual
+     C. Karamanolis. Sinfonia: A new paradigm for build-             Technical Conference (ATC), Jun 2012.
+     ing scalable distributed systems. In ACM Symposium         [12] Developer Blog. Twemproxy: A fast, light-
+     on Operating System Principles (SOSP), Oct 2007.                weight proxy for memcached.     https:
+ [2] M. K. Aguilera, J. B. Leners, and M. Walfish. Yesquel:          //blog.twitter.com/developer/en us/
+     scalable SQL storage for Web applications. In ACM               a/2012/twemproxy.html, 2012.
+     Symposium on Operating System Principles (SOSP),
+                                                                [13] D. Didona, R. Guerraoui, J. Wang, and W. Zwaenepoel.
+     Oct 2015.
+                                                                     Causal consistency and latency optimality: friend or
+ [3] D. D. Akkoorath, A. Z. Tomsic, M. Bravo, Z. Li,                 foe? In International Conference on Very Large Data
+     T. Crain, A. Bieniusa, N. Preguiça, and M. Shapiro.            Bases (VLDB), Aug 2018.
+     Cure: Strong semantics meets high availability and low
+     latency. In IEEE International Conference on Dis-          [14] J. Du, S. Elnikety, A. Roy, and W. Zwaenepoel. Orbe:
+     tributed Computing Systems (ICDCS), Jun 2016.                   Scalable causal consistency using dependency matri-
+                                                                     ces and physical clocks. In ACM Symposium on Cloud
+ [4] S. Almeida, J. Leitao, and L. Rodrigues. ChainRe-               Computing (SoCC), Oct 2013.
+     action: a causal+ consistent datastore based on chain
+     replication. In ACM SIGOPS European Conference on          [15] J. Du, C. Iorgulescu, A. Roy, and W. Zwaenepoel. Gen-
+     Computer Systems (EuroSys), Apr 2013.                           tlerain: Cheap and scalable causal consistency with
+                                                                     physical clocks. In ACM Symposium on Cloud Com-
+ [5] P. Bailis, A. Fekete, A. Ghodsi, J. M. Hellerstein, and         puting (SoCC), Nov 2014.
+     I. Stoica. Scalable atomic visibility with RAMP trans-
+     actions. In ACM Special Interest Group on Manage-          [16] C. Dwork, N. Lynch, and L. Stockmeyer. Consensus in
+     ment of Data (SIGMOD), Jun 2014.                                the presence of partial synchrony. Journal of the ACM
+                                                                     (JACM), 35(2):288–323, 1988.
+ [6] C. Binnig, S. Hildenbrand, F. Färber, D. Kossmann,
+     J. Lee, and N. May. Distributed snapshot isolation:        [17] M. J. Fischer, N. A. Lynch, and M. S. Paterson. Impos-
+     global transactions pay globally, local transactions pay        sibility of distributed consensus with one faulty pro-
+     locally. The VLDB journal, 23(6):987–1011, 2014.                cess. Journal of the ACM (JACM), 32(2):374–382,
+                                                                     1985.
+ [7] E. A. Brewer. Towards robust distributed systems. In
+     ACM Symposium on Principles of Distributed Comput-         [18] H. Fugal, A. Likhtarov, R. Nishtala, R. McEl-
+     ing (PODC), Jul 2000.                                           roy, A. Grynenko, and V. Venkataramani.   In-
+                                                                     troducing mcrouter:     A memcached proto-
+ [8] N. Bronson, Z. Amsden, G. Cabrera, P. Chakka, P. Di-            col router for scaling memcached deploy-
+     mov, H. Ding, J. Ferris, A. Giardullo, S. Kulkarni,             ments.       https://engineering.fb.com/
+     H. Li, M. Marchukov, D. Petrov, L. Puzar, Y. J. Song,           core-data/introducing-mcrouter-
+     and V. Venkataramani. TAO: Facebook’s distributed               a-memcached-protocol-router-for-
+     data store for the social graph. In USENIX Annual               scaling-memcached-deployments/, 2014.
+     Technical Conference (ATC), Jun 2013.
+                                                                [19] G. Gibson, G. Grider, A. Jacobson, and W. Lloyd.
+ [9] B. F. Cooper, A. Silberstein, E. Tam, R. Ramakrishnan,          Probe: A thousand-node experimental cluster for com-
+     and R. Sears. Benchmarking cloud serving systems                puter systems research. USENIX ;login:, June 2013.
+     with YCSB. In ACM Symposium on Cloud Computing
+     (SoCC), Jun 2010.                                          [20] S. Gilbert and N. Lynch. Brewer’s conjecture and
+                                                                     the feasibility of consistent, available, partition-tolerant
+[10] J. C. Corbett, J. Dean, M. Epstein, A. Fikes, C. Frost,
+                                                                     web services. ACM SIGACT News, 33(2):51–59, 2002.
+     J. F. andSanjay Ghemawat, A. Gubarev, C. Heiser,
+     P. Hochschild, W. Hsieh, S. Kanthak, E. Kogan, H. Li,      [21] J. N. Gray. Notes on database systems. IBM Research
+     A. Lloyd, S. Melnik, D. Mwaura, D. Nagle, S. Quin-              Report RJ2188 (Feb.1978), 1978.
+     lan, R. Rao, L. Rolig, Y. Saito, M. Szymaniak, C. Tay-
+     lor, R. Wang, and D. Woodford. Spanner: Google’s           [22] M. P. Herlihy and J. M. Wing. Linearizability: A
+     globally-distributed database. In USENIX Sympo-                 correctness condition for concurrent objects. ACM
+     sium on Operating Systems Design and Implementation             Transactions on Programming Languages and Systems
+     (OSDI), Oct 2012.                                               (TOPLAS), 12(3):463–492, 1990.
+
+
+
+USENIX Association                         14th USENIX Symposium on Operating Systems Design and Implementation             347
+[23] R. Kallman, H. Kimura, J. Natkins, A. Pavlo, A. Rasin,    [35] H. Lu, S. Sen, and W. Lloyd. Performance-optimal
+     S. Zdonik, E. P. Jones, S. Madden, M. Stonebraker,             read-only transactions (extended version). Techni-
+     Y. Zhang, et al. H-store: a high-performance, dis-             cal Report TR-005-20, Princeton University, Computer
+     tributed main memory transaction processing system.            Science Department, 2020.
+     In Proceedings of the VLDB Endowment (PVLDB),
+     Aug 2008.                                                 [36] S. A. Mehdi, C. Littley, N. Crooks, L. Alvisi, N. Bron-
+                                                                    son, and W. Lloyd. I can’t believe it’s not causal! scal-
+[24] H.-T. Kung and J. T. Robinson. On optimistic meth-             able causal consistency with no slowdown cascades.
+     ods for concurrency control. ACM Transactions on               In USENIX Symposium on Networked Systems Design
+     Database Systems (TODS), 6(2):213–226, 1981.                   and Implementation (NSDI), Mar 2017.
+[25] A. Lakshman and P. Malik. Cassandra: A decentralized      [37] S. Mu, Y. Cui, Y. Zhang, W. Lloyd, and J. Li. Extract-
+     structured storage system. SIGOPS Operating Systems            ing more concurrency from distributed transactions. In
+     Review, 44(2):35–40, Apr. 2010.                                USENIX Symposium on Operating Systems Design and
+                                                                    Implementation (OSDI), Oct 2014.
+[26] L. Lamport. Time, clocks, and the ordering of events
+     in a distributed system. Communications of the ACM,       [38] S. Mu, L. Nelson, W. Lloyd, and J. Li. Consolidating
+     21(7), 1978.                                                   concurrency control and consensus for commits under
+                                                                    conflicts. In USENIX Symposium on Operating Systems
+[27] L. Lamport. How to make a multiprocessor computer
+                                                                    Design and Implementation (OSDI), Nov 2016.
+     that correctly executes multiprocess programs. IEEE
+     transactions on computers, 1979.                          [39] MySQL. MySQL :: MySQL Cluster CGE. https:
+                                                                    //www.mysql.com/products/cluster/, 2016.
+[28] B. Lampson and H. Sturgis. Crash recovery in a dis-
+     tributed storage system. Xerox Palo Alto Research         [40] R. Nishtala, H. Fugal, S. Grimm, M. Kwiatkowski,
+     Center, 1979.                                                  H. Lee, H. C. Li, R. McElroy, M. Paleczny, D. Peek,
+[29] C. Lee, S. J. Park, A. Kejriwal, S. Matsushitay, and           P. Saab, D. Stafford, T. Tung, and V. Venkataramani.
+     J. Ousterhout. Implementing linearizability at large           Scaling memcache at facebook. In USENIX Sympo-
+     scale and low latency. In ACM Symposium on Oper-               sium on Networked Systems Design and Implementa-
+     ating System Principles (SOSP), Oct 2015.                      tion (NSDI), Apr 2013.
+
+[30] J. Levandoski, D. Lomet, S. Sengupta, R. Stutsman,        [41] R. Padilha, E. Fynn, R. Soulé, and F. Pedone. Callini-
+     and R. Wang. High performance transactions in                  cos: Robust transactional storage for distributed data
+     deuteronomy. In Conference on Innovative Data Sys-             structures. In USENIX Annual Technical Conference
+     tems Research (CIDR), Jan 2015.                                (ATC), Jun 2016.
+
+[31] W. Lloyd, M. J. Freedman, M. Kaminsky, and D. G.          [42] C. H. Papadimitriou. The serializability of concurrent
+     Andersen. Don’t settle for eventual: Scalable causal           database updates. Journal of the ACM, 26(4), 1979.
+     consistency for wide-area storage with COPS. In ACM       [43] D. Peng and F. Dabek. Large-scale incremental pro-
+     Symposium on Operating System Principles (SOSP),               cessing using distributed transactions and notifications.
+     Oct 2011.                                                      In USENIX Symposium on Operating Systems Design
+[32] W. Lloyd, M. J. Freedman, M. Kaminsky, and D. G.               and Implementation (OSDI), Oct 2010.
+     Andersen. Stronger semantics for low-latency geo-         [44] H. Qin, Q. Li, J. Speiser, P. Kraft, and J. Ousterhout.
+     replicated storage. In USENIX Symposium on Net-                Arachne: core-aware thread management. In USENIX
+     worked Systems Design and Implementation (NSDI),               Symposium on Operating Systems Design and Imple-
+     Apr 2013.                                                      mentation (OSDI), Oct 2018.
+[33] H. Lu, K. Veeraraghavan, P. Ajoux, J. Hunt, Y. J. Song,   [45] D. P. Reed. Implementing atomic actions on decen-
+     W. Tobagus, S. Kumar, and W. Lloyd. Existential con-           tralized data. ACM Transactions on Computer Systems
+     sistency: Measuring and understanding consistency at           (TOCS), 1(1):3–23, 1983.
+     Facebook. In ACM Symposium on Operating System
+     Principles (SOSP), Oct 2015.                              [46] F. B. Schneider. Implementing fault-tolerant services
+                                                                    using the state machine approach: A tutorial. ACM
+[34] H. Lu, C. Hodsdon, K. Ngo, S. Mu, and W. Lloyd. The            Computer Surveys, 22(4), Dec. 1990.
+     SNOW theorem and latency-optimal read-only trans-
+     actions. In USENIX Symposium on Operating Systems         [47] ScyllaDB. ScyllaDB :: Scylla Is Next Generation
+     Design and Implementation (OSDI), Nov 2016.                    NoSQL. http://www.scylladb.com/, 2018.
+
+
+
+348   14th USENIX Symposium on Operating Systems Design and Implementation                             USENIX Association
+[48] D. B. Terry, V. Prabhakaran, R. Kotla, M. Balakrish-             Eiger-PORT.git. It includes a README file that pro-
+     nan, M. K. Aguilera, and H. Abu-Libdeh. Consistency-             vides step-by-step instructions on how to set up the environ-
+     based service level agreements for cloud storage.                ment and run experiments.
+     In ACM Symposium on Operating System Principles
+     (SOSP), Nov 2013.
+                                                                      A.4    Installation
+                                                                      Please clone the code repository under a clean directory on
+[49] X. Wei, J. Shi, Y. Chen, R. Chen, and H. Chen. Fast              a machine. The scripts in the package will work seamlessly
+     in-memory transaction processing using RDMA and                  if the repository is cloned under /local. The required de-
+     HTM. In ACM Symposium on Operating System Prin-                  pendencies can be installed by simply running the bash file
+     ciples (SOSP), Oct 2015.                                         install-dependencies.bash. Apache Ant is used to build the
+[50] B. White, J. Lepreau, L. Stoller, R. Ricci, S. Gu-               source code. Both the system files and the stress tool need to
+     ruprasad, M. Newbold, M. Hibler, C. Barb, and                    be compiled. Please see the README file in the repository
+     A. Joglekar. An Integrated Experimental Environment              for more details.
+     for Distributed Systems and Networks. In USENIX                  A.5    Experiment workflow
+     Symposium on Operating Systems Design and Imple-
+                                                                      Running experiments as described in the paper requires set-
+     mentation (OSDI), Dec 2002.
+                                                                      ting up two clusters with each having 8 servers and 8 clients.
+[51] I. Zhang, N. K. Sharma, A. Szekeres, A. Krishna-                 One cluster is the active cluster for processing transactions
+     murthy, and D. R. K. Ports. Building consistent transac-         and the other cluster is used as a replica, which passively re-
+     tions with inconsistent replication. In ACM Symposium            ceives replicated writes from the active cluster. One extra
+     on Operating System Principles (SOSP), Oct 2015.                 machine is needed for the control node. Therefore, to create
+                                                                      an 8-server-8-client environment, 33 machines are needed in
+[52] F. Zhou, Y. Gan, S. Ma, and Y. Wang. wPerf: generic              total (2 clusters, 16 machines in each, and 1 control node).
+     Off-CPU analysis to identify bottleneck waiting events.             When the experiment topology is determined, the config-
+     In USENIX Symposium on Operating Systems Design                  uration files under the directory vicci dcl config need to be
+     and Implementation (OSDI), Oct 2018.                             modified accordingly. All the scripts used to run experi-
+                                                                      ments are under the directory eval-scripts. Experiments can
+A     Artifact Appendix                                               be launched by executing latency throughput.bash. The ex-
+                                                                      perimental parameters, such as Zipfian constant and read-to-
+A.1     Abstract                                                      write ratio, are specified in the file dynamic defaults. For
+This appendix presents the steps for installing Eiger-PORT            details, please see the README file.
+and running experiments that compare the performance of
+Eiger-PORT and its base system, Eiger. Eiger-PORT is im-
+                                                                      A.6    Evaluation and expected result
+plemented as a modification to Eiger’s code base, which is            The results of each experiment are stored under the directory
+built on top of Cassandra and written in Java. The exper-             experiments/dynamic. Throughput numbers are shown in the
+iments evaluate latency, throughput, and scalability. The             file combined.graph. A set of latency processing scripts are
+results are expected to show that Eiger-PORT outperforms              provided under the directory data proc scripts. Eiger-PORT
+Eiger in all experiments and the performance advantages be-           is expected to have ~2X higher throughput and ~50% latency
+come more significant under more skewed workloads. Eiger-             compared to Eiger. The performance advantages of Eiger-
+PORT’s better performance comes from its performance-                 PORT are expected to become more significant under more
+optimal read-only transactions.                                       skewed workloads.
+A.2     Artifact check-list                                           A.7    AE Methodology
+    • Hardware: 2.4 GHz Quad-Core Xeon CPU, 12 GB RAM,                Submission, reviewing and badging methodology:
+      1 Gbps network interface
+    • Metrics: latency, throughput, scalability                          • https://www.usenix.org/conference/
+                                                                           osdi20/call-for-artifacts
+    • Expected experiment run time: 10–20 hours
+    • Public link: http://github.com/princeton-sns/
+      Eiger-PORT.git
+
+A.3     Description
+A.3.1    How to access
+The code base of Eiger-PORT is publicly accessible
+on Github at http://github.com/princeton-sns/
+
+
+
+USENIX Association                                14th USENIX Symposium on Operating Systems Design and Implementation           349
+

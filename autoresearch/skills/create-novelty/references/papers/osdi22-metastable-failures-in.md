@@ -1,0 +1,34 @@
+# Metastable Failures in the Wild
+OSDI'22 · Lexiang Huang, Matthew Magnusson et al. / Penn State, UNH, Twitter · Full text: https://www.usenix.org/system/files/osdi22-huang-lexiang.pdf (USENIX camera-ready) · Selected: Community favorite (4 sources: DSRG (charap.co), Marc Brooker blog, Micah Lerner blog, Murat blog)
+
+**One sentence**: The root cause of a metastable failure is not the trigger but a feedback loop that keeps growing during overload; the loop can either amplify load or reduce capacity, and whether the system heals itself depends on a race between headroom and how long the trigger lasts.
+
+## Problem
+A metastable failure is when a temporary trigger overloads a system, and the overload turns on a feedback loop (a sustaining effect, such as retries), so that after the trigger is removed the system still stays in a state of very low goodput (useful throughput).
+Bronson et al. (HotOS'21) proposed the concept, but used only a simplified Facebook example with no real data, and did not know how common it is or how to diagnose and recover from it.
+
+## Strawman / Baseline
+- **Classify failures by root cause (bug, misconfiguration, fail-slow hardware, scalability bug)**: Assumes the system recovers once the root cause is removed. An engineer's first reaction is also to roll back the configuration or hot-fix the bug. But for a metastable failure, removing the trigger does not recover the system.
+- **The original model of Bronson et al.**: Assumes the trigger is a load increase, the sustaining mechanism is extra load (retries), and a system is either "vulnerable" or not. In real incidents, many triggers involve no load increase at all.
+- **Fix by intuition**: Without seeing the feedback loop, the fix can make it stronger. After AWS2 (SimpleDB), the fix was "retry without limit", and a year later DynamoDB's AWS3 was exactly retry amplification; Spotify added logging on the error path, and in the next incident every retry became more expensive.
+- **Blind load shedding or autoscaling**: Without knowing how far to shed, operators can only shed and restart again and again; losing a cache with a 99% hit rate brings 100× amplification, which scaling can hardly keep up with.
+
+## Novelty
+1. **The trigger is not the root cause; the feedback loop is**
+   Finding: From hundreds of public incident reports, 22 metastable failures at 11 organizations were found. At least 4 of AWS's 15 major incidents in about ten years are of this type, lasting 1.5–73.5 hours. About 45% of triggers are human error or latent bugs, about 35% are load spikes, and 45% have more than one trigger; over half are sustained by retries; over half were recovered by load shedding.
+   So: Recovery must break the feedback loop. The "amplification cap" is the most the loop can multiply load (capacity degradation is folded in); the "stability line" is normal capacity divided by the amplification cap. When load is below it, even full amplification stays under capacity, and the system recovers by itself. So either shed load below the stability line, or lower the amplification cap to raise the stability line: with at most 2 retries per request, load is amplified at most 3×; with unlimited retries there is no cap, and no stable region. AWS2's fix of unlimited retries removed exactly that stable region.
+2. **The feedback loop can also act on capacity**
+   Finding: Bugs and configuration changes can cut capacity directly with no load increase; the sustaining mechanism can also be a continuing drop in capacity. In one Twitter load test: longer queue → more live objects, busier GC → slower jobs → longer queue. With load below the pre-test level, the success rate stayed under the SLO until a restart.
+   So: The model is extended to "load spike/capacity drop" triggers × "load amplification/capacity degradation" amplification, four cases in total. Load and capacity are both measured in work per second, and two theorems are given. First: if normal load times the maximum load-amplification factor times the maximum capacity-degradation factor is still below normal capacity, the system never enters a metastable state. Second: once the overload (load minus capacity) exceeds the part caused by the trigger itself (at the current amplification factor), the system stays overloaded after the trigger is removed, that is, it has entered a metastable state.
+3. **"Vulnerable" is a matter of degree, set by a race between headroom and trigger duration**
+   Finding: The amplification factor grows with time spent in overload; as long as the amplification built up over that time stays below "normal capacity / normal load", the system can recover.
+   So: Operators should watch not whether the trigger is still there, but whether the overload is close to the part caused by the trigger itself. Before that line is crossed, removing or shortening the trigger quickly is enough, and things that delay amplification, such as timeouts, buy time. After it is crossed, rolling back the trigger no longer works; load must be shed below the stability line (shedding only to the pre-trigger level is not enough, as the Twitter case shows), or capacity must be added or retries limited. The paper gives no way to measure the amplification factor online, so the exact amount to shed still cannot be computed.
+
+## Evidence
+- End to end: the incident statistics above (Table 1), and the internal Twitter case.
+- Novelty 1, 3 → MongoDB with three replicas, client timeout 3 s, at most 4 retries: cutting primary CPU by 78% for 10 seconds recovers; cutting 80% does not, requests rise to about 20K RPS (3×), and goodput drops 90% to 600 RPS. Shortening the trigger to 9 seconds, or lowering baseline load by 30%, both recover.
+- Novelty 2 → A small Java program reproduces the GC loop; the larger the heap, the less vulnerable. Look-aside cache (on a miss, the application queries the database and fills the cache): raising the timeout from 1 s to 2 s shrinks the vulnerable region; a 95% hit rate is more stable at each RPS, but because of that it can run at higher RPS, so the vulnerable range is actually wider.
+- Gaps: Public reports have limited detail, and whether a case is metastable is the authors' judgment (some are marked only "possible"), so the sample has selection bias; the Twitter case is correlational evidence; all reproductions are small single-machine programs; the amplification cap in the model cannot be measured in real systems, and the paper neither proposes nor evaluates any prevention mechanism.
+
+## When it applies
+The conclusions target services that run at high utilization (the vulnerable region) for long periods and have amplification mechanisms such as retries, caches, or GC. When load is far below capacity (for example CAS2 uses only 10–30% of capacity), the system recovers by itself however large the trigger.

@@ -1,0 +1,890 @@
+                         SplitFS: Reducing Software Overhead
+                        in File Systems for Persistent Memory
+               Rohan Kadekodi                                           Se Kwon Lee                                  Sanidhya Kashyap
+         University of Texas at Austin                         University of Texas at Austin                    Georgia Institute of Technology
+
+                   Taesoo Kim                                         Aasheesh Kolli                                Vijay Chidambaram
+       Georgia Institute of Technology                     Pennsylvania State University and                   University of Texas at Austin and
+                                                                  VMware Research                                     VMware Research
+
+
+Abstract                                                                                ACM Reference Format:
+We present SplitFS, a file system for persistent memory (PM)                            Rohan Kadekodi, Se Kwon Lee, Sanidhya Kashyap, Taesoo Kim,
+                                                                                        Aasheesh Kolli, and Vijay Chidambaram. 2019. SplitFS: Reducing
+that reduces software overhead significantly compared to
+                                                                                        Software Overhead in File Systems for Persistent Memory . In
+state-of-the-art PM file systems. SplitFS presents a novel                              SOSP ’19: Symposium on Operating Systems Principles, October 27–30,
+split of responsibilities between a user-space library file sys-                        2019, Huntsville, ON, Canada. ACM, New York, NY, USA, 15 pages.
+tem and an existing kernel PM file system. The user-space                               https://doi.org/10.1145/3341301.3359631
+library file system handles data operations by intercepting
+POSIX calls, memory-mapping the underlying file, and serv-
+ing the read and overwrites using processor loads and stores.
+Metadata operations are handled by the kernel PM file sys-                              1    Introduction
+tem (ext4 DAX). SplitFS introduces a new primitive termed                               Persistent Memory (PM) is a new memory technology that
+relink to efficiently support file appends and atomic data op-                          was recently introduced by Intel [17]. PM will be placed on
+erations. SplitFS provides three consistency modes, which                               the memory bus like DRAM and will be accessed via proces-
+different applications can choose from, without interfering                             sor loads and stores. PM has a unique performance profile:
+with each other. SplitFS reduces software overhead by up-to                             compared to DRAM, loads have 2–3.7× higher latency and
+4× compared to the NOVA PM file system, and 17× com-                                    1/3r d bandwidth, while stores have the same latency but
+pared to ext4 DAX. On a number of micro-benchmarks and                                  1/6t h bandwidth [18]. A single machine can be equipped
+applications such as the LevelDB key-value store running                                with up to 6 TB of PM. Given its large capacity and low la-
+the YCSB benchmark, SplitFS increases application perfor-                               tency, an important use case for PM will be acting as storage.
+mance by up to 2× compared to ext4 DAX and NOVA while                                      Traditional file systems add large overheads to each file-
+providing similar consistency guarantees.                                               system operation, especially on the write path. The overhead
+                                                                                        comes from performing expensive operations on the criti-
+CCS Concepts • Information systems → Storage class                                      cal path, including allocation, logging, and updating mul-
+memory; • Hardware → Non-volatile memory; • Soft-                                       tiple complex structures. The systems community has pro-
+ware and its engineering → File systems management;                                     posed different architectures to reduce overhead. BPFS [7],
+                                                                                        PMFS [24], and NOVA [33] redesign the in-kernel file system
+Keywords Persistent Memory, File Systems, Crash Consis-                                 from scratch to reduce overhead for file-system operations.
+tency, Direct Access                                                                    Aerie [28] advocates a user-space library file system coupled
+                                                                                        with a slim kernel component that does coarse-grained allo-
+                                                                                        cations. Strata [19] proposes keeping the file system entirely
+                                                                                        in user-space, dividing the system between a user-space li-
+Permission to make digital or hard copies of all or part of this work for               brary file system and a user-space metadata server. Aerie
+personal or classroom use is granted without fee provided that copies are not
+made or distributed for profit or commercial advantage and that copies bear
+                                                                                        and Strata both seek to reduce overhead by not involving
+this notice and the full citation on the first page. Copyrights for components          the kernel for most file-system operations.
+of this work owned by others than ACM must be honored. Abstracting with                    Despite these efforts, file-system data operations, espe-
+credit is permitted. To copy otherwise, or republish, to post on servers or to          cially writes, have significant overhead. For example, con-
+redistribute to lists, requires prior specific permission and/or a fee. Request         sider the common operation of appending 4K blocks to a file
+permissions from permissions@acm.org.
+                                                                                        (total 128 MB). It takes 671 ns to write a 4 KB to PM; thus,
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+© 2019 Association for Computing Machinery.
+                                                                                        if performing the append operation took a total of 675 ns,
+ACM ISBN 978-1-4503-6873-5/19/10. . . $15.00                                            Rohan Kadekodi and Se Kwon Lee are supported by SOSP 2019 student
+https://doi.org/10.1145/3341301.3359631                                                 travel scholarships from the National Science Foundation.
+
+
+
+
+                                                                                  494
+                                                                          mature, well-tested code in ext4 DAX for metadata opera-
+File system              Append         Overhead      Overhead
+                                                                          tions. Second, the user-space library file system in SplitFS
+                         Time (ns)      (ns)          (%)
+                                                                          allows each application to run with one of three consistency
+ext4 DAX                 9002           8331          1241%               modes (POSIX, sync, strict). We observe that not all appli-
+PMFS                     4150           3479          518%                cations require the same guarantees; for example, SQLite
+NOVA-Strict              3021           2350          350%                does not require the strong guarantees provided by NOVA-
+SplitFS-Strict           1251           580           86%                 strict, and gets 2.5× higher throughput on ext4 DAX and
+SplitFS-POSIX            1160           488           73%                 SplitFS-POSIX than on NOVA-strict owing to their weaker
+                                                                          guarantees. Applications running with different consistency
+Table 1. Software Overhead. The table shows the software                  modes do not interfere with each other on SplitFS.
+overhead of various PM file systems for appending a 4K block.                SplitFS introduces the relink primitive to optimize file
+It takes 671 ns to write 4KB to PM. Strict and POSIX indicate             appends and atomic data operations. Relink logically and
+the guarantees offered by the file systems (§3.2).                        atomically moves a contiguous extent from one file to an-
+                                                                          other, without any physical data movement. Relink is built
+                                                                          on top of the swap_extents ioctl in ext4 DAX, and uses
+                                                                          ext4 journaling to ensure the source and destination files are
+the software overhead would be 4 ns. Table 1 shows the soft-              modified atomically. Both file appends and data overwrites
+ware overhead on the append operation on various PM file                  in strict mode are redirected to a temporary PM file we term
+systems. We observe that there is still significant overhead              the staging file. On fsync(), the data from the staging file
+(3.5 − 12.4×) for file appends.                                           is relinked into the original file. Relink provides atomic data
+   This paper presents SplitFS, a PM file system that seeks               operations without paging faults or data copying.
+to reduce software overhead via a novel split architecture: a                SplitFS also introduces an optimized logging protocol. In
+user-space library file system handles data operations while              strict mode, all data and metadata operations in SplitFS are
+a kernel PM file system (ext4 DAX) handles metadata opera-                atomic and synchronous. SplitFS achieves this by logging
+tions. We refer to all file system operations that modify file            each operation. In the common case, SplitFS will write a sin-
+metadata as metadata operations. Such operations include                  gle cache line worth of data (64B), followed by one memory
+open(), close(), and even file appends (since the file size               fence (e.g., sfence in x86 systems), for each operation; in
+is changed). The novelty of SplitFS lies in how responsibili-             contrast, NOVA writes at least two cache lines and issues two
+ties are divided between the user-space and kernel compo-                 fences. As a result of these optimizations, SplitFS logging is
+nents, and the semantics provided to applications. Unlike                 4× faster than NOVA in the critical path. Thanks to relink
+prior work like Aerie, which used the kernel only for coarse-             and optimized logging, atomic data operations in SplitFS
+grained operations, or Strata, where all operations are in                are 2–6× faster than in NOVA-strict, providing strong guar-
+user-space, SplitFS routes all metadata operations to the                 antees at low software overhead.
+kernel. While FLEX [32] invokes the kernel at a fine gran-                   We evaluate SplitFS using a number of micro-benchmarks,
+ularity like SplitFS, it does not provide strong semantics                three utilities (git, tar, rsync), two key-value stores (Redis,
+such as synchronous, atomic operations to applications. At                LevelDB), and an embedded database (SQLite). Our evalu-
+a high level, the SplitFS architecture is based on the belief             ation on Intel DC Persistent Memory shows that SplitFS,
+that if we can accelerate common-case data operations, it                 though it is built on ext4 DAX, outperforms ext4 DAX by
+is worth paying a cost on the comparatively rarer metadata                up-to 2× on many workloads. SplitFS outperforms NOVA by
+operations. This is in contrast with in-kernel file systems like          10%–2× (when providing the same consistency guarantees)
+NOVA which extensively modify the file system to optimize                 on LevelDB, Redis, and SQLite when running benchmarks
+the metadata operations.                                                  like YCSB and TPCC. SplitFS also reduces total amount of
+   SplitFS transparently reduces software overhead for reads              write IO by 2× compared to Strata on certain workloads. On
+and overwrites by intercepting POSIX calls, memory map-                   metadata-heavy workloads such as git and tar, SplitFS suf-
+ping the underlying file, and serving reads and overwrites via            fers a modest drop in performance (less than 15%) compared
+processor loads and stores. SplitFS optimizes file appends                to NOVA and ext4 DAX.
+by introducing a new primitive named relink that minimizes                   SplitFS is built on top of ext4 DAX; this is both a strength
+both data copying and trapping into the kernel. The appli-                and a weakness. Since SplitFS routes all metadata operations
+cation does not have to be rewritten in any way to benefit                through ext4 DAX, it suffers from the high software overhead
+from SplitFS. SplitFS reduces software overhead by up-to                  and high write IO for metadata operations. Despite these
+4× compared to NOVA and 17× compared to ext4 DAX.                         limitations, we believe SplitFS presents a useful new point in
+   Apart from lowering software overhead, the split architec-             the spectrum of PM file-system designs. ext4 DAX is a robust
+ture leads to several benefits. First, instead of re-implementing         file system under active development; its performance will
+file-system functionality, SplitFS can take advantage of the              improve with every Linux kernel version. SplitFS provides
+
+
+
+                                                                    495
+ Property                          DRAM       Intel PM                2.2 Direct Access (DAX) and Memory Mapping
+ Sequential read latency (ns)      81         169 (2.08×)             The Linux ext4 file system introduced a new mode called
+ Random read latency (ns)          81         305 (3.76×)             Direct Access (DAX) to help users access PM [21]. DAX file
+ Store + flush + fence (ns)        86         91 (1.05×)              systems eschew the use of page caches and rely on memory
+                                                                      mapping to provide low-latency access to PM.
+ Read bandwidth (GB/s)             120        39.4 (0.33×)
+ Write bandwidth (GB/s)            80         13.9 (0.17×)
+                                                                         A memory map operation (performed via the mmap() sys-
+                                                                      tem call) in ext4 DAX maps one or more pages in the process
+Table 2. PM Performance. The table shows performance                  virtual address space to extents on PM. For example, consider
+characteristics of DRAM, PM and the ratio of PM/DRAM, as              virtual addresses 4K to 8K-1 are mapped to bytes 0 to 4K-1
+reported by Izraelevitz et al. [18].                                  on file foo on ext4 DAX. Bytes 0 to 4K-1 in foo then corre-
+                                                                      spond to bytes 10*4K to 11*4K -1 on PM. A store instruction
+                                                                      to virtual address 5000 would then translate to a store to
+                                                                      byte 40964 on PM. Thus, PM can be accessed via processor
+                                                                      loads and stores without the interference of software; the
+the best features of ext4 DAX while making up for its lack
+                                                                      virtual memory subsystem is in charge of translating virtual
+of performance and strong consistency guarantees.
+                                                                      addresses into corresponding physical addresses on PM.
+   This paper makes the following contributions:
+                                                                         While DAX and mmap() provide low-latency access to
+    • A new architecture for PM file systems with a novel             PM, they do not provide other features such as naming or
+      split of responsibilities between a user-space library          atomicity for operations. The application is forced to impose
+      file system and a kernel file system.                           its own structure and semantics on the raw bytes offered
+    • The novel relink primitive that can be used to provide          by mmap(). As a result, PM file systems still provide useful
+      efficient appends and atomic data operations.                   features to applications and end users.
+    • The design and implementation of SplitFS, based on              2.3 PM File Systems
+      the split architecture. We have made SplitFS publicly
+                                                                      Apart from ext4 DAX, researchers have developed a num-
+      available at https://github.com/utsaslab/splitfs.
+                                                                      ber of other PM file systems such as SCMFS [31], BPFS [7],
+    • Experimental evidence demonstrating that SplitFS
+                                                                      Aerie [28], PMFS [24], NOVA [33], and Strata [19]. Only ext4
+      outperforms state-of-the-art in-kernel and in-user-space
+                                                                      DAX, PMFS (now deprecated), NOVA, and Strata are publicly
+      PM file systems, on a range of workloads.
+                                                                      available and supported by modern Linux 4.x kernels.
+                                                                         These file systems make trade-offs between software over-
+2   Background                                                        head, amount of write IO, and operation guarantees. NOVA
+This section provides background on persistent memory                 provides strong guarantees such as atomicity for file-system
+(PM), PM file systems, Direct Access, and memory mapping.             operations. PMFS provides slightly weaker guarantees (data
+                                                                      operations are not atomic), but as a result obtains better per-
+2.1 Persistent Memory                                                 formance on some workloads. Strata is a cross-media file
+Persistent memory is a new memory technology that offers              system which uses PM as one of its layers. Strata writes all
+durability and performance close to that of DRAM. PM can              data to per-process private log, then coalesces the data and
+be attached on the memory bus similar to DRAM, and would              copies it to a shared area for public access. For workloads
+be accessed via processor loads and stores. PM offers 8-byte          dominated by operations such as appends, Strata cannot coa-
+atomic stores and they become persistent as soon as they              lesce the data effectively, and has to write data twice: once to
+reach the PM controller [16]. There are two ways to ensure            the private log, and once to the shared area. This increases
+that stores become persistent: (i) using non-temporal store           the PM wear-out by up to 2×. All these file systems still suffer
+instructions (e.g., movnt in x86) to bypass the cache hierar-         from significant overhead for write operations (Table 1).
+chy and reach the PM controller or (ii) using a combination
+of regular temporal store instructions and cache line flush
+instructions (e.g., clflush or clwb in x86).                          3   SplitFS: Design and Implementation
+   Intel DC Persistent Memory is the first PM product that
+was made commercially available in April 2019. Table 2 lists          We present the goals of SplitFS, its three modes and their
+the performance characteristics of PM revealed in a report            guarantees. We present an overview of the design, describe
+by Izraelevitz et al. [18]. Compared to DRAM, PM has 3.7×             how different operations are handled, and discuss how SplitFS
+higher latency for random reads, 2× higher latency for se-            provides atomic operations at low overhead. We describe the
+quential reads, 1/3r d read bandwidth, and close to 1/6t h            implementation of SplitFS, and discuss its various tuning
+write bandwidth. Finally, PMs are expected to exhibit limited         parameters. Finally, we discuss how the design of SplitFS
+write endurance (about 107 write cycles [25]).                        affects security.
+
+
+
+
+                                                                496
+Mode      Sync.   Atomic   Sync.      Atomic     Equivalent to          Technique                     Benefit
+          Data    Data     Metadata   Metadata
+                                                                        Split architecture            Low-overhead data operations,
+          Ops     Ops      Ops        Ops
+                                                                                                      correct metadata operations
+POSIX ✗           ✗        ✗          ✓          ext4-DAX
+                                                                        Collection of memory-mmaps    Low-overhead data operations in
+sync      ✓       ✗        ✓          ✓          Nova-Relaxed,                                        the presence of updates and ap-
+                                                 PMFS                                                 pends
+strict    ✓       ✓        ✓          ✓          NOVA-Strict,           Relink + Staging              Optimized appends, atomic data
+                                                 Strata                                               operations, low write amplifica-
+                                                                                                      tion
+Table 3. SplitFS modes. The table shows the three modes
+                                                                        Optimized operation logging   Atomic operations, low write am-
+of SplitFS, the guarantees provided by each mode, and list                                            plification
+current file systems which provide the same guarantees.
+                                                                        Table 4. Techniques. The table lists each main technique
+                                                                        used in SplitFS along with the benefit it provides. The tech-
+                                                                        niques work together to enable SplitFS to provide strong
+3.1      Goals
+                                                                        guarantees at low software overhead.
+Low software overhead. SplitFS aims to reduce software
+overhead for data operations, especially writes and appends.
+Transparency. SplitFS does not require the application to
+be modified in any way to obtain lower software overhead
+and increased performance.                                              in the POSIX mode guarantees atomic appends, a property
+                                                                        not provided by ext4 DAX. This mode slightly differs from
+Minimal data copying and write IO. SplitFS aims to re-
+                                                                        the standard POSIX semantics: when a file is accessed or
+duce the number of writes made to PM. SplitFS aims to
+                                                                        modified, the file metadata will not immediately reflect that.
+avoid copying data within the file system whenever possible.
+This both helps performance and reduces wear-out on PM.                 Sync mode. SplitFS ensures that on top of POSIX mode
+Minimizing writes is especially important when providing                guarantees, operations are also guaranteed to be synchro-
+strong guarantees like atomic operations.                               nous. An operation may be considered complete and persis-
+                                                                        tent once the corresponding call returns and applications do
+Low implementation complexity. SplitFS aims to re-use
+                                                                        not need a subsequent fsync(). Operations are not atomic
+existing software like ext4 DAX as much as possible, and
+                                                                        in this mode; a crash may leave a data operation partially
+reduce the amount of new code that must be written and
+                                                                        completed. No additional crash recovery needs to be per-
+maintained for SplitFS.
+                                                                        formed by SplitFS in this mode. This mode provides similar
+Flexible guarantees. SplitFS aims to provide applications               guarantees to PMFS as well as NOVA without data and meta-
+with a choice of crash-consistency guarantees to choose from.           data checksuming and with in-place updates; we term this
+This is in contrast with PM file systems today, which provide           NOVA configuration NOVA-Relaxed.
+all running applications with the same set of guarantees.
+                                                                        Strict mode. SplitFS ensures that on top of sync mode
+3.2 SplitFS Modes and Guarantees                                        guarantees, each operation is also atomic. This is a useful
+SplitFS provides three different modes: POSIX, sync, and                guarantee for applications; editors can allow atomic changes
+strict. Each mode provides a different set of guarantees. Con-          to the file when the user saves the file, and databases can
+current applications can use different modes at the same time           remove logging and directly update the database. This mode
+as they run on SplitFS. Across all modes, SplitFS ensures               does not provide atomicity across system calls though; so it
+the file system retains its integrity across crashes.                   cannot be used to update two files atomically together. This
+   Table 3 presents the three modes provided by SplitFS.                mode provides similar guarantees to a NOVA configuration
+Across all modes, appends are atomic in SplitFS; if a series            we term NOVA-Strict: NOVA with copy-on-write updates,
+of appends is followed by fsync(), the file will be atomically          but without checksums enabled.
+appended on fsync().                                                    Visibility. Apart from appends, all SplitFS operations be-
+POSIX mode. In POSIX mode, SplitFS provides metadata                    come immediately visible to all other processes on the sys-
+consistency [6], similar to ext4 DAX. The file system will              tem. On fsync(), appends are persisted and become visible
+recover to a consistent state after a crash with respect to its         to the rest of the system. SplitFS is unique in its visibility
+metadata. In this mode, overwrites are performed in-place               guarantees, and takes the middle ground between ext4 DAX
+and are synchronous. Note that appends are not synchronous,             and NOVA where all operations are immediately visible, and
+and require an fsync() to be persisted. However, SplitFS                Strata where new files and data updates are only visible to
+
+
+
+                                                                  497
+                                                                                                                                        Target file   Staging file
+        POSIX Application                                  POSIX Application                                                                                              Init state: Staging file
+                                  fsync()                                            fsync()                          Logical blocks                  Staging   Staging
+      read()  write()                                    read()  write()
+                                                                                                                                                         1         2      has a mmap() region
+                                  open()                                             open()
+      write() [append]
+                                  close()
+                                                         write() [append]
+                                                                                     close()                     1                                                          of 2 pre-allocated
+                                                                                                                                                                               physical block
+                                                                                                                      Physical blocks                   1         2
+                                                                                                                                                                          available for appends
+                                    U-Split                                            U-Split
+           mmaps                                              mmaps
+
+                                                                                           User space                                                                         An append to the
+                                                                                          Kernel space                Logical blocks                  Target
+                                                                                                                                                        2
+                                                                                                                                                                Staging
+                                                                                                                                                                   2
+                                                                                                                                                                             target file is routed
+                                                                                                                                                                          to the staging file block.
+                                              K-Split                                                            2                                                            Later reads to the
+                                                                                                                      Physical blocks                             2         appended region are
+                                                                                                                                                                          also routed to the block
+                                                                                      PM Device
+     File on PM    Staging File     Op log              File on PM    Staging File     Op log                                                                                On fsync, the newly
+                                                                                                                      Logical blocks                            Staging       written block in the
+                                                                                                                                                                   2        staging file is logically
+                                                                                                                 3                                                         linked to the target file,
+                                                                                                                      Physical blocks                                         while retaining its
+                                                                                                                                                                  2
+Figure 1. SplitFS Overview. The figure provides an                                                                                                                            mmap() region and
+                                                                                                                                                                                physical block
+overview of how SplitFS works. Read and write opera-
+tions are transformed into loads and stores on the memory-                                                     Figure 2. relink steps. This figure provides an overview
+mapped file. Append operations are staged in a staging file                                                    of the steps involved while performing a relink operation.
+and relinked on fsync(). Other metadata POSIX calls like                                                       First, appends to a target file are routed to pre-allocated
+open(), close(), etc. are passed through to the in-kernel                                                      blocks in the staging file and subsequently on an fsync(),
+PM file system. Note that loads and stores do not incur the                                                    they are relinked into the target file while retaining existing
+overhead of trapping into the kernel.                                                                          memory-mapped regions.
+
+
+
+other processes after the digest operation. Immediate visibil-                                                 Staging. SplitFS uses temporary files called staging files for
+ity of changes to data and metadata combined with atomic,                                                      both appends and atomic data operations. Appends are first
+synchronous guarantees removes the need for leases to coor-                                                    routed to a staging file, and are later relinked on fsync().
+dinate sharing; applications can share access to files as they                                                 Similarly, file overwrites in strict mode are also first sent to
+would on any other POSIX file system.                                                                          staging files and later relinked to their appropriate files.
+                                                                                                               Relink. On an fsync(), all the staged appends of a file
+3.3 Overview
+                                                                                                               must be moved to the target file; in strict mode, overwrites
+We now provide an overview of the design of SplitFS, and                                                       have to be moved as well. One way to move the staged
+how it uses various techniques to provide the outlined guar-                                                   appends to the target file is to allocate new blocks and then
+antees. Table 4 lists the different techniques and the benefit                                                 copy appended data to them. However, this approach leads
+each technique provides.                                                                                       to write amplification and high overhead. To avoid these
+Split architecture. As shown in Figure 1, SplitFS comprises                                                    unnecessary data copies, we developed a new primitive called
+of two major components, a user-space library linked to the                                                    relink. Relink logically moves PM blocks from the staging
+application called U-Split and a kernel file system called K-                                                  file to the target file without incurring any copies.
+Split. SplitFS services all data operations (e.g., read() and                                                     Relink has the following signature: relink(file1, offset1,
+write() calls) directly in user-space and routes metadata                                                      file2, offset2, size). Relink atomically moves data from
+operations (e.g., fsync(), open(), etc. ) to the kernel file sys-                                              offset1 of file1 to offset2 of file2. If file2 already
+tem underneath. File system crash-consistency is guaranteed                                                    has data at offset2, existing data blocks are de-allocated.
+at all times. This approach is similar to Exokernel [12] where                                                 Atomicity is ensured by wrapping the changes in a ext4 jour-
+only the control operations are handled by the kernel and                                                      nal transaction. Relink is a metadata operation, and does
+data operations are handled in user-space.                                                                     not involve copying data when the involved offsets and
+Collection of mmaps. Reads and overwrites are handled by                                                       size are block aligned. When offset1 or offset2 happens
+mmap()-ing the surrounding 2 MB part of the file, and serving                                                  to be in the middle of a block, SplitFS copies the partial
+reads via memcpy and writes via non-temporal stores (movnt                                                     data for that block to file2, and performs a metadata-only
+instructions). A single logical file may have data present in                                                  relink for the rest of the data. Given that SplitFS is targeted
+multiple physical files; for example, appends are first sent                                                   at POSIX applications, block writes and appends are often
+to a staging file, and thus the file data is spread over the                                                   block-aligned by the applications. Figure 2 illustrates the
+original file and the staging file. SplitFS uses a collection of                                               different steps involved in the relink operation.
+memory-maps to handle this situation. Each file is associated                                                  Optimized logging. In strict mode, SplitFS guarantees atom-
+with a number of open mmap() calls over multiple physical                                                      icity for all operations. To provide atomicity, we employ an
+files, and reads and over-writes are routed appropriately.                                                     Operation Log and use logical redo logging to record the
+
+
+
+                                                                                                         498
+intent of each operation. Each U-Split instance has its own               Relink allows SplitFS to implement a form of localized copy-
+operation log that is pre-allocated, mmap-ed by U-Split, and              on-write. Due to the staging files being pre-allocated, locality
+written using non-temporal store instructions. We use the                 is preserved to an extent. SplitFS logs metadata operations
+necessary memory fence instructions to ensure that log en-                to ensure they are atomic and synchronous. Optimized log-
+tries persist in the correct order. To reduce the overheads               ging ensures that for most operations exactly one cache line
+from logging, we ensure that in the common case, per opera-               is written and one sfence is issued for logging.
+tion, we write one cache line (64B) worth of data to PM and
+                                                                          3.4   Handling Reads, Overwrites, and Appends
+use a single memory fence (sfence in x86) instruction in the
+process. Operation log entries do not contain the file data               Reads. Reads consult the collection of mmaps to determine
+associated with the operation (e.g., data being appended to a             where the most recent data for this offset is, since the data
+file), instead they contain a logical pointer to the staging file         could have been overwritten or appended (and thus in a
+where the data is being held.                                             staging file). If a valid memory mapped region for the offsets
+    We employ a number of techniques to optimize logging.                 being read exists in U-Split, the read is serviced from the
+First, to distinguish between valid and invalid or torn log               corresponding region. If such a region does not exist, then
+entries, we incorporate a 4B transactional checksum [23]                  the 2 MB region surrounding the read offset is first memory
+within the 64B log entry. The use of checksum reduces the                 mapped, added to the the collection of mmaps, and then the
+number of fence instructions necessary to persist and val-                read operation is serviced using processor loads.
+idate a log entry from two to one. Second, we maintain a                  Overwrites. Similar to reads, if the target offset is already
+tail for the log in DRAM and concurrent threads use the tail              memory mapped, then U-Split services the overwrite using
+as a synchronization variable. They use compare-and-swap                  non-temporal store instructions. If the target offset is not
+to atomically advance the tail and write to their respective              memory mapped, then the 2MB region surrounding the offset
+log entries concurrently. Third, during the initialization of             is first memory mmaped, added to the collection of mmaps,
+the operation log file, we zero it out. So, during crash re-              and then the overwrite is serviced. However, in strict mode,
+covery, we identify all non-zero 64B aligned log entries as               to guarantee atomicity, overwrites are first redirected to a
+being potentially valid and then use the checksum to identify             staging file (even if the offset is memory mapped), then the
+any torn entries. The rest are valid entries and are replayed.            operation is logged, and finally relinked on a subsequent
+Replaying log entries is idempotent, so replaying them mul-               fsync() or close().
+tiple times on crashes is safe. We employ a 128MB operation
+                                                                          Appends. SplitFS redirects all appends to a staging file, and
+log file and if it becomes full, we checkpoint the state of
+                                                                          performs a relink on a subsequent fsync() or close(). As
+the application by calling relink() on all the open files that
+                                                                          with overwrites, appends are performed with non-temporal
+have data in staging files. We then zero out the log and reuse
+                                                                          writes and in strict mode, SplitFS also logs details of the
+it. Finally, we designed our logging mechanism such that
+                                                                          append operation to ensure atomicity.
+all common case operations (write(), open(), etc.) can be
+logged using a single 64B log entry while some uncommon                   3.5 Implementation
+operations, like rename(), require multiple log entries.                  We implement SplitFS as a combination of a user-space
+    Our logging protocol works well with the SplitFS archi-               library file system (9K lines of C code) and a small patch
+tecture. The tail of each U-Split log is maintained only in               to ext4 DAX to add the relink system call (500 lines of C
+DRAM as it is not required for crash recovery. Valid log en-              code). SplitFS supports 35 common POSIX calls, such as
+tries are instead identified using checksums. In contrast, file           pwrite(), pread64(), fread(), readv(), ftruncate64(),
+systems such as NOVA have a log per inode that resides on                 openat(), etc; we found that supporting this set of calls
+PM, whose tail is updated after each operation via expensive              is sufficient to support a variety of applications and micro-
+clflush and sfence operations.                                            benchmarks. Since PM file systems PMFS and NOVA are
+Providing Atomic Operations. In strict mode, SplitFS                      supported by Linux kernel version 4.13, we modified 4.13
+provides synchronous, atomic operations. Atomicity is pro-                to support SplitFS. We now present other details of our
+vided in an efficient manner by the combination of staging                implementation.
+files, relink, and optimized logging. Atomicity for data oper-            Intercepting POSIX calls. SplitFS uses LD_PRELOAD to in-
+ations like overwrites is achieved by redirecting them also to            tercept POSIX calls and either serve from user-space or route
+a staging file, similar to how appends are performed. SplitFS             them to the kernel after performing some book-keeping tasks.
+logs these writes and appends to record where the latest data             Since SplitFS intercepts calls at the POSIX level in glibc
+resides in the event of a crash. On fsync(), SplitFS relinks              rather than at the system call level, SplitFS has to intercept
+the data from the staging file to the target file atomically.             several variants of common system calls like write().
+Once again, the data is written exactly once, though SplitFS
+                                                                          Relink. We implement relink by leveraging an ioctl pro-
+provides the strong guarantee of atomic data operations.
+                                                                          vided by ext4 DAX. The EXT4_IOC_MOVE_EXT ioctl swaps
+
+
+
+                                                                    499
+extents between a source file and a destination file, and uses              A memory-mapping is only discarded on unlink(). This re-
+journaling to perform this atomically. The ioctl also de-                   duces the cost of setting up memory mappings in the critical
+allocates blocks in the target file if they are replaced by blocks          path on read or write.
+from the source file. By default, the ioctl also flushes the                Multi-thread access. SplitFS uses a lock-free queue for
+swapped data in the target file; we modify the ioctl to only                managing the staging files. It uses fine-grained reader-writer
+touch metadata, without copying, moving, or persisting of                   locks to protect its in-memory metadata about open files,
+data. We also ensure that after the swap has happened, exist-               inodes, and memory-mappings.
+ing memory mappings of both source and destination files
+are valid; this is vital to SplitFS performance as it avoids                3.6 Tunable Parameters
+page faults. The ioctl requires blocks to be allocated at                   SplitFS provides a number of tunable parameters that can be
+both source and destination files. To satisfy this requirement,             set by application developers and users for each U-Split in-
+when handling appends via relink, we allocate blocks at                     stance. These parameters affect the performance of SplitFS.
+the destination file, swap extents from the staging file, and               mmap() size. SplitFS supports a configurable size of mmap()
+then de-allocate the blocks. This allows us to perform relink               for handling overwrites and reads. Currently, SplitFS sup-
+without using up extra space, and reduces implementation                    ports mmap() sizes ranging from 2MB to 512MB. The default
+complexity at the cost of temporary allocation of data.                     size is 2 MB, allowing SplitFS to employ huge pages while
+Handling file open and close. On file open, SplitFS per-                    pre-populating the mappings.
+forms stat() on the file and caches its attributes in user-                 Number of staging files at startup. There are ten staging
+space to help handle later calls. When a file is closed, we do              files at startup by default; when a staging file is used up,
+not clear its cached information. When the file is unlinked, all            SplitFS creates another staging file in the background. We
+cached metadata is cleared, and if the file has been memory-                experimentally found that having ten staging files provides
+mapped, it is un-mapped. The cached attributes are used to                  a good balance between application performance and the
+check file permissions on every subsequent file operation                   initialization cost and space usage of staging files.
+(e.g., read()) intercepted by U-Split.
+                                                                            Size of the operation log. The default size of the operation
+Handling fork. Since SplitFS uses a user-space library file                 log is 128MB for each U-Split instance. Since all log entries
+system, special care needs to be taken to handle fork()                     consist of a single cacheline in the common case, SplitFS can
+and execve() correctly. When fork() is called, SplitFS is                   support up to 2M operations without clearing the log and
+copied into the address space of the new process (as part of                re-initializing it. This helps applications with small bursts to
+copying the address space of the parent process), so that the               achieve good performance while getting strong semantics.
+new process can continue to access SplitFS.
+                                                                            3.7 Security
+Handling execve. execve() overwrites the address space,
+but open file descriptors are expected to work after the call               SplitFS does not expose any new security vulnerabilities as
+completes. To handle this, SplitFS does the following: be-                  compared to an in-kernel file system. All metadata operations
+fore executing execve(), SplitFS copies its in-memory data                  are passed through to the kernel which performs security
+about open files to a shared memory file on /dev/shm; the file              checks. SplitFS does not allow a user to open, read, or write
+name is the process ID. After executing execve(), SplitFS                   a file to which they previously did not have permissions. The
+checks the shared memory device and copies information                      U-Split instances are isolated from each other in separate
+from the file if it exists.                                                 processes; therefore applications cannot access the data of
+                                                                            other applications while running on SplitFS. Each U-Split
+Handling dup. When a file descriptor is duplicated, the                     instance only stores book-keeping information in DRAM
+file offset is changed whenever operations are performed                    for the files that the application already has access to. An
+on either file descriptor. SplitFS handles by maintaining a                 application that uses SplitFS may corrupt its own files, just
+single offset per open file, and using pointers to this file in the         as in an in-kernel file system.
+file descriptor maintained by SplitFS. Thus, if two threads
+dup a file descriptor and change the offset from either thread,             4   Discussion
+SplitFS ensures both threads see the changes.
+                                                                            We reflect on our experiences building SplitFS, describe
+Staging files. SplitFS pre-allocates staging files at startup,              problems we encountered, how we solved them, and surpris-
+creating 10 files each 160 MB in size. Whenever a staging file              ing insights that we discovered.
+is completely utilized, a background thread wakes up and
+                                                                            Page faults lead to significant cost. SplitFS memory maps
+creates and pre-allocates a new staging file. This avoids the
+                                                                            files before accessing them, and uses MAP_POPULATE to pre-
+overhead of creating staging files in the critical path.
+                                                                            fault all pages so that later reads and writes do not incur
+Cache of memory-mappings. SplitFS caches all memory-                        page-fault latency. As a result, we find that a significant por-
+mappings its creates in its collection of memory mappings.                  tion of the time for open() is consumed by page faults. While
+
+
+
+                                                                      500
+the latency of device IO usually dominates page fault cost in             Application                 Description
+storage systems based on solid state drives or magnetic hard
+drives, the low latency of persistent memory highlights the               TPC-C [9] on SQLite [26]    Online transaction processing
+cost of page faults.                                                      YCSB [8] on LevelDB [15]    Data retreival & maintenance
+Huge pages are fragile. A natural way of minimizing page                  Set in Redis [1]            In-memory data structure store
+faults is to use 2 MB huge pages. However, we found huge                  Git                         Popular version control software
+pages fragile and hard to use. Setting up a huge-page map-                Tar                         Linux utility for data compression
+ping in the Linux kernel requires a number of conditions.
+                                                                          Rsync                       Linux utility for data copy
+First, the virtual address must be 2 MB aligned. Second,
+the physical address on PM must be 2 MB aligned. As a                    Table 5. Applications used in evaluation. The table pro-
+result, fragmentation in either the virtual address space or             vides a brief description of the real-world applications we
+the physical PM prevents huge pages from being created. For              use to evaluate PM file systems.
+most workloads, after a few thousand files were created and
+deleted, fragmenting PM, we found it impossible to create                5      Evaluation
+any new huge pages. Our collection-of-mappings technique
+                                                                         In this section, we use a number of microbenchmarks and
+sidesteps this problem by creating huge pages at the begin-
+                                                                         applications to evaluate SplitFS in relation to state-of-the-
+ning of the workload, and reusing them to serve reads and
+                                                                         art PM filesystems like ext4 DAX, NOVA, and PMFS. While
+writes. Without huge pages, we observed read performance
+                                                                         comparing these different file systems, we seek to answer
+dropping by 50% in many workloads. We believe this is a
+                                                                         the following questions:
+fundamental problem that must be tackled since huge pages
+are crucial for accessing large quantities of PM.
+                                                                             • How does SplitFS affect the performance of different
+Avoiding work in the critical path is important. Finally,                      system calls as compared to ext4 DAX? (§5.4)
+we found that a general design technique that proved crucial
+for SplitFS is simplifying the critical path. We pre-allocate                • How do the different techniques employed in SplitFS
+wherever possible, and use a background thread to perform                      contribute to overall performance? (§5.5)
+pre-allocation in the background. Similarly, we pre-fault                    • How does SplitFS compare to other file systems for
+memory mappings, and use a cache to re-use memory map-                         different PM access patterns? (§5.6)
+pings as much as possible. SplitFS rarely performs heavy-                    • Does SplitFS reduce file-system software overhead as
+weight work in the critical path of a data operation. Similarly,               compared to other PM file systems? (§5.7)
+even in strict mode, SplitFS optimizes logging, trading off
+shorter recovery time for a simple, low overhead logging                     • How does SplitFS compare to other file systems for
+protocol. We believe this design principle will be useful for                  real-world applications? (§5.8 & §5.9)
+other systems designed for PM.                                               • What are the compute and storage overheads incurred
+Staging writes in DRAM. An alternate design that we tried                      when using SplitFS? (§5.10)
+was staging writes in DRAM instead of on PM. While DRAM
+staging files incur less allocation costs than PM staging files,            We first briefly describe our experimental methodology
+we found that the cost of copying data from DRAM to PM on                (§5.1 & §5.2) before addressing each of the above questions.
+fsync() overshadowed the benefit of staging data in DRAM.                5.1 Experimental Setup
+In general, DRAM buffering is less useful in PM systems                  We evaluate the performance of SplitFS against other PM
+because PM and DRAM performances are similar.                            file systems on Intel Optane DC Persistent Memory Module
+Legacy applications need to be rewritten to take max-                    (PMM). The experiments are performed on a 2-socket, 96-
+imum advantage of PM. We observe that the applications                   core machine with 768 GB PMM, 375 GB DRAM, and 32 MB
+we evaluate such as LevelDB spent a significant portion of               Last Level Cache (LLC). We run all evaluated file systems on
+their time (60 − 80%) performing POSIX calls on current                  the 4.13 version of the Linux kernel (Ubuntu 16.04). We run
+PM file systems. SplitFS is able to reduce this percentage               each experiment multiple times and report the mean. In all
+down to 46-50%, but further reduction in software overhead               cases, the standard deviation was less than five percent of
+will have negligible impact on application runtime since the             the mean, and the experiments could be reliably repeated.
+majority of the time is spent on application code. Applica-
+                                                                         5.2 Workloads
+tions would need to be rewritten from scratch to use libraries
+like libpmem that exclusively operate on data structures in              We used two key-value stores (Redis, LevelDB), an embedded
+mmap() to take further advantage of PM.                                  database (SQLite), and three utilities (tar, git, rsync) to evalu-
+                                                                         ate the performance of SplitFS. Table 5 lists the applications
+                                                                         and their characteristics.
+
+
+
+                                                                   501
+TPC-C on SQLite. TPC-C is an online transaction process-                     System call    Strict   Sync    POSIX    ext4 DAX
+ing benchmark. It has five different types of transactions
+each with different ratios of reads and writes. We run SQLite                open             2.09    2.08     1.82         1.54
+v3.23.1 with SplitFS, and measured the performance of TPC-
+                                                                             close            0.78    0.69     0.69         0.34
+C on SQLite in the Write-Ahead-Logging (WAL) mode.
+                                                                             append           3.14    3.09     2.84        11.05
+YCSB on LevelDB. The Yahoo Cloud Serving Benchmark [8]
+has six different key-value store benchmarks, each with dif-                 fsync            6.85    6.80     6.80        28.98
+ferent read/write ratios. We run the YCSB workloads on the                   read             4.57    4.53     4.53         5.04
+LevelDB key-value stores. We set the sstable size to 64 MB                   unlink         14.60    13.56    14.33         8.60
+as recommended in Facebook’s tuning guide [13].
+Redis. We set 1M key-value pairs in Redis [1], an in-memory             Table 6. SplitFS system call overheads. The table com-
+key-value store. We ran Redis in the Append-Only-File mode,             pares the latency (in us) of different system calls for various
+where it logs updates to the database in a file and performs            modes of SplitFS and ext4 DAX.
+fsync() on the file every second.
+Utilities. We also evaluated the performance of SplitFS for
+tar, git, and rsync. With git, we measured the time taken               metadata operations. The micro-benchmark first creates and
+for git add and git commit of all files in the Linux kernel             appends 16KB to a file (as four appends, each followed by an
+ten times. With rsync, we copy a 7 GB dataset of 1200 files             fsync()), closes it, opens it again, read the whole file as one
+with characteristics similar to backup datasets [30] from one           read call, closes it, then opens and closes the file once more,
+PM location to another. With tar, we compressed the Linux               and finally deletes the file. The multiple open and close calls
+kernel 4.18 along with the files from the backup dataset.               were introduced to account for the fact that their latency
+5.3   Correctness and recovery                                          varies over time. Opening a file for the first time takes longer
+                                                                        than opening a file that we recently closed, due to file meta-
+Correctness. First, to validate the functional correctness of           data caching inside U-Split. Table 6 shows the latencies we
+SplitFS we run various micro-benchmarks and real-world                  observed for different system calls and they are reported for
+applications and compare the resulting file-system state to             all the three modes provided by SplitFS and for ext4 DAX
+the ones obtained with ext4 DAX. We observe that the file-              on which SplitFS was built.
+system states obtained with ext4 DAX and SplitFS are equiv-                We make three observations based on these results. First,
+alent, validating how SplitFS handles POSIX calls in its user-          data operations on SplitFS are significantly faster than on
+space library file system.                                              ext4 DAX. Writes especially are 3–4× faster. Second, meta-
+Recovery times. Crash recovery in POSIX and sync modes                  data operations (e.g., open(), close(), etc.) are slower on
+of SplitFS do not require anything beyond allowing the                  SplitFS than on ext4 DAX, as SplitFS has to setup its own
+underlying ext4 DAX file system to recover. In strict mode              data structures in addition to performing the operation on
+however, all valid log entries in the operation log need to             ext4 DAX. In SplitFS, unlink() is an expensive operation
+be replayed on top of ext4 DAX recovery. This additional                because the file mappings that are created for serving reads
+log replay time depends on the number and type of valid log             and overwrites need to be unmapped in the unlink() wrap-
+entries in the log. To estimate the additional time needed              per. Third, as the consistency guarantees provided by SplitFS
+for recovery, we crash our real-world workloads at random               get stronger, the syscall latency generally increases. This in-
+points in their execution and measure the log replay time. In           crease can be attributed to more work SplitFS has to do
+our crash experiments, the maximum number of log entries                (e.g., logging in strict mode) for each system call to provide
+to be replayed was 18,000 and that took about 3 seconds                 stronger guarantees. Overall, SplitFS achieves its objective
+on emulated PM (emulation details in §5.8). In a worst-case             of accelerating data operations albeit at the expense of meta-
+micro-benchmark where we perform cache-line sized writes                data operations.
+and crash with 2M (128MB of data) valid log entries, we                 5.5 SplitFS performance breakdown
+observed a log replay time of 6 seconds on emulated PM.
+                                                                        We examine how the various techniques employed by SplitFS
+5.4 SplitFS system call overheads                                       contribute to overall performance. We use two write-intensive
+The central premise of SplitFS is that it is a good trade-off           microbenchmarks: sequential 4KB overwrites and 4KB ap-
+to accelerate data operations at the expense of metadata                pends. An fsync() is issued every ten operations. Figure 3
+operations. Since data operations are more prevelant, this              shows how individual techniques introduced one after the
+optimization improves overall application performance. To               other improve performance.
+validate this premise, we construct a micro-benchmark simi-             Sequential overwrites. SplitFS increases sequential over-
+lar to FileBench Varmail [27] that issues a variety of data and         write performance by more than 2× compared to ext4 DAX
+
+
+
+                                                                  502
+Figure 3. SplitFS techniques contributions. This figure
+shows the contributions of different techniques to overall
+                                                                       Figure 4. Performance on different IO patterns. This
+performance. We compare the relative merits of these tech-
+                                                                       figure compares SplitFS with the state-of-the-art PM file
+niques using two write intensive microbenchmarks; sequen-
+                                                                       systems in their respective modes using micrbenchmarks
+tial overwrites and appends.
+                                                                       that perform five different kinds of file access patters. The
+                                                                       y-axis is throughput normalized to ext4 DAX in POSIX mode,
+                                                                       PMFS in sync mode, and NOVA-Strict in Strict mode (higher
+                                                                       is better). The absolute throughput numbers in Mops/s are
+since overwrites are served from user-space via processor
+                                                                       given over the baseline in each group.
+stores. However, further optimizations like handling appends
+using staging files and relink have negligible impact on this
+workload as it does not issue any file append operations.              user-space has a higher payoff than servicing a read, an
+Appends. The split architecture does not accelerate appends            observation we already made in Table 6.
+since without staging files or relink all appends go to ext4           Sync mode. Compared to PMFS, SplitFS improves the per-
+DAX as they are metadata operations. Just introducing stag-            formance for write workloads (by as much as 2.89×) and
+ing files to buffer appends improves performance by about              increases performance for read workloads (by as much as
+2×. In this setting, even though appends are serviced in user-         56%). Similar to ext4 DAX, SplitFS’s ability to not incur
+space, overall performance is bogged down by expensive                 expensive write system calls translates to its superior per-
+data copy operations on fsync(). Introducing the relink                formance for the write workloads.
+primitive to this setting eliminates data copies and increases
+                                                                       Strict mode. NOVA, Strata, and SplitFS in this mode pro-
+application throughput by 5×.
+                                                                       vide atomicity guarantees to all operations and perform the
+5.6 Performance on different IO patterns                               necessary logging. As can be expected, the overheads of log-
+To understand the relative merits of different PM file sys-            ging result in reduced performance compared to file systems
+tems, we compare their performance on microbenchmarks                  in other modes. Overall, SplitFS improves the performance
+performing different file IO patterns: sequential reads, ran-          over NOVA by up to 5.8× on the random writes workload.
+dom reads, sequential writes, random writes, and appends.              This improvement stems from SplitFS’s superior logging
+Each benchmark reads/writes an entire 128MB file in 4KB                which incurs half the number of log writes and fence opera-
+operations. We compare file systems providing the same                 tions than NOVA.
+guarantees: SplitFS-POSIX with ext4 DAX, SplitFS-sync                  5.7 Reducing software overhead
+with PMFS, and SplitFS-strict with Nova-strict and Strata.
+                                                                       The central premise of SplitFS is that it is possible to accel-
+Figure 4 captures the performance of these file systems for
+                                                                       erate applications by reducing file system software overhead.
+the different micro-benchmarks.
+                                                                       We define file-system software overhead as the time taken
+POSIX mode. SplitFS is able to reduce the execution times              to service a file-system call minus the time spent actually
+of ext4 DAX by at least 27% and as much as 7.85× (sequen-              accessing data on the PM device. For example, if a system
+tial reads and appends respectively). Read-heavy workloads             call takes 100 µs to be serviced, of which only 25 µs were
+present fewer improvement opportunities for SplitFS as                 spent read or writing to PM, then we say that the software
+file read paths in the kernel are optimized in modern PM               overhead is 75 µs. To provide another example, for append-
+file systems. However, write paths are much more complex               ing 4 KB (which takes 10 µs to write to PM), if file system A
+and longer, especially for appends. So, servicing a write in           writes 10 metadata items (incurring 100 µs) while file system
+
+
+
+                                                                 503
+                                                                           Workload               Strata                 SplitFS
+
+                                                                           Load A                 29.1 kops/s            1.73×
+                                                                           Run A                  55.2 kops/s            1.76×
+                                                                           Run B                  76.8 kops/s            2.16×
+                                                                           Run C                  94.3 kops/s            2.14×
+                                                                           Run D                  113.1 kops/s           2.25×
+                                                                           Load E                 29.1 kops/s            1.72×
+                                                                           Run E                  8.1 kops/s             2.03×
+                                                                           Run F                  73.3 kops/s            2.25×
+
+                                                                        Table 7. SplitFS vs. Strata. This table compares the perfor-
+                                                                        mance of Strata and SplitFS strict running YCSB on LevelDB.
+                                                                        We present the raw throughput numbers for Strata and nor-
+Figure 5. Software overhead in applications. This figure                malized SplitFS strict throughput w.r.t Strata. This is the
+shows the relative file system software overhead incurred by            biggest workload that we could run reliably on Strata.
+different applications with various file systems as compared
+SplitFS providing the same level of consistency guarantees
+(lower is better). The numbers shown indicate the absolute
+time taken to run the workload for the baseline file system.            have also reported problems in evaluating Strata [32]. We
+                                                                        evaluated Strata with a smaller-scale YCSB workload using
+B writes two metadata items (incurring 20 µs), file-system              a 20GB private log.
+B will have lower overhead. In addition to avoiding kernel                 Overall, SplitFS outperforms other PM file systems (when
+traps of system calls, the different techniques discussed in            providing similar consistency guarantees) on all data-intensive
+§3 help SplitFS reduce its software overhead. Minimizing                workloads by as much as 2.70×. We next present a break-
+software overhead allows applications to fully leverage PMs.            down of these numbers for different guarantees.
+   Figure 5 highlights the relative software overheads in-              POSIX mode. SplitFS outperforms ext4 DAX in all work-
+curred by different file systems compared to SplitFS provid-            loads. Write-heavy workloads like RunA (2×), LoadA (89%),
+ing the same level of guarantees. We present results for three          LoadE (91%), Redis (27%), etc. benefit the most with SplitFS.
+write-heavy workloads, LevelDB running YCSB Load A and                  SplitFS speeds up writes and appends the most, so write-
+Run A, and SQLite running TPCC. ext4 DAX and NOVA (in                   heavy workloads benefit the most from SplitFS. SplitFS
+relaxed mode) suffer the highest relative software overheads,           outperforms ext4 DAX on read-dominated workloads, but
+up to 3.6× and 7.4× respectively. NOVA-Relaxed incurs the               the margin of improvement is lower.
+highest software overhead for TPCC because it has to up-                Sync and strict mode. SplitFS outperforms sync-mode
+date the per-inode logical log entries on overwrites before             file systems PMFS and NOVA (relaxed) and strict-mode file
+updating the data in-place. On the other hand, SplitFS-sync             system NOVA (strict) for all the data intensive workloads.
+can directly perform in-place data updates, and thus has sig-           Once again, its the write-heavy workloads that show the
+nificantly lower software overhead. PMFS suffers the lowest             biggest boost in performance. For example, SplitFS in sync
+relative software overhead, capping off at 1.9× for YCSB Load           mode outperforms NOVA (relaxed) and PMFS by 2× and 30%
+A and Run A. Overall, SplitFS incurs the lowest software                on RunA and in strict mode outperforms NOVA (strict) by
+overhead.                                                               2×. Ready-heavy workloads on the other hand do not show
+5.8 Performance on data-intensive workloads                             much improvement in performance.
+Figure 6 summarizes the performance of various applications             Comparison with Strata. We were able to reliably evalu-
+on different file systems. The performance metric we use for            ate Strata (employing a 20 GB private log) using LevelDB
+these data intensive workloads (LevelDB with YCSB, Redis                running smaller-scale YCSB workloads (1M records, and 1M
+with 100% writes, and SQLite with TPCC) is throughput mea-              ops for workloads A–D and F, 500K ops for workload E). We
+sured in KOps/s. For each mode of consistency guarantee                 were unable to run Strata on Intel DC Persistent Memory.
+(POSIX, sync, and strict), we compare SplitFS to state-of-the-          Hence, we use DRAM to emulate PM. We employ the same
+art PM file systems. We report the absolute performance for             PM emulation framework used by Strata. We inject a delay
+the baseline file system in each category and relative through-         of 220ns on every read() system call, to emulate the access
+put for SplitFS. Despite our best efforts, we were not able             latencies of the PM hardware. We do not add this fixed 220ns
+to run Strata on these large applications; other researchers            delay for writes, because writes do not go straight to PM
+
+
+
+                                                                  504
+Figure 6. Real application performance. This figure shows the performance of both data intensive applications (YCSB,
+Redis, and TPCC) and metadata instensive utilities (git, tar, and rsync) with different file systems, providing three different
+consistency guarantees, POSIX, sync, and strict. Overall, SplitFS beats all other file systems on all data intensive applications
+(in their respective modes) while incurring minor performance degradation on metadata heavy workloads. For throughput
+workloads, higher is better. For latency workloads, lower is better. The numbers indicate the absolute throughput in Kops/s or
+latency in seconds for the base file system.
+
+in the critical path, but only to the memory controller. We         These metadata-heavy workloads do not present many op-
+add bandwidth-modeling delays for reads as well as writes           portunities for SplitFS to service system calls in userspace
+to emulate a memory device with 1/3r d the bandwidth of             and in turn slow metadata operations down due to the addi-
+DRAM, an expected characteristic of PMs [18]. While this            tional bookkeeping performed by SplitFS. These workloads
+emulation approach is far from perfect, we observe that the         represent the worst case scenarios for SplitFS. The maxi-
+resulting memory access characteristics are inline with the         mum overhead experienced by SplitFS is 13%.
+expected behavior of PMs [19]. SplitFS outperforms Strata
+                                                                    5.10 Resource Consumption
+on all workloads, by 1.72×–2.25× as shown in Table 7.
+                                                                    SplitFS consumes memory for its file-related metadata (e.g.,,
+5.9 Performance on metadata-heavy workloads                         to keep track of open file descriptors, staging files used). It
+Fig 6 compares the performance of SplitFS with other PM             also additionally consumes CPU time to execute background
+file systems (we only show the best performing PM file sys-         threads that help with metadata management and to move
+tem) on metadata-heavy workloads like git, tar, and rsync.          some expensive tasks off the application’s critical path.
+
+
+
+
+                                                              505
+Memory usage. SplitFS using a maximum of 100MB to                           ext4 DAX appends. At the time of writing this paper, FLEX
+maintain its own metadata to help track different files, the                has not been made open-source, so we could not evaluate it.
+mappings between file offsets and mmap()-ed regions, etc.                   PM file systems. Several file systems such as SCMFS [31],
+In strict mode, SplitFS additionally uses 40MB to maintain                  BPFS [7], and NOVA [33] have been developed specifically
+data structures to provide atomicity guarantees.                            for PM. While each file system tries to reduce software over-
+CPU utilization. SplitFS uses a background thread to han-                   head, they are unable to avoid the cost of trapping into
+dle various deferred tasks (e.g.,, stage file allocation, file clo-         the kernel. The relink primitive from SplitFS is similar to
+sures). This thread utilizes one physical thread of the ma-                 the short-circuit paging presented in BPFS. However, while
+chine, occasionally increasing CPU consumption by 100%.                     short-circuit paging relies on an atomic 8-byte write, SplitFS
+                                                                            relies on ext4’s journaling mechanism to make relink atomic.
+                                                                            Kernel By-Pass. Several projects have advocated direct
+6    Related Work                                                           user-space access to networking [29], storage [5, 10, 14, 20],
+SplitFS builds on a large body of work on PM file systems                   and other hardware features [3, 4, 22]. These projects typi-
+and building low-latency storage systems. We briefly de-                    cally follow the philosophy of separating the control path
+scribe the work that is closest to SplitFS.                                 and data path, as in Exokernel [12] and Nemesis [2]. SplitFS
+Aerie. Aerie [28] was one of the first systems to advocate                  follows this philosophy, but differs in the abstraction pro-
+for accessing PM from user-space. Aerie proposed a split                    vided by the kernel component; SplitFS uses a PM file system
+architecture similar to SplitFS, with a user-space library file             as its kernel component to handle all metadata operations,
+system and a kernel component. Aerie used a user-space                      instead of limiting it to lower-level decisions like allocation.
+metadata server to hand out leases, and only used the kernel
+component for coarse-grained activities like allocation. In                 7   Conclusion
+contrast, SplitFS does not use leases (instead making most                  We present SplitFS, a PM file system built using the split ar-
+operations immediately visible) and uses ext4 DAX as its ker-               chitecture. SplitFS handles data operations entirely in user-
+nel component, passing all metadata operations to the kernel.               space, and routes metadata operations through the ext4 DAX
+Aerie proposed eliminating the POSIX interface, and aimed                   PM file system. SplitFS provides three modes with varying
+to provide applications flexibility in interfaces. In contrast,             guarantees, and allows applications running at the same time
+SplitFS aims to efficiently support the POSIX interface.                    to use different modes. SplitFS only requires adding a single
+Strata. The Strata [19] cross-device file system is similar to              system call to the ext4 DAX file system. Evaluating SplitFS
+Aerie and SplitFS in many respects. There are two main                      with micro-benchmarks and real applications, we show that
+differences from SplitFS. First, Strata writes all data to a                it outperforms state-of-the-art PM file systems like NOVA on
+process-private log, coalesces the data, and then writes it to              many workloads. The design of SplitFS allows users to ben-
+a shared space. In contrast, only appends are private (and                  efit from the maturity and constant development of the ext4
+only until fsync) in SplitFS; all metadata operations and                   DAX file system, while getting the performance and strong
+overwrites are immediately visible to all processes in SplitFS.             guarantees of state-of-the-art PM file systems. SplitFS is
+SplitFS does not need to copy data between a private space                  publicly available at https://github.com/utsaslab/splitfs.
+and a shared space; it instead relinks data into the target file.
+Finally, since Strata is implemented entirely in user-space,
+                                                                            Acknowledgments
+the authors had to re-implement a lot of VFS functionality                  We would like to thank our shepherd, Keith Smith, the anony-
+in their user-space library. SplitFS instead depends on the                 mous reviewers, and members of the LASR group and the
+mature codebase of ext4 DAX for all metadata operations.                    Systems and Storage Lab for their feedback and guidance.
+                                                                            We would like to thank Intel and ETRI IITP/KEIT[2014-3-
+Quill and FLEX. Quill [11] and File Emulation with DAX
+                                                                            00035] for providing access to Optane DC Persistent Memory
+(FLEX) [32] both share with SplitFS the core technique of
+                                                                            for conducting experiments for the paper. This work was
+transparently transforming read and overwrite POSIX calls
+                                                                            supported by NSF CAREER grant 1751277 and generous do-
+into processor loads and stores. However, while Quill and
+                                                                            nations from VMware, Google and Facebook. Any opinions,
+FLEX do not provide strong semantics, SplitFS can provide
+                                                                            findings, and conclusions, or recommendations expressed
+applications with synchronous, atomic operations if required.
+                                                                            herein are those of the authors and do not necessarily reflect
+SplitFS also differs in its handling of appends. Quill calls into
+                                                                            the views of other institutions.
+the kernel for every operation, and FLEX optimizes appends
+by pre-allocating data beyond what the application asks for.
+In contrast, SplitFS elegantly handles this problem using
+staging files and the relink primitive. While Quill appends
+are slower than ext4 DAX, SplitFS appends are faster than
+
+
+
+
+                                                                      506
+References                                                                               [15] Google. 2019. LevelDB. https://github.com/google/leveldb.
+ [1] 2019. Redis: In-memory data structure store. https://redis.io.                      [16] Intel Corporation. 2019.          Platform brief Intel Xeon Proces-
+ [2] Paul R. Barham. 1997. A fresh approach to file system quality of                         sor C5500/C3500 Series and Intel 3420 Chipset. https://www.
+     service. In Proceedings of 7th International Workshop on Network and                     intel.com/content/www/us/en/intelligent-systems/picket-post/
+     Operating System Support for Digital Audio and Video (NOSSDAV’97).                       embedded-intel-xeon-c5500-processor-series-with-intel-3420-chipset.
+     IEEE, 113–122.                                                                           html.
+ [3] Adam Belay, Andrea Bittau, Ali José Mashtizadeh, David Terei, David                 [17] Intel Corporation. 2019. Revolutionary Memory Technology. http:
+     Mazières, and Christos Kozyrakis. 2012. Dune: Safe User-level Access                     //www.intel.com/content/www/us/en/architecture-and-technology/
+     to Privileged CPU Features. In 10th USENIX Symposium on Operat-                          non-volatile-memory.html.
+     ing Systems Design and Implementation, OSDI 2012, Hollywood, CA,                    [18] Joseph Izraelevitz, Jian Yang, Lu Zhang, Juno Kim, Xiao Liu, Amir-
+     USA, October 8-10, 2012. 335–348. https://www.usenix.org/conference/                     saman Memaripour, Yun Joon Soh, Zixuan Wang, Yi Xu, Subra-
+     osdi12/technical-sessions/presentation/belay                                             manya R. Dulloor, Jishen Zhao, and Steven Swanson. 2019. Ba-
+ [4] Adam Belay, George Prekas, Ana Klimovic, Samuel Grossman, Christos                       sic Performance Measurements of the Intel Optane DC Persistent
+     Kozyrakis, and Edouard Bugnion. 2014. IX: A Protected Dataplane                          Memory Module. CoRR abs/1903.05714 (2019). arXiv:1903.05714
+     Operating System for High Throughput and Low Latency. In 11th                            http://arxiv.org/abs/1903.05714
+     USENIX Symposium on Operating Systems Design and Implementation,                    [19] Youngjin Kwon, Henrique Fingler, Tyler Hunt, Simon Peter, Emmett
+     OSDI ’14, Broomfield, CO, USA, October 6-8, 2014. 49–65. https://www.                    Witchel, and Thomas E. Anderson. 2017. Strata: A Cross Media File
+     usenix.org/conference/osdi14/technical-sessions/presentation/belay                       System. In Proceedings of the 26th Symposium on Operating Systems
+ [5] Adrian M. Caulfield, Todor I. Mollov, Louis Alex Eisner, Arup De,                        Principles, Shanghai, China, October 28-31, 2017. ACM, 460–477. https:
+     Joel Coburn, and Steven Swanson. 2012. Providing safe, user space                        //doi.org/10.1145/3132747.3132770
+     access to fast, solid state disks. In Proceedings of the 17th International         [20] Edward K. Lee and Chandramohan A. Thekkath. 1996. Petal: Dis-
+     Conference on Architectural Support for Programming Languages and                        tributed Virtual Disks. In ASPLOS-VII Proceedings - Seventh Interna-
+     Operating Systems, ASPLOS 2012, London, UK, March 3-7, 2012. 387–400.                    tional Conference on Architectural Support for Programming Languages
+     https://doi.org/10.1145/2150976.2151017                                                  and Operating Systems, Cambridge, Massachusetts, USA, October 1-5,
+ [6] Vijay Chidambaram, Tushar Sharma, Andrea C. Arpaci-Dusseau, and                          1996. 84–92. https://doi.org/10.1145/237090.237157
+     Remzi H. Arpaci-Dusseau. 2012. Consistency Without Ordering. In                     [21] Linux. 2019. Direct Access for files. https://www.kernel.org/doc/
+     Proceedings of the 10th USENIX Symposium on File and Storage Tech-                       Documentation/filesystems/dax.txt.
+     nologies (FAST ’12). San Jose, California, 101–116.                                 [22] Simon Peter, Jialin Li, Irene Zhang, Dan R. K. Ports, Doug Woos, Arvind
+ [7] Jeremy Condit, Edmund B. Nightingale, Christopher Frost, Engin Ipek,                     Krishnamurthy, Thomas E. Anderson, and Timothy Roscoe. 2014. Ar-
+     Benjamin Lee, Doug Burger, and Derrick Coetzee. 2009. Better I/O                         rakis: The Operating System is the Control Plane. In 11th USENIX
+     Through Byte-addressable, Persistent Memory. In Proceedings of the                       Symposium on Operating Systems Design and Implementation, OSDI ’14,
+     ACM SIGOPS 22nd Symposium on Operating Systems Principles (SOSP                          Broomfield, CO, USA, October 6-8, 2014. 1–16. https://www.usenix.org/
+     ’09). 133–146.                                                                           conference/osdi14/technical-sessions/presentation/peter
+ [8] Brian F. Cooper, Adam Silberstein, Erwin Tam, Raghu Ramakrishnan,                   [23] Vijayan Prabhakaran, Lakshmi N. Bairavasundaram, Nitin Agrawal,
+     and Russell Sears. 2010. Benchmarking cloud serving systems with                         Haryadi S. Gunawi, Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-
+     YCSB. In Proceedings of the 1st ACM symposium on Cloud computing.                        Dusseau. 2005. IRON file systems. In Proceedings of the 20th ACM
+     ACM, 143–154.                                                                            Symposium on Operating Systems Principles 2005, SOSP 2005, Brighton,
+ [9] Transaction Processing Performance Council. 2001. TPC benchmark                          UK, October 23-26, 2005. 206–220. https://doi.org/10.1145/1095810.
+     C, Standard Specification Version 5.                                                     1095830
+[10] Matt DeBergalis, Peter F. Corbett, Steven Kleiman, Arthur Lent, Dave                [24] Dulloor Subramanya Rao, Sanjay Kumar, Anil Keshavamurthy, Philip
+     Noveck, Thomas Talpey, and Mark Wittle. 2003. The Direct Access                          Lantz, Dheeraj Reddy, Rajesh Sankaran, and Jeff Jackson. 2014. System
+     File System. In Proceedings of the FAST ’03 Conference on File and                       software for persistent memory. In Ninth Eurosys Conference 2014,
+     Storage Technologies, March 31 - April 2, 2003, Cathedral Hill Hotel, San                EuroSys 2014, Amsterdam, The Netherlands, April 13-16, 2014. 15:1–
+     Francisco, California, USA. http://www.usenix.org/events/fast03/tech/                    15:15. https://doi.org/10.1145/2592798.2592814
+     debergalis.html                                                                     [25] Storage Review. 2019. Intel Optane DC Persistent Memory Module
+[11] Louis Alex Eisner, Todor Mollov, and Steven J. Swanson. 2013. Quill:                     (PMM). https://www.storagereview.com/intel_optane_dc_persistent_
+     Exploiting fast non-volatile memory by transparently bypassing the file                  memory_module_pmm.
+     system. Department of Computer Science and Engineering, University                  [26] SQLite. 2019. SQLite transactional SQL database engine. http://www.
+     of California, San Diego.                                                                sqlite.org/.
+[12] Dawson R. Engler, M. Frans Kaashoek, and James O’Toole. 1995. Ex-                   [27] Vasily Tarasov, Erez Zadok, and Spencer Shepler. 2016. Filebench: A
+     okernel: An Operating System Architecture for Application-Level Re-                      flexible framework for file system benchmarking. login: The USENIX
+     source Management. In Proceedings of the Fifteenth ACM Symposium                         Magazine 41, 1 (2016), 6–12.
+     on Operating System Principles, SOSP 1995, Copper Mountain Resort,                  [28] Haris Volos, Sanketh Nalli, Sankarlingam Panneerselvam,
+     Colorado, USA, December 3-6, 1995. 251–266. https://doi.org/10.1145/                     Venkatanathan Varadarajan, Prashant Saxena, and Michael M.
+     224056.224076                                                                            Swift. 2014. Aerie: Flexible File-system Interfaces to Storage-class
+[13] Facebook. 2017. RocksDB Tuning Guide. https://github.com/facebook/                       Memory. In Proceedings of the Ninth European Conference on Computer
+     rocksdb/wiki/RocksDB-Tuning-Guide.                                                       Systems (EuroSys ’14).
+[14] Garth A. Gibson, David Nagle, Khalil Amiri, Fay W. Chang, Eugene M.                 [29] Thorsten von Eicken, Anindya Basu, Vineet Buch, and Werner Vogels.
+     Feinberg, Howard Gobioff, Chen Lee, Berend Ozceri, Erik Riedel, David                    1995. U-Net: A User-Level Network Interface for Parallel and Dis-
+     Rochberg, and Jim Zelenka. 1997. File Server Scaling with Network-                       tributed Computing. In Proceedings of the Fifteenth ACM Symposium
+     Attached Secure Disks. In Proceedings of the 1997 ACM SIGMETRICS                         on Operating System Principles, SOSP 1995, Copper Mountain Resort,
+     international conference on Measurement and modeling of computer                         Colorado, USA, December 3-6, 1995. 40–53. https://doi.org/10.1145/
+     systems, Seattle, Washington, USA, June 15-18, 1997. 272–284. https:                     224056.224061
+     //doi.org/10.1145/258612.258696
+
+
+
+
+                                                                                   507
+[30] Grant Wallace, Fred Douglis, Hangwei Qian, Philip Shilane,
+     Stephen Smaldone, Mark Chamness, and Windsor Hsu. 2012.
+     Characteristics of backup workloads in production systems. In
+     Proceedings of the 10th USENIX conference on File and Stor-
+     age Technologies, FAST 2012, San Jose, CA, USA, February 14-
+     17, 2012. 33–48.           https://www.usenix.org/conference/fast12/
+     characteristics-backup-workloads-production-systems
+[31] XiaoJian Wu, Sheng Qiu, and A. L. Narasimha Reddy. 2013. SCMFS:
+     A File System for Storage Class Memory and its Extensions. TOS 9, 3
+     (2013), 7:1–7:23. https://doi.org/10.1145/2501620.2501621
+[32] Jian Xu, Juno Kim, Amirsaman Memaripour, and Steven Swanson. 2019.
+     Finding and Fixing Performance Pathologies in Persistent Memory
+     Software Stacks. In Proceedings of the Twenty-Fourth International
+     Conference on Architectural Support for Programming Languages and
+     Operating Systems, ASPLOS 2019, Providence, RI, USA, April 13-17, 2019.
+     427–439. https://doi.org/10.1145/3297858.3304077
+[33] Jian Xu and Steven Swanson. 2016. NOVA: A Log-structured File Sys-
+     tem for Hybrid Volatile/Non-volatile Main Memories. In 14th USENIX
+     Conference on File and Storage Technologies, FAST 2016, Santa Clara,
+     CA, USA, February 22-25, 2016. 323–338. https://www.usenix.org/
+     conference/fast16/technical-sessions/presentation/xu
+
+
+
+
+                                                                               508
+

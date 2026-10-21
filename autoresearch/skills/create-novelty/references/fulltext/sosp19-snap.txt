@@ -1,0 +1,947 @@
+        Snap: a Microkernel Approach to Host Networking
+     Michael Marty, Marc de Kruijf, Jacob Adriaens, Christopher Alfeld, Sean Bauer, Carlo Contavalli*
+      Michael Dalton* , Nandita Dukkipati, William C. Evans, Steve Gribble, Nicholas Kidd, Roman
+      Kononov, Gautam Kumar, Carl Mauer, Emily Musick, Lena Olson, Erik Rubow, Michael Ryan,
+              Kevin Springborn, Paul Turner, Valas Valancius, Xi Wang, and Amin Vahdat
+                                                                     Google, Inc.
+                                                             sosp2019-snap@google.com
+
+Abstract                                                                              Keywords      network stack, datacenter, microkernel, RDMA
+   This paper presents our design and experience with a                               ACM Reference Format:
+microkernel-inspired approach to host networking called Snap.                         Marty and De Kruijf, et al. 2019. Snap: a Microkernel Approach to
+Snap is a userspace networking system that supports Google’s                          Host Networking. In ACM SIGOPS 27th Symposium on Operating
+rapidly evolving needs with flexible modules that implement a                         Systems Principles (SOSP ’19), October 27–30, 2019, Huntsville,
+range of network functions, including edge packet switching,                          ON, Canada. ACM, New York, NY, USA, 15 pages. https://doi.org/
+                                                                                      10.1145/3341301.3359657
+virtualization for our cloud platform, traffic shaping policy
+enforcement, and a high-performance reliable messaging and
+                                                                                      1   Introduction
+RDMA-like service. Snap has been running in production for
+over three years, supporting the extensible communication                                The host networking needs of large-scale Internet services
+needs of several large and critical systems.                                          providers are vast and rapidly evolving. Continuous capac-
+   Snap enables fast development and deployment of new                                ity growth demands novel approaches to edge switching and
+networking features, leveraging the benefits of address space                         bandwidth management, the rise of cloud computing necessi-
+isolation and the productivity of userspace software devel-                           tates rich virtualization features, and high-performance dis-
+opment together with support for transparently upgrading                              tributed systems continually seek more efficient and lower
+networking services without migrating applications off of a                           latency communication.
+machine. At the same time, Snap achieves compelling perfor-                              Our experiences realizing these needs with conventional
+mance through a modular architecture that promotes princi-                            kernel-based networking were hampered by lengthy develop-
+pled synchronization with minimal state sharing, and supports                         ment and release cycles. Hence, several years ago we started
+real-time scheduling with dynamic scaling of CPU resources                            an effort to move networking functionality out of the kernel
+through a novel kernel/userspace CPU scheduler co-design.                             and into userspace modules through a common framework.
+Our evaluation demonstrates over 3x Gbps/core improvement                             This framework, Snap, has evolved into a rich architecture
+compared to a kernel networking stack for RPC workloads,                              supporting a diverse set of host networking needs with high
+software-based RDMA-like performance of up to 5M IOPS/-                               performance, and critically, high developer productivity and
+core, and transparent upgrades that are largely imperceptible                         release velocity.
+to user applications. Snap is deployed to over half of our fleet                         Before Snap, we were limited in our ability to develop and
+of machines and supports the needs of numerous teams.                                 deploy new network functionality and performance optimiza-
+                                                                                      tions in several ways. First, developing kernel code was slow
+CCS Concepts • Networks → Network design princi-
+                                                                                      and drew on a smaller pool of software engineers. Second,
+ples; Data center networks; • Software and its engineering;
+                                                                                      feature release through the kernel module reloads covered
+• Computer systems organization → Maintainability and
+                                                                                      only a subset of functionality and often required disconnect-
+maintenance;
+                                                                                      ing applications, while the more common case of requiring a
+* Work performed while at Google.
+                                                                                      machine reboot necessitated draining the machine of running
+Permission to make digital or hard copies of part or all of this work for             applications. Mitigating this disruption required us to severely
+personal or classroom use is granted without fee provided that copies are not         pace our rate of kernel upgrades. In practice, a change to the
+made or distributed for profit or commercial advantage and that copies bear           kernel-based stack takes 1-2 months to deploy whereas a new
+this notice and the full citation on the first page. Copyrights for third-party
+                                                                                      Snap release gets deployed to our fleet on a weekly basis.
+components of this work must be honored. For all other uses, contact the
+owner/author(s).                                                                      Finally, the broad generality of Linux made optimization diffi-
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                 cult and defied vertical integration efforts, which were easily
+© 2019 Copyright held by the owner/author(s).                                         broken by upstream changes.
+ACM ISBN 978-1-4503-6873-5/19/10.                                                        The Snap architecture has similarities with a microkernel
+https://doi.org/10.1145/3341301.3359657                                               approach where traditional operating system functionality
+                                                                                      is hoisted into ordinary userspace processes. However, un-
+                                                                                      like prior microkernel systems, Snap benefits from multicore
+                                                                                  1
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                                          Marty and De Kruijf, et al.
+
+
+
+
+Figure 1. Three different approaches to organizing networking functionality: (a) shows a traditional monolithic kernel where
+applications make system calls, (b) shows a library OS approach without centralization and with application-level thread
+scheduling of processing, and (c) shows the Snap microkernel-like approach leveraging multicore for fast IPC.
+
+hardware for fast IPC and does not require the entire sys-               a custom kernel packet injection driver and a custom CPU
+tem to adopt the approach wholesale, as it runs as a user-               scheduler that enables interoperability without requiring
+space process alongside our standard Linux distribution and              adoption of new application runtimes and while maintain-
+kernel. Yet Snap retains the advantages of a centralized OS              ing high performance across use cases that simultaneously
+for managing and scheduling resources, which makes our                   require packet processing through both Snap and the Linux
+work distinct from other recent work in userspace networking             kernel networking stack.
+that put functionality into uncoordinated application libraries        • Snap encapsulates packet processing functions into com-
+[1, 14, 30, 51]. Our approach also allows Snap to eschew the             posable units called “engines”, which enables both modu-
+complexity of full compatibility with existing interfaces like           lar CPU scheduling as well as incremental and minimally-
+POSIX and socket system calls, and to instead favor opportu-             disruptive state transfer during upgrades.
+nities for vertical integration with our applications. Through         • Through Pony Express, Snap provides support for OSI
+Snap, dataplane interaction occurs over custom interfaces                layer 4 and 5 functionality through an interface similar
+that communicate via lock-free shared memory queues. Ad-                 to an RDMA-capable “smart” NIC. In concert with trans-
+ditionally, for use cases that integrate with existing kernel            parent upgrade support, this enables transparently leverag-
+functionality, Snap supports an internally-developed driver              ing offload capabilities in emerging hardware NICs as a
+for efficiently moving packets between Snap and the kernel.              means to further improve server efficiency and throughput.
+   Unlocking higher levels of performance in networking is             • Minimizing I/O overhead is critical to scaling modern
+critical as Moore’s Law slows and as faster storage devices              distributed services. We carefully tuned Snap and the Pony
+continue to emerge. Through Snap, we created a new commu-                Express transport for performance, supporting 3x better
+nication stack called Pony Express that implements a custom              transport processing efficiency than the baseline Linux
+reliable transport and communications API. Pony Express                  kernel and supporting RDMA-like functionality at speeds
+provides significant communication efficiency and latency                of 5M ops/sec/core.
+advantages to our applications, supporting use cases ranging
+from web search to storage.
+   Snap’s architecture is a composition of recent ideas in user-
+                                                                       2   Snap as a Microkernel Service
+space networking, in-service upgrades, centralized resource               Unlike monolithic operating systems, Snap implements
+accounting, programmable packet processing, kernel-bypass              host networking functionality as an ordinary Linux userspace
+RDMA functionality, and optimized co-design of transport,              process. However, compared to other userspace networking
+congestion control and routing. We present our experience              approaches that assume a library OS model [14, 30, 31, 51,
+building and deploying Snap across Google, and as a uni-               59], Snap maintains the centralized coordination and manage-
+fied and production-hardened realization of several modern             ability benefits of a traditional OS. The host grants Snap ex-
+systems design principles:                                             clusive access to device resources by enabling specific Linux
+                                                                       capabilities for Snap (Snap does not run with root privileges)
+• Snap enables a high rate of feature development with a               and applications communicate with Snap through library calls
+  microkernel-inspired approach of developing in userspace             that transfer data either asynchronously over shared memory
+  with transparent software upgrades. It retains the benefits          queues (fast path) or synchronously over a Unix domain sock-
+  of centralized resource allocation and management capa-              ets interface (slow path).
+  bilities of monolithic kernels while also improving upon                Figure 1 illustrates the differences among (a) the traditional
+  accounting gaps with existing Linux-based systems.                   approach of placing all networking functionality in kernel-
+• Any practical evolution of operating system architecture             space, (b) the library OS approach of accessing hardware
+  requires interoperability with existing kernel network func-         directly from application threads, and (c) the Snap approach
+  tions and application thread schedulers. Snap implements
+                                                                   2
+Snap: a Microkernel Approach to Host Networking                                  SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+
+
+Figure 2. Snap is divided into a control plane, centered around RPC serving, and a data plane, centered around engines. Engines
+encapsulate packet processing pipelines that communicate through memory-mapped I/O. Engine groups dictate the method of
+scheduling engines to cores. Except for host kernel interactions, all code executes in userspace.
+
+of leveraging fast multicore IPC to implement network func-            little state to communicate across the IPC (common in zero-
+tionality as a user-level service.                                     copy networking) and in avoiding ring switch costs of system
+   Approach (c) provides a number of benefits. First, it com-          calls. Moreover, recent security vulnerabilities such as Melt-
+bines the centralization benefits of (a) with the userspace            down [43] force kernel/user address space isolation, even in
+development benefits of (b). Second, it uniquely decouples             monolithic kernels [25]. Techniques like tagged-TLB support
+the release of new networking functionality from both kernel           in modern processors, streamlined ring switching hardware
+and application binary release cycles. Third, unlike the library       made necessary with the resurgence of virtualization, and
+OS implementations of approach (b) that achieve low latency            IPC optimization techniques such as those explored in the
+but typically rely on spin-polling application threads to do           L4 microkernel [29], in FlexSC [58], and in SkyBridge [44],
+so, approach (c) decouples application threading and CPU               further allow a modern microkernel to essentially close the
+provisioning from network services. This enables managing              performance gap between direct system calls and indirect
+networking latency and spin-polling capability as a system-            system calls through IPC.
+level resource, which is essential for production machines             2.1 Snap Architecture Overview
+that typically run dozens of independent applications.
+   Over the years, Snap has incrementally absorbed network-               Figure 2(a) shows the architecture of Snap and its inter-
+                                                                       actions with external systems. It shows Snap separated into
+ing functionality from the host kernel while other OS func-
+                                                                       “control plane” (left) and “data plane” (right) components,
+tionality like memory management, thread scheduling, ex-
+isting kernel networking, and non-networking I/O continues             with engines as the unit of encapsulation for data plane op-
+to leverage the rich Linux ecosystem. This aspect is not like          erations. Examples of engines include packet processing for
+a traditional microkernel. However, Snap still maintains the           network virtualization [19], pacing and rate limiting (“shap-
+microkernel benefits of address space isolation between the            ing”) for bandwidth enforcement [39], and a stateful network
+                                                                       transport like Pony Express (presented in Section 3).
+networking component and other kernel components, devel-
+                                                                          Figure 2(a) also illustrates the separate communication
+oper and release velocity as bugs found during development
+and testing do not bring down the machine, and centralization,         paradigms employed across distinct component types: on the
+which enables rich scheduling and management policies that             left, communication between control plane components and
+are lost with traditional OS-bypass networking systems.                external systems is orchestrated through RPC; on the right,
+   While early microkernel work saw significant performance            communication to and from data plane components occurs
+                                                                       through memory-mapped I/O; and in the middle, control plane
+overheads attributed to inter-process communication (IPC)
+                                                                       and data plane components interact through a specialized uni-
+and address space changes [15, 16, 20], such overheads are
+less significant today. Compared to the uniprocessor systems           directional RPC mechanism called an engine mailbox. Finally,
+of the 80s and 90s, today’s servers contain dozens of cores,           the figure shows engines organized into groups that share a
+which allows microkernel invocation to leverage inter-core             common scheduling discipline. Engines are shown handling
+IPC while maintaining application cache locality. This ap-             all guest VM I/O traffic, all Pony Express traffic, and a sub-
+                                                                       set of host kernel traffic that needs Snap-implemented traffic
+proach can even improve overall performance when there is
+                                                                   3
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                                          Marty and De Kruijf, et al.
+
+
+shaping policies applied. The following sections elaborate on          2.4 Engine Groups and CPU Scheduling
+each of these aspects in turn.                                            Snap seeks to balance the scheduling latency, performance
+2.2 Principles of Engine Design                                        isolation, and CPU efficiency of engines. However, this bal-
+   Engines are stateful, single-threaded tasks that are sched-         ance is different for different types of engines: some engines
+uled and run by a Snap engine scheduling runtime. Snap                 care most about low tail latency, while others seek maximum
+exposes to engine developers a bare-metal programming envi-            fairness given a fixed CPU budget, while still others aim to
+ronment with libraries for OS-bypass networking, rate limit-           prioritize efficiency above all else.
+                                                                          Snap accommodates each of these cases with support for
+ing, ACL enforcement, protocol processing, tuned data struc-
+tures, and more, as well as a library of Click-style [47] plug-        bundling engines into groups with a specific scheduling mode,
+gable “elements” to construct packet processing pipelines.             which dictates a scheduling algorithm and CPU resource con-
+   Figure 2(b) shows the structure of a Snap engine and its            straints. Figure 2(c) shows the composition of an engine group
+interaction with external systems through queues and mail-             and Figure 3 classifies three broad categories of scheduling
+                                                                       modes supported by Snap.
+boxes. An engine’s inputs and outputs can include userspace
+and guest applications, kernel packet rings, NIC receive/trans-        Dedicating cores: In this mode, engines are pinned to dedi-
+mit queues, support threads, and other engines. In each of             cated hyperthreads on which no other work can run. Although
+these cases, lock-free communication occurs over memory-               this mode does not allow CPU utilization to scale in propor-
+mapped regions shared with the input or output. Occasionally,          tion to load, it can be suitable when the CPU allowance is a
+an engine may also communicate with outputs via interrupt              fixed budget of the total machine, where it can then also mini-
+delivery (e.g. by writing to an eventfd-like construct) to             mize latency via spin polling, optionally invoking a userspace
+notify of inbound work, and interrupts may also be received            mwait [9] to conserve power. Due to static provisioning,
+on inputs under some engine scheduling policies (see Sec-              however, this system can strain under load or face high cost
+tion 2.4). However, these are the only forms of communica-             from overprovisioning. When CPU constrained, the scheduler
+tion generally performed by engines. In particular, to maintain        attempts to fair-share CPU time between engines in order
+real-time properties, Snap prohibits forms of communication            to provide reasonable performance isolation and robustness
+that rely on blocking synchronization.                                 under high load conditions.
+   From the perspective of the Snap framework, it is the role of       Spreading engines: This mode scales CPU consumption
+engine developers to determine how many engines are needed,            in proportion to load, with a focus on minimizing scheduling
+how they are instantiated—either statically or dynamically—            tail latency. The Snap implementation binds each engine to a
+and how work is distributed among engines (utilizing NIC               unique thread that schedules only when active and blocks on
+steering functionality as needed). Sections 3.1 and 6.4 provide        interrupt notification when idle. Interrupts are then triggered
+some discussion of this topic, but it is otherwise not a focus         either from the NIC or from an application via a system call to
+of this paper.                                                         schedule an engine. Given a sufficient number of schedulable
+                                                                       cores, this mode can provide the best tail latency properties for
+2.3 Modules and Control-to-Engine Communication
+                                                                       two reasons. First, it is not subject to scheduling delays caused
+   Snap modules are responsible for setting up control plane           by multiplexing the work of potentially many engines onto a
+RPC services, instantiating engines, loading them into engine          small number of threads or cores. Second, by leveraging our
+groups, and proxying all user setup interactions for those en-         internally-developed real-time kernel scheduling class (more
+gines. For example, in the case of Pony Express, the “Pony             detail in Section 2.4.1), engines bypass the default Linux
+module” shown in Figure 2(a) authenticates users and sets up           CFS kernel scheduler [5] and quickly schedule, with priority,
+memory regions shared with user applications by exchanging             to an available core upon interrupt delivery. With interrupts,
+file descriptors over a local RPC system. It also services other       however, there are system-level interference effects that must
+performance-insensitive functions such as engine creation/de-          be carefully managed; in Section 5.3 we elaborate on some
+struction, compatibility checks, and policy updates.                   of the schedulability challenges that may arise when a thread
+   Some control actions in the service of the above, such as           is scheduled to a core that is either in a low-power sleep state
+setting up user command/completion queues, shared mem-                 or is in the midst of running non-preemptible kernel code.
+ory registration, rotating encryption keys, etc. require control
+                                                                       Compacting engines: This mode collapses work onto as
+components to synchronize with engines. To support Snap’s
+                                                                       few cores as possible, combining the scaling advantages
+real-time, high performance requirements, control compo-
+                                                                       of interrupt-driven execution with the cache-efficiency ad-
+nents synchronize with engines lock-free through an engine
+                                                                       vantages of dedicating cores. However, it relies on periodic
+mailbox. This mailbox is a queue of depth 1 on which con-
+                                                                       polling of engine queueing delays to detect load imbalance
+trol components post short sections of work for synchronous
+                                                                       instead of relying on instantaneous interrupt signaling as with
+execution by an engine, on the thread of the engine, and in a
+                                                                       the “spreading engines” scheduling mode above. The speed
+manner that is non-blocking with respect to the engine.
+                                                                       of rebalancing is thus constrained by the latency in polling
+                                                                   4
+Snap: a Microkernel Approach to Host Networking                                 SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+
+
+Figure 3. Snap supports three different engine scheduling modes with different resource, latency, and efficiency properties. In
+the visualization column, a rectangle is a physical core that contains two logical cores, with portions consumed by Snap shown
+in dark gray, non-Snap shown in light blue, and idle time shown in white.
+
+for these queueing delays, which, in our current design, is           algorithm for high and low priority tasks (rather than more
+non-preemptive and requires engine tasks to return control            traditional fixed time slots).
+to the scheduler within a fixed latency budget. The latency              MicroQuanta is a robust way for Snap to get priority on
+delay from polling engines, in addition to both the delay for         cores runnable by CFS tasks that avoids starvation of criti-
+statistical confidence in queueing estimation and the delay in        cal per-core kernel threads [7]. The sharing pattern is simi-
+actually handing off an engine to another core, can be higher         lar to SCHED_DEADLINE or SCHED_FIFO with real-time
+than the latency of interrupt signaling.                              group scheduling bandwidth control. However, MicroQuanta
+   In terms of implementation, this scheduling mode executes          schedules with much lower latency and scales to many more
+engines on a single thread while the CPU-bottlenecked queue-          cores. While other Linux real-time scheduling classes use
+ing delay of all engines—measured using an algorithm similar          both per-CPU tick-based and global high-resolution timers
+to Shenango [48]—stays below some configured latency SLO.             for bandwidth control, MicroQuanta uses only per-CPU high-
+Then, interleaved with engine execution, a rebalancing func-          resolution timers. This allows scalable time slicing at mi-
+tion periodically performs one of several actions. One action         crosecond granularity.
+is to respond to queue build-up by scaling out an engine to
+                                                                      2.5 CPU and Memory Accounting
+another thread (awoken if necessary). Another action is to
+                                                                         Strong CPU and memory accountability is important in
+detect excess capacity and migrate back an engine that has suf-
+ficiently low load. Other actions include engine compaction           datacenter and cloud computing environments because of
+and engine swaps to effectively bin-pack work and maximize            the heavy and dynamic multiplexing of VMs and jobs onto
+efficiency within the constraints of the SLO. The algorithm           machines. For example, prior work [12, 36] demonstrates
+estimates the queueing load of engines by directly accessing          the shortcoming of soft-interrupt accounting with the kernel
+                                                                      networking stack, as softirqs steal CPU time from whatever
+concurrently-updated shared variables in memory, with any
+                                                                      application happens to be running on the core irrespective
+subsequent load balancing decision synchronizing directly
+with affected threads through a message passing mechanism             of whether softirq processing is for data destined to that ap-
+similar to the engine mailbox, but non-blocking on both sides.        plication. Snap maintains strong accounting and isolation by
+Although fundamentally driven by polling, this mode also              accurately attributing both CPU and memory consumed on
+supports blocking on interrupt notification after some period         behalf of applications to those applications using internally-
+                                                                      developed Linux kernel interfaces to charge CPU and memory
+of idleness in order to scale down to less than a full core.
+                                                                      to application containers. This allows Snap to scale Snap CPU
+2.4.1 MicroQuanta Kernel Scheduling Class                             processing and per-user memory consumption (for per-user
+   To dynamically scale CPU resources, Snap works in con-             data structures) without oversubscribing the system.
+junction with a new lightweight kernel scheduling class called
+                                                                      2.6 Security
+MicroQuanta that provides a flexible way to share cores be-
+tween latency-sensitive Snap engine tasks and other tasks,               Snap engines may handle sensitive application data, doing
+limiting the CPU share of latency-sensitive tasks and main-           work on behalf of potentially multiple applications with dif-
+taining low scheduling latency at the same time. A Micro-             fering levels of trust simultaneously. As such, security and
+Quanta thread runs for a configurable runtime out of every            isolation are critically important. Unlike a monolithic kernel,
+period time units, with the remaining CPU time available to           Snap runs as a special non-root user with reduced privilege,
+other CFS-scheduled tasks using a variation of a fair queuing         although care must still be taken to ensure that packets and
+
+
+                                                                  5
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                                          Marty and De Kruijf, et al.
+
+
+payloads are not mis-delivered. Applications establishing in-
+teractions with Snap authenticate its identity using standard
+Linux mechanisms.
+   One benefit of the Snap userspace approach is that soft-
+ware development can leverage a broad range of internal tools,
+such as memory access sanitizers and fuzz testers, developed
+to improve the security and robustness of general user-level
+software. The CPU scheduling modes of Section 2.4 also
+provide options to mitigate Spectre-class vulnerabilities [37]
+by cleanly separating cores running engines for certain appli-
+cations from those running engines for different applications.         Figure 4. The architecture of a Pony Express engine on the
+                                                                       left and associated control logic on the right.
+3   Pony Express: A Snap Transport
+   Over the course of several years, the architecture under-           this socket bootstraps shared memory regions between appli-
+pinning Snap has been used in production for multiple net-             cations and Pony Express, using the ancillary data features of
+working applications, including network virtualization for             domain sockets to pass tmpfs-backed file descriptors between
+cloud VMs [19], packet-processing for Internet peering [62],           processes. One such shared memory region implements the
+scalable load balancing [22], and Pony Express, a reliable             command and completion queues for asynchronous opera-
+transport and communications stack that is our focus for the           tions. When an application wishes to invoke an operation,
+remainder of this paper. Our datacenter applications seek ever         it writes a command into the command queue. Application
+more CPU-efficient and lower-latency communication, which              threads can then either spin-poll the completion queue, or can
+Pony Express delivers. It implements reliability, congestion           request to receive a thread notification when a completion
+control, optional ordering, flow control, and execution of             is written. Other shared memory regions map to application
+remote data access operations.                                         regions for zero-copy request/response payloads.
+   Rather than reimplement TCP/IP or refactor an existing                 Pony Express implements custom memory allocators to
+transport, we started Pony Express from scratch to innovate            optimize the dynamic creation and management of state,
+on more efficient interfaces, architecture, and protocol. The          which includes streams, operations, flows, packet memory,
+application interface to Pony Express is based on asynchro-            and application buffer pools. These structures are appropri-
+nous operation-level commands and completions, as opposed              ately charged back to application memory containers using
+to a packet-level or byte-streaming sockets interface. Pony            the mechanisms discussed in Section 2.5.
+Express implements both (two-sided) messaging operations               Transport design: Pony Express separates its transport
+as well as one-sided operations of which RDMA is one ex-               logic into two layers: an upper layer implements the state
+ample. A one-sided operation does not involve any remote               machines for application-level operations and a lower layer
+application thread interaction and thereby avoids invoking the         implements reliability and congestion control. The lower layer
+application thread scheduler for remote data access.                   implements reliable flows between a pair of engines across the
+   As a contrast to the Linux TCP stack, which attempts to             network and a flow mapper maps application-level connec-
+keep transport processing affinity local to application CPUs [8,       tions to flows. This lower layer is only responsible for reliably
+21], Pony Express runs transport processing in a thread sepa-          delivering individual packets whereas the upper layer handles
+rate from the application CPU through Snap, which affinitizes          reordering, reassembly, and semantics associated with spe-
+its engine threads to the NUMA node of the PCI-attached NIC.           cific operations. The congestion control algorithm we deploy
+Through Snap, Pony Express predominantly shares CPU with               with Pony Express is a variant of Timely [45] and runs on ded-
+other engines and other transport processing work rather than          icated fabric QoS classes. The ability to rapidly deploy new
+application work. This enables better batching, code local-            versions of Pony Express significantly aided development and
+ity, reduced context switching, and opportunities for latency          tuning of congestion control.
+reduction through spin polling. The overarching design prin-              With Pony Express, we periodically extend and change
+ciple is that, given zero-copy capability, NIC NUMA node               our internal wire protocol while maintaining compatibility
+locality and locality within the transport layer are together          with prior versions during the time horizon where multiple
+more important than locality with the application thread.              release versions may exist in our fleet. Although our weekly
+3.1 Architecture and Implementation                                    release cycle makes this time horizon small, we nonetheless
+   The architecture of Pony Express is illustrated in Figure 4.        still require interoperability and backwards compatibility as
+Client applications contact Pony Express over a Unix domain            we transition users. We currently use an out-of-band mecha-
+socket at a well-known address through the Pony Express                nism (a TCP socket) to advertise the wire protocol versions
+client library API. As previously described in Section 2.3,            available when connecting to a remote engine, and select the
+
+                                                                   6
+Snap: a Microkernel Approach to Host Networking                                   SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+least common denominator. Once the fleet has turned over,               spin-polling thread for every application (discussed further in
+we subsequently remove the code for unused versions.                    Section 6.1).
+Engine operation: A Pony Express engine services incom-                    The software flexibility of Pony Express enables richer op-
+ing packets, interacts with applications, runs state machines           erations that go beyond basic remote memory read and write
+to advance messaging and one-sided operations, and gener-               operations. As noted in prior work [33, 38], the efficiency
+ates outgoing packets. When polling NIC receive queues, the             advantages of RDMA can disappear with remote data struc-
+maximum number of packets processed is configurable to                  tures that require multiple network round-trips to traverse.
+vary the latency vs. bandwidth trade-off—our current default            As an example, we support a custom indirect read operation,
+is 16 packets per batch. Polling application command queues             which consults an application-filled indirection table to de-
+similarly uses a configurable batch size. Based on incoming             termine the actual memory target to access. Compared to a
+packets and commands from applications, as well as the avail-           basic remote read, an indirect read effectively doubles the
+ability of NIC transmit descriptor slots, the engine produces           achievable operation rate and halves the latency when the
+new packets for transmission. This just-in-time generation of           data structure requires a single pointer indirection. Another
+packets based on slot availability ensures we generate pack-            custom operation is a scan and read, which scans a small
+ets only when the NIC can transmit them (there is no need               application-shared memory region to match an argument and
+for per-packet queueing in the engine). Throughout, work                fetches data from a pointer associated with the match. Both
+scheduling provides tight bounds on engine execution time,              of these operations are used in production systems.
+implements fairness, and opportunistically exploits batching            3.3 Messaging and Flow Control
+for efficiency.                                                            Pony Express provides send/recv messaging operations for
+   Applications using Pony Express can either request their             RPC and non-RPC use cases. As with HTTP2 and QUIC [40],
+own exclusive engines, or can use a set of pre-loaded shared            we provide a mechanism to create message streams to avoid
+engines. As discussed in Section 2, engines are the unit                head-of-line blocking of independent messages. Rather than
+of scheduling and load balancing within Snap, and thus,                 a per-connection receive window of bytes (as found in TCP
+with application-exclusive engines, an application receives             sockets), flow control is based on a mix of receiver-driven
+stronger performance isolation by not sharing the fate of CPU           buffer posting as well as a shared buffer pool managed using
+and scheduling decisions with other applications, but at poten-         credits, for smaller messages.
+tially higher CPU and memory cost. Applications use shared                 Flow control for one-sided operations is more subtle, as
+engines when strong isolation is less important. This has eco-          there are no application-visible mechanisms to stop initiators
+nomic advantages and also reduces the challenges associated             from hitting a machine with a never-ending stream of read
+with scaling to a high number of engines, which is an area of           requests, for example. That is, unlike byte streaming sock-
+ongoing work.                                                           ets and two-sided messaging, an application cannot pause
+3.2 One-Sided Operations                                                a sender by refusing to read from a socket or post memory
+   One-sided operations do not involve any application code             to receive a message. While one-sided clients can amelio-
+on the destination, instead executing to completion entirely            rate server overload by limiting outstanding operations on a
+within the Pony Express engine. Avoiding the invocation of              connection or with other client-side backoff strategies, we
+the application thread scheduler (i.e., Linux CFS) to dispatch,         ultimately address this problem with the Snap CPU schedul-
+notify, and schedule a thread substantially improves CPU effi-          ing and accounting mechanisms discussed in Section 2. In
+ciency and tail latency. An RDMA Read is a classic example              particular, users of one-sided operations instantiate a Pony
+of a one-sided operation, and this section covers how Pony              Express engine that receives a fair allocation of CPU time.
+Express enables similar benefits.                                       If clients overrun this engine with one-sided operations, in-
+   Unlike RPC systems, which enable applications to write               evitably request packets get dropped and congestion control
+handlers that implement arbitrary user logic, one-sided opera-          backs off. Thus, while our one-sided users typically avoid
+tions in Pony Express must be pre-defined and pre-installed             these scenarios, one-sided operations fall back to relying on
+as part of the Pony Express release. We do not allow arbitrary          congestion control and CPU scheduling mechanisms rather
+application-defined operations and instead follow a feature re-         than higher-level flow control mechanisms for fair sharing.
+quest and review process. Since the one-sided logic executes            3.4 Hardware Offloads
+in the address space of Snap, applications must explicitly                 The pursuit of offloads and other accelerators is strategi-
+share remotely-accessible memory even though their threads              cally important as Moore’s Law slows. Pony Express exploits
+do not execute the logic. While it is certainly possible to avoid       stateless offloads, including the Intel I/OAT DMA device [2]
+the invocation of the application thread scheduler for every            to offload memory copy operations. We developed a kernel
+operation by using spin-polling application threads in con-             module to make this capability available to Snap and found
+junction with two-sided messaging, there are downsides to a             the asynchronous interactions around DMA to be a natural fit
+                                                                        for Snap, with its continuously-executing packet processing
+                                                                    7
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                                         Marty and De Kruijf, et al.
+
+
+                                                                       time, suspends control plane Unix domain socket connections
+                                                                       and transfers them in the background along with shared mem-
+                                                                       ory file descriptor handles. This is accomplished using the
+                                                                       ancillary fd-passing feature of Unix domain sockets. While
+                                                                       control plane connections are transferred, the new Snap re-
+                                                                       establishes shared memory mappings, creates queues, packet
+                                                                       allocators, and various other data structures associated with
+                                                                       the new instance of the engine while the old engine is still op-
+     Figure 5. Transparent upgrade sequence diagram.                   erating. Upon completion, the old engine begins the blackout
+                                                                       period by ceasing packet processing, detaching NIC receive
+pipelines, compared to Linux’s synchronous socket system               filters, and serializing remaining state into a tmpfs shared
+calls. Section 5.1 quantifies the overall CPU efficiency im-           memory volume. The new engine then attaches identical NIC
+provement from copy offload for Pony Express. Pony Express             filters and deserialize state. Once all engines are transferred
+also exploits other stateless NIC offloads; one example is             this way, the old Snap is terminated.
+an end-to-end invariant CRC32 calculation over each packet.
+Section 6.5 discusses the use of stateful offloads and how we          5   Evaluation
+see them interacting with Pony Express.                                   This section evaluates the performance and dynamic scala-
+4   Transparent Upgrades                                               bility of Snap, focusing on the Pony Express communication
+                                                                       stack. We measure the isolation and fairness properties of
+   Snap substantially enhances our ability to innovate in host
+                                                                       Snap running Pony Express (“Snap/Pony”) and also demon-
+networking. A critical enabler is our ability to release new
+                                                                       strate our incremental state transfer for transparent upgrades.
+versions of Snap without disrupting running applications. This
+                                                                       All of our results below report CPU usage with hyperthread-
+section describes our approach.
+                                                                       ing enabled such that a single reported “core” or “CPU” refers
+   An initial goal was to afford developers maximum flexibil-
+                                                                       to a single hardware thread context. In Sections 5.1-5.3, we
+ity in making substantial changes between releases (keeping
+                                                                       compare against the Linux kernel TCP/IP stack, not only be-
+API and wire format compatibility issues in mind). This pre-
+                                                                       cause it is the baseline at our organization but also because
+cluded schemes that kept binary state in memory while chang-
+                                                                       kernel TCP/IP implementations remain, to our knowledge, the
+ing out code. Instead, during upgrades, the running version
+                                                                       only widely-deployed and production-hardened alternative
+of Snap serializes all state to an intermediate format stored
+                                                                       for datacenter environments. In Section 5.4, we also provide
+in memory shared with a new version. As with virtual ma-
+                                                                       qualitative comparisons against a hardware RDMA technol-
+chine migration techniques [18], the upgrade is two-phased to
+                                                                       ogy available within our organization.
+minimize the blackout period when the network stack is un-
+available. The initial brownout phase performs a preparatory           5.1 Baseline Throughput and Latency
+background transfer that has minimal performance impact.                  To establish the baseline performance of Snap/Pony, we
+   A second goal was to minimize disruption to applications,           start with performance measurements between a pair of ma-
+both in terms of writing code to handle upgrade and loss of            chines connected to the same top-of-rack switch. The ma-
+connectivity. We target a blackout period of 200msecs or less,         chines are equipped with Intel Skylake processors and 100Gbps
+and in order to meet this target, Snap performs upgrades incre-        NICs. We compare against kernel TCP sockets using the
+mentally, migrating engines one at a time, each in its entirety.       Neper [3] utility (similar to Netperf but with support for
+As the number of engines running in production increased,              flowing data over multiple simultaneous streams), while for
+this approach became necessary to protect a single engine              Snap/Pony we use a custom (non-sockets) benchmark con-
+from experiencing prolonged blackout due to the transfer of            figured similarly. All benchmarks employ a single applica-
+other engines. Beyond this, with a gradual upgrade process             tion thread for sending and receiving—we look at scaling
+across a cluster, we have found that our existing applications         performance with multiple processes and threads in the fol-
+do not notice hundred millisecond blips in communication               lowing section. The Pony Express engine always spins and
+that occur once per week. Packet loss may occur during this            for measuring end-to-end latency we vary whether or not the
+blackout period, but end-to-end transport protocols tolerate           application thread spins.
+this as if it were congestion-caused packet loss. Importantly,            Table 1 shows that the baseline, single-stream throughput
+authenticated application connections remain established (on           of TCP is 22Gbps on our kernel configuration using Neper.
+both ends) and state such as bidirectional message streams             Also shown is the measured average core utilization across
+remain intact.                                                         both application and kernel, which is about 1.2 cores. By
+   Figure 5 illustrates the upgrade flow. First, a Snap “master”       contrast, Snap/Pony delivers 38Gbps using 1.0 Snap cores
+daemon launches a second instance of Snap. The running                 and 0.05 application cores. Recently we have also started to
+Snap instance connects to it and then, for each engine one at a
+                                                                   8
+Snap: a Microkernel Approach to Host Networking                                         SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+
+
+Figure 6. Benchmark data. Graph (a) shows mean latency between two machines connected to the same top-of-rack switch.
+Graphs (b), (c), and (d) show per-machine CPU time, prober tail latency, and the latency impact of background machine
+antagonists, respectively, for an all-to-all RPC benchmark as offered load is increased. Graphs (b) and (c) compare scheduling
+modes while (d) compares MicroQuanta versus optimized Linux CFS. All graphs compare against Linux TCP and in all graphs
+Gbps is bidirectional, since each job both requests and responds to RPCs.
+
+experiment with a larger MTU size on our switches and fab-                                       # streams           CPU/sec Gbps
+rics. We show that a 5000B MTU1 increases the single-core                                         1 stream            1.17   22.0
+                                                                                    Linux TCP
+throughput of Snap/Pony to over 67Gbps, and enabling I/OAT                                      200 streams           1.15   12.4
+receive copy offload (to complement zero-copy transmit) fur-                                      1 stream            1.05   38.5
+ther increases throughput to over 80Gbps using a single core.                        Snap/Pony
+                                                                                                200 streams           1.05   39.1
+Finally, Table 1 shows that, while TCP performance degrades                         Snap/Pony     1 stream            1.05   67.5
+substantially as the number of simultaneously active streams                       w/ 5kB MTU 200 streams             1.05   65.7
+increases, Snap/Pony demonstrates robust connection scaling                         Snap/Pony     1 stream            1.05   82.2
+by avoiding heavy context switching and maintaining good                           w/ 5kB+I/OAT 200 streams           1.05   80.5
+locality on this benchmark.
+   Figure 6(a) illustrates the average round-trip latency be-                  Table 1. Throughput measured for TCP (using Neper), and
+tween two applications sending and receiving a small message                   Snap/Pony (using an internal tool). All tools use a single
+(two-sided). In this configuration, TCP_RR in Neper shows                      application thread to drive the load.
+TCP provides a baseline latency of 23µsecs. A similar appli-
+cation using Snap/Pony delivers latency of 18µsecs. Configur-                  5.2 Scaling and Performance Isolation
+ing the application to spin-poll on the Pony Express comple-                      This section evaluates Snap/Pony performance when scal-
+tion queue reduces latency to less than 10µsecs whereas using                  ing beyond a single core. The experiment uses a rack of 42
+the busy-polling socket feature in Linux reduces TCP_RR                        machines all connected to the same switch. Each machine is
+latency to 18µsecs. We also show the Snap/Pony latency                         equipped with a 50Gbps NIC and Intel Broadwell processors
+achieved with a one-sided access, which further reduces la-                    in a dual-socket configuration. We schedule 10 background
+tency to 8.8µsecs.                                                             jobs on each machine where each job communicates over
+1 We chose 5000B in order to comfortably fit a 4096B application payload       RPC at a chosen rate with a Poisson distribution. Each RPC
+with additional headers and metadata.                                          chooses one of the 420 total jobs at random as the target and
+                                                                               requests a 1MB (cache resident) response with no additional
+                                                                               computation. The offered load is varied by increasing the
+                                                                           9
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                                         Marty and De Kruijf, et al.
+
+
+
+
+Figure 7. Latency degradation from system-level effects. Graph (a) shows the latency impact of low-power C-states for an RPC
+benchmark running at low QPS and on an otherwise idle machine, while graph (b) shows the latency impact of a harsh antagonist
+that spawns threads to continually perform mmap() and munmap() system calls.
+
+request rate of each job. The measured CPU time includes                  While the Snap compacting scheduler offers the best CPU
+all application, system, and interrupt time. The MTU size              efficiency, the spreading scheduler has the best tail latency as
+for Snap/Pony is 5000B. For TCP, it is 4096B, which is the             illustrated in Figure 6(c). The lower CPU efficiency under the
+analogous “large MTU” setting for TCP at our organization;             spreading scheduler comes from time spent in interrupt and
+regrettably, the values are different, but close enough that we        system contexts, whereas the majority of scheduler time in
+believe the data is still representative. In addition to the 10        the compacting scheduler is in the user context and is overall
+jobs generating background load with 1MB RPCs, we also                 lower. This experiment does not show performance loss expe-
+schedule a single latency prober job on each machine that sim-         rienced by bystander applications due to context switching.
+ilarly chooses a random destination but measures the latency           This effect is higher for the spreading scheduler and for TCP
+of only a tiny RPC. We report the 99th percentile latency              softirq processing, which both rely on application interrupts,
+of these measurements. In the case of Snap/Pony, each job              than for the compacting scheduler, which consolidates work
+requests its own exclusive engine, and we evaluate the two             onto the fewest cores and minimizes application interference.
+scheduling modes from Section 2.4, “spreading engines” and                Figure 6(d) shows the impact of loading the machine with
+“compacting engines”.                                                  background antagonist compute processes, running Snap en-
+   Figure 6(b) shows the overall per-machine CPU usage and             gines using the spreading scheduler, and comparing the Micro-
+Figure 6(c) shows the 99th percentile prober latency as the to-        Quanta kernel scheduling class to Linux CFS with a niceness
+tal background load increases to 80Gbps per machine (which             of -20 (its most aggressive setting). The background antago-
+includes traffic in both directions on the 50Gbps NICs). We            nists run with reduced priority relative to the load-generating
+first observe that both Snap engine schedulers succeed in              network application jobs and continually wake threads to per-
+scaling CPU consumption in proportion to load. Next, Snap              form MD5 computations. They place enormous pressure on
+generally shows sub-linear increase in CPU consumption,                both the hardware (e.g., DRAM, cache) and software sched-
+a consequence of batching efficiencies. Finally, the relative          uling systems, and thus substantially increase the overall tail
+CPU time differences between Snap and TCP increases as                 latency compared to the Figure 6(c) runs without the antago-
+dynamic scaling mechanisms are stressed. At an offered load            nists, particularly for the non-MicroQuanta cases.
+of 8Gbps, CPU time across both TCP and Snap is comparable,             5.3 System-Level Interrupt Latency Impacts
+but at an offered load of 80Gbps, Snap is over 3x more effi-              While Figures 6(c) and (d) shows favorable latency results
+cient than TCP. We attribute the performance improvement               under the spreading scheduler, this scheduler relies on inter-
+due to a combination of copy reduction, avoiding fine-grained          rupts to wake on idleness, which is prone to a number of
+synchronization, the 5000B vs. 4096B MTU difference, and               additional system-level latency contributors in practice. First,
+in hotter instruction and data caches in the case of the Snap          an interrupt generated by the NIC may target a core in a deep
+compacting scheduler. Notably, for these larger 1MB RPCs,              power-saving C-state. Second, our production machines run
+the cost of kernel TCP socket system calls amortizes well and          complex antagonists that can affect the schedulability of even
+avoiding them does not show performance gain. The Gbp-                 a MicroQuanta thread. We illustrate these effects in Figures
+s/core of Snap/Pony is less than with the peak single-core             7(a) and 7(b), in which we run the same 42-machine all-to-all
+throughput of 82Gbps illustrated in Table 1 because work is            RPC benchmark as previously, but running only the prober
+spread to multiple engines, reducing batching and introducing          job, running it only at 1000 QPS (one RPC per millisecond),
+previously absent scheduler overheads.                                 and with the prober application thread spin-polling to isolate
+                                                                       application thread wakeup from transport wakeup.
+                                                                  10
+Snap: a Microkernel Approach to Host Networking                                 SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+
+
+                                                                      Figure 9. Transparent upgrade blackout duration data from a
+                                                                      large and representative production cluster.
+Figure 8. Production dashboard illustrating the rate of IOPS
+served by the hottest machine over each minute interval. Some         Hardware RDMA implementations typically implement small
+intervals show a single Snap/Pony engine and core serving             caches of connection and RDMA permission state, and access
+upwards of 5M IOPS.                                                   patterns that spill out of the cache result in significant perfor-
+                                                                      mance cliffs. A “thrashing” RDMA NIC emits fabric pauses,
+   First, Figure 7(a) shows that, running a low QPS benchmark
+                                                                      which can quickly spread to other switches and servers. This
+on an otherwise unloaded machine, both kernel TCP and the
+                                                                      led us to implement a cap of 1M RDMAs/sec per machine
+Snap spreading scheduler see remarkably worse latency than
+                                                                      and credits were statically allocated to each client. Switching
+the prior two-machine (closed loop) ping-pong latency result
+                                                                      to Snap/Pony allowed us to remove these caps, to increase
+in 6(a) due to C-state interrupt wakeup latency. The Snap
+                                                                      IOP rates, and to rely on congestion control on lossy fabrics
+compacting scheduler avoids this wakeup cost because its
+                                                                      to handle transient hot-spotting. Then switching to our cus-
+most compacted, least-loaded state spin-polls on a single core
+                                                                      tom indirect read operation with integrated batching yielded
+by default (expanding to more cores as needed).
+                                                                      another significant performance boost.
+   Second, Figure 7(b) shows the impact of running a harsh
+antagonist that spawns threads to repeatedly mmap() and               5.5 Transparent Upgrades
+munmap() 50MB buffers. While perhaps an uncommon and                     Figure 9 shows production statistics for a transparent up-
+unrealistic scenario, this demonstrates a pathology found in          grade performed in one of our production cells, supporting
+many Linux kernels in which certain code regions cannot be            internal services, on 2019-01-18. The median blackout du-
+preempted by any userspace process. Compacting engines                ration is 250ms, which is slightly above the goal of 200ms
+provides the best latency because, in this benchmark, engine          we set when starting the project. The latency distribution
+work compacts down to a single spin-polling core that does            is heavy-tailed, and strongly correlates with the amount of
+not time-share with the antagonist. We further discuss ongo-          state checkpointed. Internal application owners do not notice
+ing challenges around CPU scaling in Section 6.3.                     the blips that occur once per week, although we are explor-
+                                                                      ing ways to further reduce blackout duration through more
+5.4 RDMA and One-sided Operations
+                                                                      incremental transfer steps.
+   We see significant application-level performance improve-
+ments from leveraging the one-sided operations available in           6   Experiences, Challenges, and Future Work
+Snap/Pony. Conventional RPC stacks written on standard                   This section discusses our experiences in building and
+TCP sockets, like gRPC, see less than 100,000 achievable              deploying Snap and related networking technologies. We also
+IOPS/core [4]. Figure 8 shows a production dashboard snap-            discuss ongoing work and recent challenges.
+shot of a service using Snap/Pony for one-sided data access.          6.1 In-Application Transports
+The service supports a large-scale distributed data analyt-              An alternative to kernel TCP or Pony Express is a transport
+ics system. This workload demands up to 5 million remote              that operates entirely in the address space of an application
+memory accesses per second served with a single Snap/Pony             process, using either frameworks such as netmap [55] or
+dedicated core. Many of the operations use a custom batched           DPDK [1] for high-performance use cases, or UDP sockets
+indirect read operation, in which Snap/Pony consults a table          for lower-performance WAN use cases like QUIC [40]. Such
+to perform a batch of eight indirections locally rather than          an in-application transport design enables applications to run
+requiring those indirections to occur over the network.               transport code in their own thread contexts, which can enable
+   Relative to a hardware RDMA implementation that relied             faster CPU scale-out in response to bursts and can improve
+on fabric flow control, switching to Snap/Pony doubled the            latency by avoiding system calls (kernel TCP) or the cross-
+production performance of the data analytics service. This            core hop between application threads and network threads
+was primarily due to relaxation of rate limits previously put         (Pony Express). Indeed, we experimented with this approach,
+in place to prevent excessive fabric back-pressure when indi-         but found that, despite the benefits, it imposed too many
+vidual RDMA NICs became overloaded during hot-spotting.               manageability and performance drawbacks.
+                                                                 11
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                                         Marty and De Kruijf, et al.
+
+
+   First and most important, our transparent upgrade approach              Hardware RDMA NICs, along with OS bypass, encounter
+described in Section 4 relies on running the transport as a             similar problems because they also do not have access to ap-
+separate process. With well-managed weekly releases of Snap,            plication page tables and rely on long-lived memory pinning
+we can quickly make wire protocol changes to systems like               and I/O page tables. While many MPI stacks provide an al-
+Pony Express without needing to speak all wire formats of               ternative heap that transparently registers heap memory with
+any client library that is installed anywhere. While some of            NICs, fluid address space modifications in our environment
+our techniques could apply to in-application transports with            may require excessive coordination with a NIC (or IOMMU).
+extensions for dynamic linking, binary upgrades would still                Pony Express does register some application-shared mem-
+be at the whim of a large number of individual service owners.          ory with the NIC for zero-copy transmit; but we do so se-
+   Second, we find that datacenter transports are sensitive to          lectively and some of our current applications take a copy
+careful CPU provisioning and scheduling, while transports               from application heap memory into bounce buffer memory
+that run in an application container encounter a complicated            shared and registered with Snap (and vice versa). We are ex-
+set of threading and CPU provisioning issues. A spin-polling            ploring techniques to avoid these copies, for instance, if the
+transport thread with a provisioned core in every applica-              cost of a custom system call to translate and temporarily pin
+tion could help ameliorate scheduling unpredictability, but             the memory is cheaper than a memory copy.
+considering that it is common for us to run dozens of indi-             6.3 Dynamic CPU Scaling
+vidual applications on a single machine, this approach is not
+                                                                           Scheduling and scaling of CPU for Snap is an area of on-
+practical in general. At the same time, relying on interrupt-           going research and development. In this paper we presented
+driven wakeup of an application transport thread can see                three different approaches: dedicated cores, spreading en-
+unpredictable scheduling delays. Non-responsive transports              gines, and compacting engines. Our initial Snap deployments
+cause collateral damage, for instance, when well-provisioned            used dedicates cores, in part because of simplicity but also
+servers see excessive transport timeouts and needless retrans-
+                                                                        because static provisioning meets performance SLOs up to a
+missions because packets that have successfully reached a
+                                                                        known load threshold, and thus many deployments continue
+client are stuck waiting for CPU service. Interrupt-driven              to use dedicated cores today. However, as we seek to grow
+Snap leverages our MicroQuanta kernel scheduling class to               usage of Snap, particularly with Pony Express as a general-
+help bound the scheduling delay, but this is a privileged sched-        purpose TCP/IP replacement, dynamic provisioning of host
+uling class that cannot be used by arbitrary internal applica-          networking CPU resources has become paramount; we find
+tions without special policy and arbitration.
+                                                                        that kernel TCP networking usage is very bursty, sometimes
+6.2 Memory Mapping and Management                                       consuming upwards of a dozen cores over short bursts. Al-
+   One significant challenge with non-kernel networking lies            though our performance evaluation demonstrated that our
+with memory management. This is true not only for the Snap              compacting engines scheduler provides the best overall CPU
+approach, but also for offload stacks like hardware RDMA                efficiency, and provides the lowest latency at low loads and
+and for in-application userspace stacks.                                in the presence of system call antagonists, we also showed
+   Ultimately, applications wish to send and receive data in            that spreading engines can offer better tail latency at higher
+and out of their heaps. While the Linux kernel can copy di-             Snap loads because of the delay in reacting to engine queue
+rectly to and from any application-specified virtual memory             build-up. We are currently working towards achieving the
+address, and also implement zero-copy by translating through            best of both worlds by combining elements of both types of
+an application’s page table and temporarily pinning applica-            schedulers, and continuing to refine our kernel support.
+tion buffers, Snap does not have access to application page             6.4 Rebalancing Across Engines
+tables and Linux cannot share arbitrary anonymous-backed                   As discussed in Section 2.2, engines are single-threaded,
+heap memory between processes. In Linux, any memory                     which steers Snap developers away from the overheads of fine-
+shared between applications and Snap must be backed by                  grained synchronization and towards siloing state as much
+tmpfs or memfds [6]. We considered modifying our heap                   as possible. Pony Express engines, for example, do not cur-
+implementation to back all application heap memory with
+                                                                        rently share flow state between engines, and flows also do not
+tmpfs, and to then coordinate with Snap to map everything
+                                                                        currently rebalance between engines. As a consequence, how-
+into the Snap address space (and page table), but we did not            ever, serialization of flow processing across flows within an
+implement this due to concerns around TLB shootdowns,                   engine can limit performance. Our client libraries implement
+as any application address space modification can result in             a variety of different mechanisms to spread load across mul-
+inter-processor interrupts targeting the core(s) running Snap.          tiple engines, ranging from simple sharding of flows across
+Moreover, our heap implementation frequently returns mem-
+                                                                        engines to duplicating flows and implementing rebalancing
+ory to the kernel to account for phase behavior, which can
+                                                                        above the Pony Express layer. Nonetheless, we are consid-
+result in frequent remappings.                                          ering the possible need for fine-grained rebalancing across
+                                                                        engines using mechanisms such as work stealing [48, 51].
+                                                                   12
+Snap: a Microkernel Approach to Host Networking                                    SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+6.5 Stateful Offloads                                                    24, 27, 46, 49], although much of it requires fabric modifica-
+   Our early experience with an OS-bypass RDMA stack                     tion, which is not in scope for this work. Like Pony Express
+implemented entirely in hardware and directly accessed by                running on machines without RDMA offload, FaSST [34]
+uncoordinated application libraries did not scale and did not            implements RDMA using two-sided datagram exchange, and
+have the iteration velocity required. Nonetheless as Moore’s             also like Pony Express, LITE [60] exposes RDMA through
+Law slows we continue to explore the next generation of state-           a software indirection layer, but implemented in the kernel
+ful offloads as they overcome hurdles for datacenter adoption.           rather than in userspace.
+Going forward, we see several benefits in leveraging Snap                   In terms of kernel design, FlexSC [58] is similar to Snap
+as a centralized management layer for accessing future hard-             in leveraging modern multicore hardware and delegating sys-
+ware offloads. First, it allows us to deploy workarounds for             tem calls to separate threads from application threads, but
+hardware and firmware bugs frequently encountered in com-                it does not propose a microkernel-like approach to doing
+plex, stateful NICs. Second, it can flexibly implement the               so. At the same time, microkernels have a decades-long his-
+traditional role of an OS in providing multiplexing and man-             tory [10, 15, 16, 20, 23, 28, 29, 41, 61]. Most relevant is the
+agement policies. Third, providing robust and secure virtual             work of Thekkath et al. [59], which discusses the trade-offs
+functions for complex hardware offloads is challenging and               implementing network protocols in a monolithic kernel versus
+Snap can provide a transparent fallback mechanism when                   a microkernel approach. They ultimately dismiss the latter,
+needed. Finally, decoupling applications from specific hard-             citing domain switching overheads. However, as previously
+ware allows us to transparently migrate applications between             discussed, these overheads have diminished significantly with
+machines irrespective of the underlying hardware.                        multi-core systems and fine-grained memory sharing mecha-
+                                                                         nisms in modern server architectures.
+7   Related Work
+   In the space of networking as a separate host service,                8   Conclusions
+TAS [35], IsoStack [57], and SoftNIC [26] dedicate cores                    We present the design and architecture of Snap, a widely-
+for efficiency and low latency, with a focus on performance              deployed, microkernel-inspired system for host networking.
+through minimization, spin-polling, and the elimination of               Snap enables numerous teams to develop high-performance
+data structure sharing. At the same time, in the space of library        packet processing systems with high developer and release
+OS solutions, IX [14, 52], ZygOS [51], and Shinjuku [31] de-             velocity. We describe, in detail, a communication stack based
+velop high-performance systems that service a single applica-            on this microkernel approach and how we transparently up-
+tion in a single address space, integrating application process-         grade the communication stack without draining applications
+ing handlers into the transport itself and assuming dedicated            from running machines. Our evaluation demonstrates up to
+NIC resources. ZygOS diverges from IX by incorporating task              3x improvement in Gbps/core efficiency, sub-10-microsecond
+stealing with intermediate buffering, and Shinjuku adds intelli-         latency, dynamic scaling capability, millions of one-sided
+gent preemption; however, all three efforts sidestep problems            operations per second, and CPU scheduling with a customiz-
+around inter-application sharing and arbitration, and require            able emphasis between efficiency and latency. Snap has been
+Dune virtualization [13]. None of the above efforts tackle               running in production for 3 years supporting the extensible
+efficiency and low latency with fine-grained dynamic CPU                 communication needs of several critical systems. Our experi-
+scaling, transparent upgrades, or achieve the full generality of         ence indicates that the Snap release velocity has essentially
+what Snap provides in a general-purpose, multi-application               been a requirement for deploying these services because of the
+production and/or cloud environment.                                     needed iteration speed in production. The performance gains
+   Other recent approaches take advantage of lightweight run-            are a corollary benefit, enabled by aggressive deployment
+times and kernel bypass to achieve high performance, both                of novel application structures that bring to bear advanced
+inside academia [30, 32, 42, 48, 50, 53] and outside [1, 55].            one-sided and low-latency messaging features in a way that
+Perhaps the most similar to our work is Shenango [48], which             would otherwise not have been possible.
+tackles dynamic CPU scaling even more aggressively than
+our work by dedicating an entire core to thread scheduling
+                                                                         Acknowledgements
+and packet steering functions. However, Shenango requires                   We would like to thank our reviewers, shepherd Irene
+a custom application scheduling runtime and requires parti-              Zhang, Jeff Mogul, Thomas Wenisch, Aditya Akella, Mark
+tioning cores away from the operating system. Snap uniquely              Hill, Neal Cardwell, and Christos Kozyrakis for helpful paper
+integrates with a general purpose host through its Micro-                feedback; Luiz Barroso and Sean Quinlan for encouragement
+Quanta kernel scheduling class and also uniquely addresses               throughout; Joel Scherplez and Emily Blem for some of the
+transparent upgrades.                                                    earliest exploratory work on the project; We also thank Bill
+   On the transport side, mixed onload/offload approaches                Vareka, Larry Greenfield, Matt Reid, Steven Rhodes, Anish
+have been previously proposed for TCP [54, 56]. There is                 Shankar, Alden King, Yaogong Wang, and the large support-
+also abundant recent work on datacenter transports [11, 17,              ing cast at Google who helped realize this project.
+                                                                    13
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                                                                Marty and De Kruijf, et al.
+
+
+References                                                                                 scale in cloud network virtualization. In 15th USENIX Symposium
+                                                                                           on Networked Systems Design and Implementation (NSDI 18), pages
+ [1] Data plane development kit. http://www.dpdk.org.
+                                                                                           373–387, Renton, WA, 2018. USENIX Association.
+ [2] Fast memcpy with SPDK and intel I/OAT DMA engine.
+                                                                                      [20] R. P. Draves, B. N. Bershad, R. F. Rashid, and R. W. Dean. Using
+     https://software.intel.com/en-us/articles/fast-memcpy-using-
+                                                                                           continuations to implement thread management and communication in
+     spdk-and-ioat-dma-engine.
+                                                                                           operating systems. In Proceedings of the Thirteenth ACM Symposium
+ [3] Github repository: Neper linux networking performance tool. https:
+                                                                                           on Operating Systems Principles, SOSP ’91, pages 122–136, New York,
+     //github.com/google/neper.
+                                                                                           NY, USA, 1991. ACM.
+ [4] grpc       benchmarking.                https://grpc.io/docs/guides/
+                                                                                      [21] P. Druschel and G. Banga. Lazy receiver processing (LRP): A network
+     benchmarking.html.
+                                                                                           subsystem architecture for server systems. In Proceedings of the Second
+ [5] Linux CFS scheduler. https://www.kernel.org/doc/Documentation/
+                                                                                           USENIX Symposium on Operating Systems Design and Implementation,
+     scheduler/sched-design-CFS.txt.
+                                                                                           OSDI ’96, pages 261–275, New York, NY, USA, 1996. ACM.
+ [6] memfd manpage.            http://man7.org/linux/man-pages/man2/
+                                                                                      [22] D. E. Eisenbud, C. Yi, C. Contavalli, C. Smith, R. Kononov, E. Mann-
+     memfd_create.2.html.
+                                                                                           Hielscher, A. Cilingiroglu, B. Cheyney, W. Shang, and J. D. Hosein.
+ [7] Nice levels in the linux scheduler. https://www.kernel.org/doc/
+                                                                                           Maglev: A fast and reliable software network load balancer. In Pro-
+     Documentation/scheduler/sched-nice-design.txt.
+                                                                                           ceedings of the 13th Usenix Conference on Networked Systems Design
+ [8] Scaling in the linux networking stack. https://www.kernel.org/doc/
+                                                                                           and Implementation, NSDI’16, pages 523–535, Berkeley, CA, USA,
+     Documentation/networking/scaling.txt.
+                                                                                           2016. USENIX Association.
+ [9] Short waits with umwait. https://lwn.net/Articles/790920/.
+                                                                                      [23] D. R. Engler, M. F. Kaashoek, and J. O’Toole, Jr. Exokernel: An oper-
+[10] M. J. Accetta, R. V. Baron, W. J. Bolosky, D. B. Golub, R. F. Rashid,
+                                                                                           ating system architecture for application-level resource management.
+     A. Tevanian, and M. Young. Mach: A new kernel foundation for UNIX
+                                                                                           In Proceedings of the Fifteenth ACM Symposium on Operating Systems
+     development. In Proceedings of the USENIX Summer Conference,
+                                                                                           Principles, SOSP ’95, pages 251–266, New York, NY, USA, 1995.
+     Altanta, GA, USA, June 1986, pages 93–113, 1986.
+                                                                                           ACM.
+[11] M. Alizadeh, S. Yang, M. Sharif, S. Katti, N. McKeown, B. Prabhakar,
+                                                                                      [24] P. X. Gao, A. Narayan, G. Kumar, R. Agarwal, S. Ratnasamy, and
+     and S. Shenker. pFabric: Minimal near-optimal datacenter transport. In
+                                                                                           S. Shenker. pHost: Distributed near-optimal datacenter transport over
+     Proceedings of the ACM SIGCOMM 2013 Conference on SIGCOMM,
+                                                                                           commodity network fabric. In Proceedings of the 11th ACM Conference
+     SIGCOMM ’13, pages 435–446, New York, NY, USA, 2013. ACM.
+                                                                                           on Emerging Networking Experiments and Technologies, CoNEXT ’15,
+[12] G. Banga, P. Druschel, and J. C. Mogul. Resource containers: A new
+                                                                                           pages 1:1–1:12, New York, NY, USA, 2015. ACM.
+     facility for resource management in server systems. In Proceedings
+                                                                                      [25] D. Gruss, M. Lipp, M. Schwarz, R. Fellner, C. Maurice, and S. Mangard.
+     of the Third Symposium on Operating Systems Design and Implemen-
+                                                                                           KASLR is dead: Long live KASLR. In Engineering Secure Software
+     tation, OSDI ’99, pages 45–58, Berkeley, CA, USA, 1999. USENIX
+                                                                                           and Systems - 9th International Symposium, ESSoS 2017, Proceedings,
+     Association.
+                                                                                           volume 10379 LNCS of Lecture Notes in Computer Science (including
+[13] A. Belay, A. Bittau, A. Mashtizadeh, D. Terei, D. Mazières, and
+                                                                                           subseries Lecture Notes in Artificial Intelligence and Lecture Notes in
+     C. Kozyrakis. Dune: Safe user-level access to privileged CPU features.
+                                                                                           Bioinformatics), pages 161–176, Italy, 2017. Springer-Verlag Italia.
+     In Proceedings of the 10th USENIX Conference on Operating Systems
+                                                                                      [26] S. Han, K. Jang, A. Panda, S. Palkar, D. Han, and S. Ratnasamy.
+     Design and Implementation, OSDI’12, pages 335–348, Berkeley, CA,
+                                                                                           SoftNIC: A software NIC to augment hardware. Technical Report
+     USA, 2012. USENIX Association.
+                                                                                           UCB/EECS-2015-155, EECS Department, University of California,
+[14] A. Belay, G. Prekas, A. Klimovic, S. Grossman, C. Kozyrakis, and
+                                                                                           Berkeley, May 2015.
+     E. Bugnion. IX: A protected dataplane operating system for high
+                                                                                      [27] M. Handley, C. Raiciu, A. Agache, A. Voinescu, A. W. Moore, G. An-
+     throughput and low latency. In Proceedings of the 11th USENIX Con-
+                                                                                           tichi, and M. Wójcik. Re-architecting datacenter networks and stacks
+     ference on Operating Systems Design and Implementation, OSDI’14,
+                                                                                           for low latency and high performance. In Proceedings of the Con-
+     pages 49–65, Berkeley, CA, USA, 2014. USENIX Association.
+                                                                                           ference of the ACM Special Interest Group on Data Communication,
+[15] B. N. Bershad, T. E. Anderson, E. D. Lazowska, and H. M. Levy.
+                                                                                           SIGCOMM ’17, pages 29–42, New York, NY, USA, 2017. ACM.
+     Lightweight remote procedure call. ACM Trans. Comput. Syst., 8(1):37–
+                                                                                      [28] P. B. Hansen. The nucleus of a multiprogramming system. Commun.
+     55, Feb. 1990.
+                                                                                           ACM, 13(4):238–241, Apr. 1970.
+[16] J. B. Chen and B. N. Bershad. The impact of operating system structure
+                                                                                      [29] H. Härtig, M. Hohmuth, J. Liedtke, S. Schönberg, and J. Wolter. The
+     on memory system performance. In Proceedings of the Fourteenth
+                                                                                           performance of µ-kernel-based systems. In Proceedings of the Sixteenth
+     ACM Symposium on Operating Systems Principles, SOSP ’93, pages
+                                                                                           ACM Symposium on Operating Systems Principles, SOSP ’97, pages
+     120–133, New York, NY, USA, 1993. ACM.
+                                                                                           66–77, New York, NY, USA, 1997. ACM.
+[17] L. Chen, K. Chen, W. Bai, and M. Alizadeh. Scheduling mix-flows in
+                                                                                      [30] E. Jeong, S. Wood, M. Jamshed, H. Jeong, S. Ihm, D. Han, and K. Park.
+     commodity datacenters with karuna. In Proceedings of the 2016 ACM
+                                                                                           mTCP: a highly scalable user-level TCP stack for multicore systems.
+     SIGCOMM Conference, SIGCOMM ’16, pages 174–187, New York,
+                                                                                           In 11th USENIX Symposium on Networked Systems Design and Im-
+     NY, USA, 2016. ACM.
+                                                                                           plementation (NSDI 14), pages 489–502, Seattle, WA, 2014. USENIX
+[18] C. Clark, K. Fraser, S. Hand, J. G. Hansen, E. Jul, C. Limpach, I. Pratt,
+                                                                                           Association.
+     and A. Warfield. Live migration of virtual machines. In Proceedings of
+                                                                                      [31] K. Kaffes, T. Chong, J. T. Humphries, A. Belay, D. Mazières, and
+     the 2Nd Conference on Symposium on Networked Systems Design &
+                                                                                           C. Kozyrakis. Shinjuku: Preemptive scheduling for usecond-scale tail
+     Implementation - Volume 2, NSDI’05, pages 273–286, Berkeley, CA,
+                                                                                           latency. In 16th USENIX Symposium on Networked Systems Design
+     USA, 2005. USENIX Association.
+                                                                                           and Implementation (NSDI 19), pages 345–360, Boston, MA, 2019.
+[19] M. Dalton, D. Schultz, J. Adriaens, A. Arefin, A. Gupta, B. Fahs,
+                                                                                           USENIX Association.
+     D. Rubinstein, E. C. Zermeno, E. Rubow, J. A. Docauer, J. Alpert, J. Ai,
+                                                                                      [32] A. Kalia, M. Kaminsky, and D. Andersen. Datacenter RPCs can be
+     J. Olson, K. DeCabooter, M. de Kruijf, N. Hua, N. Lewis, N. Kasi-
+                                                                                           general and fast. In 16th USENIX Symposium on Networked Systems
+     nadhuni, R. Crepaldi, S. Krishnan, S. Venkata, Y. Richter, U. Naik,
+                                                                                           Design and Implementation, NSDI 2019, Boston, MA, February 26-28,
+     and A. Vahdat. Andromeda: Performance, isolation, and velocity at
+                                                                                           2019., pages 1–16, 2019.
+
+
+                                                                                 14
+Snap: a Microkernel Approach to Host Networking                                                  SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+[33] A. Kalia, M. Kaminsky, and D. G. Andersen. Using RDMA efficiently               [47] R. Morris, E. Kohler, J. Jannotti, and M. F. Kaashoek. The click
+     for key-value services. In Proceedings of the 2014 ACM Conference                    modular router. In Proceedings of the Seventeenth ACM Symposium on
+     on SIGCOMM, SIGCOMM ’14, pages 295–306, New York, NY, USA,                           Operating Systems Principles, SOSP ’99, pages 217–231, New York,
+     2014. ACM.                                                                           NY, USA, 1999. ACM.
+[34] A. Kalia, M. Kaminsky, and D. G. Andersen. FaSST: Fast, scalable and            [48] A. Ousterhout, J. Fried, J. Behrens, A. Belay, and H. Balakrishnan.
+     simple distributed transactions with two-sided (RDMA) datagram rpcs.                 Shenango: Achieving high CPU efficiency for latency-sensitive data-
+     In Proceedings of the 12th USENIX Conference on Operating Systems                    center workloads. In 16th USENIX Symposium on Networked Systems
+     Design and Implementation, OSDI’16, pages 185–201, Berkeley, CA,                     Design and Implementation (NSDI 19), pages 361–378, Boston, MA,
+     USA, 2016. USENIX Association.                                                       2019. USENIX Association.
+[35] A. Kaufmann, T. Stamler, S. Peter, N. K. Sharma, A. Krishnamurthy,              [49] J. Perry, A. Ousterhout, H. Balakrishnan, D. Shah, and H. Fugal. Fast-
+     and T. Anderson. TAS: TCP acceleration as an OS service. In Proceed-                 pass: A centralized "zero-queue" datacenter network. In Proceedings
+     ings of the Fourteenth EuroSys Conference 2019, EuroSys ’19, pages                   of the 2014 ACM Conference on SIGCOMM, SIGCOMM ’14, pages
+     24:1–24:16, New York, NY, USA, 2019. ACM.                                            307–318, New York, NY, USA, 2014. ACM.
+[36] J. Khalid, E. Rozner, W. Felter, C. Xu, K. Rajamani, A. Ferreira, and           [50] S. Peter, J. Li, I. Zhang, D. R. K. Ports, D. Woos, A. Krishnamurthy,
+     A. Akella. Iron: Isolating network-based CPU in container environ-                   T. Anderson, and T. Roscoe. Arrakis: The operating system is the
+     ments. In 15th USENIX Symposium on Networked Systems Design                          control plane. pages 1–16, 2014.
+     and Implementation (NSDI 18), pages 313–328, Renton, WA, 2018.                  [51] G. Prekas, M. Kogias, and E. Bugnion. Zygos: Achieving low tail
+     USENIX Association.                                                                  latency for microsecond-scale networked tasks. In Proceedings of the
+[37] P. Kocher, J. Horn, A. Fogh, , D. Genkin, D. Gruss, W. Haas, M. Ham-                 26th Symposium on Operating Systems Principles, SOSP ’17, pages
+     burg, M. Lipp, S. Mangard, T. Prescher, M. Schwarz, and Y. Yarom.                    325–341, New York, NY, USA, 2017. ACM.
+     Spectre attacks: Exploiting speculative execution. In 40th IEEE Sympo-          [52] G. Prekas, M. Primorac, A. Belay, C. Kozyrakis, and E. Bugnion.
+     sium on Security and Privacy (S&P’19), 2019.                                         Energy proportionality and workload consolidation for latency-critical
+[38] C. Kulkarni, S. Moore, M. Naqvi, T. Zhang, R. Ricci, and R. Stutsman.                applications. In Proceedings of the Sixth ACM Symposium on Cloud
+     Splinter: Bare-metal extensions for multi-tenant low-latency storage. In             Computing, SoCC 2015, Kohala Coast, Hawaii, USA, August 27-29,
+     13th USENIX Symposium on Operating Systems Design and Implemen-                      2015, pages 342–355, 2015.
+     tation (OSDI 18), pages 627–643, Carlsbad, CA, Oct. 2018. USENIX                [53] H. Qin, Q. Li, J. Speiser, P. Kraft, and J. Ousterhout. Arachne: Core-
+     Association.                                                                         aware thread management. In Proceedings of the 12th USENIX Con-
+[39] A. Kumar, S. Jain, U. Naik, A. Raghuraman, N. Kasinadhuni, E. C. Zer-                ference on Operating Systems Design and Implementation, OSDI’18,
+     meno, C. S. Gunn, J. Ai, B. Carlin, M. Amarandei-Stavila, M. Robin,                  pages 145–160, Berkeley, CA, USA, 2018. USENIX Association.
+     A. Siganporia, S. Stuart, and A. Vahdat. BwE: Flexible, hierarchical            [54] G. J. Regnier, S. Makineni, R. Illikkal, R. R. Iyer, D. B. Minturn,
+     bandwidth allocation for WAN distributed computing. In Proceedings                   R. Huggahalli, D. Newell, L. S. Cline, and A. P. Foong. TCP onloading
+     of the 2015 ACM Conference on Special Interest Group on Data Com-                    for data center servers. IEEE Computer, 37(11):48–58, 2004.
+     munication, SIGCOMM ’15, pages 1–14, New York, NY, USA, 2015.                   [55] L. Rizzo. Netmap: A novel framework for fast packet I/O. In Proceed-
+     ACM.                                                                                 ings of the 2012 USENIX Conference on Annual Technical Conference,
+[40] A. Langley, A. Riddoch, A. Wilk, A. Vicente, C. Krasic, D. Zhang,                    USENIX ATC’12, pages 9–9, Berkeley, CA, USA, 2012. USENIX
+     F. Yang, F. Kouranov, I. Swett, J. Iyengar, J. Bailey, J. Dorfman,                   Association.
+     J. Roskind, J. Kulik, P. Westin, R. Tenneti, R. Shade, R. Hamilton,             [56] L. Shalev, V. Makhervaks, Z. Machulsky, G. Biran, J. Satran, M. Ben-
+     V. Vasiliev, W.-T. Chang, and Z. Shi. The QUIC transport protocol:                   Yehuda, and I. Shimony. Loosely coupled TCP acceleration architecture.
+     Design and internet-scale deployment. In Proceedings of the Con-                     In Hot Interconnects, pages 3–8. IEEE Computer Society, 2006.
+     ference of the ACM Special Interest Group on Data Communication,                [57] L. Shalev, J. Satran, E. Borovik, and M. Ben-Yehuda. IsoStack: Highly
+     SIGCOMM ’17, pages 183–196, New York, NY, USA, 2017. ACM.                            efficient network processing on dedicated cores. In Proceedings of the
+[41] J. Liedtke. Improving IPC by kernel design. In Proceedings of the                    2010 USENIX Conference on USENIX Annual Technical Conference,
+     Fourteenth ACM Symposium on Operating Systems Principles, SOSP                       USENIXATC’10, pages 5–5, Berkeley, CA, USA, 2010. USENIX
+     ’93, pages 175–188, New York, NY, USA, 1993. ACM.                                    Association.
+[42] H. Lim, D. Han, D. G. Andersen, and M. Kaminsky. MICA: A holistic               [58] L. Soares and M. Stumm. FlexSC: Flexible system call scheduling with
+     approach to fast in-memory key-value storage. In Proceedings of the                  exception-less system calls. In Proceedings of the 9th USENIX Con-
+     11th USENIX Conference on Networked Systems Design and Implemen-                     ference on Operating Systems Design and Implementation, OSDI’10,
+     tation, NSDI’14, pages 429–444, Berkeley, CA, USA, 2014. USENIX                      pages 33–46, Berkeley, CA, USA, 2010. USENIX Association.
+     Association.                                                                    [59] C. A. Thekkath, T. D. Nguyen, E. Moy, and E. D. Lazowska. Im-
+[43] M. Lipp, M. Schwarz, D. Gruss, T. Prescher, W. Haas, A. Fogh, J. Horn,               plementing network protocols at user level. IEEE/ACM Trans. Netw.,
+     S. Mangard, P. Kocher, D. Genkin, Y. Yarom, and M. Hamburg. Melt-                    1(5):554–565, Oct. 1993.
+     down: Reading kernel memory from user space. In 27th USENIX                     [60] S.-Y. Tsai and Y. Zhang. LITE kernel RDMA support for datacenter
+     Security Symposium (USENIX Security 18), 2018.                                       applications. In Proceedings of the 26th Symposium on Operating
+[44] Z. Mi, D. Li, Z. Yang, X. Wang, and H. Chen. SkyBridge: Fast and                     Systems Principles, SOSP ’17, pages 306–324, New York, NY, USA,
+     secure inter-process communication for microkernels. In Proceedings                  2017. ACM.
+     of the Fourteenth EuroSys Conference 2019, EuroSys ’19, pages 9:1–              [61] W. Wulf, E. Cohen, W. Corwin, A. Jones, R. Levin, C. Pierson, and
+     9:15, New York, NY, USA, 2019. ACM.                                                  F. Pollack. HYDRA: The kernel of a multiprocessor operating system.
+[45] R. Mittal, T. Lam, N. Dukkipati, E. Blem, H. Wassel, M. Ghobadi,                     Commun. ACM, 17(6):337–345, June 1974.
+     A. Vahdat, Y. Wang, D. Wetherall, and D. Zats. Timely: RTT-based                [62] K. Yap, M. Motiwala, J. Rahe, S. Padgett, M. Holliman, G. Baldus,
+     congestion control for the datacenter. In Sigcomm ’15, 2015.                         M. Hines, T. Kim, A. Narayanan, A. Jain, V. Lin, C. Rice, B. Rogan,
+[46] B. Montazeri, Y. Li, M. Alizadeh, and J. K. Ousterhout. Homa: A                      A. Singh, B. Tanaka, M. Verma, P. Sood, M. Tariq, M. Tierney, D. Tru-
+     receiver-driven low-latency transport protocol using network priorities.             mic, V. Valancius, C. Ying, M. Kallahalla, B. Koley, and A. Vahdat.
+     CoRR, abs/1803.09615, 2018.                                                          Taking the edge off with espresso: Scale, reliability and programmabil-
+                                                                                          ity for global internet peering. 2017.
+
+                                                                                15
+

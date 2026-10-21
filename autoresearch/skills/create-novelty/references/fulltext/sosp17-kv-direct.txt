@@ -1,0 +1,1238 @@
+ KV-Direct: High-Performance In-Memory Key-Value
+            Store with Programmable NIC
+
+                  Bojie Li* §† Zhenyuan Ruan* ‡† Wencong Xiao•†                                                          Yuanwei Lu§†
+              Yongqiang Xiong†                        Andrew Putnam†                        Enhong Chen§                    Lintao Zhang†
+                                    †Microsoft Research               §USTC         ‡UCLA            •Beihang University
+
+ABSTRACT                                                                                CCS CONCEPTS
+Performance of in-memory key-value store (KVS) continues                                •Information systems → Key-value stores; •Hardware →
+to be of great importance as modern KVS goes beyond the                                 Hardware-software codesign;
+traditional object-caching workload and becomes a key in-
+frastructure to support distributed main-memory computation                             KEYWORDS
+in data centers. Recent years have witnessed a rapid increase                           Key-Value Store, Programmable Hardware, Performance
+of network bandwidth in data centers, shifting the bottleneck
+                                                                                         ACM Reference format:
+of most KVS from the network to the CPU. RDMA-capable
+                                                                                         Bojie Li* §† Zhenyuan Ruan[1]‡† Wencong Xiao•† Yuanwei
+NIC partly alleviates the problem, but the primitives provided                           Lu§† and Yongqiang Xiong† Andrew Putnam† Enhong Chen§
+by RDMA abstraction are rather limited. Meanwhile, pro-                                  Lintao Zhang† . 2017. KV-Direct: High-Performance In-Memory
+grammable NICs become available in data centers, enabling                                Key-Value Store with Programmable NIC. In Proceedings of SOSP
+in-network processing. In this paper, we present KV-Direct, a                           ’17, Shanghai, China, October 28, 2017, 16 pages.
+high performance KVS that leverages programmable NIC to                                  DOI: 10.1145/3132747.3132756
+extend RDMA primitives and enable remote direct key-value
+access to the main host memory.
+                                                                                        1    INTRODUCTION
+   We develop several novel techniques to maximize the through-
+put and hide the latency of the PCIe connection between                                 In-memory key-value store (KVS) is a key distributed system
+the NIC and the host memory, which becomes the new bot-                                 component in many data centers. KVS enables access to a
+tleneck. Combined, these mechanisms allow a single NIC                                  shared key-value hash table among distributed clients. His-
+KV-Direct to achieve up to 180 M key-value operations per                               torically, KVS such as Memcached [25] gained popularity
+second, equivalent to the throughput of tens of CPU cores.                              as an object caching system for web services. Large web
+Compared with CPU based KVS implementation, KV-Direct                                   service providers such as Amazon [17] and Facebook [3, 57],
+improves power efficiency by 3x, while keeping tail latency                             have deployed distributed key-value stores at scale. More
+below 10 µs. Moreover, KV-Direct can achieve near linear                                recently, as main-memory based computing becomes a major
+scalability with multiple NICs. With 10 programmable NIC                                trend in the data centers [18, 58], KVS starts to go beyond
+cards in a commodity server, we achieve 1.22 billion KV                                 caching and becomes an infrastructure to store shared data
+operations per second, which is almost an order-of-magnitude                            structure in a distributed system. Many data structures can
+improvement over existing systems, setting a new milestone                              be expressed in a key-value hash table, e.g., data indexes in
+for a general-purpose in-memory key-value store.                                        NoSQL databases [12], model parameters in machine learn-
+                                                                                        ing [46], nodes and edges in graph computing [67, 74] and
+                                                                                        sequencers in distributed synchronization [37]. For most of
+Permission to make digital or hard copies of all or part of this work for               these applications, the performance of the KVS is the key
+personal or classroom use is granted without fee provided that copies are not           factor that directly determines the system efficiency. Due to
+made or distributed for profit or commercial advantage and that copies bear
+this notice and the full citation on the first page. Copyrights for components
+                                                                                        its importance, over the years significant amount of research
+of this work owned by others than ACM must be honored. Abstracting with                 effort has been invested on improving KVS performance.
+credit is permitted. To copy otherwise, or republish, to post on servers or to             Earlier key-value systems [17, 25, 57] are built on top
+redistribute to lists, requires prior specific permission and/or a fee. Request         of traditional OS abstractions such as OS lock and TCP/IP
+permissions from permissions@acm.org.                                                   stack. This puts considerable stress on the performance of
+SOSP ’17, Shanghai, China
+© 2017 ACM. 978-1-4503-5085-3/17/10. . . $15.00                                         * Bojie Li and Zhenyuan Ruan are co-first authors who finish this work during
+DOI: 10.1145/3132747.3132756                                                            internship at Microsoft Research.
+
+
+
+
+                                                                                  137
+SOSP ’17, October 28, 2017, Shanghai, China                                                                                           B. Li et al.
+
+
+
+                                           Mem                                     Mem                                          Mem
+                                                                                                                FPGA
+
+         Client             NIC            CPU   Client             NIC            CPU       Client             NIC             CPU
+
+                  Network         Server                  Network         Server                      Network          Server
+           (a) Software / two-sided RDMA.                  (b) One-sided RDMA.                            (c) KV-Direct.
+
+Figure 1: Design space of KVS data path and processing device. Line indicates data path. One KV operation (thin line)
+may require multiple address-based memory accesses (thick line). Black box indicates where KV processing takes place.
+the OS, especially the networking stack. The bottleneck is                and reduces network traffic. In addition, to support vector-
+exacerbated by the fact that physical network transport speed             based operations and reduce network traffic, KV-Direct also
+has seen huge improvements in the last decade due to heavy                provides new vector primitives UPDATE, REDUCE, and
+bandwidth demand from data center applications.                           FILTER, allowing users to define active messages [19] and
+    More recently, as both the single core frequency scaling              delegate certain computation to programmable NIC for effi-
+and multi-core architecture scaling are slowing down [21, 69],            ciency.
+a new research trend in distributed systems is to leverage Re-               Since the key-value operations are offloaded to the pro-
+mote Direct Memory Access (RDMA) technology on NIC to                     grammable NIC, we focus our design on optimizing the PCIe
+reduce network processing cost. One line of research [36, 37]             traffic between the NIC and host memory. KV-Direct adopts
+uses two-sided RDMA to accelerate communication (Fig-                     a series of optimizations to fully utilize PCIe bandwidth and
+ure 1a). KVS built with this approach are bounded by CPU                  hide latency. Firstly, we design a new hash table and mem-
+performance of the KVS servers. Another line of research                  ory allocator to leverage parallelism available in FPGA and
+uses one-sided RDMA to bypass remote CPU and shift KV                     minimize the number of PCIe DMA requests. On average,
+processing workload to clients [18, 55] (Figure 1b). This                 KV-Direct achieves close to one PCIe DMA per READ oper-
+approach achieves better GET performance but degrades per-                ation and two PCIe DMAs per WRITE operation. Secondly,
+formance for PUT operations due to high communication                     to guarantee consistency among dependent KV operations,
+and synchronization overhead. Due to lack of transactional                KV-Direct includes an out-of-order execution engine to track
+support, the abstraction provided by RDMA is not a perfect                operation dependencies while maximizing the throughput of
+fit for building efficient KVS.                                           independent requests. Thirdly, KV-Direct exploits on-board
+    In the meantime, another trend is emerging in data center             DRAM buffer available on programmable NIC by implement-
+hardware evolution. More and more servers in data centers                 ing a hardware-based load dispatcher and caching component
+are now equipped with programmable NICs [10, 27, 64]. At                  in FPGA to fully utilize on-board DRAM bandwidth and
+the heart of a programmable NIC is a field-programmable                   capacity.
+gate array (FPGA) with an embedded NIC chip to connect                       A single NIC KV-Direct is able to achieve up to 180 M KV
+to the network and a PCIe connector to attach to the server.              operations per second (Ops), equivalent to the throughput of
+Programmable NIC is initially designed to enable network                  36 CPU cores [47]. Compared with state-of-art CPU KVS
+virtualization [24, 44]. However, many found that FPGA                    implementations, KV-Direct reduces tail latency to as low as
+resources can be used to offload some workloads of CPU and                10 µs while achieving a 3x improvement on power efficiency.
+significantly reduce CPU resource usage [14, 30, 52, 60]. Our             Moreover, KV-Direct can achieve near linear scalability with
+work takes this general approach.                                         multiple NICs. With 10 programmable NIC cards in a server,
+    We present KV-Direct, a new in-memory key-value system                we achieve 1.22 billion KV operations per second in a single
+that takes advantage of programmable NIC in data center. KV-              commodity server, which is more than an order of magnitude
+Direct, as its name implies, directly fetches data and applies            improvement over existing systems.
+updates in the host memory to serve KV requests, bypass-                     KV-Direct supports general atomic operations up to 180 Mops,
+ing host CPU (Figure 1c). KV-Direct extends the RDMA                      equal to normal KV operation and significantly outperforms
+primitives from memory operations (READ and WRITE) to                     the number reported in state-of-art RDMA-based system:
+key-value operations (GET, PUT, DELETE and ATOMIC                         2.24 Mops [36]. The atomic operation agnostic performance
+ops). Compared with one-sided RDMA based systems, KV-                     is mainly a result of our out-of-order execution engine that
+Direct deals with the consistency and synchronization issues              can efficiently track the dependency among KV operations
+at server-side, thus removes computation overhead in client               without explicitly stalling the pipeline.
+
+
+
+
+                                                                    138
+KV-Direct                                                                         SOSP ’17, October 28, 2017, Shanghai, China
+
+2 BACKGROUND                                                             takes place, state-of-the-art high-performance KVS systems
+2.1 Workload Shift in KVS                                                basically falls into three categories: on the CPU of KVS server
+                                                                         (Figure 1a), on KVS clients (Figure 1b) or on a hardware
+Historically, KVS such as Memcached [25] gained popular-                 accelerator (Figure 1c).
+ity as an object caching system for web services. In the                    When pushed to the limit, in high performance KVS sys-
+era of in-memory computation, KVS goes beyond caching                    tems the throughput bottleneck can be attributed to the com-
+and becomes an infrastructure service to store shared data               putation in KV operation and the latency in random memory
+structure in a distributed system. Many data structures can              access. CPU-based KVS needs to spend CPU cycles for key
+be expressed in a key-value hash table, e.g., data indexes in            comparison and hash slot computation. Moreover, KVS hash
+NoSQL databases [12], model parameters in machine learn-                 table is orders of magnitude larger than the CPU cache, there-
+ing [46], nodes and edges in graph computing [67, 74] and                fore the memory access latency is dominated by cache miss
+sequencers in distributed synchronization [37, 45].                      latency for practical access patterns.
+   The workload shifts from object cache to generic data                    By our measurement, a 64-byte random read latency for a
+structure store implies several design goals for KVS.                    contemporary computer is ∼110 ns. A CPU core can issue
+   High batch throughput for small KV. In-memory compu-                  several memory access instructions concurrently when they
+tations typically access small key-value pairs in large batches,         fall in the instruction window, limited by the number of load-
+e.g., sparse parameters in linear regression [48, 74] or all             store units in a core (measured to be 3∼4 in our CPU) [26, 28,
+neighbor nodes in graph traversal [67], therefore a KVS                  75]. In our CPU, we measure a max throughput of 29.3 M
+should be able to benefit from batching and pipelining.                  random 64B access per second per core. On the other hand,
+   Predictable low latency. For many data-parallel compu-                an operation to access 64-byte KV pair typically requires
+tation tasks, the latency of an iteration is determined by the           ∼100 ns computation or ∼500 instructions, which is too large
+slowest operations [59]. Therefore, it is important to control           to fit in the instruction window (measured to be 100∼200).
+the tail latency of KVS. CPU based implementations often                 When interleaved with computation, the performance of a
+have large fluctuations under heavy load due to scheduling               CPU core degrades to only 5.5 M KV operations per second
+irregularities and inflated buffering.                                   (Mops). An optimization is to batch memory accesses in a
+   High efficiency under write-intensive workload. For                   KV store by clustering the computation for several operations
+cache workloads, KVS often has much more reads than                      together before issuing the memory access all at once [47, 56].
+writes [3], but it is no longer the case for distributed compu-          This improves the per-core throughput to 7.9 MOps in our
+tation workloads such as graph computation [61], parameter               CPU, which is still far less than the random 64B throughput
+servers [46]. These workloads favor hash table structures that           of host DRAM.
+can handle both read and write operations efficiently.                      Observing the limited capacity of CPU in KV processing,
+   Fast atomic operations. Atomic operations on several                  recent work [18, 55, 70] leverage one-sided RDMA to of-
+extremely popular keys appear in applications such as central-           fload KV processing to clients and effectively using the KVS
+ized schedulers [63], sequencers [37, 45], counters [76] and             server as a shared memory pool. Despite the high message
+short-term values in web applications [3]. This requires high            rate (8∼150 Mops [37]) provided by RDMA NICs, it is chal-
+throughput on single-key atomics.                                        lenging to find an efficient match between RDMA primitives
+   Support vector-type operations. Machine learning and                  and key-value operations. For a write (PUT or atomic) op-
+graph computing workloads [46, 67, 74] often require oper-               eration, multiple network round-trips and multiple memory
+ating on every element in a vector, e.g., incrementing every             accesses may be required to query the hash index, handle
+element in a vector with a scalar or reducing a vector into the          hash collisions and allocate variable-size memory. RDMA
+sum of its elements. KVS without vector support requires                 does not support transactions. Clients must synchronize with
+the client to either issue one KVS operation per element, or             each other to ensure consistency using RDMA atomics or dis-
+retrieve the vector back to the client and perform the opera-            tributed atomic broadcast [70], both incurring communication
+tion. Supporting vector data type and operations in KVS can              overhead and synchronization latency [18, 55]. Therefore,
+greatly reduce network communication and CPU computation                 most RDMA-based KVS [18, 36, 55] recommend using one-
+overhead.                                                                sided RDMA for GET operations only. For PUT operations,
+                                                                         they fall back to the server CPU. The throughput of write-
+2.2    Achilles’ Heel of High-Performance KVS                            intensive workload is still bottlenecked by CPU cores.
+       Systems
+Building a high performance KVS is a non-trivial exercise of             2.3    Programmable NIC with FPGA
+optimizing various software and hardware components in a                 Ten years ago, processor frequency scaling slowed down and
+computer system. Characterized by where the KV processing                people turned to multi-core and concurrency [69]. Nowadays,
+
+
+
+
+                                                                   139
+SOSP ’17, October 28, 2017, Shanghai, China                                                                                                                                  B. Li et al.
+
+                                                                                                                              To saturate PCIe Gen3 x8 with 64-byte DMA requests,
+                                                                                                                           92 concurrent DMA requests are needed considering our
+                                                                                                                           latency of 1050 ns. In practice, two factors further limit the
+                                                                                                                           concurrency of DMA requests. First, PCIe credit-based flow
+                                                                                                                           control constrains the number of in-flight requests for each
+                                                                                                                           DMA type. The PCIe root complex in our server advertises
+                                                                                                                           88 TLP posted header credits for DMA write and 84 TLP
+                                                                                                                           non-posted header credits for DMA read. Second, DMA
+                                                                                                                           read requires assigning a unique PCIe tag to identify DMA
+                         Figure 2: Programmable NIC with FPGA.                                                             responses which may come out of order. The DMA engine
+                                                                                                                           in our FPGA only support 64 PCIe tags, further limiting
+                    90                                                       100                                           our DMA read concurrency to 64 requests, which renders
+Throughput (Mops)
+
+
+
+
+                    80                      Read                              90
+                                                                                                                           a throughput of 60 Mops as shown in Figure 3a. On the
+                                                            Percentile (%)
+
+
+
+
+                    70                      Write                             80
+                    60                                                        70
+                    50                                                        60                                           other hand, with 40 Gbps network and 64-byte KV pairs, the
+                                                                              50
+                    40
+                    30
+                                                                              40
+                                                                              30
+                                                                                                                           throughput ceiling is 78 Mops with client-side batching. In
+                    20
+                    10
+                                                                              20
+                                                                              10
+                                                                                                                           order to saturate the network with GET operations, the KVS
+                     0                                                         0                                           on NIC must make full use of PCIe bandwidth and achieve
+                         32    64   128 256 512 1024 2048                          800   900   1000 1100 1200 1300
+                         Request Payload Size (B)                                        RTT Latency (ns)                  close to one average memory access per GET. This boils
+                              (a) Throughput.                                      (b) DMA Read Latency.                   down to three challenges:
+                         Figure 3: PCIe random DMA performance.                                                               Minimize DMA requests per KV operation. Hash table
+                                                                                                                           and memory allocation are two major components in KVS
+power ceiling implies that multi-core scaling has also met                                                                 that require random memory access. Previous works pro-
+difficulties [22]. People are now turning to domain-specific                                                               pose hash tables [9, 18] with close to 1 memory access per
+architectures (DSAs) for better performance.                                                                               GET operation even under high load factors. However, un-
+   Due to the increasing mismatch of network speed and                                                                     der higher than 50% load factor, these tables need multiple
+CPU network processing capacity, programmable NICs with                                                                    memory accesses per PUT operation on average with large
+FPGA [10, 24, 27, 44] now witness large-scale deployment                                                                   variance. This not only consumes PCIe throughput, but also
+in datacenters. As shown in Figure 2, the heart of the pro-                                                                leads to latency variations for write-intensive workloads.
+grammable NIC we use is an FPGA, with an embedded NIC                                                                         In addition to hash table lookup, dynamic memory alloca-
+chip to connect to the network. Programmable NICs typically                                                                tion is required to store variable-length KVs that cannot be
+come with on-board DRAM as packet buffers and runtime                                                                      inlined in the hash table. Minimizing hash table lookups per
+memory for NIC firmware [44], but the DRAM is typically                                                                    KV operation and memory accesses per memory allocation
+not large enough to hold the entire key-value store.                                                                       is essential for matching PCIe and network throughput under
+                                                                                                                           write-intensive, small-KV workloads.
+2.4                      Challenges for Remote Direct Key-Value                                                               Hide PCIe latency while maintaining consistency. An
+                         Access                                                                                            efficient KVS on NIC must pipeline KV operations and DMA
+KV-Direct moves KV processing from the CPU to the pro-                                                                     requests to hide the PCIe latency. However, KV operations
+grammable NIC in the server (Figure 1c). Same as RDMA,                                                                     may have dependencies. A GET following PUT on a same
+the KV-Direct NIC accesses host memory via PCIe. PCIe is                                                                   key needs to return the updated value. This requires tracking
+a packet switched network with ∼500 ns round-trip latency                                                                  KV operations being processed and stall the pipeline on data
+and 7.87 GB/s theoretical bandwidth per Gen3 x8 endpoint.                                                                  hazard, or better, design an out-of-order executor to resolve
+On the latency side, for our programmable NIC, the cached                                                                  data dependency without explicitly stalling the pipeline.
+PCIe DMA read latency is 800 ns due to additional processing                                                                  Dispatch load between NIC DRAM and host memory.
+delay in FPGA. For random non-cached DMA read, there                                                                       An obvious idea is to use the DRAM on NIC as a cache
+is an additional 250 ns average latency (Figure 3b) due to                                                                 for host memory, but in our NIC, the DRAM throughput
+DRAM access, DRAM refresh and PCIe response reordering                                                                     (12.8 GB/s) is on par with the achievable throughput (13.2 GB/s)
+in PCIe DMA engine. On the throughput side, each DMA                                                                       of two PCIe Gen3 x8 endpoints. It is more desirable to dis-
+read or write operation needs a PCIe transport-layer packet                                                                tribute memory access between DRAM and host memory in
+(TLP) with 26-byte header and padding for 64-bit addressing.                                                               order to utilize both of their bandwidths. However, the on-
+For a PCIe Gen3 x8 NIC to access host memory in 64-byte                                                                    board DRAM is small (4 GiB) compared to the host memory
+granularity, the theoretical throughput is therefore 5.6 GB/s,                                                             (64 GiB), calling for a hybrid caching and load-dispatching
+or 87 Mops.                                                                                                                approach.
+
+
+
+
+                                                                                                                     140
+KV-Direct                                                                              SOSP ’17, October 28, 2017, Shanghai, China
+
+                  Table 1: KV-Direct operations.
+ get (k) → v                Get the value of key k.
+ put (k, v) → bool          Insert or replace a (k, v) pair.
+ delete (k) → bool          Delete key k.
+
+ update scalar2scalar       Atomically update the value of key k
+ (k, ∆, λ(v, ∆) → v)        using function λ on scalar ∆, and return
+ →v                         the original value.
+ update scalar2vector       Atomically update all elements in vec-
+ (k, ∆, λ(v, ∆) → v)        tor k using function λ and scalar ∆, and                     Figure 4: KV processor architecture.
+ → [v]                      return the original vector.
+ update vector2vector       Atomically update each element in vec-                When a vector operation update, reduce or filter is operated
+ (k, [∆], λ(v, ∆) → v)      tor k using function λ on the correspond-         on a key, its value is treated as an array of fixed-bit-width ele-
+ → [v]                      ing element in vector [∆], and return the         ments. Each function λ operates on one element in the vector,
+                            original vector.
+                                                                              a client-specified parameter ∆, and/or an initial value Σ for
+ reduce                     Reduce vector k to a scalar using func-           reduction. The KV-Direct development toolchain duplicates
+ (k, Σ, λ(v, Σ)    →   Σ)   tion λ on initial value, and return the           the λ several times to leverage parallelism in FPGA and match
+ →Σ                         reduction result Σ.                               computation throughput with PCIe throughput, then compiles
+ filter (k, λ(v) → bool)    Filter elements in a vector k by func-            it into reconfigurable hardware logic using an high-level syn-
+ → [v]                      tion λ, and return the filtered vector.           thesis (HLS) tool [2]. The HLS tool automatically extracts
+                                                                              data dependencies in the duplicated function and generates a
+                                                                              fully pipelined programmable logic.
+                                                                                  Update operations with user-defined functions are capable
+  In the following, we will present KV-Direct, a novel FPGA-                  of general stream processing on a vector value. For example,
+based key-value store that satisfies all aforementioned goals                 a network processing application may interpret the vector as
+and describe how we address the challenges.                                   a stream of packets for network functions [44] or a bunch
+                                                                              of states for packet transactions [68]. Single-object trans-
+3 DESIGN                                                                      action processing completely in the programmable NIC is
+                                                                              also possible, e.g., wrapping around S QUANTITY in TPC-C
+3.1 System Architecture                                                       benchmark [16]. Vector reduce operation supports neighbor
+KV-Direct enables remote direct key-value access. Clients                     weight accumulation in PageRank [61]. Non-zero values in a
+send KV-Direct operations (§3.2) to KVS server while the                      sparse vector can be fetched with vector filter operation.
+programmable NIC processes the requests and sending back
+results, bypassing the CPU. The programmable NIC on KVS                       3.3    KV Processor
+server is an FPGA reconfigured as a KV processor (§3.3).
+Figure 2 shows the architecture of KV-Direct.                                 As shown in Figure 4, the KV processor in FPGA receives
+                                                                              packets from the network, decodes vector operations and
+                                                                              buffers KV operations in the reservation station (§3.3.3).
+3.2    KV-Direct Operations                                                   Next, the out-of-order engine (§3.3.3) issues independent
+KV-Direct extends one-sided RDMA operations to key-value                      KV operations from reservation station into the operation
+operations, as summarized in Table 1. In addition to stan-                    decoder. Depending on the operation type, the KV processor
+dard KVS operations as shown in the top part of Table 1,                      looks up the hash table (§3.3.1) and executes the correspond-
+KV-Direct supports two types of vector operations: Sending a                  ing operations. To minimize the number of memory accesses,
+scalar to the NIC on the server and the NIC applies the update                small KV pairs are stored inline in the hash table, others
+to each element in the vector; or send a vector to the server                 are stored in dynamically allocated memory from the slab
+and the NIC updates the original vector element-by-element.                   memory allocator (§3.3.2). Both the hash index and the slab-
+Furthermore, KV-Direct supports user-defined update func-                     allocated memory are managed by a unified memory access
+tions as a generalization to atomic operations. The update                    engine (§3.3.4), which accesses the host memory via PCIe
+function needs to be pre-registered and compiled to hardware                  DMA and caches a portion of host memory in NIC DRAM.
+logic before executing. KV operations with user-defined up-                   After the KV operation completes, the result is sent back to
+date functions are similar to active messages [19], saving                    the out-of-order execution engine (§3.3.3) to find and execute
+communication and synchronization cost.                                       matching KV operations in reservation station.
+
+
+
+
+                                                                        141
+SOSP ’17, October 28, 2017, Shanghai, China                                                                                                                         B. Li et al.
+
+                                                                                                          1.8
+                                                                                                                     10B        15B   20B      25B
+                                                                                                          1.7
+
+
+
+
+                                                                                    Memory Access Times
+                                                                                                          1.6
+                                                                                                          1.5
+                                                                                                          1.4
+                                                                                                          1.3
+                                                                                                          1.2
+Figure 5: Hash index structure. Each line is a hash                                                       1.1
+bucket containing 10 hash slots, 3 bits of slab memory                                                     1
+                                                                                                                5   10     15   20 25 30 35 40            45   50   55
+type per hash slot, one bitmap marking the beginning                                                                             Memory Utilization (%)
+
+and end of inline KV pairs and a pointer to the next
+chained bucket on hash collision.                                         Figure 6: Average memory access count under varying
+                                                                          inline thresholds (10B, 15B, 20B, 25B) and memory uti-
+   As discussed in §2.4, the scarcity of PCIe operation through-          lizations.
+put requires the KV processor to be frugal on DMA accesses.
+For GET operation, at least one memory read is required. For              hash fields are re-purposed for storing KV data. It might not
+PUT or DELETE operation, one read and one write are min-                  be optimal to inline all KVs that can fit in a bucket. To mini-
+imal for hash tables. Log-based data structures can achieve               mize average access time, assuming that smaller and larger
+one write per PUT, but it sacrifices GET performance. KV-                 keys are equally likely to be accessed, it is more desirable
+Direct carefully designs the hash table to achieve close to               to inline KVs smaller than an inline threshold. To quantify
+ideal DMA accesses per lookup and insertion, as well as the               the portion of used buckets in all buckets, we use memory
+memory allocator to achieve < 0.1 amortized DMA opera-                    utilization instead of load factor, because it relates more to the
+tions per dynamic memory allocation.                                      number of KVs that can fit in a fixed amount of memory. As
+                                                                          shown in Figure 6, for a certain inline threshold, the average
+   3.3.1 Hash Table. To store variable-sized KVs, the KV
+                                                                          memory access count increases with memory utilization, due
+storage is partitioned into two parts. The first part is a hash
+                                                                          to more hash collisions. Higher inline threshold shows a more
+index (Figure 5), which consists a fixed number of hash buck-
+                                                                          steep growth curve of memory access count, so an optimal
+ets. Each hash bucket contains several hash slots and some
+                                                                          inline threshold can be found to minimize memory accesses
+metadata. The rest of the memory is dynamically allocated,
+                                                                          under a given memory utilization. As with hash index ratio,
+and managed by a slab allocator (§3.3.2). A hash index ratio
+                                                                          the inline threshold can also be configured at initialization
+configured at initialization time determines the percentage
+                                                                          time.
+of the memory allocated for hash index. The choice of hash
+                                                                             When all slots in a bucket are filled up, there are several
+index ratio will be discussed in §5.1.1.
+                                                                          solutions to resolve hash collisions. Cuckoo hashing [62] and
+   Each hash slot includes a pointer to the KV data in dynam-
+                                                                          hopscotch hashing [29] guarantee constant-time lookup by
+ically allocated memory and a secondary hash. Secondary
+                                                                          moving occupied slots during insertion. However, in write-
+hash is an optimization that enables parallel inline checking.
+                                                                          intensive workload, the memory access time under high load
+The key is always checked to ensure correctness, at the cost
+                                                                          factor would experience large fluctuations. Linear probing
+of one additional memory access. Assuming a 64 GiB KV
+                                                                          may suffer from primary clustering, therefore its performance
+storage in host memory and 32-byte allocation granularity (a
+                                                                          is sensitive to the uniformity of hash function. We choose
+trade-off between internal fragmentation and allocation meta-
+                                                                          chaining to resolve hash conflicts, which balances lookup and
+data overhead), the pointer requires 31 bits. A secondary hash
+                                                                          insertion, while being more robust to hash clustering.
+of 9 bits gives a 1/512 false positive probability. Cumulatively,
+the hash slot size is 5 bytes. To determine the hash bucket                  3.3.2 Slab Memory Allocator. Chained hash slots and
+size, we need to trade-off between the number of hash slots               non-inline KVs need dynamic memory allocation. We choose
+per bucket and the DMA throughput. Figure 3a shows that                   slab memory allocator [7] to achieve O(1) average memory
+the DMA read throughput below 64B granularity is bound by                 access per allocation and deallocation. The main slab allo-
+PCIe latency and parallelism in the DMA engine. A bucket                  cator logic runs on host CPU and communicates with the
+size less than 64B is suboptimal due to increased possibility             KV-processor through PCIe. Slab allocator rounds up allo-
+of hash collision. On the other hand, increasing the bucket               cation size to the nearest power of two, called slab size. It
+size above 64B would decrease hash lookup throughput. So                  maintains a free slab pool for each possible slab size (32,
+we choose the bucket size to be 64 bytes.                                 64, . . . , 512 bytes), and a global allocation bitmap to help to
+   KV size is the combined size of key and value. KVs smaller             merge small free slabs back to larger slabs. Each free slab
+than a threshold are stored inline in the hash index to save the          pool is an array of slab entries consisting of an address field
+additional memory access to fetch KV data. An inline KV                   and a slab type field indicating the size of the slab entry. The
+may span multiple hash slots, whose pointer and secondary                 free slab pool can be cached on the NIC. The cache syncs
+
+
+
+
+                                                                    142
+KV-Direct                                                                           SOSP ’17, October 28, 2017, Shanghai, China
+
+with the host memory in batches of slab entries. Amortized
+by batching, less than 0.07 DMA operation is needed per
+allocation or deallocation. When a small slab pool is almost
+empty, larger slabs need to be split. Because the slab type is
+already included in a slab entry, in slab splitting, slab entries
+are simply copied from the larger pool to the smaller pool,
+without the need for computation. Including slab type in the
+slab entry also saves communication cost because one slab
+entry may contain multiple slots.
+   On deallocation, the slab allocator needs to check whether
+                                                                                       Figure 7: DRAM load dispatcher.
+the freed slab can be merged with its neighbor, requiring at
+least one read and write to the allocation bitmap. Inspired by             under workload with popular keys, and ensure consistency
+garbage collection, we propose lazy slab merging to merge                  because no two operations on the same key can be in the main
+free slabs in batch when a slab pool is almost empty and no                processing pipeline simultaneously.
+larger slab pools have enough slabs to split.                                 3.3.4 DRAM Load Dispatcher. To further save the bur-
+                                                                           den on PCIe, we dispatch memory accesses between PCIe and
+   3.3.3 Out-of-Order Execution Engine. Dependency                         the NIC on-board DRAM. Our NIC DRAM has 4 GiB size
+between two KV operations with the same key in the KV                      and 12.8 GB/s throughput, which is an order of magnitude
+processor will lead to data hazard and pipeline stall. This                smaller than the KVS storage on host DRAM (64 GiB) and
+problem is magnified in single-key atomics where all opera-                slightly slower than the PCIe link (14 GB/s). One approach
+tions are dependent, thus limiting the atomics throughput. We              is to put a fixed portion of the KVS in NIC DRAM. However,
+borrow the concept of dynamic scheduling from computer                     the NIC DRAM is too small to carry a significant portion
+architecture and implement a reservation station to track all              of memory accesses. The other approach is to use the NIC
+in-flight KV operations and their execution context. To sat-               DRAM as a cache for host memory, the throughput would
+urate PCIe, DRAM and the processing pipeline, up to 256                    degrade due to the limited throughput of our NIC DRAM.
+in-flight KV operations are needed. However, comparing 256                    We adopt a hybrid solution to use the DRAM as a cache
+16-byte keys in parallel would take 40% logic resource of                  for a fixed portion of the KVS in host memory, as shown in
+our FPGA. Instead, we store the KV operations in a small                   Figure 7. The cache-able part is determined by the hash of
+hash table in on-chip BRAM, indexed by the hash of the key.                memory address, in granularity of 64 bytes. The hash function
+To simplify hash collision resolution, we regard KV opera-                 is selected so that a bucket in hash index and a dynamically
+tions with the same hash as dependent, so there may be false               allocated slab have an equal probability of being cache-able.
+positives, but it will never miss a dependency. Operations                 The portion of cache-able part in entire host memory is called
+with the same hash are organized in a chain and examined                   load dispatch ratio (l). Assume the cache hit probability is
+sequentially. Hash collision would degrade the efficiency of               h(l). To balance load on PCIe and NIC DRAM, the load
+chain examination, so the reservation station contains 1024                dispatch ratio l should be optimized so that:
+hash slots to make hash collision probability below 25%.                                       l           (1 − l) + l · (1 − h(l))
+   The reservation station not only holds pending operations,                                           =
+                                                                                          tput DRAM               tput PC I e
+but also caches their latest values for data forwarding. When
+                                                                              let k be the ratio of NIC memory size and host mem-
+a KV operation is completed by the main processing pipeline,
+                                                                           ory size. Under uniform workload, cache hit probability
+its result is returned to the client, and the latest value is for-                    NIC memory size
+                                                                           h(l) = cache-able corpus size = l when k ≤ l. Caching under
+                                                                                                             k
+warded to the reservation station. Pending operations in the
+same hash slot are checked one by one, and operations with                 uniform workload is not efficient. Under long-tail workload
+matching key are executed immediately and removed from                     with Zipf distribution, assume n is the total number of KVs,
+                                                                                                         log(NIC memory size)       log(kn)
+the reservation station. For atomic operations, the computa-               approximately h(l) = log(cache-able corpus size) = log(ln) when
+tion is performed in a dedicated execution engine. For write               k ≤ l. Under long-tail workload, the cache hit probability is
+operations, the cached value is updated. The execution result              as high as 0.7 with 1M cache in 1G corpus. An optimal l can
+is returned to the client directly. After scanning through the             be solved numerically, as discussed in §6.3.1.
+chain of dependent operations, if the cached value is updated,
+a PUT operation is issued to the main processing pipeline for              4   IMPLEMENTATION
+cache write back. This data forwarding and fast execution                  Our hardware platform is built on an Intel Stratix V FPGA
+path enable single-key atomics to be processed one operation               based programmable NIC (§2.3). The programmable NIC
+per clock cycle (180 Mops), eliminate head-of-line blocking                is attached to the server through two PCIe Gen3 x8 links in
+
+
+
+
+                                                                     143
+SOSP ’17, October 28, 2017, Shanghai, China                                                                                                                                     B. Li et al.
+
+                                                      Host Daemon
+                 32B stack                32B stack                                                                                                        3.5
+
+                                                            merger
+
+
+
+
+                                                                                 Memory Access Times
+
+
+
+
+                                                                                                                                         Memory Access Times
+                                                                                                   8                inline     offline                                         inline      offline
+                                                                                                   7                                                           3
+
+  Hashtable                    Sync
+                                                                                                   6                                                       2.5
+
+                512B stack               512B stack
+                                                                                                   5
+
+                                                            Splitter
+                                                                                                                                                               2
+                                                                                                   4
+                                                                                                   3                                                       1.5
+                                                                                                   2                                                           1
+
+                 NIC side                       Host side
+                                                                                                   1
+                                                                                                                                                           0.5
+                                                                                                        10 15 20 25 30 35 40 45 50                                 25 30 35 40 45 50 55 60 65
+                                                                                                             Hash Index Ratio (%)                                       Memory Utilization (%)
+
+                                                                                          (a) Fix memory utilization 0.5.                                      (b) Fix hash index ratio 0.5.
+              Figure 8: Slab memory allocator.
+                                                                             Figure 9: Memory access count under different memory uti-
+a bifurcated x16 physical connector, and contains 4 GiB of                   lizations or hash index ratio.
+on-board DRAM with a single DDR3-1600 channel.
+   For development efficiency, we use Intel FPGA SDK for                        Vector Operation Decoder. Compared with PCIe, net-
+OpenCL [2] to synthesize hardware logic from OpenCL. Our                     work is a more scarce resource with lower bandwidth (5 GB/s)
+KV processor is implemented in 11K lines of OpenCL code                      and higher latency (2 µs). An RDMA write packet over Eth-
+and all kernels are fully pipelined, i.e., the throughput is one             ernet has 88 bytes of header and padding overhead, while a
+operation per clock cycle. With 180 MHz clock frequency,                     PCIe TLP packet has only 26 bytes of overhead. This is why
+our design can process KV operations at 180 M op/s if not                    previous FPGA-based key-value stores [5, 6] have not satu-
+bottlenecked by network, DRAM or PCIe.                                       rated the PCIe bandwidth, although their hash table designs
+   Below highlights several implementation details.                          are less efficient than KV-Direct. This calls for client-side
+   Slab Memory Allocator. As shown in Figure 8, for each                     batching in two aspects: batching multiple KV operations
+slab size, the slab cache on the NIC is synchronized with                    in one packet and supporting vector operations for a more
+host DRAM using two double-ended stacks. For the NIC-                        compact representation. Towards this end, we implement a
+side double-ended stack (left side in Figure 8), the left end is             decoder in the KV-engine to unpack multiple KV operations
+popped and pushed by the allocator and deallocator, and the                  from a single RDMA packet. Observing that many KVs have
+right end is synchronized with the left end of the correspond-               a same size or repetitive values, the KV format includes two
+ing host-side stack via DMA. The NIC monitors the size of                    flag bits to allow copying key and value size, or the value of
+NIC stack and synchronizes to or from the host stack accord-                 the previous KV in the packet. Fortunately, many significant
+ing to high and low watermarks. Host daemon periodically                     workloads (e.g. graph traversal, parameter server) can issue
+checks the size of host-side double-ended stack. If it grows                 KV operations in batches. Looking forward, batching would
+above a high watermark, slab merging is triggered; when                      be unnecessary if higher-bandwidth network is available.
+it drops below a low watermark, slab splitting is triggered.
+Because each end of a stack is either accessed by the NIC or                 5                         EVALUATION
+the host, and the data is accessed prior to moving pointers,                 In this section, we first take a reductionist perspective to
+race conditions would not occur.                                             support our design choices with microbenchmarks of key
+   DRAM Load Dispatcher. One technical challenge is the                      components, then switch to a holistic approach to demonstrate
+storage of metadata in DRAM cache, which requires addi-                      the overall performance of KV-Direct in system benchmark.
+tional 4 address bits and one dirty flag per 64-byte cache                      We evaluate KV-Direct in a testbed of eight servers and
+line. Cache valid bit is not needed because all KVS storage is               one Arista DCS-7060CX-32S switch. Each server equips
+accessed exclusively by the NIC. To store the 5 metadata bits                two 8 core Xeon E5-2650 v2 CPUs with hyper-threading
+per cache line, extending the cache line to 65 bytes would re-               disabled, forming two NUMA nodes connected through QPI
+duce DRAM performance due to unaligned access; saving the                    Link. Each NUMA node is populated with 8 DIMMs of
+metadata elsewhere will double memory accesses. Instead,                     8 GiB Samsung DDR3-1333 ECC RAM, resulting a total of
+we leverage spare bits in ECC DRAM for metadata storage.                     128 GiB of host memory on each server. A programmable
+ECC DRAM typically has 8 ECC bits per 64 bits of data. For                   NIC [10] is connected to the PCIe root complex of CPU
+Hamming code to correct one bit of error in 64 bits of data,                 0, and its 40 Gbps Ethernet port is connected to the switch.
+only 7 additional bits are required. The 8th ECC bit is a parity             The programmable NIC has two PCIe Gen3 x8 links in a
+bit for detecting double-bit errors. As we access DRAM in                    bifurcated Gen3 x16 physical connector. The tested server
+64-byte granularity and alignment, there are 8 parity bits per               equips SuperMicro X9DRG-QF motherboard and one 120 GB
+64B data. We increase the parity checking granularity from                   SATA SSD running Archlinux (kernel 4.11.9-1).
+64 data bits to 256 data bits, so double-bit errors can still be                For system benchmark, we use YCSB workload [15]. For
+detected. This allows us to have 6 extra bits which can save                 skewed Zipf workload, we choose skewness 0.99 and refer it
+our address bits and dirty flag.                                             as long-tail workload.
+
+
+
+
+                                                                       144
+KV-Direct                                                                                                                   SOSP ’17, October 28, 2017, Shanghai, China
+
+                                                                                                                                         30
+                                                                                                                                                                          bitmap
+                                                                                                                                         25                             radix sort
+
+                                                                                                                                         20
+
+
+
+
+                                                                                                                              Time (s)
+                                                                                                                                         15
+
+                                                                                                                                         10
+
+                                                                                                                                         5
+
+                                                                                                                                         0
+                                                                                                                                              1 2 3 4 5 6 7 8 10 12 14 16 18 20 24 28 32
+                                                                                                                                                          Core Number
+
+
+
+Figure 10: Determine the optimal hash index ratio for a                                                             Figure 12: Execution time of merging 4 billion slab slots.
+required memory utilization and KV size.                                                                            Since the hash table of MemC3 and FaRM cannot support
+                  4.5                                                                                               more than 55% memory utilization for 10B KV size, the three
+Memory Access Times
+
+
+
+
+                                                          Memory Access Times
+
+
+
+
+                               KV-D    MemC3       Farm                     40       KV-D    MemC3       Farm
+                    4                                                                                               rightmost bars in Figure 11a and Figure 11b only show the
+                                                                            35
+                  3.5
+                                                                            30
+                    3                                                       25                                      performance of KV-Direct.
+                  2.5                                                       20
+                    2                                                       15
+                                                                                                                       For inline KVs, KV-Direct has close to 1 memory access
+                  1.5                                                       10                                      per GET and close to 2 memory accesses per PUT under
+                    1                                                        5
+                  0.5
+                           30 35 40 45 50 55 60 65
+                                                                             0
+                                                                                 30 35 40 45 50 55 60 65
+                                                                                                                    non-extreme memory utilizations. GET and PUT for non-
+                               Memory Utilization (%)                                Memory Utilization (%)
+                                                                                                                    inline KVs have one additional memory access. Comparing
+                               (a) 10B GET.                                          (b) 10B PUT.                   KV-Direct and chained hopscotch hashing under high mem-
+                  4.5                                                                                               ory utilization, hopscotch hashing performs better in GET,
+Memory Access Times
+
+
+
+
+                                                          Memory Access Times
+
+
+
+
+                               KV-D    MemC3       Farm                     30       KV-D    MemC3       Farm
+                      4
+                  3.5
+                                                                            25                                      but significantly worse in PUT. Although KV-Direct cannot
+                                                                            20
+                      3                                                                                             guarantee worst case DMA accesses, we strike for a balance
+                                                                            15
+                  2.5                                                       10                                      between GET and PUT. Cuckoo hashing needs to access up to
+                      2                                                      5                                      two hash slots on GET, therefore has more memory accesses
+                  1.5                                                        0
+                           50 55 60 65 70 75 80 85                               50 55 60 65 70 75 80 85            than KV-Direct under most memory utilizations. Under high
+                               Memory Utilization (%)                                Memory Utilization (%)
+                                                                                                                    memory utilization, cuckoo hashing incurs large fluctuations
+                              (c) 254B GET.                                         (d) 254B PUT.
+                                                                                                                    in memory access times per PUT.
+                          Figure 11: Memory accesses per KV operation.
+                                                                                                                       5.1.2 Slab Memory Allocator. The communication over-
+5.1                        Microbenchmarks                                                                          head of slab memory allocator comes from the NIC accessing
+   5.1.1 Hash Table. There are two free parameters in our                                                           available slab queues in host memory. To sustain the maximal
+hash table design: (1) inline threshold, (2) the ratio of hash                                                      throughput of 180M operations per second, in the worst case,
+index in the entire memory space. As shown in Figure 9a,                                                            180M slab slots need to be transferred, consuming 720 MB/s
+when hash index ratio grows, more KV pairs can be stored in-                                                        PCIe throughput, i.e., 5% of total PCIe throughput of our
+line, yielding a lower average memory access time. Figure 9b                                                        NIC.
+shows the increase of memory accesses as more memory is                                                                The computation overhead of slab memory allocator comes
+utilized. As shown in Figure 10, the maximal achievable                                                             from slab splitting and merging on host CPU. Fortunately,
+memory utilization drops under higher hash index ratio, be-                                                         they are not frequently invoked. For workloads with stable
+cause less memory is available for dynamic allocation. Conse-                                                       KV size distributions, newly freed slab slots are reused by
+quently, aiming to accommodate the entire corpus in a given                                                         subsequent allocations, therefore does not trigger splitting
+memory size, the hash index ratio has an upper bound. We                                                            and merging.
+choose this upper bound and get a minimal average memory                                                               Slab splitting requires moving continuous slab entries from
+access times, shown as the dashed line in Figure 10.                                                                one slab queue to another. When the workload shifts from
+   In Figure 11, we plot the number of memory accesses per                                                          large KV to small KV, in the worst case the CPU needs to
+GET and PUT operation for three possible hash table designs:                                                        move 90M slab entries per second, which only utilizes 10%
+chaining in KV-Direct, bucket cuckoo hashing in MemC3 [23]                                                          of a core because it is simply continuous memory copy.
+and chain-associative hopscotch hashing in FaRM [18]. For                                                              Merging free slab slots to larger slots is rather a time-
+KV-Direct, we make the optimal choice of inline threshold                                                           consuming task, because it involves filling the allocation
+and hash index ratio for the given KV size and memory uti-                                                          bitmap with potentially random offsets and thus requiring
+lization requirement. For cuckoo and hopscotch hashing, we                                                          random memory accesses. To sort the addresses of free slabs
+assume that keys are inlined and can be compared in parallel,                                                       and merge continuous ones, radix sort [66] scales better to
+while the values are stored in dynamically allocated slabs.                                                         multiple cores than simple bitmap. As shown in Figure 12,
+
+
+
+
+                                                                                                              145
+SOSP ’17, October 28, 2017, Shanghai, China                                                                                                                                                                                                              B. Li et al.
+
+                                                                                                                                                                                      200        baseline    uniform                    long-tail
+
+
+
+
+                                                                                                                                                                  Throughtput(Mops)
+                                    with OoO   two-sided RDMA
+                                 without OoO   one-sided RDMA                              with OoO     without OoO                                                                   150
+
+
+
+
+                                                                Throughput (Mops)
+                                                                             102
+ Throughput (Mops)
+
+
+
+
+                     102
+                                                                                                                                                                                      100
+                     101                                                     101
+                                                                                                                                                                                      50
+                     100                                                     100
+                                                                                                                                                                                       0
+                                                                                                                                                                                                   50%     95%     100%
+               10-1                                                      10-1                                                                                                                       Read Percentage(%)
+                           1     2    3      4       5                                 0     1     10     50   100
+                                 Number of Keys                                               Put Ratio (%)
+
+                               (a) Atomics.                                         (b) Long-tail workload.                 Figure 14: DMA throughput with load dispatch (load dis-
+Figure 13: Effectiveness of out-of-order execution engine.                                                                  patch ratio = 0.5).
+merging all 4 billion free slab slots in a 16 GiB vector requires                                                                               Vector Size (B)                                             64                    128         256     512      1024
+                                                                                                                                                Vector update with return                                11.52                  11.52       11.52   11.52      11.52
+30 seconds on a single core, or only 1.8 seconds on 32 cores
+                                                                                                                                                Vector update without return                              4.37                   4.53        4.62    4.66       4.68
+using radix sort [66]. Although garbage collecting free slab                                                                                    One key per element                                       2.09                   2.09        2.09    2.09       2.09
+slots takes seconds, it runs in background without stalling                                                                                     Fetch to client                                           0.03                   0.06        0.12    0.24       0.46
+the slab allocator, and practically only triggered when the                                                                 Table 2: Throughput (GB/s) of vector operations with
+workload shifts from small KV to large KV.                                                                                  vector update or alternatives.
+   5.1.3 Out-of-Order Execution Engine. We evaluate
+                                                                                                                                                200
+
+
+
+
+                                                                                                                            Throughput (MOps)
+                                                                                                                                                                                      No Batching                               3.4                  No Batching
+the effectiveness of out-of-order execution by comparing the                                                                                    180
+                                                                                                                                                160                                      Batching                               3.2                     Batching
+
+
+
+
+                                                                                                                                                                                                                 Latency (us)
+throughput with the simple approach that stalls the pipeline                                                                                    140                                                                               3
+                                                                                                                                                120
+                                                                                                                                                100                                                                             2.8
+on key conflict, under atomics and long-tail workload. One-                                                                                      80                                                                             2.6
+                                                                                                                                                 60                                                                             2.4
+sided RDMA and two-sided RDMA [37] throughputs are also                                                                                          40
+                                                                                                                                                                                                                                2.2
+                                                                                                                                                 20
+shown as baselines.                                                                                                                               0
+                                                                                                                                                       8     16          32                 64   128   256
+                                                                                                                                                                                                                                  2
+                                                                                                                                                                                                                                        8     16    32    64   128   256
+   Without this engine, an atomic operation needs to wait                                                                                                   Batched KV Size (B)                                                               Batched KV Size (B)
+for PCIe latency and processing delay in the NIC, during                                                                                                   (a) Throughput.                                                                    (b) Latency.
+which subsequent atomic operations on the same key cannot                                                                                             Figure 15: Efficiency of network batching.
+be executed. This renders a single-key atomics throughput of
+0.94 Mops in Figure 13a, consistent with 2.24 Mops measured                                                                    5.1.4 DRAM Load Dispatcher. Figure 14 shows the
+from an RDMA NIC [37]. The higher throughput of RDMA                                                                        throughput improvement of DRAM load dispatch over the
+NIC can be attributed to its higher clock frequency and lower                                                               baseline of using PCIe only. Under uniform workload, the
+processing delay. With out-of-order execution, single-key                                                                   caching effect of DRAM is negligible because its size is only
+atomic operations in KV-Direct can be processed at peak                                                                     6% of host KVS memory. Under long-tail workload, ∼30% of
+throughput, i.e., one operation per clock cycle. In MICA [51],                                                              memory accesses are served by the DRAM cache. Overall, the
+single-key atomics throughput cannot scale beyond a single                                                                  memory access throughput for 95% and 100% GET achieves
+core. Atomic fetch-and-add can be spread to multiple cores                                                                  the 180 Mops clock frequency bound. However, if DRAM is
+in [37], but it relies on the commutativity among the atomics                                                               simply used as a cache, the throughput would be adversely
+and therefore does not apply to non-commutative atomics                                                                     impacted because the DRAM throughput is lower than PCIe
+such as compare-and-swap.                                                                                                   throughput.
+   With out-of-order execution, single-key atomics through-
+put improves by 191x and reaches the clock frequency bound                                                                     5.1.5 Vector Operation Decoder. To evaluate the effi-
+of 180 Mops. When the atomic operations spread uniformly                                                                    ciency of vector operations in KV-Direct, Table 2 compares
+among multiple keys, the throughput of one-sided RDMA,                                                                      the throughput of atomic vector increment with two alterna-
+two-sided RDMA and KV-Direct without out-of-order execu-                                                                    tive approaches: (1) If each element is stored as a unique
+tion grow linearly with the number of keys, but still far from                                                              key, the bottleneck is the network to transfer the KV oper-
+the optimal throughput of KV-Direct.                                                                                        ations. (2) If the vector is stored as a large opaque value,
+   Figure 13b shows the throughput under the long-tail work-                                                                retrieving the vector to the client also overwhelms the net-
+load. Recall that the pipeline is stalled when a PUT operation                                                              work. Additionally, the two alternatives in Table 2 do not
+finds any in-flight operation with the same key. The long-tail                                                              ensure consistency within the vector. Adding synchronization
+workload has multiple extremely popular keys, so it is likely                                                               would incur further overhead.
+that two operations with the same popular key arrive closely                                                                   KV-Direct client packs KV operations in network packets
+in time. With higher PUT ratio, it is more likely that at least                                                             to mitigate packet header overhead. Figure 15 shows that
+one of the two operations is a PUT, therefore triggering a                                                                  network batching increases network throughput by up to 4x,
+pipeline stall.                                                                                                             while keeping networking latency below 3.5 µs.
+
+
+
+
+                                                                                                                      146
+KV-Direct                                                                                                                                              SOSP ’17, October 28, 2017, Shanghai, China
+
+
+                                 100% GET        50% PUT                                   100% GET        50% PUT                                     GET uniform         PUT uniform                                     GET uniform         PUT uniform
+
+
+
+
+                                                                                                                                                                                         Non−batched Latency (us)
+                                   5% PUT       100% PUT                                     5% PUT       100% PUT                                     GET skewed          PUT skewed                                      GET skewed          PUT skewed
+                     140                                                        180                                                               10                                                                10
+
+
+
+
+                                                                                                                           Batched Latency (us)
+                                                                                160                                                                9                                                                 9
+ Throughput (Mops)
+
+
+
+
+                                                            Throughput (Mops)
+                     120
+                                                                                140                                                                8                                                                 8
+                     100                                                                                                                           7                                                                 7
+                                                                                120
+                     80                                                         100                                                                6                                                                 6
+                                                                                 80
+                                                                                                                                                   5                                                                 5
+                     60                                                                                                                            4                                                                 4
+                                                                                 60                                                                3                                                                 3
+                     40
+                                                                                 40                                                                2                                                                 2
+                     20                                                          20                                                                1                                                                 1
+                      0                                                           0                                                                0                                                                 0
+                       5    10     15    62     126   254                         5   10     15    62     126   254                                     5    15      62      254                                            5    15      62      254
+                                  KV size (B)                                               KV size (B)                                                      KV size (B)                                                         KV size (B)
+                             (a) Uniform.                                              (b) Long-tail.                                                  (a) With batching.                                                (b) Without batching.
+Figure 16: Throughput of KV-Direct under YCSB work-                                                                        Figure 17: Latency of KV-Direct under peak throughput
+load.                                                                                                                      of YCSB workload.
+                                                                                                                           Under long-tail workload, the out-of-order execution engine
+5.2                        System Benchmark                                                                                merges up to ∼15% operations on the most popular keys, and
+   5.2.1 Methodology. Before each benchmark, we tune                                                                       the NIC DRAM has ∼60% cache hit rate under 60% load
+hash index ratio, inline threshold and load dispatch ratio ac-                                                             dispatch ratio, which collectively lead to up to 2x throughput
+cording to the KV size, access pattern and target memory                                                                   as uniform workload. As shown in Table 3, the throughput of
+utilization. Then we generate random KV pairs with a given                                                                 a KV-Direct NIC is on-par with a state-of-the-art KVS server
+size. The key size in a given inline KV size is irrelevant to                                                              with tens of CPU cores.
+the performance of KV-Direct, because the key is padded to
+                                                                                                                             5.2.3 Power efficiency. When the KV-Direct server is at
+the longest possible inline KV size during processing. To
+                                                                                                                           peak throughput, the system power is 121.4 watts (measured
+test inline case, we use KV size that is a multiple of slot size
+                                                                                                                           on the wall). Compared with state-of-the-art KVS systems in
+(when size ≤ 50, i.e. 10 slots). To test non-inline case, we use
+                                                                                                                           Table 3, KV-Direct is 3x more power efficient than other sys-
+KV size that is a power of two minus 2 bytes (for metadata).
+                                                                                                                           tems, being the first general-purpose KVS system to achieve
+As the last step of preparation, we issue PUT operations to
+                                                                                                                           1 million KV operations per watt on commodity servers.
+insert the KV pairs into an idle KVS until 50% memory uti-
+                                                                                                                             When the KV-Direct NIC is unplugged, an idle server
+lization. The performance under other memory utilizations
+                                                                                                                           consumes 87.0 watts power, therefore the combined power
+can be derived from Figure 11.
+                                                                                                                           consumption of programmable NIC, PCIe, host memory and
+   During benchmark, we use an FPGA-based packet genera-
+                                                                                                                           the daemon process on CPU is only 34 watts. The measured
+tor [44] in the same ToR to generate batched KV operations,
+                                                                                                                           power difference is justified since the CPU is almost idle
+send them to the KV server, receive completions and measure
+                                                                                                                           and the server can run other workloads when KV-Direct is
+sustainable throughput and latency. The processing delay of
+                                                                                                                           operating (we use the same criterion for one-sided RDMA,
+the packet generator is pre-calibrated via direct loop-back and
+                                                                                                                           shown at parentheses of Table 3). In this regard, KV-Direct is
+removed from latency measurements. Error bars represent
+                                                                                                                           10x more power efficient than CPU-based systems.
+the 5t h and 95t h percentile.
+                                                                                                                              5.2.4 Latency. Figure 17 shows the latency of KV-Direct
+   5.2.2 Throughput. Figure 16 shows the throughput of
+                                                                                                                           under the peak throughput of YCSB workload. Without net-
+KV-Direct under YCSB uniform and long-tail (skewed Zipf)
+                                                                                                                           work batching, the tail latency ranges from 3∼9 µs depending
+workload. Three factors may be the bottleneck of KV-Direct:
+                                                                                                                           on KV size, operation type and key distribution. PUT has
+clock frequency, network and PCIe/DRAM. For 5B∼15B
+                                                                                                                           higher latency than GET due to additional memory access.
+KVs inlined in the hash index, most GETs require one PCIe/-
+                                                                                                                           Skewed workload has lower latency than uniform due to more
+DRAM access and PUTs require two PCIe/DRAM accesses.
+                                                                                                                           likelihood of being cached in NIC DRAM. Larger KV has
+Such tiny KVs are prevalent in many systems. In PageRank,
+                                                                                                                           higher latency due to additional network and PCIe transmis-
+the KV size for an edge is 8B. In sparse logistic regression,
+                                                                                                                           sion delay. Network batching adds less than 1 µs latency than
+the KV size is typically 8B-16B. For sequencers and locks in
+                                                                                                                           non-batched operations, but significantly improves through-
+distributed systems, the KV size is 8B.
+                                                                                                                           put, which has been evaluated in Figure 15.
+   Under same memory utilization, larger inline KVs have
+lower throughput, due to a higher probability of hash colli-                                                                  5.2.5 Impact on CPU performance. KV-Direct is de-
+sion. 62B and larger KVs are not inlined, so they require an                                                               signed to bypass the server CPU and uses only a portion of
+additional memory access. Long-tail workload has higher                                                                    host memory for KV storage. Therefore, the CPU can still
+throughput than uniform workload and able to reach the clock                                                               run other applications. Our measurements find a minimal
+frequency bound of 180 Mops under read-intensive workload,                                                                 impact on other workloads on the server when a single NIC
+or reach the network throughput bound for ≥62B KV sizes.                                                                   KV-Direct is at peak load. Table 4 quantifies this impact at the
+
+
+
+
+                                                                                                                     147
+SOSP ’17, October 28, 2017, Shanghai, China                                                                                                                               B. Li et al.
+
+  KVS                    Comment                                 Bottleneck                         Tput (Mops)     Power Efficiency (Kops/W)                     Avg Delay (µs)
+                                                                                                    GET PUT                GET           PUT                      GET      PUT
+  Memcached [25]         Traditional                             Core synchronization                  1.5    1.5            ∼5                           ∼5       ∼50           ∼50
+  MemC3 [23]             Traditional                             OS network stack                      4.3    4.3          ∼14                           ∼14       ∼50           ∼50
+  RAMCloud [59]          Kernel bypass                           Dispatch thread                         6      1          ∼20                          ∼3.3          5            14
+  MICA [51]              Kernel bypass, 24 cores, 12 NIC ports   CPU KV processing                    137     135           342                          337         81            81
+  FaRM [18]              One-sided RDMA for GET                  RDMA NIC                                6      3     ∼30 (261)                          ∼15        4.5          ∼10
+  DrTM-KV [72]           One-sided RDMA and HTM                  RDMA NIC                           115.2    14.3   ∼500 (3972)                          ∼60        3.4           6.3
+  HERD’16 [37]           Two-sided RDMA, 12 cores                PCIe                                98.3    ∼60          ∼490                          ∼300          5             5
+  Xilinx’13 [5]          FPGA (with host)                        Network                                13     13           106                          106        3.5           4.5
+  Mega-KV [75]           GPU (4 GiB on-board RAM)                GPU KV processing                    166      80         ∼330                          ∼160       280           280
+  KV-Direct (1 NIC)      Programmable NIC, two Gen3 x8           PCIe & DRAM                         180     114    1487 (5454)                    942 (3454)       4.3           5.4
+  KV-Direct (10 NICs)    Programmable NIC, one Gen3 x8 each      PCIe & DRAM                        1220     610    3417 (4518)                   1708 (2259)       4.3           5.4
+Table 3: Comparison of KV-Direct with other KVS systems under long-tail (skewed Zipf) workload of 10B tiny KVs.
+For metrics not reported in the papers, we emulate the systems using similar hardware and report our approximate
+measurements. For CPU-bypass systems, numbers in parentheses report power difference under peak load and idle.
+
+             KV-Direct status →           Idle        Busy
+
+
+
+
+                                                                              Throughtput (Mops)
+
+
+
+
+                                                                                                                                  Throughtput (Mops)
+                                                                                           100                 cpu-bypass                      100                        cpu-bypass
+                        CPU0-0         82.2 ns      83.5 ns                                                         1 core                                                     1 core
+         Random         CPU0-1        129.3 ns     129.9 ns                                 80                     2 cores                      80                            2 cores
+                                                                                                                   3 cores                                                    3 cores
+         Latency        CPU1-0        122.3 ns     122.2 ns                                 60                     4 cores
+                                                                                                                                                60
+                        CPU1-1         84.2 ns      84.3 ns                                 40                                                  40
+                        CPU0-0      60.3 GB/s    55.8 GB/s                                  20                                                  20
+         Sequential     CPU0-1      25.7 GB/s    25.6 GB/s                                   0      64   128 256 512                             0       64   128 256 512
+         Throughput     CPU1-0      25.5 GB/s    25.9 GB/s                                         Request Payload Size (B)                             Request Payload Size (B)
+                        CPU1-1      60.2 GB/s    60.3 GB/s                                              (a) Read.                                               (b) Write.
+                        32B read    10.53 GB/s   10.46 GB/s                                         Figure 18: Scatter-gather performance.
+          Random        64B read    14.41 GB/s   14.42 GB/s
+         Throughput     32B write    9.01 GB/s    9.04 GB/s
+                        64B write   12.96 GB/s   12.94 GB/s                   in our system. In this case, the TLP head and padding over-
+Table 4: Impact on CPU memory access performance                              head is only 9%, and the DMA engine has enough parallelism
+when KV-Direct is at peak throughput. Measured with                           (64) to saturate the PCIe link with 27 in-flight DMA reads.
+Intel Memory Latency Checker v3.4.                                            To batch the DMA operations on PCIe link, we can leverage
+                                                                              the CPU to perform scatter-gather (Figure 19). First, the NIC
+                                                                              DMAs addresses to a request queue in host memory. The
+peak throughput of KV-Direct. Except for sequential through-                  host CPU polls the request queue, performs random memory
+put of CPU 0 to access its own NUMA memory (the line                          access, put the data in response queue and writes MMIO door-
+marked in bold), the latency and throughput of CPU memory                     bell to the NIC. The NIC then fetches the data from response
+accesses are mostly unaffected. This is because 8 channels of                 queue via DMA.
+host memory can provide far higher random access through-                        Figure 18 shows that CPU-based scatter-gather DMA has
+put than all CPU cores could consume, while the CPU can                       up to 79% throughput improvement compared to the CPU-
+indeed stress the sequential throughput of the DRAM chan-                     bypassing approach. In addition to the CPU overhead, the
+nels. The impact of the host daemon process is minimal                        primary drawback of CPU-based scatter-gather is the addi-
+when the distribution of KV sizes is relatively stable, because               tional latency. To save MMIOs from the CPU to the NIC, we
+the garbage collector is invoked only when the number of                      batch 256 DMA operations per doorbell, which requires 10 µs
+available slots for different slab sizes are imbalanced.                      to complete. The overall latency for the NIC to access host
+                                                                              memory using CPU-based scatter-gather is ∼20 µs, almost
+                                                                              20x higher than direct DMA.
+6 EXTENSIONS
+6.1 CPU-based Scatter-Gather DMA                                              6.2                  Multiple NICs per Server
+PCIe has 29% TLP header and padding overhead for 64B                          In some cases, it may be desirable to build a dedicated key-
+DMA operations (§2.4) and the DMA engine may not have                         value store with maximal throughput per server. Through
+enough parallelism to saturate the PCIe bandwidth-delay prod-                 simulation, [47] showed the possibility of achieving a billion
+uct with small TLPs (§4). Larger DMA operations with up to                    KV op/s in a single server with four (currently unavailable)
+256-byte TLP payload is supported by the PCIe root complex                    60-core CPUs. As shown in Table 3, with 10 KV-Direct NICs
+
+
+
+
+                                                                       148
+KV-Direct                                                                                                SOSP ’17, October 28, 2017, Shanghai, China
+
+                                                                                                               1/1024    1/256   1/64   1/16    1/4      1
+                                                              GET           PUT                          1/2      1.36    1.39   1.40   1.37   1.19   1.02
+
+
+
+
+                                 Throughtput (MOps)
+                                                 1400                                                    1        1.71    1.77   1.81   1.79   1.57   1.01
+                                                 1200
+                                                 1000                                                    2        2.40    2.52   2.62   2.62   2.33   1.52
+                                                  800
+                                                  600                                                    4        3.99    4.02   4.22   4.27   3.83   2.52
+                                                  400                                                    8        7.99    7.97   7.87   7.56   6.83   4.52
+                                                  200
+                                                    00        2      4      6    8   10         Table 6: Relative throughput of load dispatch compared
+                                                                  Number of NICs
+                                                                                                to simple partitioning. Column titles are same as Table 5.
+Figure 19: Scatter-gather Figure 20: Performance of
+architecture.             multiple NICs per server.                                             still shows performance gain over the simple design of parti-
+             1/1024   1/256    1/64                    1/16         1/4       1                 tioning the keys uniformly according to NIC and host memory
+       1/2    0.366   0.358   0.350                   0.342       0.335   0.327                 capacity. Table 5 shows the optimal load dispatch ratio for
+       1      0.583   0.562   0.543                   0.525       0.508   0.492                 long-tail workload with a corpus of 1 billion keys, under
+       2      0.830   0.789   0.752                   0.718       0.687   0.658                 different ratio of NIC DRAM and PCIe throughput and dif-
+       4          1   0.991   0.933                   0.881       0.835   0.793
+                                                                                                ferent ratio of NIC and host memory size. If a NIC has faster
+       8          1       1       1                   0.995       0.937   0.885
+                                                                                                DRAM, more load will be dispatched to the NIC. A load
+Table 5: Optimal load dispatch ratio for long-tail work-
+                                                                                                dispatch ratio of 1 means the NIC memory behaves exactly
+load under different NIC DRAM/PCIe throughput ratio
+                                                                                                like a cache of host memory. If a NIC has larger DRAM, a
+(vertical) and NIC/host memory size ratio (horizontal).
+                                                                                                slightly less portion of load will be dispatched to the NIC. As
+on a server, the one billion KV op/s performance is readily                                     shown in Table 6, even when the size of NIC DRAM is a tiny
+achievable with a commodity server. The KV-Direct server                                        fraction of host memory, the throughput gain is significant.
+consumes 357 watts power (measured on the wall) to achieve                                         The hash table and slab allocator design (Sec. 3.3.1) is
+1.22 Gop/s GET or 0.61 Gop/s PUT.                                                               generally applicable to hash-based storage systems that need
+   In order to saturate the 80 PCIe Gen3 lanes of two Xeon E5                                   to be frugal of random accesses for both lookup and insertion.
+CPUs, we replace the motherboard of the benchmarked server                                         The out-of-order execution engine (Sec. 3.3.3) can be ap-
+(Sec. 5) with a SuperMicro X9DRX+-F motherboard with                                            plied to all kinds of applications in need of latency hiding,
+10 PCIe Gen3 x8 slots. We use PCIe x16 to x8 converters                                         and we hope future RDMA NICs to support that for atomics.
+to connect 10 programmable NICs on each of the slots, and                                          In 40 Gbps networks, network bandwidth bounds non-
+only one PCIe Gen3 x8 link is enabled on each NIC, so the                                       batched KV throughput, so we use client-side batching (Sec.4).
+throughput per NIC is lower than Figure 16. Each NIC owns                                       With higher network bandwidth, batch size can be reduced,
+an exclusive memory region in host memory and serves a                                          thus reducing latency. In a 200 Gbps network, a KV-Direct
+disjoint partition of keys. Multiple NICs suffer the same                                       NIC could achieve 180 Mop/s without batching.
+load imbalance problem as a multi-core KVS implementation.                                         KV-Direct leverages widely-deployed programmable NICs
+Fortunately, for a small number of partitions (e.g. 10), the                                    with FPGAs [10, 64]. FlexNIC [40, 41] is another promising
+load imbalance is not significant [47, 51]. Under YCSB long-                                    architecture for programmable NICs with Reconfigurable
+tail workload, the highest-loaded NIC has 1.5x load of the                                      Match-action Tables (RMT) [8]. NetCache [35] implements
+average, and the added load from extremely popular keys                                         a KV cache in RMT-based programmable switches, showing
+is served by the out-of-order execution engine (Sec. 3.3.3).                                    potential for building KV-Direct in an RMT-based NIC.
+Figure 20 shows that KV-Direct throughput scales almost                                            6.3.2 Implications for real-world applications. Back-
+linearly with the number of NICs on a server.                                                   of-the-envelope calculations show potential performance gains
+                                                                                                when KV-Direct is applied in end-to-end applications. In
+6.3    Discussion                                                                               PageRank [61], because each edge traversal can be imple-
+   6.3.1 NIC hardware with different capacity. The goal                                         mented with one KV operation, KV-Direct supports 1.22G
+of KV-Direct is to leverage existing hardware in data centers                                   TEPS on a server with 10 programmable NICs. In compari-
+to offload an important workload (KV access), instead of                                        son, GRAM [73] supports 250M TEPS per server, bound by
+designing a special hardware to achieve maximal KVS perfor-                                     interleaved computation and random memory access.
+mance. We use programmable NICs, which usually contain                                             KV-Direct supports user-defined functions and vector op-
+limited amount of DRAM for buffering and connection-state                                       erations (Table 1) that can further optimize PageRank by
+tracking. Large DRAMs are expensive in both die size and                                        offloading client computation to hardware. Similar arguments
+power consumption.                                                                              hold for parameter server [46]. We expect future work to
+   Even if future NICs have faster or larger on-board memory,                                   leverage hardware-accelerated key-value stores to improve
+under long-tail workload, our load dispatch design (Sec. 3.3.4)                                 distributed application performance.
+
+
+
+
+                                                                                          149
+SOSP ’17, October 28, 2017, Shanghai, China                                                                                          B. Li et al.
+
+7   RELATED WORK                                                         making our FPGA-based key-value store system general and
+As an important infrastructure, the research and development             capable of large-scale deployment. Furthermore, our careful
+of distributed key-value store systems have been driven by               hardware and software co-design, together with optimizations
+performance. A large body of distributed KVS are based                   for PCIe and networking push the performance to the physical
+on CPU. To reduce the computation cost, Masstree [53],                   limitation, advancing state-of-art solutions.
+MemC3 [23] and libcuckoo [48] optimize locking, caching,                    Secondary index is an important feature to retrieve data by
+hashing and memory allocation algorithms, while KV-Direct                keys other than the primary key in data storage system [20,
+comes with a new hash table and memory management mech-                  42]. SLIK [42] supports multiple secondary keys using a
+anism specially designed for FPGA to minimize the PCIe                   B+ tree algorithm in key-value store system. It would be
+traffic. MICA [51] partitions the hash table to each core thus           interesting to explore how to support secondary index to
+completely avoids synchronization. This approach, however,               help KV-Direct step towards a general data storage system.
+introduces core imbalance for skewed workloads.                          SwitchKV [49] leverages content-based routing to route re-
+   To get rid of the OS kernel overhead, [31, 65] directly poll          quests to backend nodes based on cached keys, and Net-
+network packets from NIC and [34, 54] process them with                  Cache [35] takes a further step to cache KV in the switches.
+the user space lightweight network stack. Key-value store                Such load balancing and caching will also benefit our system.
+systems [39, 47, 51, 58, 59] benefit from such optimizations             Eris [45] leverages network sequencers to achieve efficient
+for high performance. As a further step towards this direction,          distributed transactions, which may give a new life to the
+recent works [1, 36, 36, 37, 37] leverage the hardware-based             one-sided RDMA approach with client synchronization.
+network stack of RDMA NIC, using two-sided RDMA as an
+RPC mechanism between KVS client and server to further                   8    CONCLUSION
+improve per-core throughput and reduce latency. Still, these             In this paper, we describe the design and evaluation of KV-
+systems are CPU bound (§2.2).                                            Direct, a high performance in-memory key-value store. Fol-
+   Another different approach is to leverage one-sided RDMA.             lowing a long history in computer system design, KV-Direct
+Pilaf [55] and FaRM [18] adopt one-sided RDMA read for                   is another exercise in leveraging reconfigurable hardware to
+GET operation and FaRM achieves throughput that saturates                accelerate an important workload. KV-Direct is able to obtain
+the network. Nessie [70], DrTM [72], DrTM+R [13] and                     superior performance by carefully co-designing hardware and
+FaSST [38] leverage distributed transactions to implement                software in order to remove bottlenecks in the system and
+both GET and PUT with one-sided RDMA. However, the                       achieve performance that is close to the physical limits of the
+performance of PUT operation suffer from unavoidable syn-                underlying hardware.
+chronization overhead for consistency guarantee, limited by                 After years of broken promises, FPGA-based reconfig-
+RDMA primitives [37]. Moreover, client-side CPU is in-                   urable hardware finally becomes widely available in main
+volved in KV processing, limiting per-core throughput to                 stream data centers. Many significant workloads will be scru-
+∼10 Mops on the client side. In contrast, KV-Direct extends              tinized to see whether they can benefit from reconfigurable
+the RDMA primitives to key-value operations while guaran-                hardware, and we expect much more fruitful work in this
+tees the consistency in server side, leaving the KVS client              general direction.
+totally transparent while achieving high throughput and low
+latency even for PUT operation.
+   As a flexible and customizable hardware, FPGA is now
+                                                                         ACKNOWLEDGEMENTS
+widely deployed in datacenter-scale [10, 64] and greatly im-             We would like to thank Kun Tan, Ningyi Xu, Ming Wu, Jian-
+proved for programmability [4, 44]. Several early works have             song Zhang and Anuj Kalia for all technical discussions and
+explored building KVS on FPGA. But some of them are not                  valuable comments. We’d also like to thank the whole Cata-
+practical by limiting the data storage in on-chip (about several         pult v-team at Microsoft for support on the FPGA platform.
+MB memory) [50] or on-board DRAM (typically 8GB mem-                     We thank our shepherd, Simon Peter, and other anonymous
+ory) [11, 32, 33]. [6] focuses on improving system capacity              reviewers for their valuable feedback and comments.
+rather than throughput, and adopts SSD as the secondary stor-
+age out of on-board DRAM. [11, 50] limit their usage in fixed            REFERENCES
+size key-value pairs, which can only work for the special pur-            [1] 2000. InfiniBand Architecture Specification: Release 1.0. InfiniBand
+pose rather than a general key-value store. [5, 43] uses host                 Trade Association.
+DRAM to store the hash table, and [71] uses NIC DRAM as                   [2] 2017. Altera SDK for OpenCL. (2017). http://www.altera.com/.
+                                                                          [3] Berk Atikoglu, Yuehai Xu, Eitan Frachtenberg, Song Jiang, and Mike
+a cache of host DRAM, but they did not optimize for network
+                                                                              Paleczny. 2012. Workload analysis of a large-scale key-value store. In
+and PCIe DMA bandwidth, resulting in poor performance.                        ACM SIGMETRICS Performance Evaluation Review, Vol. 40. ACM,
+KV-Direct fully utilizes both NIC DRAM and host DRAM,                         53–64.
+
+
+
+
+                                                                   150
+KV-Direct                                                                                    SOSP ’17, October 28, 2017, Shanghai, China
+
+ [4] David F Bacon, Rodric Rabbah, and Sunil Shukla. 2013. FPGA pro-                    scaling. In Computer Architecture (ISCA), 2011 38th Annual Interna-
+     gramming for the masses. Commun. ACM 56, 4 (2013), 56–63.                          tional Symposium on. IEEE, 365–376.
+ [5] Michaela Blott, Kimon Karras, Ling Liu, Kees Vissers, Jeremia Bär,           [22] Hadi Esmaeilzadeh, Emily Blem, Renée St Amant, Karthikeyan Sankar-
+     and Zsolt István. 2013. Achieving 10Gbps Line-rate Key-value Stores               alingam, and Doug Burger. 2013. Power challenges may end the
+     with FPGAs. In The 5th USENIX Workshop on Hot Topics in Cloud                      multicore era. Commun. ACM 56, 2 (2013), 93–102.
+     Computing. USENIX, San Jose, CA.                                              [23] Bin Fan, David G Andersen, and Michael Kaminsky. 2013. MemC3:
+ [6] Michaela Blott, Ling Liu, Kimon Karras, and Kees A Vissers. 2015.                  Compact and concurrent memcache with dumber caching and smarter
+     Scaling Out to a Single-Node 80Gbps Memcached Server with 40Ter-                   hashing. In NSDI ’13. 371–384.
+     abytes of Memory.. In HotStorage ’15.                                         [24] Daniel Firestone. 2017. VFP: A Virtual Switch Platform for Host SDN
+ [7] Jeff Bonwick and others. 1994. The Slab Allocator: An Object-Caching               in the Public Cloud. In NSDI ’17. Boston, MA, 315–328.
+     Kernel Memory Allocator.. In USENIX summer, Vol. 16. Boston, MA,              [25] Brad Fitzpatrick. 2004. Distributed caching with memcached. Linux
+     USA.                                                                               journal 2004, 124 (2004), 5.
+ [8] Pat Bosshart, Glen Gibb, Hun-Seok Kim, George Varghese, Nick McK-             [26] Kourosh Gharachorloo, Anoop Gupta, and John Hennessy. 1992. Hid-
+     eown, Martin Izzard, Fernando Mujica, and Mark Horowitz. 2013. For-                ing memory latency using dynamic scheduling in shared-memory mul-
+     warding metamorphosis: Fast programmable match-action processing                   tiprocessors. Vol. 20. ACM.
+     in hardware for SDN. In ACM SIGCOMM Computer Communication                    [27] Albert Greenberg. 2015. SDN for the Cloud. In Keynote in the 2015
+     Review, Vol. 43. ACM, 99–110.                                                      ACM Conference on Special Interest Group on Data Communication.
+ [9] Alex D Breslow, Dong Ping Zhang, Joseph L Greathouse, Nuwan                   [28] Sangjin Han, Keon Jang, KyoungSoo Park, and Sue Moon. 2010.
+     Jayasena, and Dean M Tullsen. 2016. Horton tables: fast hash tables                PacketShader: a GPU-accelerated software router. In ACM SIGCOMM
+     for in-memory data-intensive computing. In USENIX ATC ’16.                         Computer Communication Review, Vol. 40. ACM, 195–206.
+[10] Adrian M Caulfield, Eric S Chung, Andrew Putnam, Hari Angepat,                [29] Maurice Herlihy, Nir Shavit, and Moran Tzafrir. 2008. Hopscotch hash-
+     Jeremy Fowers, Michael Haselman, Stephen Heil, Matt Humphrey,                      ing. In International Symposium on Distributed Computing. Springer,
+     Puneet Kaur, Joo-Young Kim, and others. 2016. A cloud-scale acceler-               350–364.
+     ation architecture. In Microarchitecture (MICRO), 2016 49th Annual            [30] Muhuan Huang, Di Wu, Cody Hao Yu, Zhenman Fang, Matteo In-
+     IEEE/ACM International Symposium on. IEEE, 1–13.                                   terlandi, Tyson Condie, and Jason Cong. 2016. Programming and
+[11] Sai Rahul Chalamalasetti, Kevin Lim, Mitch Wright, Alvin AuYoung,                  Runtime Support to Blaze FPGA Accelerator Deployment at Datacen-
+     Parthasarathy Ranganathan, and Martin Margala. 2013. An FPGA                       ter Scale. In Proceedings of the Seventh ACM Symposium on Cloud
+     memcached appliance. In Proceedings of the ACM/SIGDA interna-                      Computing (SoCC ’16). ACM, New York, NY, USA, 456–469.
+     tional symposium on Field programmable gate arrays (FPGA). ACM,               [31] DPDK Intel. 2014. Data plane development kit. (2014).
+     245–254.                                                                      [32] Zsolt István, Gustavo Alonso, Michaela Blott, and Kees Vissers. 2013.
+[12] Fay Chang, Jeffrey Dean, Sanjay Ghemawat, Wilson C Hsieh, Debo-                    A flexible hash table design for 10gbps key-value stores on fpgas.
+     rah A Wallach, Mike Burrows, Tushar Chandra, Andrew Fikes, and                     In 23rd International Conference on Field programmable Logic and
+     Robert E Gruber. 2008. Bigtable: A distributed storage system for                  Applications. IEEE, 1–8.
+     structured data. ACM Transactions on Computer Systems (TOCS) 26,              [33] Zsolt István, Gustavo Alonso, Michaela Blott, and Kees Vissers. 2015.
+     2 (2008), 4.                                                                       A hash table for line-rate data processing. ACM Transactions on
+[13] Yanzhe Chen, Xingda Wei, Jiaxin Shi, Rong Chen, and Haibo Chen.                    Reconfigurable Technology and Systems (TRETS) 8, 2 (2015), 13.
+     2016. Fast and general distributed transactions using RDMA and HTM.           [34] EunYoung Jeong, Shinae Woo, Muhammad Asim Jamshed, Haewon
+     In Eurosys ’16. ACM.                                                               Jeong, Sunghwan Ihm, Dongsu Han, and KyoungSoo Park. 2014.
+[14] Jason Cong, Muhuan Huang, Di Wu, and Cody Hao Yu. 2016. Invited -                  mTCP: a Highly Scalable User-level TCP Stack for Multicore Sys-
+     Heterogeneous Datacenters: Options and Opportunities. In Proceedings               tems.. In NSDI ’14. 489–502.
+     of the 53rd Annual Design Automation Conference (DAC ’16). ACM,               [35] Xin Jin, Xiaozhou Li, Haoyu Zhang, Robert Soule, Jeongkeun Lee,
+     New York, NY, USA, Article 16, 16:1–16:6 pages.                                    Nate Foster, Changhoon Kim, and Ion Stoica. 2017. NetCache: Bal-
+[15] Brian F Cooper, Adam Silberstein, Erwin Tam, Raghu Ramakrishnan,                   ancing Key-Value Stores with Fast In-Network Caching. In SOSP ’17.
+     and Russell Sears. 2010. Benchmarking cloud serving systems with              [36] Anuj Kalia, Michael Kaminsky, and David G Andersen. 2014. Us-
+     YCSB. In Proceedings of the 1st ACM symposium on Cloud computing.                  ing RDMA efficiently for key-value services. In ACM SIGCOMM
+     ACM, 143–154.                                                                      Computer Communication Review, Vol. 44. ACM, 295–306.
+[16] TPC Council. 2010. tpc-c benchmark, revision 5.11. (2010).                    [37] Anuj Kalia, Michael Kaminsky, and David G Andersen. 2016. De-
+[17] Giuseppe DeCandia, Deniz Hastorun, Madan Jampani, Gunavardhan                      sign Guidelines for High Performance RDMA Systems. In USENIX
+     Kakulapati, Avinash Lakshman, Alex Pilchin, Swaminathan Sivasubra-                 ATC ’16.
+     manian, Peter Vosshall, and Werner Vogels. 2007. Dynamo: amazon’s             [38] Anuj Kalia, Michael Kaminsky, and David G Andersen. 2016. FaSST:
+     highly available key-value store. ACM SIGOPS Operating Systems                     fast, scalable and simple distributed transactions with two-sided RDMA
+     Review 41, 6 (2007), 205–220.                                                      datagram RPCs. In OSDI ’16. 185–201.
+[18] Aleksandar Dragojević, Dushyanth Narayanan, Miguel Castro, and               [39] Rishi Kapoor, George Porter, Malveeka Tewari, Geoffrey M Voelker,
+     Orion Hodson. 2014. FaRM: fast remote memory. In NSDI ’14.                         and Amin Vahdat. 2012. Chronos: predictable low latency for data
+[19] TV Eicken, David E Culler, Seth Copen Goldstein, and Klaus Erik                    center applications. In Proceedings of the Third ACM Symposium on
+     Schauser. 1992. Active messages: a mechanism for integrated commu-                 Cloud Computing. ACM, 9.
+     nication and computation. In Computer Architecture, 1992. Proceed-            [40] Antoine Kaufmann, Simon Peter, Thomas E Anderson, and Arvind
+     ings., The 19th Annual International Symposium on. IEEE, 256–266.                  Krishnamurthy. 2015. FlexNIC: Rethinking Network DMA.. In Ho-
+[20] Robert Escriva, Bernard Wong, and Emin Gün Sirer. 2012. HyperDex:                 tOS ’15.
+     A distributed, searchable key-value store. ACM SIGCOMM Computer               [41] Antoine Kaufmann, Simon Peter, Navven Kumar Sharma, and Thomas
+     Communication Review 42, 4 (2012), 25–36.                                          Anderson. 2016. High Performance Packet Processing with FlexNIC.
+[21] Hadi Esmaeilzadeh, Emily Blem, Renee St Amant, Karthikeyan Sankar-                 In Proceedings of the 21th International Conference on Architectural
+     alingam, and Doug Burger. 2011. Dark silicon and the end of multicore
+
+
+
+
+                                                                             151
+SOSP ’17, October 28, 2017, Shanghai, China                                                                                                        B. Li et al.
+
+     Support for Programming Languages and Operating Systems.                         [60] Jian Ouyang, Shiding Lin, Wei Qi, Yong Wang, Bo Yu, and Song Jiang.
+[42] Ankita Kejriwal, Arjun Gopalan, Ashish Gupta, Zhihao Jia, Stephen                     2014. SDA: Software-defined accelerator for large-scale DNN systems.
+     Yang, and John Ousterhout. 2016. SLIK: Scalable low-latency indexes                   2014 IEEE Hot Chips 26 Symposium (HCS) 00 (2014), 1–23.
+     for a key-value store. In USENIX ATC ’16.                                        [61] Lawrence Page, Sergey Brin, Rajeev Motwani, and Terry Winograd.
+[43] Maysam Lavasani, Hari Angepat, and Derek Chiou. 2014. An FPGA-                        1999. The PageRank citation ranking: Bringing order to the web.
+     based in-line accelerator for Memcached. IEEE Computer Architecture                   Technical Report. Stanford InfoLab.
+     Letters 13, 2 (2014), 57–60.                                                     [62] Rasmus Pagh and Flemming Friche Rodler. 2004. Cuckoo hashing.
+[44] Bojie Li, Kun Tan, Layong Larry Luo, Yanqing Peng, Renqian Luo,                       Journal of Algorithms 51, 2 (2004), 122–144.
+     Ningyi Xu, Yongqiang Xiong, Peng Cheng, and Enhong Chen. 2016.                   [63] Jonathan Perry, Amy Ousterhout, Hari Balakrishnan, Devavrat Shah,
+     ClickNP: Highly flexible and High-performance Network Processing                      and Hans Fugal. 2014. Fastpass: A centralized zero-queue datacen-
+     with Reconfigurable Hardware. In SIGCOMM ’16. ACM, 1–14.                              ter network. In ACM SIGCOMM Computer Communication Review,
+[45] Jialin Li, Ellis Michael, and Dan R. K. Ports. 2017. Eris: Coordination-              Vol. 44. ACM, 307–318.
+     Free Consistent Transactions Using In-Network Concurrency Control.               [64] Andrew Putnam, Adrian M Caulfield, Eric S Chung, Derek Chiou,
+     In SOSP ’17.                                                                          Kypros Constantinides, John Demme, Hadi Esmaeilzadeh, Jeremy
+[46] Mu Li, David G Andersen, and Jun Woo Park. 2014. Scaling Dis-                         Fowers, Gopi Prashanth Gopal, Jan Gray, and others. 2014. A reconfig-
+     tributed Machine Learning with the Parameter Server.                                  urable fabric for accelerating large-scale datacenter services. In 2014
+[47] Sheng Li, Hyeontaek Lim, Victor W Lee, Jung Ho Ahn, Anuj Kalia,                       ACM/IEEE 41st International Symposium on Computer Architecture
+     Michael Kaminsky, David G Andersen, Sukhan Lee, Pradeep Dubey,                        (ISCA). IEEE, 13–24.
+     and others. 2016. Full-Stack Architecting to Achieve a Billion Requests          [65] Luigi Rizzo. 2012. Netmap: a novel framework for fast packet I/O. In
+     Per Second Throughput on a Single Key-Value Store Server Platform.                    21st USENIX Security Symposium (USENIX Security 12). 101–112.
+     ACM Transactions on Computer Systems (TOCS) 34, 2 (2016), 5.                     [66] Nadathur Satish, Changkyu Kim, Jatin Chhugani, Anthony D Nguyen,
+[48] Xiaozhou Li, David G Andersen, Michael Kaminsky, and Michael J                        Victor W Lee, Daehyun Kim, and Pradeep Dubey. 2010. Fast sort
+     Freedman. 2014. Algorithmic improvements for fast concurrent cuckoo                   on CPUs and GPUs: a case for bandwidth oblivious SIMD sort. In
+     hashing. In Eurosys ’14. ACM, 27.                                                     Proceedings of the 2010 ACM SIGMOD International Conference on
+[49] Xiaozhou Li, Raghav Sethi, Michael Kaminsky, David G Andersen,                        Management of data. ACM, 351–362.
+     and Michael J Freedman. 2016. Be fast, cheap and in control with                 [67] Bin Shao, Haixun Wang, and Yatao Li. 2013. Trinity: A distributed
+     SwitchKV. In NSDI ’16.                                                                graph engine on a memory cloud. In Proceedings of the 2013 ACM
+[50] Wei Liang, Wenbo Yin, Ping Kang, and Lingli Wang. 2016. Mem-                          SIGMOD International Conference on Management of Data. ACM,
+     ory efficient and high performance key-value store on FPGA using                      505–516.
+     Cuckoo hashing. In 2016 26th International Conference on Field Pro-              [68] Anirudh Sivaraman, Alvin Cheung, Mihai Budiu, Changhoon Kim, Mo-
+     grammable Logic and Applications (FPL). 1–4.                                          hammad Alizadeh, Hari Balakrishnan, George Varghese, Nick McKe-
+[51] Hyeontaek Lim, Dongsu Han, David G Andersen, and Michael Kamin-                       own, and Steve Licking. 2016. Packet transactions: High-level program-
+     sky. 2014. MICA: a holistic approach to fast in-memory key-value                      ming for line-rate switches. In Proceedings of the ACM SIGCOMM
+     storage. In NSDI ’14. 429–444.                                                        2016 Conference. ACM, 15–28.
+[52] Xiaoyu Ma, Dan Zhang, and Derek Chiou. 2017. FPGA-Accelerated                    [69] Herb Sutter. 2005. The free lunch is over: A fundamental turn toward
+     Transactional Execution of Graph Workloads. In Proceedings of the                     concurrency in software. Dr. Dobbs journal 30, 3 (2005), 202–210.
+     2017 ACM/SIGDA International Symposium on Field-Programmable                     [70] Tyler Szepesi, Bernard Wong, Ben Cassell, and Tim Brecht. 2014.
+     Gate Arrays, FPGA 2017, Monterey, CA, USA, February 22-24, 2017,                      Designing a low-latency cuckoo hash table for write-intensive work-
+     Jonathan W. Greene and Jason Helge Anderson (Eds.). ACM, 227–236.                     loads using RDMA. In First International Workshop on Rack-scale
+[53] Yandong Mao, Eddie Kohler, and Robert Tappan Morris. 2012. Cache                      Computing.
+     craftiness for fast multicore key-value storage. In Proceedings of the           [71] Yuta Tokusashi and Hiroki Matsutani. 2016. A multilevel NOSQL
+     7th ACM european conference on Computer Systems. ACM, 183–196.                        cache design combining In-NIC and In-Kernel caches. In High-
+[54] Ilias Marinos, Robert NM Watson, and Mark Handley. 2014. Network                      Performance Interconnects (HOTI ’16). IEEE, 60–67.
+     stack specialization for performance. In ACM SIGCOMM Computer                    [72] Xingda Wei, Jiaxin Shi, Yanzhe Chen, Rong Chen, and Haibo Chen.
+     Communication Review, Vol. 44. ACM, 175–186.                                          2015. Fast in-memory transaction processing using RDMA and HTM.
+[55] Christopher Mitchell, Yifeng Geng, and Jinyang Li. 2013. Using One-                   In SOSP ’15. ACM, 87–104.
+     Sided RDMA Reads to Build a Fast, CPU-Efficient Key-Value Store.                 [73] Ming Wu, Fan Yang, Jilong Xue, Wencong Xiao, Youshan Miao, Lan
+     In USENIX ATC ’13. 103–114.                                                           Wei, Haoxiang Lin, Yafei Dai, and Lidong Zhou. 2015. GraM: scaling
+[56] Neha Narula, Cody Cutler, Eddie Kohler, and Robert Morris. 2014.                      graph computation to the trillions. In Proceedings of the Sixth ACM
+     Phase Reconciliation for Contended In-Memory Transactions.. In                        Symposium on Cloud Computing. ACM, 408–421.
+     OSDI ’14, Vol. 14. 511–524.                                                      [74] Wencong Xiao, Jilong Xue, Youshan Miao, Zhen Li, Cheng Chen,
+[57] Rajesh Nishtala, Hans Fugal, Steven Grimm, Marc Kwiatkowski, Her-                     Ming Wu, Wei Li, and Lidong Zhou. 2017. TuX2: Distributed Graph
+     man Lee, Harry C Li, Ryan McElroy, Mike Paleczny, Daniel Peek, Paul                   Computation for Machine Learning. In NSDI ’17.
+     Saab, and others. 2013. Scaling memcache at facebook. In NSDI ’13.               [75] Kai Zhang, Kaibo Wang, Yuan Yuan, Lei Guo, Rubao Lee, and Xi-
+[58] John Ousterhout, Parag Agrawal, David Erickson, Christos Kozyrakis,                   aodong Zhang. 2015. Mega-KV: a case for GPUs to maximize the
+     Jacob Leverich, David Mazières, Subhasish Mitra, Aravind Narayanan,                  throughput of in-memory key-value stores. Proceedings of the VLDB
+     Guru Parulkar, Mendel Rosenblum, and others. 2010. The case for                       Endowment 8, 11 (2015), 1226–1237.
+     RAMClouds: scalable high-performance storage entirely in DRAM.                   [76] Yibo Zhu, Nanxi Kang, Jiaxin Cao, Albert Greenberg, Guohan Lu,
+     ACM SIGOPS Operating Systems Review 43, 4 (2010), 92–105.                             Ratul Mahajan, Dave Maltz, Lihua Yuan, Ming Zhang, Ben Y Zhao,
+[59] John Ousterhout, Arjun Gopalan, Ashish Gupta, Ankita Kejriwal,                        and others. 2015. Packet-level telemetry in large datacenter networks.
+     Collin Lee, Behnam Montazeri, Diego Ongaro, Seo Jin Park, Henry                       In ACM SIGCOMM Computer Communication Review, Vol. 45. ACM,
+     Qin, Mendel Rosenblum, and others. 2015. The ramcloud storage sys-                    479–491.
+     tem. ACM Transactions on Computer Systems (TOCS) 33, 3 (2015).
+
+
+
+
+                                                                                152
+

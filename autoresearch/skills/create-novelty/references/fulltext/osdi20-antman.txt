@@ -1,0 +1,1152 @@
+AntMan: Dynamic Scaling on GPU Clusters
+          for Deep Learning
+ Wencong Xiao, Shiru Ren, Yong Li, Yang Zhang, Pengyang Hou, Zhi Li,
+       Yihui Feng, Wei Lin, and Yangqing Jia, Alibaba Group
+         https://www.usenix.org/conference/osdi20/presentation/xiao
+
+
+
+
+    This paper is included in the Proceedings of the
+    14th USENIX Symposium on Operating Systems
+             Design and Implementation
+                          November 4–6, 2020
+                             978-1-939133-19-9
+
+
+
+                                    Open access to the Proceedings of the
+                                    14th USENIX Symposium on Operating
+                                     Systems Design and Implementation
+                                           is sponsored by USENIX
+                  AntMan: Dynamic Scaling on GPU Clusters for Deep Learning
+
+                        Wencong Xiao, Shiru Ren∗ , Yong Li, Yang Zhang, Pengyang Hou,
+                                  Zhi Li, Yihui Feng, Wei Lin, Yangqing Jia
+
+                                                       Alibaba Group
+
+
+
+                         Abstract                                DL-production training jobs cannot fully utilize all the GPU
+Efficiently scheduling deep learning jobs on large-scale GPU     resources throughout their execution. Training a DL model
+clusters is crucial for job performance, system throughput,      often requires a mixture of computations, some of which can
+and hardware utilization. It is getting ever more challeng-      hardly be parallelized using GPU, such as graph sampling
+ing as deep learning workloads become more complex. This         in graph neural network [21, 54], feature extraction in adver-
+paper presents AntMan, a deep learning infrastructure that       tisement [15, 23], data augmentation in computer vision [56],
+co-designs cluster schedulers with deep learning frameworks      etc. Besides, when scaled to distributed training, 90% of the
+and has been deployed in production at Alibaba to manage         time can be spent on networking [32]. Secondly, the common
+tens of thousands of daily deep learning jobs across thousands   reservation-based approach for cluster scheduling results in
+of GPUs. AntMan accommodates the fluctuating resource de-        significant GPU idling because DL jobs often cannot consume
+mands of deep learning training jobs. As such, it utilizes the   partial resources. For example, stochastic gradient descent
+spare GPU resources to co-execute multiple jobs on a shared      (SGD) is synchronous and requires all resources to be avail-
+GPU. AntMan exploits unique characteristics of deep learn-       able simultaneously for gang-scheduling [27]. The cluster
+ing training to introduce dynamic scaling mechanisms for         scheduler thus forces partially available resources to idle in
+memory and computation within the deep learning frame-           reserve until the final request is satisfied.
+works. This allows fine-grained coordination between jobs            Packing jobs on shared GPUs can boost GPU utilization
+and prevents job interference. Evaluations show that AntMan      and make the same cluster accomplish more jobs overall.
+improves the overall GPU memory utilization by 42% and           However, this approach is rarely used in production clusters.
+computation utilization by 34% in our multi-tenant cluster       The reason is that although improving GPU utilization is bene-
+without compromising fairness, presenting a new approach         ficial, it is also critical to guarantee the performance of impor-
+to efficiently utilizing GPUs at scale.                          tant resource-guarantee jobs (i.e., jobs with resource quota).
+                                                                 Co-executing multiple jobs on the same GPU can result in in-
+                                                                 terference, which leads to significant performance slowdown
+1    Introduction                                                of the resource guarantee jobs [48]. What’s more, the job pack-
+                                                                 ing strategy can introduce memory contention on concurrent
+Over the past years we have witnessed the great success of       jobs, which could even cause the failure of the training jobs
+Deep Learning (DL) with GPUs. DL already powers several          if the resource demands of a job abruptly increase. Therefore,
+widely-used products today, spreading across fields including    it is typical in existing production GPU clusters to perform
+computer vision, language understanding, speech recognition,     exclusive allocation of resources on jobs [27].
+recommendation, advertisement, etc. Therefore, it has become
+                                                                     We present AntMan, a DL system that improves GPU clus-
+a vital workload integrated into the production pipeline at
+                                                                 ter utilization while ensuring fairness and performance of
+scale. Large companies often build multi-tenant GPU clus-
+                                                                 resource-guaranteed jobs by doing cooperative resource scal-
+ters for DL workloads, similar to shared clusters for big-data
+                                                                 ing to minimize job interference. New mechanisms are intro-
+analytics.
+                                                                 duced in DL frameworks to allocate the exact required amount
+   At Alibaba, we have observed low utilization of GPU
+                                                                 of GPU memory and computation unit dynamically during
+hardware in shared multi-tenant DL clusters, while queu-
+                                                                 the job training. Any spare GPU resources, including GPU
+ing many jobs waiting for resources. Such low utilization
+                                                                 memory and compute cycles, could be leveraged by over-
+of DL cluster arises from two main aspects. Firstly, most
+                                                                 subscription jobs. AntMan co-designs the cluster scheduler
+    ∗ Co-first author                                            and DL frameworks to adapt to the inherent fluctuating re-
+
+
+
+USENIX Association                          14th USENIX Symposium on Operating Systems Design and Implementation              533
+source characteristics in production jobs, through framework          • By deploying AntMan in Alibaba to serve tens of thou-
+information aware scheduling, transparent memory extension,             sands of daily jobs, we conduct experiments and report
+and fast continuous inter-job coordination. With this architec-         the performance improvement in a cluster with more
+ture, AntMan opens a space for policy design of co-executing            than 5000 GPUs, demonstrating a productive approach
+DL jobs using GPU resources. In the GPU clusters of Al-                 in managing multi-tenant DL cluster fairly and efficiently
+ibaba, AntMan adopts a simple and practical strategy to max-            at scale (Section 5).
+imize the cluster throughput. While providing performance
+guarantee on resource-guarantee jobs, AntMan dispatches
+                                                                  2     Motivation
+opportunistic jobs to best-effort utilize GPU resources at a
+low-priority without any resource guarantees.                     In this section, we start by introducing essential DL terminolo-
+   We have implemented AntMan by modifying two most               gies as the background. We then highlight our observations
+popular DL frameworks, PyTorch [35] and TensorFlow [8],           by characterising the GPU production cluster to motivate the
+to expose necessary new primitives for the cluster scheduler      design of AntMan. We end by discussing opportunities to
+to leverage at runtime. Our scheduling policy is implemented      leverage the DL training characteristics.
+in a scheduler prototype on top of Kubernetes for evaluation,
+and the complete system is fully implemented in Fuxi [52],
+the internal scheduler of Alibaba, to serve the production DL     2.1     Deep Learning Training
+jobs in the GPU clusters.                                         Deep learning training often consists of millions of iterations,
+   We evaluate AntMan on a 64 V100-GPU Kubernetes clus-           and each iteration processes a few samples, called a mini-
+ter to show the advantages of the new scheduling primitives       batch. Usually, a training mini-batch can be divided into three
+and policies with micro-benchmarks and real workloads. The        phases. Firstly, samples and model weights are calculated to
+trace evaluation shows that AntMan can preserve the perfor-       produce a set of scores, known as a forward pass. Secondly,
+mance of resource-guarantee jobs ideally without preemp-          a loss error is calculated between the produced scores and
+tion. Moreover, it improves the average Job Completion Time       the desired ones using an objective function. The loss is then
+(JCT) of all jobs by up to 2.05x compared to current produc-      spread backwards through the model to compute gradients,
+tion cluster scheduler, and 1.84x compared to Gandiva [48], a     called a backward pass. Finally, the gradients are scaled by
+state-of-the-art DL cluster scheduler. We also deploy AntMan      a learning rate, as defined by an optimizer, to update the
+in real production clusters and report the evaluations and        model parameters. The computation output of a forward pass
+statistics on a heterogeneous cluster with over 5000 GPUs.        usually includes many data outputs, each of which is called
+The cluster statistics shows that AntMan improves the overall     a tensor. These tensors should be temporarily held in the
+throughput by offering up to 17.1% more GPUs for DL jobs,         memory and consumed by the backward pass to calculate
+significantly reduces the average queuing delay by 2.05x, and     gradients. Usually, to monitor the model quality in training,
+raises the GPU memory and computation unit utilization by         evaluations are periodically triggered.
+42% and 34% respectively.                                            To train models with massive data, DL generally adopts
+   The key contributions of this paper are as follows.            data parallelism in multiple GPUs where each GPU is re-
+                                                                  sponsible for processing a subset of data in parallel while
+  • We investigate the comprehensive characteristics of pro-      performing gradient synchronizations per mini-batch before
+    duction DL clusters to understand low utilization from        the model update.
+    three aspects: hardware, cluster scheduling, and job be-         In large companies, multi-tenant clusters are commonly
+    havior (Section 2).                                           used to improve hardware utilization, where users can some-
+                                                                  times oversubscribe GPU resource quota, especially when
+  • We introduce two new dynamic scaling mechanisms in            GPU demands burst [33].
+    both memory and computation unit management for DL
+    frameworks to address the challenges of GPU sharing.          2.2     Characterizing Production DL Cluster
+    The new mechanisms leverage DL job characteristics
+    to dynamically adjust the resource usage of DL jobs           We study resource usage in production clusters from three
+    efficiently during the job execution (Section 3.1).           perspectives: hardware, cluster scheduling, and job behavior.
+
+  • Through co-designing the cluster scheduler and DL             Low utilization of in-use GPUs. Figure 1 illustrates a one-
+    frameworks to utilize dynamic scaling mechanisms, we          week statistic of GPU memory usage and computation unit
+    introduce a new industrial method to GPU sharing. This        utilization. The numbers are collected from one of the produc-
+    maintains the job service-level agreement (SLA) in a          tion clusters with thousands of heterogeneous GPUs. GPU
+    multi-tenant cluster while improving the cluster utiliza-     memory consumption is normalized by the memory capac-
+    tion with opportunistic scheduling (Section 3.2 and 3.3).     ity of the running GPU due to the heterogeneity in the GPU
+
+
+
+534   14th USENIX Symposium on Operating Systems Design and Implementation                                  USENIX Association
+       1                                                              160                                          25                                                                             80                                        40
+
+
+
+
+                                                Avg. Idle GPU (GPU*min)
+                                                                      140                                                                                      500                                70                                SM util 35
+
+
+
+
+                                                                                                                                                                     GPU memory (MB)
+                                                                                                                   20
+
+
+
+
+                                                                                                                                                                                                                                                 GPU memory (GB)
+      0.8                                                                                                                                                                                                                         Memory
+                                                                      120                                                                                      400                                60                                        30
+
+
+
+
+                                                                                                        GPU util (%)
+
+
+
+
+                                                                                                                                                                                       GPU util (%)
+      0.6                                                             100                                          15                                                                             50                                        25
+                                                                                                                                                               300
+CDF
+
+
+
+
+                                                                       80                                                                                                                         40                                        20
+      0.4                                                              60                                          10                                         200                                 30                                        15
+                                                                       40                                                                                                                         20                                        10
+      0.2                         GPU util                                                                             5                              SM util 100
+                               GPU memory                              20                                                                            Memory                                       10                                        5
+                                                                        0                                              0                                      0                                    0                                        0
+            0   20      40    60     80   100                                   U      U     U      U
+                                                                            2-GP 4-GP 8-GP 16-GP                           0      2          4    6    8     10                                    1200               1400     1600       1800
+                     GPU Resource (%)                                         Number of GPU Request                                        Time (min)                                                                 Time (second)
+  Figure 1: GPU resource                                    Figure 2: Average GPU idle                            Figure 3: DeepFM on Criteo                                                   Figure 4: ESPnet on text-
+  statistic on a GPU produc-                                waiting waste from gang-                              dataset.                                                                     speech dataset.
+  tion cluster.                                             schedule.
+memory capacity. As shown in the figure, only 20% of the                                                                   cycle. Figure 3 illustrates the first 10 minutes of resource
+GPUs are running applications that consume more than half                                                                  usage when running DeepFM [20] on Criteo dataset. At the
+of the GPU memory. With regards to the usage of compu-                                                                     beginning, preprocessing on the dataset only requires CPU.
+tation unit, only 10% of the GPUs achieve higher than 80%                                                                  However, both GPU Streaming Multiprocessor (SM) utiliza-
+GPU utilization. This statistic indicates that both the GPU                                                                tion and memory usage are boosted at 275 seconds. Such
+memory and computation units are not being fully utilized,                                                                 dynamic resource demands also commonly exist in other
+and are thus wasting the expensive hardware resources.                                                                     jobs. Figure 4 illustrates a 10-minute (1200∼1800 seconds)
+                                                                                                                           profiling on ESPnet [46], an end-to-end speech model train-
+                                                                                                                           ing job. The model training pipeline could contain several
+Idle waiting for gang-schedule. To train deep learning
+                                                                                                                           phases. During the training phase, ESPnet consumes 3.6 GB
+with massive amounts of data, distributed multi-GPU training
+                                                                                                                           GPU memory with a dynamic GPU SM utilization up to 70%.
+is essential. Multi-GPU training jobs require gang-scheduling,
+                                                                                                                           At 1400 seconds, decoding on GPU (around 1400∼1600 sec-
+which means a job will not start training unless all required
+                                                                                                                           onds) and synthesis (around 1600∼1700 seconds) on the CPU
+GPUs are simultaneously available [19, 27]. However, in a
+                                                                                                                           are issued in order to evaluate the model. It is worthy of note
+cluster, GPU resources can hardly be satisfied simultaneously.
+                                                                                                                           that, the decoding phase requires up to 19 GB GPU memory.
+(e.g., three GPUs might need to be held and then wait for
+                                                                                                                           After the evaluation phase, the model training continues. Such
+the last one before launching a 4-GPU job, leaving the three
+                                                                                                                           intra-job dynamic resource demand is common in production
+GPUs in idle waiting mode). The more resources a job re-
+                                                                                                                           DL pipelines, making it hard to predict desired resources. We
+quires, the more GPU cycles are wasted when in idle waiting
+                                                                                                                           also find some jobs periodically become CPU bound, which is
+mode due to partial resource reservation. To understand the
+                                                                                                                           consistent with the observations in neural machine translation
+resource waste due to idle waiting, the timestamp of every re-
+                                                                                                                           tasks [49]. We omit the result due to space limitation.
+source grant for every gang-scheduled job was recorded. The
+idle waiting time of each GPU (i.e., the gap between the job
+launching time and the resource granting time) is summed up                                                                   The dynamic resource demand actually conflicts with the
+to calculate the total resources wasted in idle waiting for a job.                                                         fixed resource allocation and the potentially long running time
+Figure 2 illustrates the average idle waiting resource waste                                                               in the training of deep learning jobs. Jobs requiring sufficient
+for different sizes of jobs. The more GPUs a job requires, the                                                             resources according to their peak usage make expensive hard-
+higher the cost the cluster must pay for holding idle resources.                                                           ware underutilized. If not granted sufficient resources, the job
+   The unpredictable arrival of upcoming resources is the                                                                  performance may be limited and thus the job completion time
+reason that reserved resources are left idle. A naïve approach                                                             could be delayed. In addition, the memory caching design in
+to improving utilization is to launch other jobs on idle waiting                                                           existing DL frameworks (e.g., TensorFlow and PyTorch) also
+resources. However, this can cause the large jobs to become                                                                conceal the temporal memory usage variations [50], which
+starved and break the scheduling fairness. In addition, once all                                                           prevents GPU memory from potential sharing.
+resources are satisfied, the burst GPU demand of this resource-
+guarantee job can lead to inter-job resource conflicts with the
+                                                                                                                                  1
+ones that are currently running in GPUs, which may cause the
+jobs to fail. Recently, elastic training (e.g., TorchElastic [7])                                                                0.9                                                                        0.8
+
+is proposed to adapt to the incrementally available resources.                                                                   0.8                                                                        0.6
+                                                                                                                           CDF
+
+
+
+
+                                                                                                                                                                                                      CDF
+
+
+
+
+However, it is rarely used in production because of the non-                                                                     0.7                                                                        0.4
+determinism it introduces to the accuracy [18, 47].                                                                              0.6                                                                        0.2
+                                                                                                                                                            Model size                                                             Mini-batch time
+                                                                                                                                 0.5                                                                         0
+                                                                                                                                       0       500    1000    1500                2000                            0     300 600 900 1200 1500
+Dynamic resource demand. In addition to the idle wast-                                                                                           model size (MB)                                                         mini-batch time (ms)
+ing from job scheduling, our observation finds that DL jobs                                                                      (a) Model size distribution.                                         (b) Mini-batch time distribution.
+usually cannot fully utilize GPU resources during their life                                                                           Figure 5: One-week deep learning tasks statistic.
+
+
+
+USENIX Association                                                               14th USENIX Symposium on Operating Systems Design and Implementation                                                                                                          535
+         Existing DL framework                               Dynamic Scaling in AntMan
+             GPU Memory   GPU Memory        GPU Memory       GPU Memory    GPU Memory Host Memory       GPU Memory Host Memory
+
+                           Tensor                               Shrink                                     Growth
+
+                           Tensor            Tensor            Tensor        Tensor                       Tensor
+              Tensor       Tensor            Tensor            Tensor        Tensor            Tensor     Tensor          Tensor
+                (a)            (b)               (c)              (d)                    (e)                        (f)
+
+                                        Figure 6: Dynamic scaling universal memory in AntMan
+
+
+2.3      Opportunities in DL Uniqueness                                   first describe the new mechanism extensions in DL frame-
+                                                                          works. We then introduce the collaborative scheduling design
+The preceding characterization of the production DL cluster
+                                                                          to leverage those new primitives. Finally, we present a new
+shows that low utilization is common for both GPU mem-
+                                                                          productive policy enabled in the cluster scheduler of Alibaba
+ory and GPU computation unit (i.e., SM). It shows great op-
+                                                                          to manage DL jobs.
+portunities to improve the cluster throughput with resource
+over-subscription. However, the unpredictable inter-job and
+intra-job demand burst introduces challenges to safe resource             3.1     Dynamic Scaling in DL Frameworks
+sharing. Jobs could run out of memory due to resource con-
+                                                                          As mentioned in Section 2.2, DL training clusters exhibit low
+tention. Besides, in multi-tenant clusters, it is important to pro-
+                                                                          utilization due to unsaturated GPU usage in DL workloads
+vide performance isolation for jobs holding a resource quota
+                                                                          and unique gang-schedule requirements during job schedul-
+when the jobs are executed in a resource-sharing approach.
+                                                                          ing, which contains great potentials that can be exploited to
+To cater to these challenges when scheduling deep learning
+                                                                          execute more jobs. However, some challenges need to be ad-
+jobs, AntMan leverages the opportunities in the uniqueness
+                                                                          dressed, such as executing jobs at their minimal requirements
+of DL training.
+                                                                          while preventing GPU memory usage outbreak failures, adapt-
+   We sample 10K tasks in a week of our production cluster
+                                                                          ing to the fluctuating computation unit usage while limiting
+to understand DL characteristics. We measure model size and
+                                                                          potential interference. At its core, existing DL frameworks
+mini-batch size during model training, both shown in Figure 5.
+                                                                          are designed for dedicated GPU executions, which lack key
+Even though DL training could potentially use as much as 32
+                                                                          capabilities when collaborating with other jobs. Such con-
+to 40 GB GPU memory (e.g., V100 and A100), only a small
+                                                                          flicts between production DL cluster characteristics and DL
+portion is used to store the persistent DL model. 90% of DL
+                                                                          framework limitation motivate the design of dynamic scaling
+models occupy only 500 MB GPU memory.1 The majority
+                                                                          mechanisms to enhance DL frameworks. The dynamic scaling
+of GPU memory is allocated and freed within the same mini-
+                                                                          mechanisms include the fine-grained dynamic control in two
+batch. Moreover, the DL training cycle is also rather small. As
+                                                                          aspects, GPU memory and computation unit. We elaborate
+much as 80% of tasks consume a mini-batch within 600 ms.
+                                                                          them next.
+   We exploit such unique characteristics in several ways to
+schedule jobs on shared GPUs. Firstly, due to the small model
+size in common, the majority of GPU memory could be sched-                3.1.1   Memory Management
+uled among the co-executing jobs. Secondly, mini-batch cy-
+                                                                          A dynamic memory management mechanism is introduced
+cles are generally quite small, allowing fine-grained GPU
+                                                                          in AntMan to adapt the allocated memory on the fluctuat-
+memory and computation scheduling at every mini-batch
+                                                                          ing memory demands of a DL training job. This is achieved
+boundary. This could further allow fast resource coordination
+                                                                          by allocating universal memory to DL application tensors,
+between jobs. Thirdly, mini-batches apply mostly similar com-
+                                                                          i.e., switching tensors between GPU and CPU host machine
+putations that can be utilized to profile the job performance,
+                                                                          DRAM across mini-batches. Modern operating systems sup-
+therefore their progress rate can be created as a performance
+                                                                          port paging in memory management at the granularity of
+metrics to quantify interference.
+                                                                          memory pages, where they use disk as memory when they run
+                                                                          out of physical memory. AntMan adopts a similar approach,
+3     Design                                                              however, this is carried out in an application-specific granular-
+                                                                          ity, tensor, which can be transparently migrated in universal
+AntMan deeply co-designs cluster schedulers and DL frame-                 memory addresses at runtime. In this way, DL frameworks
+works to address GPU sharing challenges. In this section, we              can support the dynamic GPU memory upper limit.
+    1 we omit the largest 2% jobs’ model size as the number is business      Figure 6 illustrates the memory management in existing DL
+sensitive.                                                                frameworks as well as the differences to AntMan. The total
+
+
+
+536     14th USENIX Symposium on Operating Systems Design and Implementation                                        USENIX Association
+      Memory                              Memory
+                                                            GPU      CPU                                         GPU kernels of Job-A               GPU kernels of Job-B
+                                                                                                             Launch kernel           Op execution         Op dependency
+a                                                  Shrink
+                                      b                                            GPU             1         2                   3        4                 5       6
+                           Growth
+                                                                   Growth
+                                                                              (a) Job-A executes in a GPU exclusively despite some idle cycles.
+a                                     b
+                                                                                   GPU             1         1          2        2        3         4       5       3
+                T0    T1       Time           T0              T1       Time
+
+(a) Scaling for memory burst up. (b) Scaling to secure memory.
+                                                                               DL framework        GPU Op         GPU Op     GPU Op       GPU Op        GPU Op
+    Figure 7: Leveraging mini-batch behavior to scale memory                    Op executor
+                                                                                                CPU Op           CPU Op      CPU Op       CPU Op
+    efficiently.
+                                                                                             (b) Job-A significantly interfered by Job-B.
+number of cached GPU memory size (i.e., red dash line) in-
+                                                                                  GPU              1         2          1        3        4         2       5       6
+creases with tensors created in DL frameworks (Figure 6a∼b).
+In order to eliminate the expensive overheads in memory al-                     GPU Op
+                                                                                                  IdleTime        GPU Op       IdleTime       GPU Op
+                                                                                Manager
+locations and de-allocations, and also to speed up training
+among mini-batches, the GPU memory is cached in a global                                           GPU Op         GPU Op      GPU Op      GPU Op        GPU Op
+                                                                              DL framework
+memory allocator inside DL frameworks after tensors are de-                    Op executor
+                                                                                                CPU Op           CPU Op      CPU Op                       CPU Op
+stroyed. Prevalently, some tensors are used only in certain
+stages of DL training (e.g., data preprocessing, evaluation),
+which are no longer required. However, this portion of cached                         (c) GpuOpManager of Job-B controls the interference.
+GPU memory is not released (Figure 6c). This cached mem-
+ory design in DL frameworks optimizes individual job perfor-                   Figure 8: Computation management to run two jobs in a
+mance at the cost of losing sharing potentials.                                shared GPU without interference.
+   AntMan turns to the approach of scaling the GPU memory
+upper limit. It proactively detects in-used memory to shrink
+the cached memory to introspectively adjust GPU memory                        the tensors to be fully allocated in the GPU device for the
+usage to an appropriate fit. This is done by monitoring applica-              next mini-batch. Note that, the performance of this running
+tion performance and memory requirements when processing                      job might slowdown in a mini-batch as tensors are placed in
+mini-batches (Figure 6d). Furthermore, new primitives are                     the host memory. However, such performance overheads are
+provided to shrink the upper limit of GPU memory at runtime,                  negligible, considering a typical DL training often requires
+even below the actual GPU memory demand of a job. AntMan                      millions of mini-batches. The overhead of memory shrinkage
+uses its greatest effort to allocate tensors on GPU devices,                  and growth is quantified in Section 5. Furthermore, AntMan
+however, tensors can be allocated outside of GPU with the                     provides fine-grained GPU memory scheduling at runtime.
+host memory if GPU memory is still lacking (Figure 6e). With                  A training job might shrink to secure memory resources for
+such universal memory support, jobs can continue to process                   other jobs, and grow back after other jobs are finished, as
+even below their actual GPU memory requirements, where we                     shown in Figure 7b. It illustrates that a DL job scales down at
+find workloads slowdown the performance differently (Sec-                     T0 and scales up at T1 , at the cost of some tensors allocated
+tion 3.3). Tensors can be allocated back to GPU automatically                 on the host memory. Therefore, the usage of the remaining
+when the GPU memory’s upper limit increases (Figure 6f).                      GPU memory between T0 and T1 for jobs running in the same
+   Paging in operating systems introduces costly page copy be-                shared GPU is secured.
+tween the memory and disk. In contrast, thanks to the unique
+pattern of DL, tensor copy between the GPU and CPU host                       3.1.2      Computation Management
+DRAM is explicitly avoided. Identical tensors are created
+across mini-batches, and therefore, AntMan exploits this pat-                 Dynamic computation unit management is a mechanism in-
+tern to adjust the upper limit of the memory at the boundary                  troduced in AntMan to control the GPU utilization of a DL
+of the mini-batches. Figure 7a illustrates how memory scaling                 training job. Modern operating systems (e.g., Linux) support
+addresses the burst demand. At T0 , the memory requirement                    cgroups, which limits, accounts for, and isolates the CPU
+of a running DL training job increases, due to the limited                    resources that a process requires [1]. AntMan introduces a
+upper-bound of GPU memory, some tensors cannot be placed                      similar method of dynamically isolating the GPU computation
+in the GPU memory, and are instead created using the host                     resource access of DL-specific processes at runtime.
+memory. AntMan detects the usage of the host memory, and                         When multiple DL jobs are launched on the same GPU,
+at T1 , it raises the GPU memory’s upper limit for that job                   the interference is mainly caused by the potential GPU kernel
+according to the usage of the host memory, which allows                       queuing delay and PCIe bus contention [14], which could
+
+
+
+USENIX Association                                     14th USENIX Symposium on Operating Systems Design and Implementation                                                537
+result in consistent performance downgrades across all jobs if               Global Scheduler                        Local Coordinator                              GPU0
+packing jobs are running on the same model and configura-                                                                                         TF Job
+                                                                                            Scheduler         Scheduling   Coordinator
+tion [48]. Our observation shows that jobs slowdown in dif-                                                     decision                                            GPU1
+ferent ways if different jobs are packed together (Section 5.1).                        Cluster Stats                      Local Stats        Job Stats              ……
+This is because jobs have different capabilities at acquiring                                                                                             Device Stats
+
+                                                                                                                                         ……
+GPU computation units. Consequently, job performance can                               Job-A Job-B …
+                                                                    Device
+barely guarantee or predict in GPU sharing, resulting in dif-        Info
+                                                                              GpuUtil    30%   40%
+                                                                             GpuMem 5.6 GB 5.1 GB                    Local Coordinator            TF Job
+                                                                             MiniBatch 300 ms 233 ms
+ficulties on the deployment of GPU sharing for multi-tenant           DL     PeakMem 5.6 GB 6.5 GB                         Coordinator
+                                                                                                                                                                    GPU0
+                                                                     Job     MinMem 0.5 GB 0.2 GB                                             PyTorch Job
+clusters. Figure 8 illustrates an example of GPU computa-            Info    HostMem 0 GB 1.4 GB
+                                                                                 …
+tion unit interference for two jobs that are executed on the                                                               Local Stats        Job Stats              ……
+                                                                      Data statistic flow      Control flow                                               Device Stats
+same GPU. Figure 8a illustrates how Job-A executes on a
+GPU in a fine-grained manner. In short, GPU kernels will be
+                                                                     Figure 9: Collaborative scheduling workflow of AntMan.
+placed in order and processed by the GPU computation unit
+one by one. Note that, in Figure 8, Job-A might not be able
+to fully saturate the GPU, resulting in idle GPU cycles and        scheduling. Each working server contains a local coordinator
+low GPU utilization which can potentially be used by other         that is responsible for managing the job execution using the
+jobs. Therefore, Job-B is scheduled on this GPU (Figure 8b).       primitives of dynamic resource scaling through considering
+The GPU operators of Job-B launch kernels (green blocks)           the statistics reported from DL frameworks. AntMan is de-
+executed in the GPU, which can fill it up, and thus delay the      signed for multi-tenant GPU clusters. In a multi-tenant cluster,
+execution of other GPU kernels (blue blocks), leading to the       each tenant usually owns certain resources, annotated as a re-
+poor performance of Job-A. The interference mainly comes           source quota (i.e., number of GPUs), which is the concurrent
+from the lack of ability to control the execution frequency        performance guarantee resources that can be assigned to the
+of GPU kernels. To address this issue, We introduce a GPU          jobs of that tenant. The sum of the GPU resource quota of each
+operator manager in DL framework(Figure 8c). Existing DL           tenant is less equal to the total capacity of a GPU cluster. In
+frameworks issue GPU kernels in the GPU operator once its          AntMan, jobs are classified into resource-guarantee jobs and
+control dependency is satisfied. In AntMan, the execution          opportunistic jobs by global scheduler with different schedul-
+of GPU operator is dedicated to a newly-introduced mod-            ing policies applied (Section 3.3). Resource-guarantee jobs
+ule, called GpuOpManager. When a GPU operator is ready             consume a certain amount of GPU resources quota of their
+to execute, it is added to GpuOpManager instead of being           corresponding tenants while opportunistic jobs do not. There-
+directly launched. The main idea of GpuOpManager is to             fore, AntMan ensures that the performance of the resource-
+control the launching frequency by delaying the execution of       guarantee jobs should be consistent with that in exclusive
+GPU operators. In this way, AntMan introduces a new prim-          executions.
+itive to limit the GPU utilization of a DL training job using         In AntMan, similar to conventional cluster schedulers, the
+GpuOpManager. GpuOpManager continuously profiles the               scheduling decision is dispatched from the global scheduler
+GPU operators execution time and simply distributes idle time      to the local coordinator. In addition, the local coordinator
+slots before launching the GPU operators. Note that, GpuOp-        introspectively schedules the GPU resources to DL training
+Manager only delays the GPU kernel execution. Therefore,           jobs using the dynamic scaling mechanisms (Section 3.1).
+the potential dependencies among operators (including GPU          Therefore, the scheduling decisions can be treated as a top-
+operators and CPU operators) are retained, meaning that CPU        down control flow. In contrast, data statistic flow information
+operators can continue if possible. As illustrated in Figure 8c,   is collected by statistic modules of the local coordinator and
+the third CPU operator is not blocked, however, the fourth one     aggregated on the cluster statistic module in a bottom-up ap-
+is delayed as it depends on the second GPU operator, which         proach to help make scheduling decisions, which is similar to
+has its execution delayed by the GpuOpManager.                     Apollo [10]. Alongside with the hardware information (e.g.,
+                                                                   GPU utilization, GPU memory usage), AntMan also lever-
+3.2    Collaborative Scheduler                                     ages detailed job information reported by DL frameworks,
+                                                                   including mini-batch duration, peak memory usage, minimal
+In this section, we describe how we co-design the cluster          memory usage, and host memory consumption, etc. This in-
+scheduler and DL frameworks to leverage the dynamic scaling        formation can also assist job scheduling decisions made by
+mechanisms mentioned above for collaborative scheduling.           the global scheduler. For example, peak memory and minimal
+We focus on the overall architecture of AntMan and how             memory usage are used to indicate the GPU memory size
+different modules operate. The detailed policy description is      that can be made available quickly. Mini-batch time shows
+in the next section.                                               how soon the GPU memory can be available for another DL
+   As shown in Figure 9, AntMan adopts a hierarchical ar-          training job, which can affect the scheduling decisions of the
+chitecture, where a global scheduler is responsible for job        global scheduler when launching jobs.
+
+
+
+538   14th USENIX Symposium on Operating Systems Design and Implementation                                                          USENIX Association
+Algorithm 1 scheduleJob(in job, out nodes)                          jobs arrive and decides GPU locations allocated for jobs. For
+                                                                    resource-guarantee jobs and opportunistic jobs, AntMan ap-
+ 1: nodes0 ← f indNodes( job.gpu, constraints ← job.topo)
+                                                                    plies different scheduling polices as shown in Algorithm 1.
+ 2: nodes1 ← f indNodes( job.gpu, constraints ← M)
+                                                                    findNodes is a function that returns the node and GPU candi-
+ 3: nodes2 ← minLoadNodes(nodes1, job.gpu)
+ 4: if job.isResourceGuarantee:
+                                                                    dates which satisfy the job request with an optional param-
+ 5:      if numGPUs(nodes0) >= job.gpu:                             eter to specify constraints. Global scheduler fairly allocates
+ 6:          return nodes0                                          resource-guarantee jobs given sufficient GPU resources. In
+ 7:      else:                                                      addition, resource-guarantee jobs are optimized to maximize
+ 8:          reserve(nodes0)                                        the job performance using the free GPU resources, i.e., GPUs
+ 9: else:                                                           that are not allocated to other resource-guarantee jobs (line
+10:      return nodes2                                              5-6). For instance, a distributed resource-guarantee job that
+                                                                    uses all-reduce communication strategy (e.g., NCCL [5]) can
+                                                                    be scheduled on one server to utilize the NVLink [6] for
+   Once a job is launched on a GPU server, a local scheduler        high-performance communication. However, if the resource
+takes over the management of its end-to-end execution. Due          request of a job can partially be satisfied, the global scheduler
+to the load fluctuation of a DL training job, a local coordinator   reserves the resources for this job, and waits for others to meet
+acts in an introspective mode to perform continual job control      the gang-scheduling requirement (line 7-8). Such insufficient
+to DL frameworks. More specifically, it collects the statistics     resource reservation exists mainly for resource quota (e.g.,
+from the hardware and DL frameworks of all jobs, which is           three GPUs left while there is a request for four) and resource
+used to control job performance via resource usage adjust-          fragmentation (e.g., request four GPUs in the same server,
+ments (e.g., shrink GPU memory) through the new primitives          however only four are available spread across servers). The
+we introduced in Section 3.1.                                       reserved resources will never be occupied by other resource-
+                                                                    guarantee jobs, however, they can be utilized by opportunistic
+3.3    Scheduling Policy                                            jobs.
+                                                                       By default, the global scheduler will estimate the queu-
+In this section, we first present the goal of our cluster sched-    ing time for jobs without GPU quota granted. Those jobs
+uler. Then we describe the detailed policies applied in global      that suffer long queuing delay will be automatically executed
+scheduler and local coordinator. Finally, we introduce the job      as opportunistic jobs. To schedule opportunistic jobs, global
+upgrade in our system.                                              scheduler aims to utilize free resources to the best of its abil-
+                                                                    ity. It allocates opportunistic jobs on GPUs by considering
+Goal. There is an inherent tension between providing fair-          the actual GPU utilization, even when some other jobs run
+ness (e.g., to ensure SLAs of DL jobs with guaranteed re-           on those GPUs. Only GPUs with a utilization of less than M
+sources) and achieving high resource utilization (e.g., GPU         (set as 80% for now) in the past 10 seconds can be selected as
+utilization), because of the constant fluctuation in both the       candidates. AntMan adopts a heuristic strategy to allocate op-
+load on a cluster and the resource needs of a job. Prevalent        portunistic jobs on the freest candidates (i.e., minLoadNodes,
+production DL cluster schedulers often trade fairness in cer-       line 9-10). In this way, there are some jobs allocated on the
+tain ways for efficiency. For example, spare resources are          same GPU, where they are managed by the local coordinator.
+allocated to over-provision tenants. However, such GPU re-          We will elaborate their coordinated execution next. Note that,
+sources can hardly get back without preemption. Generally,          although AntMan automatically selects opportunistic jobs by
+preemption is rarely used as it fails running jobs while wastes     default, it also allows users to manually identify the job type at
+expensive GPU cycles. Besides, [27] also reports the out-of-        the point of submission; for example, as a resource-guarantee
+order behavior which discriminates large jobs (i.e., allocating     job explicitly to ensure SLAs. A job can also be specified as
+more GPUs), leading to unfairness by preferring small jobs.         an opportunistic job that will never occupy the tenant’s re-
+In AntMan, multi-tenant fairness is our primary goal, and the       source quota, and vice versa. In practice, users usually submit
+second priority is to improve the cluster efficiency therefore to   jobs in opportunistic mode to avoid the potential queuing de-
+achieve higher throughput. AntMan achieves fairness with the        lay, aiming to perform debugging and hyper-parameter tuning,
+polices that are implemented in both the global scheduler and       which are both driven by early feedbacks [48, 51].
+the local coordinator, powered by the dynamic scaling mech-
+anisms. Furthermore, GPU opportunistic jobs are introduced          Local coordinator. The main responsibility of the local co-
+in AntMan to steal idle cycles in GPUs so as to maximize            ordinator is to collaborate the execution of jobs on shared
+cluster utilization.                                                GPUs. Next, we first introduce how local coordinator ensures
+                                                                    the performance of resource-guarantee jobs at shared exe-
+Global scheduler. As a multi-tenant cluster scheduler, the          cution. Then, we describe the approach to handle resource
+global scheduler maintains multiple queues of tenants where         demand surges of a resource-guarantee job. Finally, we in-
+
+
+
+USENIX Association                            14th USENIX Symposium on Operating Systems Design and Implementation               539
+troduce a greedy approach in AntMan to maximize the ag-                                                     SR       VGG        ResNet
+
+
+
+
+                                                                           Normalized performance
+gregated job performance when a GPU is only shared by
+opportunistic jobs. These approaches are achieved by uti-                                             1
+                                                                                                    0.9
+lizing the information reported from both GPU device and                                            0.8
+DL frameworks, and by instructing the memory management                                             0.7
+                                                                                                    0.6
+module (Section 3.1.1) and computation management module                                            0.5
+                                                                                                    0.4
+(Section 3.1.2) in DL frameworks.                                                                   0.3
+                                                                                                    0.2
+   A GPU is allocated to only one resource-guarantee job                                            0.1
+as it consumes GPU quota. However, in AntMan, it is pos-                                              0
+sible that there are some opportunistic jobs executed on this                                             10 20 30 40 50 60 70 80 90 100
+GPU. As such, the local coordinator must prevent the resource-                                               GPU memory limit (%)
+guarantee job from interfering by other co-located jobs at run-
+                                                                      Figure 10: Workloads show diversity in performance sen-
+time. When a resource-guarantee job arrives on a GPU that
+                                                                      sitivity given insufficient memory.
+runs with opportunistic jobs, the local coordinator first limits
+the opportunistic jobs in using GPU, for both GPU memory
+and GPU SM. By reducing the GPU usage of the opportunis-
+tic jobs, the newly launched resource-guarantee job will be          scenarios, AntMan optimizes the aggregated job performance
+capable of persistently initializing the training variables (i.e.,   by maximizing GPU memory efficiency. With the dynamic
+model) in the GPU memory. In addition, when launching a              scaling mechanisms enabled, we find that different workloads
+DL training job, the GPU device needs to be initialized by the       show differences in sensitivity regarding the performance
+DL framework, which takes more time if the GPU is in a high          slowdown from memory limitations. The peak memory usage
+load. Once the resource-guarantee job is stably executed, the        of a job is limited using the dynamic memory scaling mecha-
+local coordinator will allocate the rest of the GPU memory to        nism, and the host memory is thereby used for the remainder
+the opportunistic jobs. Furthermore, it gradually increases the      of the excess. As illustrated in Figure 10, Super Resolution
+GPU computation unit usage of opportunistic jobs without             (SR) model suffers only around 25% performance slowdown
+interfering with resource-guarantee jobs by monitoring the           even with a 90% reduction in its device memory. VGG16 [43]
+job performance (i.e., mini-batch time). Similarly, when an          model on Cifar10 dataset (VGG) can keep most of its original
+opportunistic job arrives on a shared GPU, the local coordina-       performance even after reducing its device memory by half.
+tor raises its GPU resource usage in a step-like fashion under       ResNet50 [22] on ImageNet dataset (ResNet) is sensitive to
+the condition that the resource-guarantee job is not affected.       memory shrinkage; a 10% memory reduction introduces more
+   During the job execution, the resource demand of both the         than 60% slowdown. Therefore, when the total GPU memory
+GPU memory and GPU computation unit might surge beyond               demand of opportunistic jobs exceeds the GPU’s memory
+the currently available resources (Section 2.2). To be aware of      capacity, AntMan adopts a simple heuristic approach which
+such dynamic resource demand, the local coordinator moni-            allocates GPU memory to the job that improves the normal-
+tors the metrics that are reported by DL frameworks (e.g., host      ized aggregated job performance at best. This is carried out
+memory usage, mini-batch time). Therefore, when a resource-          via an introspective trial-and-error allocation.
+guarantee job increases the GPU memory requirement, the
+tensors are temporarily stored using host memory, thanks to
+the universal memory (Section 3.1.1). The local coordinator
+shrinks the GPU memory usage of other opportunistic jobs
+and raises the GPU memory limit of the resource-guarantee            Job upgrade. In AntMan, opportunistic jobs are executed
+job to recover its performance. It is similar for GPU computa-       at best-effort level to improve the cluster utilization. However,
+tion unit usage coordination. Note that, AntMan relies on the        this is done without an SLA guarantee. The global scheduler
+application level metric (i.e., mini-batch time) to indicate the     upgrades these jobs given sufficient resources to complete
+job performance of resource-guarantee jobs. If it observes an        them quickly. For distributed synchronous DL training, the
+unstable performance in the resource-guarantee job, it adopts        partial upgrade does not help because the performance down-
+a pessimistic strategy to limit the usage of GPU resources of        grade of a worker can be broadcast to the entire job. Thus, the
+other opportunistic jobs.                                            global scheduler checks if all GPUs are filled up in opportunis-
+   GPU resources can also be idle waiting without any                tic jobs. Once all task instances are ready to upgrade and the
+resource-guarantee jobs (e.g., due to gang-schedule as de-           resource quota is sufficient, AntMan prefers to upgrade the
+scribed in Section 2.2). In this case, if there is only one oppor-   opportunistic job rather than launch a new one. Global sched-
+tunistic job, the GPU resources can be fully utilized by this        uler notifies local coordinator to tag it as a resource-guarantee
+job without any constraints. Sometimes, it is possible that a        job and consumes the tenant’s GPU quota to accomplish the
+GPU is occupied by multiple opportunistic jobs. Under this           job upgrade.
+
+
+
+540   14th USENIX Symposium on Operating Systems Design and Implementation                                                  USENIX Association
+4     Implementation                                               file system. They both have a monitor thread to check the
+                                                                   file for receiving either job statistics or control signals. To
+At Alibaba, DL training jobs are executed in Docker con-           minimize the overhead of memory management, the dynamic
+tainers with our customized versions of DL frameworks. The         scaling of memory is triggered at the mini-batch boundaries
+APIs of the DL frameworks are compatible with the commu-           (end of session.run()).
+nity version however with AntMan’s features enhanced. A
+prototype custom cluster scheduler is implemented on Ku-
+                                                                   4.2    Cluster Scheduler
+bernetes [11] for evaluation. AntMan is fully implemented
+in our internal cluster scheduler, Fuxi [52], to serve the daily   A custom scheduler is implemented on Kubernetes [11] as a
+production training jobs on several clusters with thousands of     prototype to evaluate AntMan. The implementation requires
+GPUs each.                                                         around 2000 lines of code in Python. Overall, Kubernetes is
+                                                                   responsible for cluster management and for executing jobs in
+                                                                   Docker containers. Our global scheduler uses Python APIs to
+4.1    Deep Learning Framework                                     monitor the events in Kubernetes’s API server for scheduling.
+Dynamic scaling mechanisms are implemented in two popular          Local coordinators are deployed as a DaemonSet in Kuber-
+deep learning frameworks, TensorFlow [8] and PyTorch [35],         netes. Each coordinator monitors certain paths of the file
+on versions v1.12 and v1.3.1 respectively. The implementa-         system to collect the reported information for each job. The
+tion in TensorFlow takes 4000 lines of code (mostly in C++).       aggregated job and device information are stored in ETCD, a
+The implementation in PyTorch takes about 2000 lines of            built-in distributed key-value store in Kubernetes. Therefore,
+code (500 lines in Python and 1500 lines in C++).                  global scheduler directly reads states in ETCD when making
+   The modification of DL frameworks is mostly in three            scheduling decisions.
+components: memory allocator, executor, and interfaces. As            AntMan has been fully implemented in Alibaba’s internal
+it adopts a similar implementation in both frameworks, we          cluster scheduler, Fuxi [52]. The implementation of global
+mainly use TensorFlow terminology to describe the de-              scheduler takes about 10000 LOC, including failover support
+tails. To enable dynamic universal memory, BFCAllocator            and testing. The local coordinator implementation takes about
+(CUDACachingAllocator in PyTorch) is modified to intro-            2000 LOC. Both of them are written in C++. The DL in-
+duce an adjustable upper limit for memory. The memory              frastructure is coupled with the big-data infrastructure, as DL
+allocator keeps track of the total bytes of memory allocation      jobs are part of the data pipeline. Fuxi adopts an architec-
+and triggers out-of-memory when total bytes exceed the upper       ture that optimizes for high performance scheduling, and it
+limit. In addition, a new interface is introduced to the memory    currently does not have ETCD. Global scheduler and local
+allocator to allow emptying of cached memory at any time.          coordinator shall maintain their own aggregated device and
+A new universal memory allocator, UniversalAllocator,              job information and use RPC for communication.
+is also added to wrap the GPU memory allocator and host
+memory allocator (i.e., using cudaHostMalloc for memory            5     Evaluation
+allocation). When a memory allocation is triggered by the
+request of a tensor, UniversalAllocator tries to allocate the      In this section, we first show micro-benchmark results to
+memory using the GPU memory allocator and treats the CPU           demonstrate the effectiveness and efficiency of AntMan mech-
+memory allocator as a backup if there is insufficient GPU          anisms. We then evaluate the benefits of AntMan in a small
+memory left over. Note that, the UniversalAllocator main-          cluster with 64 V100 GPUs to compare the policies with real
+tains a set data structure that records the pointers of memory     workloads. Finally, we present the evaluation results on a
+regions allocated by GPU, which is used to classify the mem-       production cluster with more than 5000 heterogeneous GPUs
+ory pointers for de-allocation.                                    (V100 and P100). All the experiments are conducted on a
+   To enable dynamic computation unit scaling, a                   cloud GPU cluster with 8 servers, unless explicitly stated. Ev-
+GpuOpManager with an operator processing queue, which              ery server is equipped with a 96-core Intel Xeon Platinum
+runs in a standalone thread, is introduced in DL frameworks.       8163 (Skylake) @2.50GHz with 736GB RAM, running Cen-
+The operator executor of TensorFlow is modified accordingly        tOS 7.7. Each server has 8 NVIDIA V100 GPUs (32 GB
+to insert GPU operators to GpuOpManager queue in order             GPU memory, with NVLink) powered by NVIDIA driver
+so as to dedicate the execution of GPU operators to it.            418.87, CUDA 10.0, and CUDNN 7. The cloud GPU clus-
+GpuOpManager may delay the actual execution of the GPU             ter is managed by Kubernetes; jobs are submitted through
+operators based on a limited percentage of the computation         KubeFlow, and are executed in Docker containers. Only data-
+capacity.                                                          parallel is evaluated with synchronous training for jobs that
+   The statistics of memory usage patterns and the execution       require more than 1 GPU because they are common, although
+information are aggregated for the local coordinator. The DL       asynchronous training can also be supported. The trace in
+frameworks and local coordinator communicate through the           the experiment consists of 9 models, 2 of them implemented
+
+
+
+USENIX Association                           14th USENIX Symposium on Operating Systems Design and Implementation             541
+           Model      Arrival   GpuMem       BS        Quota                                                                Growth
+                                                                                                                200
+
+
+
+
+                                                                                                Overhead (ms)
+ Job-A     GCN        0 min     3.5 GB       1400      No                                                                    Shrink
+ Job-B     ResNet     26 min    30.0 GB      360       Yes                                                      150
+                                                                                                                100
+         Table 1: Setup and information of two jobs.                                                             50
+                                                                                                                  0
+           Preempt     FIFO     Pack     UMem       AntMan                                                                 16   V3     Net
+                                                                                                                      VGGceptionGoogle
+ Job-A     Failed      43.0     43.1     43.4       43.9                                                                In
+ Job-B     91.1        108.2    Failed   541.6      91.8          (a) A shrink-growth profiling on (b) Overhead of GPU memory
+                                                                  ResNet-50.                       scaling for typical models.
+ Table 2: Job status and JCT (min) of two jobs executing in
+                                                                   Figure 11: Efficiency of GPU memory scaling in AntMan.
+ different configurations.
+
+
+in PyTorch 1.3.1 and 7 of them implemented in TensorFlow          GPU memory limit (Section 3.1.1). Host memory are used
+1.12.                                                             when running out of GPU memory. Thus, Job-B will not fail
+                                                                  from out-of-memory, however, it takes 514.6 minutes to fin-
+                                                                  ish and violates the SLA. AntMan leverages both universal
+5.1    Benchmark                                                  memory and dynamic GPU memory scaling to coordinate job
+In this section, we evaluate the dynamic scaling mechanism        execution. It allocates sufficient device memory to Job-B as
+of AntMan in two aspects, memory and computation unit. We         it runs with a resource quota, and offers the rest part of GPU
+first demonstrate that dynamic memory scaling is indispens-       memory to Job-A to allow it run as efficiently as possible.
+able in preventing failure and ensuring job performance. We       More specifically, when Job-B arrives, AntMan coordinates
+then measure the efficiency of memory shrinkage and growth        two jobs to shrink the GPU memory usage of Job-A and grow
+on typical workloads and detail the timeline on a ResNet-50       the GPU memory of Job-B. Job-B uses 30 GB GPU memory
+benchmark. Finally, we demonstrate the ability of dynamic         and Job-A uses the 2 GB left over, and 1.5 GB host memory.
+computation unit scaling on avoiding job interference, by         Note that, the performance of Job-B is still slightly slower
+packing two jobs in a shared GPU.                                 compared to the preemptive scenario. This is because even
+                                                                  though the required GPU memory is sufficient through dy-
+                                                                  namic scaling of AntMan, Job-B is still interfered in by the
+Dynamic GPU memory scaling. To demonstrate that dy-
+                                                                  co-execution with Job-A in the computation unit.
+namic memory scaling is essential for sharing GPUs with
+multiple jobs, two typical jobs are chosen to construct a typ-
+ical scenario. As shown in Table 1, Job-A is a GCN model          Efficient memory shrinkage and growth. To demonstrate
+that arrives at 0 minutes. Its peak GPU memory usage is 3.5       the efficiency of the dynamic memory scaling mechanism, a
+GB and is submitted by users without a resource quota. Job-B      ResNet-50 job is run and the memory shrinkage and growth
+is a ResNet-50 task that arrives 26 minutes later. In total, it   are manually triggered in order. As shown in Figure 11a,
+consumes 30 GB GPU memory and is submitted with a re-             the performance is measured by monitoring the in-use GPU
+source quota guarantee, which means it should run directly to     memory using both Nvidia API and memory statistics in DL
+meet the SLA requirements. The cluster has only one 32 GB         frameworks. As Figure 11a indicates, the memory shrink from
+GPU left and both jobs are scheduled on this GPU at arrival.      17.6 GB to 1.3 GB takes only 17 ms. The GPU memory usage
+Both jobs are run in the setup described above multiple times,    grows back to 17.6 GB in 143 ms, which is slower than the
+but with different action policies when Job-B arrives. Table 2    memory shrink. This is because GPU memory is allocated on
+shows the job status and job completion time (JCT) in min-        demand with deep learning forward computation. Thus, the
+utes for both jobs with different configurations. At Job-B’s      measured time includes both the forward computation time,
+arrival, the scheduler can choose to preempt Job-A. In this       which is essential to this mini-batch, and the memory alloca-
+way, Job-B can be directly scheduled and finished in 91.1         tion overhead. To understand the actual overhead, the time
+minutes at the cost of Job-A’s failure. The second choice is      cost and memory usage of the next mini-batch are also plot-
+to run Job-B in a first-in-first-out (FIFO) mode. Job-B will      ted. The mini-batch with GPU memory growth takes 234 ms
+not be launched until Job-A is finished, which introduces an      and the next mini-batch, which utilizes the cached memory,
+extra 17.1-minute queuing delay. The third choice is to pack      takes 119 ms to accomplish. Therefore, the growth overhead
+two jobs in the same GPU as proposed in Gandiva [48]. In          of ResNet-50 model is 115 ms. The same approach is applied
+this case, Job-B eventually fails because of the insufficient     to measure memory scaling overhead on other typical DL
+GPU memory (28.5 GB) granted. UMem indicates running              models. Figure 11b summarizes the overhead measured for
+Job-B in packing mode with the support of AntMan’s uni-           VGG16 [43], Inception3 [45], and GoogleNet [44], which
+versal memory, but without the coordinated scaling on the         adjust GPU memory at a size of 17 GB, 16 GB, and 4 GB
+
+
+
+542   14th USENIX Symposium on Operating Systems Design and Implementation                                            USENIX Association
+                       ResNet50      ESPnet                               ResNet50      ESPnet
+          100                                                 100                                                     Model                 Type          Dataset
+           90                                                  90                                                 ResNet-50 [22]            CV        ImageNet [16]
+           80                                                  80
+           70                                                  70
+SM util (%)
+
+
+
+
+                                                    SM util (%)
+           60                                                  60
+                                                                                                        20%        VGG16 [43]               CV         Cifar10 [30]
+           50                                                  50                                               SuperResolution [42]        CV         BSD300 [34]
+           40                                                  40
+           30                                                  30                                       20%          Bert [17]              NLP        SQuAD [38]
+           20                                                  20
+           10                                                  10                                       20%         ESPnet [46]            Speech       Corp.Data
+            0                                                   0
+                0    100    200 300 400       500                   0   100    200 300 400       500             GraphSAGE [21]             Rec.         PPI [55]
+                           Time (second)                                      Time (second)             20%
+                                                                                                                     GCN [29]               Rec.        Cora [41]
+                    (a) Packing mode.               (b) Adaptive computation adjust-                                 DIN [53]               Ad.         Corp.Data
+                                                    ment mode.                                          20%
+                                                                                                                 Wide & Deep [15]           Ad.         Corp.Data
+          Figure 12: The SM utilization rates of packing mode in
+          Gandiva [48] and an adaptive computation adjustment                                           Table 3: Deep learning models and the ratios in the trace.
+          mode in AntMan for a 500s segment of execution of ESP-
+          net and ResNet-50.
+                                                                                                       results reflected in this figure is that the SM utilization rates
+                                                                                                       of ResNet-50 are constantly fluctuating between 30% to 90%
+respectively. Given a dynamic memory scaling interval of one                                           within the first 140 seconds of execution. In contrast, the de-
+minute, the largest overhead (i.e., VGG16) is still negligible                                         coding stage (between 140 and 390 seconds) of ESPnet runs
+(only 0.4%).                                                                                           without consuming GPU computation cycles. Therefore, the
+                                                                                                       SM utilization rates of ResNet-50 are relatively high at this
+                                                                                                       stage As a result, by leveraging adaptive computation adjust-
+Dynamic GPU computation unit scaling. To demonstrate
+                                                                                                       ments, the end-to-end execution time of ESPnet remains 20.8
+the adaptive computation adjustment is essential for sharing
+                                                                                                       minutes while ResNet-50 maintains 57% performance.
+GPU between multiple jobs, the SM utilization rates when
+running two typical jobs under packing mode and adaptive
+computation mode are characterized separately. As shown                                                5.2    Trace Experiment
+in Figure 12, the resource-guarantee job is an PyTorch job
+with ESPnet [46] model on the speech-text dataset. It co-                                              Workloads. Nine state-of-the-art deep learning models are
+executes with an opportunistic job which is a TensorFlow                                               selected from Github, together with open datasets, as summa-
+job with ResNet-50 [22] model on ImageNet [16]. Compared                                               rized in Table 3. As the datasets of speech and advertisement
+to ResNet-50, ESPnet consumes less SM and less memory.                                                 are too small for evaluation, the internal datasets of Alibaba
+Therefore, packing these two jobs together into one GPU in-                                            are used for the experiment. The models are classified into
+curs a relatively higher GPU kernel queuing delay for the                                              categories according to their application domains and they are
+ESPnet and eventually leads to an SLA violation. Figure 12a                                            evenly mixed up (20%). The job runtime of the trace is config-
+illustrates that ESPnet is poor at competing GPU computa-                                              ured according to the distribution reported by Microsoft [48].
+tion cycles compared to ResNet-50. The utilization of ESPnet                                           As a simplified multi-tenant setup, deep learning training jobs
+remains mostly at 30% which is lower than in Figure 12b.                                               of the trace are randomly dispatched into two tenants. Tenant-
+ResNet-50 launches many more kernels per unit time than                                                A has 64-GPU quota and Tenant-B has no quota. Therefore,
+ESPnet, therefore, it consumes more GPU computation time.                                              all Tenant-A’s jobs are resource-guarantee jobs, and all jobs
+These results show that the end-to-end execution time of ES-                                           in Tenant-B are opportunistic jobs.
+Pnet increases dramatically from 20.1 minutes (when running
+on a dedicated GPU) to 105.2 minutes (when running together                                            Baseline. The experiment compares AntMan to another
+with ResNet-50).                                                                                       GPU production cluster scheduler, Apache YARNs capacity
+   Figure 12b illustrates that AntMan can leverage adaptive                                            scheduler (YARN-CS), which is used in Microsoft Philly [19,
+computation adjustment to utilize the left over resources as                                           28]. Gandiva [48], a state-of-the-art DL scheduling system,
+much as possible while still satisfying the SLA requirements.                                          is also used for comparison. Gandiva introduces a series of
+Specifically, AntMan introduces a feedback-based adjustment                                            primitives in DL for scheduling, including packing, migra-
+approach that continuously monitors the performance of re-                                             tion, and time-slicing. The packing strategy of Gandiva is
+source guarantee jobs and uses performance feedbacks to                                                used in this experiment, which greedily schedules jobs to the
+adjust the GPU kernel launching frequency of opportunistic                                             GPUs with lowest GPU utilization and sufficient GPU mem-
+jobs. As shown in Figure 12b, the SM utilization rates of                                              ory. The migration and time-slicing proposed in Gandiva are
+the training stage (the first 140 seconds) of ESPnet fluctuate                                         to solve resource fragmentation and benefit AutoML, which
+between 5% and 50%. In this scenario, AntMan continuously                                              are orthogonal to AntMan. Note that, Gandiva relies on job
+adjusts the GPU kernel launching frequency of ResNet-50                                                profiling information (i.e., GPU utilization, GPU memory us-
+to ensure the training performance of ESPnet. Therefore, the                                           age) for greedy packing decisions. Such profiling can hardly
+
+
+
+ USENIX Association                                                            14th USENIX Symposium on Operating Systems Design and Implementation                543
+                                                  1
+                                                                                                           Avg.    90% tile     95% tile
+         1600                  JCT
+                                                 0.8                                         Dec. 2019     1132     1978         5960
+                           Makespan
+Time (Min)
+
+
+
+
+         1200                                    0.6                                         Apr. 2020      550      124          489
+
+
+
+
+                                           CDF
+             800                                 0.4                 YARN-CS
+                                                               YARN-CS-preempt        Table 4: One-week queuing delay statistic in seconds.
+             400                                 0.2                   Gandiva
+                                                                       AntMan
+               0                                  0
+                            -CS diva  an               200         400    600        Interference    0%     0∼1%       1∼2%      2∼3%       3∼4%
+                          RN Gan AntM
+                     YA                                      JCT (Mins)
+                                                                                       # of jobs    9895     26         30        20         29
+(a) Comparison of YARN-CS, (b) Job completion time of
+Gandiva, and AntMan.       resource-guarantee jobs.                               Table 5: Interference analysis on mini-batch time for 10K
+                                                                                  production jobs
+                   Figure 13: Trace experiment on 64 V100 GPUs.
+
+                                                                                 comparison because the jobs of this cluster come from the
+ be achieved in a production cluster, as its outputs might affect                same departments in Alibaba. The comparison shows that
+ the successor tasks of DL pipeline. In the trace experiment,                    AntMan provides up to 17.1% extra GPUs for DL training
+ profiling information is unknown to both AntMan and YARN-                       jobs in this cluster. Hardware statistics show that AntMan
+ CS.                                                                             achieves a 42% improvement on average for GPU memory
+                                                                                 usage and a 34% improvement on average for GPU utilization.
+Results. Figure 13a shows the average job completion time                        Table 4 illustrates the queuing delay of jobs selected from
+(JCT) and the makespan for the three schedulers when ex-                         a one-week period when roughly the same number of jobs
+ecuting the same synthesized job trace in a cluster with 64                      arrive at the cluster. It illustrates that on average, the job queu-
+V100 GPUs. Compared to the capacity scheduler and Gandiva,                       ing delay reduces by 2.05x and the tail latency significantly
+AntMan improves average JCT by 2.05x and 1.84x. The total                        reduces by more than an order of magnitude, thanks to the
+makespan is also reduced by 1.76x and 1.67x respectively.                        cluster throughput improvement.
+To understand the improvements brought about by AntMan,                             To measure the performance of resource-guarantee jobs
+we config YARN-CS to run with preemption, which allows                           in co-execution, 10000 jobs were randomly sampled from
+jobs in Tenant-A to preempt jobs in Tenant-B for execution.                      one week in April 2020 which both have the phases executing
+The JCT of resource-guarantee jobs (Tenant-A) are shown                          exclusively and co-executing with other jobs. For each job, the
+in Figure 13b. This shows the JCT of AntMan is almost the                        mini-batch time was recorded for both its dedicated execution
+same as YARN-CS-preempt, however, YARN-CS-preempt                                and packing execution with other jobs. The mini-batch time
+achieves it with 46% of jobs being preempted. AntMan re-                         difference between these two scenarios was calculated and any
+spects the jobs of Tenant-A and schedules them once their                        gaps larger than 10 ms were considered as interfered (10 ms is
+resource quota are satisfied, while conducting a performance                     small enough to be considered as mini-batch fluctuation). In
+control on the co-executing opportunistic jobs to avoid inter-                   this way, the interference ratio for each job could be calculated.
+ference. Conversely, Gandiva delays the completion time of                       As shown in Table 5, 99% of the jobs suffer zero performance
+these jobs because of the lack of performance isolation and                      downgrades during job packing.
+dynamic resource scaling.
+                                                                                 6     Related Work
+ 5.3               Cluster Experiment
+                                                                                 GPU memory management. To optimize the limited
+AntMan has been deployed on the production clusters of                           and valued GPU memory for supporting larger batch-size
+Alibaba to serve tens of thousands of daily deep learning                        DNN training, vDNN [39], Capuchin [36], CDMA [40], and
+training jobs. To verify the design and implementation of                        Gist [26] adopts eviction, prefetching, and re-computation to
+AntMan while ensuring it works properly, experiments and                         reduce the GPU memory footprint, leveraging application-
+statistics are conducted on a heterogeneous GPU cluster with                     specific knowledge. Salus [50] packs multiple jobs in the
+over 5000 GPUs.                                                                  same process to share the GPU memory management, how-
+   To illustrate the cluster efficiency improvement provided                     ever, with interference in co-execution. In addition, running
+by AntMan, one-week statistics were collected in December                        multiple jobs in a process could potentially broadcast the
+2019, right before the deployment of AntMan, as the baseline.                    failures, especially when given a significantly high failure
+It is compared to the number collected in April 2020, after                      ratio [27, 51]. AntMan provides a universal memory manage-
+AntMan was fully deployed for weeks. However, as the jobs                        ment design using dynamic GPU and CPU memory swapping
+of these two weeks are different, the average JCT cannot be                      at the granularity of tensors for the fluctuant load, which com-
+compared directly. Therefore, we focus on system metrics                         plements the memory swapping and re-computation policies.
+
+
+
+ 544               14th USENIX Symposium on Operating Systems Design and Implementation                                       USENIX Association
+Interference and performance isolation. Performance                 TorchElastic [7] and ElasticDL [2] are designed to start train-
+isolation is critical in modern operating systems and shared        ing with any number of available GPUs. A common problem
+CPU clusters. Linux uses cgroups [1] to control the CPU and         of these elastic DL frameworks is that the model training ac-
+memory usage of a process. However, it rarely has support for       curacy can hardly be guaranteed or reproduced, and are thus
+general GPU applications. A series of research works, such as       rarely used in production.
+Quincy [25] and Entropy [24], optimize the job performance
+for fair sharing on CPU clusters. In AntMan, the character-
+istic of DL jobs is leveraged to provide fine-grained control       7   Conclusion
+on GPU memory and computation unit at runtime, which is
+                                                                    We present AntMan, a deep learning infrastructure deployed
+similar to cgroups, but on an application level.
+                                                                    in the GPU production clusters of Alibaba. AntMan intro-
+   The interference issue of multiplexing jobs on a GPU has
+                                                                    duces dynamic scaling primitives in deep learning frame-
+been well studied. Baymax [14] shares GPUs by mitigating
+                                                                    works, allowing flexible fine-grained control of GPU re-
+queuing delay and PCIe contention. Prophet [13] tries to
+                                                                    sources for individual deep learning jobs at runtime. By uti-
+predict co-executed GPU workload performance using an an-
+                                                                    lizing the effective primitives mentioned above, AntMan co-
+alytical model. AntMan introduces an operator management
+                                                                    designs cluster scheduler and deep learning frameworks for
+module in the executor of the DL framework, leveraging the
+                                                                    cooperative job management, allowing GPUs to be utilized
+inherent periodical mini-batch iteration cycles as a metric
+                                                                    by over-provision of opportunistic jobs at best-effort while
+for inter-job coordination. It controls the frequency of GPU
+                                                                    avoiding the interference to other jobs. AntMan improves the
+kernel launches and resolves the contention in both the GPU
+                                                                    overall GPU memory utilization and the computation unit
+computation unit and PCIe.
+                                                                    utilization of Alibaba’s GPU clusters by 42% and 34% re-
+   NVIDIA MPS can co-operate with multi-process CUDA
+                                                                    spectively without compromising fairness.
+applications in a GPU. MPS support is not production ready
+yet [4]. The resource limit cannot be changed at the runtime
+of a client process which violates the fluctuant characteristic.    Acknowledgements
+Moreover, MPS merges CUDA execution in only one con-
+text, resulting in the termination of all clients for any fatal     We would like to thank our shepherd Roxana Geambasu and
+GPU exceptions. rCUDA [37] and FlexDirect [3] of VMWare             the anonymous reviewers for their valuable comments and
+Bitfusion allow jobs to be remotely executed on a shared            suggestions. We would also like to thank Chen Xing, Jin
+GPU.                                                                Ouyang, Xinyuan Li, Lixue Xia for their help in improving
+                                                                    quality of writing.
+GPU cluster scheduling Today, DL training jobs in multi-
+tenant production clusters are managed by infrastructures
+such as Kubernetes or YARN [9, 28], where jobs are allocated
+                                                                    References
+on dedicated GPUs, leading to common low utilization [27].
+                                                                     [1] cgroups.          https://en.wikipedia.org/wiki/
+Gandiva [48] proposes time-slicing, migration, and packing
+                                                                         Cgroups.
+to allow GPU sharing. Time-slicing and migration switch
+the GPU usage among jobs in coarse-grained, and therefore            [2] ElasticDL.              https://github.com/
+cannot improve GPU utilization. The packing approach pro-                sql-machine-learning/elasticdl/.
+posed in Gandiva [48] could potentially introduce significant
+unpredictable resource contention, which violates the fairness       [3] FlexDirect    of     VMware        BitFusion.
+requirements of a shared multi-tenant cluster. Themis [33]               https://www.vmware.com/content/dam/
+addresses the unfairness of placement-sensitive character-               digitalmarketing/vmware/en/pdf/whitepaper/
+istic in DL jobs by proposing a long term fairness object.               vmw-bitfusion-docs-flexdirect-whitepaper.
+Gandiva f air [12] addresses the fairness issue of multi-size job        pdf.
+time-slicing and proposes an automated trading mechanism.
+AlloX [31] efficiently and fairly schedules DL jobs in inter-        [4] MPS.             https://github.com/NVIDIA/
+changeable resources by modelling the scheduling problem                 nvidia-docker/issues/419.
+as a min-cost bipartite matching problem. AntMan introduces
+opportunistic DL jobs as low-priority jobs to best-effort uti-       [5] NCCL. https://developer.nvidia.com/nccl/.
+lize the GPU cycles, which is complementary to the fairness          [6] NVLink.       https://www.nvidia.com/en-us/
+metrics and policies proposed above.                                     data-center/nvlink/.
+
+Elastic training. To utilize the idle GPUs introduced by             [7] TorchElastic.         https://github.com/pytorch/
+gang-scheduling and to support fault-tolerance in DL training,           elastic.
+
+
+
+USENIX Association                            14th USENIX Symposium on Operating Systems Design and Implementation            545
+ [8] Martín Abadi, Paul Barham, Jianmin Chen, Zhifeng            [16] Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li,
+     Chen, Andy Davis, Jeffrey Dean, Matthieu Devin, San-             and Li Fei-Fei. Imagenet: A large-scale hierarchical
+     jay Ghemawat, Geoffrey Irving, Michael Isard, et al.             image database. In Computer Vision and Pattern Recog-
+     TensorFlow: A System for Large-Scale Machine Learn-              nition, 2009. CVPR 2009. IEEE Conference on, pages
+     ing. In 12th USENIX Symposium on Operating Sys-                  248–255. IEEE, 2009.
+     tems Design and Implementation (OSDI 16), volume 16,
+     pages 265–283. USENIX Association, 2016.                    [17] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and
+                                                                      Kristina Toutanova. BERT: pre-training of deep bidi-
+ [9] Scott Boag, Parijat Dube, Benjamin Herta, Waldemar               rectional transformers for language understanding. In
+     Hummer, Vatche Ishakian, K Jayaram, Michael Kalan-               Proceedings of the 2019 Conference of the North Amer-
+     tar, Vinod Muthusamy, Priya Nagpurkar, and Florian               ican Chapter of the Association for Computational Lin-
+     Rosenberg. Scalable multi-framework multi-tenant life-           guistics: Human Language Technologies, NAACL-HLT
+     cycle management of deep learning training jobs. In              2019, Minneapolis, MN, USA, June 2-7, 2019, Volume 1
+     Workshop on ML Systems, NIPS, 2017.                              (Long and Short Papers), pages 4171–4186. Association
+[10] Eric Boutin, Jaliya Ekanayake, Wei Lin, Bing Shi, Jin-           for Computational Linguistics, 2019.
+     gren Zhou, Zhengping Qian, Ming Wu, and Lidong
+                                                                 [18] Priya Goyal, Piotr Dollár, Ross B. Girshick, Pieter No-
+     Zhou. Apollo: Scalable and Coordinated Scheduling
+                                                                      ordhuis, Lukasz Wesolowski, Aapo Kyrola, Andrew Tul-
+     for Cloud-Scale Computing. In 11th USENIX Sympo-
+                                                                      loch, Yangqing Jia, and Kaiming He. Accurate, large
+     sium on Operating Systems Design and Implementa-
+                                                                      minibatch SGD: training imagenet in 1 hour. CoRR,
+     tion (OSDI 14), pages 285–300, Broomfield, CO, 2014.
+                                                                      abs/1706.02677, 2017.
+     USENIX Association.
+[11] Brendan Burns, Brian Grant, David Oppenheimer, Eric         [19] Juncheng Gu, Mosharaf Chowdhury, Kang G Shin, Yibo
+     Brewer, and John Wilkes. Borg, Omega, and Kubernetes.            Zhu, Myeongjae Jeon, Junjie Qian, Hongqiang Liu, and
+     ACM Queue, 14:70–93, 2016.                                       Chuanxiong Guo. Tiresias: A GPU cluster manager
+                                                                      for distributed deep learning. In 16th USENIX Sympo-
+[12] Shubham Chaudhary, Ramachandran Ramjee, Muthian                  sium on Networked Systems Design and Implementation
+     Sivathanu, Nipun Kwatra, and Srinidhi Viswanatha. Bal-           (NSDI 19), pages 485–500, 2019.
+     ancing efficiency and fairness in heterogeneous gpu clus-
+     ters for deep learning. In Proceedings of the Fifteenth     [20] Huifeng Guo, Ruiming Tang, Yunming Ye, Zhenguo Li,
+     European Conference on Computer Systems, pages 1–                and Xiuqiang He. Deepfm: A factorization-machine
+     16, 2020.                                                        based neural network for CTR prediction. In Proceed-
+                                                                      ings of the Twenty-Sixth International Joint Conference
+[13] Quan Chen, Hailong Yang, Minyi Guo, Ram Srivatsa
+                                                                      on Artificial Intelligence, IJCAI 2017, Melbourne, Aus-
+     Kannan, Jason Mars, and Lingjia Tang. Prophet: Precise
+                                                                      tralia, August 19-25, 2017, pages 1725–1731. ijcai.org,
+     qos prediction on non-preemptive accelerators to im-
+                                                                      2017.
+     prove utilization in warehouse-scale computers. In Pro-
+     ceedings of the Twenty-Second International Conference
+                                                                 [21] William L. Hamilton, Zhitao Ying, and Jure Leskovec.
+     on Architectural Support for Programming Languages
+                                                                      Inductive representation learning on large graphs. In
+     and Operating Systems, pages 17–32, 2017.
+                                                                      Advances in Neural Information Processing Systems 30:
+[14] Quan Chen, Hailong Yang, Jason Mars, and Lingjia                 Annual Conference on Neural Information Processing
+     Tang. Baymax: Qos awareness and increased utilization            Systems 2017, 4-9 December 2017, Long Beach, CA,
+     for non-preemptive accelerators in warehouse scale com-          USA, pages 1024–1034, 2017.
+     puters. In Proceedings of the Twenty-First International
+     Conference on Architectural Support for Programming         [22] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian
+     Languages and Operating Systems, ASPLOS ’16, At-                 Sun. Deep residual learning for image recognition. In
+     lanta, GA, USA, April 2-6, 2016, pages 681–696. ACM,             Proceedings of the IEEE conference on computer vision
+     2016.                                                            and pattern recognition, pages 770–778, 2016.
+
+[15] Heng-Tze Cheng, Levent Koc, Jeremiah Harmsen, Tal           [23] Xinran He, Junfeng Pan, Ou Jin, Tianbing Xu, Bo Liu,
+     Shaked, Tushar Chandra, Hrishi Aradhye, Glen Ander-              Tao Xu, Yanxin Shi, Antoine Atallah, Ralf Herbrich,
+     son, Greg Corrado, Wei Chai, Mustafa Ispir, et al. Wide          Stuart Bowers, et al. Practical lessons from predicting
+     & deep learning for recommender systems. In Proceed-             clicks on ads at facebook. In Proceedings of the Eighth
+     ings of the 1st workshop on deep learning for recom-             International Workshop on Data Mining for Online Ad-
+     mender systems, pages 7–10, 2016.                                vertising, pages 1–9, 2014.
+
+
+
+546   14th USENIX Symposium on Operating Systems Design and Implementation                              USENIX Association
+[24] Fabien Hermenier, Xavier Lorca, Jean-Marc Menaud,           [34] D. Martin, C. Fowlkes, D. Tal, and J. Malik. A database
+     Gilles Muller, and Julia L. Lawall. Entropy: a consoli-          of human segmented natural images and its application
+     dation manager for clusters. In Proceedings of the 5th           to evaluating segmentation algorithms and measuring
+     International Conference on Virtual Execution Environ-           ecological statistics. In Proc. 8th Int’l Conf. Computer
+     ments, VEE 2009, Washington, DC, USA, March 11-13,               Vision, volume 2, pages 416–423, July 2001.
+     2009, pages 41–50. ACM, 2009.
+                                                                 [35] Adam Paszke, Sam Gross, Francisco Massa, Adam
+[25] Michael Isard, Vijayan Prabhakaran, Jon Currey, Udi              Lerer, James Bradbury, Gregory Chanan, Trevor Killeen,
+     Wieder, Kunal Talwar, and Andrew Goldberg. Quincy:               Zeming Lin, Natalia Gimelshein, Luca Antiga, et al.
+     fair scheduling for distributed computing clusters. In           Pytorch: An imperative style, high-performance deep
+     Proceedings of the ACM SIGOPS 22nd symposium on                  learning library. In Advances in Neural Information
+     Operating systems principles, pages 261–276. ACM,                Processing Systems, pages 8024–8035, 2019.
+     2009.
+                                                                 [36] Xuan Peng, Xuanhua Shi, Hulin Dai, Hai Jin, Weiliang
+[26] Animesh Jain, Amar Phanishayee, Jason Mars, Lingjia              Ma, Qian Xiong, Fan Yang, and Xuehai Qian. Ca-
+     Tang, and Gennady Pekhimenko. Gist: Efficient data               puchin: Tensor-based gpu memory management for
+     encoding for deep neural network training. In 2018               deep learning. In Proceedings of the Twenty-Fifth Inter-
+     ACM/IEEE 45th Annual International Symposium on                  national Conference on Architectural Support for Pro-
+     Computer Architecture (ISCA), pages 776–789. IEEE,               gramming Languages and Operating Systems, pages
+     2018.                                                            891–905, 2020.
+[27] Myeongjae Jeon, Shivaram Venkataraman, Amar Phan-
+     ishayee, Junjie Qian, Wencong Xiao, and Fan Yang.           [37] Javier Prades and Federico Silla. Gpu-job migration:
+     Analysis of large-scale multi-tenant GPU clusters for            The rcuda case. IEEE Trans. Parallel Distrib. Syst.,
+     DNN training workloads. In 2019 USENIX Annual                    30(12):2718–2729, 2019.
+     Technical Conference (USENIX ATC 19), pages 947–            [38] Pranav Rajpurkar, Jian Zhang, Konstantin Lopyrev, and
+     960, 2019.                                                       Percy Liang. Squad: 100, 000+ questions for machine
+[28] Myeongjae Jeon, Shivaram Venkataraman, Junjie Qian,              comprehension of text. In Proceedings of the 2016
+     Amar Phanishayee, Wencong Xiao, and Fan Yang.                    Conference on Empirical Methods in Natural Language
+     Multi-tenant gpu clusters for deep learning workloads:           Processing, EMNLP 2016, Austin, Texas, USA, Novem-
+     Analysis and implications. Tech. Rep., 2018.                     ber 1-4, 2016, pages 2383–2392. The Association for
+                                                                      Computational Linguistics, 2016.
+[29] Thomas N. Kipf and Max Welling. Semi-supervised
+     classification with graph convolutional networks. In        [39] Minsoo Rhu, Natalia Gimelshein, Jason Clemons, Ar-
+     5th International Conference on Learning Representa-             slan Zulfiqar, and Stephen W. Keckler. vdnn: Virtualized
+     tions, ICLR 2017, Toulon, France, April 24-26, 2017,             deep neural networks for scalable, memory-efficient neu-
+     Conference Track Proceedings. OpenReview.net, 2017.              ral network design. In 49th Annual IEEE/ACM Interna-
+                                                                      tional Symposium on Microarchitecture, MICRO 2016,
+[30] Alex Krizhevsky, Geoffrey Hinton, et al. Learning mul-           Taipei, Taiwan, October 15-19, 2016, pages 18:1–18:13.
+     tiple layers of features from tiny images. 2009.                 IEEE Computer Society, 2016.
+[31] Tan N Le, Xiao Sun, Mosharaf Chowdhury, and Zhenhua
+     Liu. Allox: compute allocation in hybrid clusters. In       [40] Minsoo Rhu, Mike O’Connor, Niladrish Chatterjee, Jeff
+     Proceedings of the Fifteenth European Conference on              Pool, Youngeun Kwon, and Stephen W Keckler. Com-
+     Computer Systems, pages 1–16, 2020.                              pressing dma engine: Leveraging activation sparsity for
+                                                                      training deep neural networks. In 2018 IEEE Inter-
+[32] Liang Luo, Peter West, Arvind Krishnamurthy, Luis                national Symposium on High Performance Computer
+     Ceze, and Jacob Nelson. Plink: Discovering and exploit-          Architecture (HPCA), pages 78–91. IEEE, 2018.
+     ing datacenter network locality for efficient cloud-based
+     distributed training, 2020.                                 [41] Prithviraj Sen, Galileo Namata, Mustafa Bilgic, Lise
+                                                                      Getoor, Brian Gallagher, and Tina Eliassi-Rad. Collec-
+[33] Kshiteej Mahajan, Arjun Balasubramanian, Arjun                   tive classification in network data. AI Mag., 29(3):93–
+     Singhvi, Shivaram Venkataraman, Aditya Akella, Amar              106, 2008.
+     Phanishayee, and Shuchi Chawla. Themis: Fair and effi-
+     cient GPU cluster scheduling. In 17th USENIX Sympo-         [42] Wenzhe Shi, Jose Caballero, Ferenc Huszár, Johannes
+     sium on Networked Systems Design and Implementation              Totz, Andrew P Aitken, Rob Bishop, Daniel Rueckert,
+     (NSDI 20), pages 289–304, 2020.                                  and Zehan Wang. Real-time single image and video
+
+
+
+USENIX Association                          14th USENIX Symposium on Operating Systems Design and Implementation          547
+      super-resolution using an efficient sub-pixel convolu-   [49] Wencong Xiao, Zhenhua Han, Hanyu Zhao, Xuan Peng,
+      tional neural network. In Proceedings of the IEEE             Quanlu Zhang, Fan Yang, and Lidong Zhou. Scheduling
+      conference on computer vision and pattern recognition,        CPU for gpu-based deep learning jobs. In Proceedings
+      pages 1874–1883, 2016.                                        of the ACM Symposium on Cloud Computing, SoCC
+                                                                    2018, Carlsbad, CA, USA, October 11-13, 2018, page
+[43] Karen Simonyan and Andrew Zisserman. Very deep con-            503. ACM, 2018.
+     volutional networks for large-scale image recognition.
+     In 3rd International Conference on Learning Represen-     [50] Peifeng Yu and Mosharaf Chowdhury. Salus: Fine-
+     tations, ICLR 2015, San Diego, CA, USA, May 7-9, 2015,         grained GPU sharing primitives for deep learning appli-
+     Conference Track Proceedings, 2015.                            cations. CoRR, abs/1902.04610, 2019.
+[44] Christian Szegedy, Wei Liu, Yangqing Jia, Pierre Ser-     [51] Ru Zhang, Wencong Xiao, Hongyu Zhang, Yu Liu,
+     manet, Scott Reed, Dragomir Anguelov, Dumitru Erhan,           Haoxiang Lin, and Mao Yang. An empirical study on
+     Vincent Vanhoucke, and Andrew Rabinovich. Going                program failures of deep learning jobs. In Proceedings
+     deeper with convolutions. In Proceedings of the IEEE           of the 42nd International Conference on Software Engi-
+     conference on computer vision and pattern recognition,         neering, ICSE ’20, pages 1159–1170, NY, USA, 2020.
+     pages 1–9, 2015.                                               Association for Computing Machinery.
+
+[45] Christian Szegedy, Vincent Vanhoucke, Sergey Ioffe, Jon   [52] Zhuo Zhang, Chao Li, Yangyu Tao, Renyu Yang, Hong
+     Shlens, and Zbigniew Wojna. Rethinking the inception           Tang, and Jie Xu. Fuxi: a fault-tolerant resource man-
+     architecture for computer vision. In Proceedings of            agement and job scheduling system at internet scale. In
+     the IEEE Conference on Computer Vision and Pattern             Proceedings of the VLDB Endowment, volume 7, pages
+     Recognition, pages 2818–2826, 2016.                            1393–1404. VLDB Endowment Inc., 2014.
+
+[46] Shinji Watanabe, Takaaki Hori, Shigeki Karita, Tomoki     [53] Guorui Zhou, Xiaoqiang Zhu, Chenru Song, Ying Fan,
+     Hayashi, Jiro Nishitoba, Yuya Unno, Nelson Enrique             Han Zhu, Xiao Ma, Yanghui Yan, Junqi Jin, Han Li, and
+     Yalta Soplin, Jahn Heymann, Matthew Wiesner, Nanxin            Kun Gai. Deep interest network for click-through rate
+     Chen, Adithya Renduchintala, and Tsubasa Ochiai. Es-           prediction. In Proceedings of the 24th ACM SIGKDD
+     pnet: End-to-end speech processing toolkit. In Inter-          International Conference on Knowledge Discovery &
+     speech, pages 2207–2211, 2018.                                 Data Mining, pages 1059–1068, 2018.
+[47] Pijika Watcharapichat, Victoria Lopez Morales,
+     Raul Castro Fernandez, and Peter R. Pietzuch. Ako:        [54] Rong Zhu, Kun Zhao, Hongxia Yang, Wei Lin, Chang
+     Decentralised deep learning with partial gradient ex-          Zhou, Baole Ai, Yong Li, and Jingren Zhou. Aligraph:
+     change. In Proceedings of the Seventh ACM Symposium            a comprehensive graph neural network platform. Pro-
+     on Cloud Computing, Santa Clara, CA, USA, October              ceedings of the VLDB Endowment, 12(12):2094–2105,
+     5-7, 2016, pages 84–97. ACM, 2016.                             2019.
+
+[48] Wencong Xiao, Romil Bhardwaj, Ramachandran Ram-           [55] Marinka Zitnik and Jure Leskovec. Predicting multi-
+     jee, Muthian Sivathanu, Nipun Kwatra, Zhenhua Han,             cellular function through multi-layer tissue networks.
+     Pratyush Patel, Xuan Peng, Hanyu Zhao, Quanlu Zhang,           Bioinformatics, 33(14):i190–i198, 2017.
+     Fan Yang, and Lidong Zhou. Gandiva: Introspective
+     cluster scheduling for deep learning. In 13th USENIX      [56] Barret Zoph, Ekin D. Cubuk, Golnaz Ghiasi, Tsung-Yi
+     Symposium on Operating Systems Design and Imple-               Lin, Jonathon Shlens, and Quoc V. Le. Learning data
+     mentation, OSDI 2018, Carlsbad, CA, USA, October 8-            augmentation strategies for object detection. CoRR,
+     10, 2018, pages 595–610. USENIX Association, 2018.             abs/1906.11172, 2019.
+
+
+
+
+548   14th USENIX Symposium on Operating Systems Design and Implementation                            USENIX Association
+

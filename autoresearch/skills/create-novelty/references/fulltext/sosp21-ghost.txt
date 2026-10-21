@@ -1,0 +1,1121 @@
+               ghOSt: Fast & Flexible User-Space Delegation
+                           of Linux Scheduling
+     Jack Tigar Humphries1 , Neel Natu1 , Ashwin Chaugule1 , Ofir Weisse1 , Barret Rhoden1 , Josh Don1 ,
+                    Luigi Rizzo1 , Oleg Rombakh1 , Paul Turner1 , Christos Kozyrakis2
+                                                             1 Google, Inc.             2 Stanford University
+
+
+Abstract                                                                                      Keywords Operating systems, thread scheduling
+We present ghOSt, our infrastructure for delegating kernel
+scheduling decisions to userspace code. ghOSt is designed                                     ACM Reference Format:
+to support the rapidly evolving needs of our data center                                      Jack Tigar Humphries, Neel Natu, Ashwin Chaugule, Ofir Weisse,
+workloads and platforms.                                                                      Barret Rhoden, Josh Don, Luigi Rizzo, Oleg Rombakh, Paul Turner,
+   Improving scheduling decisions can drastically improve                                     and Christos Kozyrakis. 2021. ghOSt: Fast & Flexible User-Space
+                                                                                              Delegation of Linux Scheduling. In ACM SIGOPS 28th Symposium
+the throughput, tail latency, scalability, and security of im-
+                                                                                              on Operating Systems Principles (SOSP ’21), October 26–28, 2021,
+portant workloads. However, kernel schedulers are difficult                                   Virtual Event, Germany. ACM, New York, NY, USA, 17 pages. https:
+to implement, test, and deploy efficiently across a large fleet.                              //doi.org/10.1145/3477132.3483542
+Recent research suggests bespoke scheduling policies, within
+custom data plane operating systems, can provide compelling
+performance results in a data center setting. However, these                                  1    Introduction
+gains have proved difficult to realize as it is impractical to                                CPU scheduling plays an important role in application perfor-
+deploy a custom OS image(s) at an application granularity,                                    mance and security. Tailoring policies for specific workload
+particularly in a multi-tenant environment, limiting the prac-                                types can substantially improve key metrics such as latency,
+tical applications of these new techniques.                                                   throughput, hard/soft real-time characteristics, energy effi-
+   ghOSt provides general-purpose delegation of schedul-                                      ciency, cache interference, and security [1–26]. For example,
+ing policies to userspace processes in a Linux environment.                                   the Shinjuku request scheduler [25] optimized highly disper-
+ghOSt provides state encapsulation, communication, and                                        sive workloads – workloads with a mix of short and long
+action mechanisms that allow complex expression of sched-                                     requests – improving request tail latency and throughput
+uling policies within a userspace agent, while assisting in                                   by an order of magnitude. The Tableau scheduler for virtual
+synchronization. Programmers use any language to develop                                      machine workloads [23] demonstrated improved throughput
+and optimize policies, which are modified without a host                                      by 1.6× and latency by 17× under multi-tenant scenarios.
+reboot. ghOSt supports a wide range of scheduling models,                                     The Caladan scheduler [21] focused on resource interference
+from per-CPU to centralized, run-to-completion to preemp-                                     between foreground low-latency apps and background best
+tive, and incurs low overheads for scheduling actions. We                                     effort apps, improving network request tail latency by as
+demonstrate ghOSt’s performance on both academic and real-                                    much as 11,000×. To mitigate recent hardware vulnerabil-
+world workloads, including Google Snap and Google Search.                                     ities [27–32], cloud platforms running multi-tenant hosts
+We show that by using ghOSt instead of the kernel scheduler,                                  had to rapidly deploy new core-isolation policies, isolating
+we can quickly achieve comparable throughput and latency                                      shared processor state between applications.
+while enabling policy optimization, non-disruptive upgrades,                                     Designing, implementing, and deploying new scheduling
+and fault isolation for our data center workloads. We open-                                   policies across a large fleet is an exacting task. It requires de-
+source our implementation to enable future research and                                       velopers to design policies capable of balancing the specific
+development based on ghOSt.                                                                   performance requirements of many applications. The imple-
+                                                                                              mentation must conform with a complex kernel architecture,
+CCS Concepts • Software and its engineering;
+                                                                                              and errors will, in many cases, crash the entire system or
+                                                                                              otherwise severely impede performance due to unintended
+                                                                                              side effects [33]. Even when successful, the disruptive nature
+                                                                                              of an upgrade carries its own opportunity cost in host and
+                                                                                              application downtime. This creates a challenging conflict
+                                                                                              between risk-minimization and progress.
+This work is licensed under a Creative Commons Attribution International 4.0 License.            Prior attempts to improve performance and reduce com-
+SOSP ’21, October 26–28, 2021, Virtual Event, Germany
+                                                                                              plexity in the kernel by designing userspace solutions have
+© 2021 Copyright held by the owner/author(s).
+ACM ISBN 978-1-4503-8709-5/21/10.                                                             significant shortcomings: they require substantial modifi-
+https://doi.org/10.1145/3477132.3483542                                                       cation of application implementation [1, 10, 21, 25, 34, 35],
+
+
+
+                                                                                        588
+    Kernel                 User                                                   agent(s) then use a transaction-based API in a synchronous
+                                                     Workload
+    space                 space                                                   path to commit scheduling decisions for the threads (§3.2).
+                                                Optional scheduling hints         ghOSt supports concurrent execution of multiple policies,
+                      Thread/CPU Messages         ghOSt agents                    fault isolation, and allocation of CPU resources to different
+     Kernel
+                      Status words                                                applications. Importantly, to enable practical transition of
+       ghOSt                    Transactions                                      existing systems in the fleet to use ghOSt, it co-exists with
+   scheduling class
+                                     Syscalls
+                                                     CPU scheduling
+                                                       decisions
+                                                                                  other schedulers running in the kernel, such as CFS (§3.4).
+                                                                                     We demonstrate that ghOSt enables us to define various
+                Figure 1. Overview of ghOSt.                                      policies leading to performance comparable or better than
+require dedicated resources in order to be highly respon-                         existing schedulers on both academic and production work-
+sive [1, 21, 25], or otherwise require application-specific                       loads (§4). We characterize the overheads of key ghOSt op-
+kernel modifications [1, 2, 10, 21, 25, 34–37].                                   erations (§4.1). We show that ghOSt’s overheads are small
+   Although Linux supports multiple scheduling implemen-                          and range from 265 ns for message delivery, several hundred
+tations; tailoring, maintaining, and deploying a different                        nanoseconds to context-switch into an agent, and 888 ns
+mechanism for each application is impractical to manage on                        to schedule a thread, making ghOSt scheduling overheads
+a large fleet. One of our goals is to formalize which kernel                      only slightly higher than in existing kernel schedulers. With
+changes are required to enable a plethora of optimizations                        amortization, these overheads allow just a single ghOSt agent
+(and experimentation) in userspace, on a stable kernel ABI.                       to schedule over 2 million threads per second (Fig. 5). We
+   Further, the hardware landscape is ever changing, stress-                      evaluate ghOSt by implementing centralized and preemptive
+ing existing scheduling abstraction models [38] originally                        policies for 𝜇s-scale workloads that lead to high throughput
+designed to manage simpler systems. Schedulers must evolve                        and low tail latency in the presence of high request dis-
+to support these rapid changes: increasing core counts, new                       persion [10, 25] and antagonists [1, 21] (§4.2). We compare
+sharing properties (e.g., SMT), and heterogeneous systems                         ghOSt to Shinjuku [25], a specialized modern data plane, to
+(e.g., big.LITTLE [39]). NUMA properties of even a single-                        show ghOSt’s minimal overhead and competitive 𝜇s-scale
+socket platform continue to increase (e.g., chiplets [40]). Com-                  performance (within 5% of Shinjuku) while supporting a
+pute offloads such as AWS Nitro [41] and DPUs [42] as well                        broader set of workloads, including multi-tenancy.
+as domain-specific accelerators such as GPUs and TPUs [43]                           We also implement a policy for Snap [2], our production
+are new types of tightly coupled compute devices that exist                       packet-switching framework used in our data centers, lead-
+entirely beyond the domain of a classical scheduler. We need                      ing to comparable and in some cases 5-30% better tail la-
+a paradigm to more efficiently support the evolving prob-                         tency than MicroQuanta, our soft real-time scheduler used
+lem domain than is possible today with monolithic kernel                          today (§4.3). We then implement a ghOSt policy for ma-
+implementations.                                                                  chines running Google Search (§4.4). By customizing the
+   In this paper, we present the design of ghOSt and its eval-                    policy to the machine’s topology, in <1000 total lines of code,
+uation on production and academic use-cases. ghOSt is a                           we demonstrate that ghOSt matches the throughput pro-
+scheduler for native OS threads that delegates policy de-                         vided by the existing scheduler, and often outperforms the
+cisions to userspace. The goal of ghOSt is to fundamentally                       latency by 40-50%. Lastly, we implement a policy for virtual
+change how scheduling policies are designed, implemented, and                     machines (§4.5) that is secure against recently discovered
+deployed. ghOSt provides the agility of userspace development                     microarchitectural vulnerabilities [27–32] and show that
+and ease of deployment, while still enabling 𝜇s-scale schedul-                    ghOSt’s performance is competitive with a pure in-kernel
+ing. ghOSt provides abstraction and interface for userspace                       policy implementation. With ghOSt, scheduling strategies —
+software to define complex scheduling policies, from the                          previously requiring extensive kernel modification — can be
+per-CPU model to a system-wide (centralized) model. Impor-                        implemented in just 10s or 100s of lines of code.
+tantly, ghOSt decouples the kernel scheduling mechanism
+from policy definition. The mechanism resides in the kernel                       2   Background & Design Goals
+and rarely changes. The policy definition resides in userspace                    Large cloud providers and users (e.g., cloud clients) are mo-
+and rapidly changes. We open-source our implementation to                         tivated to deploy new scheduling policies to optimize per-
+enable future research and development using ghOSt [44, 45].                      formance for key workloads running on increasingly com-
+   By scheduling native threads, ghOSt supports existing ap-                      plex hardware topologies, and provide protection against
+plications without any changes. In ghOSt (Fig. 1), the sched-                     new hardware vulnerabilities such as Spectre [29–32] and
+uling policy logic runs within normal Linux processes, de-                        L1TF/MDS [27, 31, 46] by isolating untrusted threads on
+noted as agents, which interact with the kernel via the ghOSt                     separate physical cores.
+API. The kernel notifies the agent(s) of state changes for                           Scheduling in Linux. Linux supports implementing mul-
+all managed threads – e.g., thread creation/block/wakeup                          tiple policies via scheduling classes [7]. Classes are ordered
+– via message queues (§3.1) in an asynchronous path. The                          by their priority: a thread scheduled with a higher priority
+
+
+
+                                                                            589
+class will preempt a thread scheduled with a lower prior-                  threads. In contrast, user-level threading runtimes sched-
+ity class. To optimize performance of specific applications,               ule user threads. These runtimes [22, 48, 52–60] multiplex
+developers can modify a scheduling class to better fit the ap-             M user threads on N native threads. This is inherently un-
+plication’s needs, e.g., prioritizing the application’s threads to         predictable: although the userspace runtime may control
+reduce network latency [21] or scheduling the application’s                which user thread runs on a given native thread, it cannot
+threads using real-time policies to meet deadlines [47] for                control when that native thread is scheduled to actually run
+database queries. In principle, a cloud provider or an appli-              or which CPU it runs on. Even worse, the kernel can de-
+cation developer can also create an entirely new class/policy              schedule a thread holding a user-level lock. To overcome
+(rather than modify an existing one) optimized for a specific              this limitation, developers have two options. (1) Dedicate
+service, such as cloud virtual machines [24] or a reinforce-               CPUs to the native threads running the user-threads, thus
+ment learning framework [20]. However, the complexity of                   guaranteeing implicit control. However, this option wastes
+implementing and maintaining these policies in the kernel                  resources at low workload utilization, because the dedicated
+leads many developers to instead use existing generic poli-                CPUs cannot be shared with another application (see §4.2),
+cies, such as the Linux Completely Fair Scheduler (CFS [7]).               and requires extensive coordination around scaling capacity.
+Therefore, existing classes in Linux are designed to support               Alternatively, developers can (2) stay at the mercy of the
+as many use-cases as possible. It is then challenging to use               native thread scheduler, allowing CPUs to be shared, but
+these overly-generic classes to optimize high-performance                  ultimately losing the control over response time that they
+applications to use the hardware at maximum efficiency.                    turned to a user-level runtime for. ghOSt enables the best
+   Implementing schedulers is hard. When developers                        of both worlds by guaranteeing control over response time
+do embark on designing a new kernel scheduler, they find                   while allowing flexible sharing of CPU resources.
+these schedulers hard to implement, test, and debug. Sched-                   Custom scheduler/data plane OS per workload is im-
+ulers are typically written in low-level languages (C and                  practical. Previous work, such as Shinjuku, Shenango, and
+assembly), cannot leverage useful libraries (e.g., Facebook                others [1, 10, 21, 25, 34], implemented highly specialized data
+Folly [48] and Google Abseil [49]), and cannot be intro-                   plane operating systems with custom scheduling policies and
+spected with popular debugging tools. Lastly, schedulers                   network stacks for specific network workloads. Although
+depend on and interact with complicated synchronization                    these systems provide good performance for their targets,
+primitives including atomic operations, RCU [50], task pre-                their kernel implementation cannot be easily changed and
+emption, and interrupts, making development and debug-                     they provide poor performance for other workloads. Shin-
+ging even harder. Long-term maintenance is also a challenge.               juku [25] is 2,535 lines of code and cannot co-exist with other
+Linux rarely merges new scheduling classes, and would be                   applications in the system (§4.2). Shenango [1] is 8,399 lines
+especially unlikely to accept a highly-tuned non-generic                   of code and can only implement a single thread scheduling
+scheduler. Thus, custom schedulers are maintained out-of-                  policy for network workloads. Adding an additional policy
+tree with consistent merge churn as upstream Linux evolves.                requires significant code modification. Further, both systems
+   Deploying schedulers is even harder. Deploying                          are unable to run on machines without particular NICs and
+changes to scheduling policy requires deploying a new ker-                 Shenango cannot schedule non-network workloads.
+nel across a large fleet. This is extremely challenging for                   Custom scheduling via BPF is insufficient. An attrac-
+cloud providers. So much so that, in our experience, kernel                tive way to customize kernel scheduling is to inject BPF [61]
+rollouts are not well-tolerated below an O(month) granular-                programs into the kernel scheduler, as has been done for
+ity. To install a new kernel on a machine, cloud providers                 other kernel subsystems [62]. It is indeed possible to im-
+must migrate or terminate the machine’s assigned work, qui-                plement a Linux scheduler class whose function pointers
+esce the machine, install the new system software, allow                   call a BPF program to decide which thread to run next. Un-
+system daemons to re-initialize, and finally, wait for newly               fortunately, BPF is limited in its expressiveness and which
+assigned applications to become ready to serve again. Initial              kernel data structures it can access. For example, the BPF-
+deployment of the new scheduler is only the beginning. After               verifier must be able to determine that loops will exit, and
+the first release candidate is deployed, the cloud provider will           BPF programs cannot use floats.
+make frequent changes to fix bugs and tune performance,                       More importantly, BPF programs run synchronously, mean-
+repeating the expensive process described above. At Google,                ing they must react quickly to scheduling events, blocking
+for instance, there was a scheduler bug on our disk servers                the CPU until they complete. An asynchronous scheduler, in
+that led to millions of dollars of lost revenue until the bug was          contrast, can receive scheduling events and react to these
+noticed and fixed [51]. ghOSt enables scheduler update, test-              events at a later time. Therefore, an asynchronous model,
+ing, and tuning without having to update the kernel and/or                 such as the global scheduler described in §3.3, can make
+reboot machines and applications.                                          scheduling decisions based on a wider perspective of the sys-
+   User-level threading is not enough. ghOSt is a ker-                     tem, comprised from multiple scheduling events. That being
+nel scheduler running in userspace, scheduling native OS
+
+
+
+                                                                     590
+                      Agent           Agent             Agent                   Inactive Agent     Global agent        Inactive agent
+                        0               1                 N                          N+1               N+2                    M
+           Message                                                               Schedule
+           queues:                                                                thread                                    Userspace
+                        0               1                 N                                              G
+                                                                                                                                Kernel
+           Threads:
+
+                      CPU 0           CPU 1             CPU N                      CPU N+1           CPU N+2              CPU M
+
+                Enclave 0 running per-CPU scheduling on CPUs 0 → N             Enclave 1 running centralized scheduling on CPUs N+1 → M
+
+  Figure 2. ghOSt policies manage CPUs assigned to enclaves. Each enclave can be managed by a different ghOSt policy.
+
+said, BPF plays a large role in ghOSt to accelerate fast-path op-          assigned to each host must be migrated or restarted and
+erations and provide customization at performance-critical                 the host itself must reboot. This time-consuming process
+spots in the kernel, as explained in §3.2.                                 reduces compute capacity and hinders the data center’s fault-
+2.1 Design Goals                                                           tolerance until the update completes. This is even a challenge
+                                                                           for users rolling out their own policies for similar reasons:
+ghOSt’s goal is to introduce a new paradigm for designing,
+                                                                           they must maintain service uptime while manually taking
+optimizing, and deploying schedulers. We design ghOSt with
+                                                                           down and upgrading nodes. Therefore, the scheduling policy
+the following requirements in mind:
+                                                                           should be decoupled from the host kernel and ghOSt must
+   Policies should be easy to implement and test. As
+                                                                           allow new policies to be deployed, updated, rolled-back, or
+new workloads, kernels, and heterogeneous hardware en-
+                                                                           even crash without incurring the machine-reboot costs.
+ter the data center, implementing new scheduling policies
+should not mandate yet another kernel patch. As DashFS [63]
+demonstrated, implementing systems in userspace rather                     3      Design
+than kernel space simplifies development and enables faster                We now discuss ghOSt’s design and implementation, and
+iteration as popular languages and tools can be used.                      explain how they achieve our requirements listed in §2.
+   Scheduling expressiveness and efficiency. Cloud                            ghOSt overview. Fig. 1 summarizes the ghOSt design.
+providers and users need to express scheduling policies for a              Userspace agents make scheduling decisions and instruct
+wide variety of optimization targets, including throughput-                the kernel how to schedule native threads on CPUs. ghOSt’s
+oriented workloads, 𝜇s-scale latency-critical workloads, soft              kernel side is implemented as a scheduling class, akin to the
+real-time, and energy efficiency requirements.                             commonly used CFS class. This scheduling class provides
+   Enabling scheduling decisions beyond the per-CPU                        userspace code with a rich API to define arbitrary scheduling
+model. The Linux scheduler ecosystem implements schedul-                   policies. To help the agents make scheduling decisions, the
+ing algorithms that make per-CPU scheduling decisions, i.e.,               kernel exposes thread state to the agents via messages and
+they use a per-CPU model. Recent work demonstrates com-                    status words (§3.1). The agents then instruct the kernel on
+pelling tail latency improvements for 𝜇s-scale workloads via               scheduling decisions via transactions and system calls (§3.2).
+centralized, dedicated polling scheduling threads [1, 21, 25],                We will use two motivating examples throughout this sec-
+i.e., they use a centralized model. Other systems such as ESXi             tion: per-CPU scheduling and centralized scheduling. Clas-
+NUMA [64] and Minos [15] have also demonstrated the ben-                   sical kernel scheduling policies, such as CFS, are per-CPU
+efits of coordination at a granularity coarser than a single               schedulers. Although these policies typically employ load-
+CPU, such as per-NUMA-node. The centralized model is                       balancing and work-stealing to even out the load across the
+difficult to support within Linux’s existing “Pluggable Sched-             system, they still operate from a per-CPU perspective. The
+uler” framework, as the framework is implemented with the                  centralized scheduling example is similar to the models pro-
+assumption of a per-CPU model. ghOSt should support dele-                  posed in Shinjuku [25], Shenango [1], and Caladan [21]. In
+gating scheduling decisions to remote CPUs to support all                  this case, there is a single global entity constantly observing
+scheduling models from per-CPU to centralized and every-                   the entire system and making scheduling decisions for all
+thing in between.                                                          threads and CPUs under its purview.
+   Supporting multiple concurrent policies. Machine ca-                       Threads and CPUs. ghOSt schedules native threads on
+pacity is continuing to horizontally scale with the addition of            CPUs. All threads mentioned in this section are native
+hundreds of cores and new accelerators, supporting multiple                threads, in contrast to user-level threads mentioned in §2.
+loads and tenants on a single server. ghOSt must support                   We refer to logical execution units as CPUs. For example, we
+partitioning and sharing the machine so that multiple sched-               consider a machine with 56 physical cores and 112 logical
+uling policies may execute in parallel.                                    cores (hyperthreads) to have 112 CPUs.
+   Non-disruptive updates and fault isolation. OS up-                         Partitioning the machine. ghOSt supports multiple con-
+grades on a large fleet incur expensive downtime. The work                 current policies on a single machine using enclaves. A system
+
+
+
+                                                                     591
+can be partitioned into multiple independent enclaves, at                 ghOSt messages. In ghOSt, the kernel uses the messages
+CPU granularity, each of which runs its own policy, as de-             listed in Table 1 to notify the userspace agents of thread
+picted in Fig. 2. From a scheduling perspective, the enclaves          state changes. For example, if a thread was blocked and now
+are isolated. Partitioning makes sense especially when run-            ready to run, the kernel posts a THREAD_WAKEUP message. Ad-
+ning different workloads on a single machine. It is often              ditionally, the kernel informs the agents of timer ticks with a
+useful to set the granularity of these enclaves by machine             TIMER_TICK message. To help agents verify they are making
+topology, such as per-NUMA-socket or per-AMD-CCX [40].                 decisions based on the most up-to-date state, messages also
+Enclaves also help in isolating faults, limiting the damage of         have sequence numbers, as will be explained later.
+an agent-crash to the enclave it belongs to (see §3.4).                   Message queues. Messages are delivered to agents via
+   ghOSt userspace agents. To achieve many of our de-                  message queues. Each thread scheduled under ghOSt is as-
+sign goals, the scheduling policy logic is implemented in              signed a single queue and all messages about that thread’s
+userspace agents. The agents can be written in any language            state changes are delivered to that queue. In the per-CPU
+and debugged by standard tools, making them easier to im-              example, each thread is assigned to a queue corresponding
+plement and test. To achieve fault tolerance and isolation, if         to the CPU it is intended to run on (Fig. 2, left). In the cen-
+one or several of the agents crash, the system will fall back          tralized example, all threads are assigned to the global queue
+to the default scheduler, such as CFS. The machine is then             (Fig. 2, right). Messages for CPU events, such as TIMER_TICK,
+still fully functional while a new ghOSt userspace agent is            are routed to the queue of the agent thread associated with
+launched — either the last known stable release or a newer             the CPU.
+revision with a fix.                                                      Although there are many ways to implement queues, we
+   Thanks to the crash resilience property, updating a sched-          opted to use custom queues in shared memory to efficiently
+uling policy amounts to relaunching the userspace agents,              handle agent wakeups (explained below). We deemed ex-
+without having to reboot the machine. This property enables            isting queue mechanisms to be insufficient for ghOSt as
+experimentation and rapid policy customization for a wide              they only exist in specific kernel versions. For instance, the
+variety of hardware and workloads. Developers can make                 BPF system passes BPF events to userspace via BPF ring
+a policy tweak and simply relaunch the agents. Dynamic                 buffers [65] and recent versions of Linux also pass asyn-
+update of a ghOSt policy is discussed in §3.4.                         chronous I/O messages to userspace via io_urings [66].
+   Regardless of the scheduling model — per-CPU or cen-                These are both fast lockless ring buffers that synchronize
+tralized — each CPU managed by ghOSt has a local agent,                consumer/producer access. However, older Linux kernels
+as shown in Fig. 2. In the per-CPU case, each agent is re-             and other operating systems do not support them.
+sponsible for thread scheduling decisions for its own CPU.                Thread-to-queue association. After ghOSt’s enclave
+In the centralized case, a single global agent is responsible          initialization, there is a single default queue in the en-
+for scheduling all CPUs in the enclave. All other local agents         clave. The agent process can create/destroy queues using
+are inactive. Each agent is implemented in a Linux pthread             the CREATE/DESTROY_QUEUE() API. Threads added to ghOSt
+and all agents belong to the same userspace process.                   are implicitly assigned to post messages to the default
+                                                                       queue. That assignment can be changed by the agent via
+3.1   Kernel-to-Agent Communication                                    ASSOCIATE_QUEUE().
+Exposing thread state to the agents. For agents to make                   Queue-to-agent association. A queue may be option-
+scheduling decisions for threads under their purview, the ker-         ally configured to wake up one or more agents when mes-
+nel must expose thread state to the agents. One approach is to         sages are produced into the queue. The agent can configure
+memory-map existing kernel data structures into userspace,             the wakeup behavior via CONFIG_QUEUE_WAKEUP(). In the
+such as task_structs, so agents can inspect them to infer              per-CPU example, each queue is associated with exactly one
+the thread state. However, the availability and format of              CPU and configured to wake up the corresponding agent. In
+these data structures varies between kernels and kernel ver-           the centralized example, the queue is continuously polled
+sions, tightly coupling userspace policy implementation with           by the global agent so a wakeup is redundant and therefore
+kernel version. Another approach is to expose thread state             not configured. The latency of producing a message into a
+via sysfs files, in a /proc/pid/... fashion. However, file             queue and observing it in the agent is discussed in §4.1.
+system APIs are inefficient for fastpath operations, making it            Agent wakeup uses the standard kernel mechanism to
+difficult to support 𝜇s-scale policies: open/read/fseek, orig-         wake up a blocked thread. This involves identifying the agent
+inally designed for block devices, are too slow and complex            thread to be woken up, marking it as runnable, optionally
+(e.g., require error handling and data-parsing).                       sending an interrupt to the target CPU to trigger a reschedule,
+   Ultimately, we need a kernel-userspace API that is both             and performing a context switch to the agent thread.
+fast and does not depend on the underlying kernel imple-                  Moving threads between queues/CPUs. In our per-
+mentation of threads. Inspired by distributed systems, we              CPU example, to enable load-balancing and work-stealing
+use messages as an efficient and simple solution.                      between CPUs, agents can change the routing of messages
+
+
+
+                                                                 592
+            Messages                  Syscalls
+                                                                     1 void Agent :: PerCpuSchedule () {
+        THREAD_CREATED        AGENT_INIT()
+                                                                     2       DrainMessageQueue () ; // Read messages from queue
+        THREAD_BLOCKED        START_GHOST()
+                                                                     3       Thread * next = runqueue_ . Dequeue () ;
+        THREAD_PREEMPTED      TXN_CREATE()                           4       if ( next == nullptr ) return ; // Runqueue empty .
+        THREAD_YIELD          TXNS_COMMIT()                          5       // Schedule thread :
+        THREAD_DEAD           TXNS_RECALL()                          6       Transaction * txn = TXN_CREATE ( next - > tid , my_cpu );
+        THREAD_WAKEUP         CREATE_QUEUE()                         7       TXNS_COMMIT ({ txn }) ;
+        THREAD_AFFINITY       DESTROY_QUEUE()                        8       if ( txn - > status != TXN_COMMITTED ) {
+        TIMER_TICK            ASSOCIATE_QUEUE()                      9            // Txn failed . Move thread to end of runqueue .
+                              CONFIG_QUEUE_WAKEUP()                 10            runqueue_ . Enqueue ( next ) ;
+                                                                    11            return ;
+        Table 1. ghOSt messages and system calls.                   12       }
+                                                                    13       // The schedule has succeeded for ` next `.
+from threads to queues via ASSOCIATE_QUEUE(). It is up to           14 }
+the agent implementation (in userspace) to properly coordi-              Figure 3. Scheduling a thread in per-CPU agent code.
+nate the message routing across queues to agents. If a thread
+has its association change from one queue to another while               then inspect whether those requests succeeded or not. A
+there are pending messages in the original queue, the associ-            shared memory interface is therefore more suitable. As
+ation operation will fail. In that case, the agent must drain            a side note, using transactions in shared memory as the
+the original queue before re-issuing ASSOCIATE_QUEUE().                  scheduling interface would allow, in the future, to offload
+   Synchronizing agents with the kernel. Agents oper-                    scheduling decisions to an external device with access to
+ate on the system’s state as observed via messages. How-                 that memory.
+ever, while the agent is making a scheduling decision, new                  Inspired by transactional memory [67] and database [68]
+messages may arrive into the queue which could change                    systems, we designed our own transaction API, imple-
+that decision. This challenge is slightly different for the per-         mented via shared memory. These systems support fast, dis-
+CPU example versus the centralized scheduling example (see               tributed commit operations with atomic semantics, and there
+§3.2 and §3.3). Either way, we address this challenge with               could be multiple commits that simultaneously target the
+agent/thread sequence numbers: Every agent has a sequence-               same remote node. ghOSt agents require similar properties.
+number, 𝐴𝑠𝑒𝑞 , which is incremented whenever a message is                Agents open a new transaction in shared memory with the
+posted to a queue associated with that agent. We explain our             TXN_CREATE() helper function. The agent writes both the
+use of 𝐴𝑠𝑒𝑞 for the per-CPU example in §3.2. Every thread 𝑇              TID of the thread to schedule along with the ID of the CPU to
+has a sequence-number,𝑇𝑠𝑒𝑞 , which is incremented whenever               schedule the thread on. In the per-CPU example, each agent
+that thread posts a new state change message, 𝑀𝑇 . When an               only schedules its own CPU. When the transaction is filled
+agent pops the queue it receives both a message and its cor-             in, the agent commits it to the kernel via the TXNS_COMMIT()
+responding sequence number: (𝑀𝑇 ,𝑇𝑠𝑒𝑞 ). We explain how                  syscall, which kicks off the commit procedure and triggers
+we use 𝑇𝑠𝑒𝑞 for the centralized scheduling example in §3.3.              the kernel to initiate a context switch. A simplified example
+   Exposing sequence numbers via shared memory.                          is shown in Fig. 3.
+ghOSt allows agents to efficiently poll auxiliary information               Group commits. In the centralized scheduling example,
+about thread and CPU state through status words, mapped                  to allow ghOSt to scale to hundreds of CPUs and hundreds of
+into the agent’s address space. For brevity, we only discuss             thousands of transactions per second, we must mitigate the
+our use of status words to expose sequence numbers, 𝐴𝑠𝑒𝑞                 expensive cost of system calls. We amortize the cost of trans-
+and 𝑇𝑠𝑒𝑞 , to the agents. When the kernel updates a thread’s or          actions by introducing group commits. Group commits also
+agent’s sequence number, it also updates the corresponding               reduce the number of interrupts to be sent to other CPUs,
+status word. Agents can then read the sequence numbers                   similar to Caladan [21]. An agent commits multiple transac-
+from the status words in the shared mapping.                             tions by passing all of them to the TXNS_COMMIT() syscall.
+3.2 Agent-to-Kernel Communication                                        This syscall amortizes the expensive overheads over several
+We now describe how the agents instruct the kernel which                 transactions. Most importantly, it amortizes the overhead of
+thread to schedule next.                                                 sending interrupts by using the batch interrupt functionality
+   Sending scheduling decisions via transactions.                        present in most processors. Instead of sending multiple inter-
+Agents send scheduling decisions to the kernel by commit-                rupts (one per transaction), the kernel sends a single batch
+ting transactions. Agents must be able to schedule both their            interrupt to the remote CPUs, saving significant overhead.
+local CPU (per-CPU case) as well as other remote CPUs                       Sequence numbers and transactions. In the per-CPU
+(centralized case). The commit mechanism must be fast to                 example, the agent committing a transaction is giving up its
+support 𝜇s-scale policies and scale to hundreds of cores.                CPU to the target thread it is scheduling. Messages posted to
+For the per-CPU example, a syscall interface, in theory,                 the queue while the agent is running do not cause a wakeup,
+would suffice. For the centralized case, the agent needs to              since the agent is already running. However, the new mes-
+efficiently send scheduling requests to multiple CPUs and                sage in the queue might be from a higher-priority thread,
+
+
+
+                                                                   593
+ 1 void GlobalAgent :: CentralizedSchedule () {                                via a shared-memory window into the agent’s address space.
+ 2       DrainMessageQueue () ;                                                The specifics of how the agent uses the BPF infrastructure
+ 3       map < Cpu , Thread * > assignments ;
+ 4       // GetIdleCPUs () will return all available CPUs .                    to schedule threads on CPUs is part of the scheduling policy.
+ 5       for ( const Cpu & cpu : GetIdleCPUs () ) {                            The ghOSt BPF program is essentially an extension of the
+ 6             Thread * next = runqueue_ . Dequeue () ;                        agent itself, and hence the BPF bytecode is embedded in the
+ 7             if ( next == nullptr ) break ; // Runqueue empty .
+ 8             assignments [ cpu ] = next ; // Run `next ` on `cpu `.          agent binary, using libbpf [69].
+ 9       }
+10       // Now send transactions for all assignments :
+11       vector < Transaction * > txns = Schedule ( assignments ) ;            3.3   The Centralized Scheduler
+12       for ( const Transaction * txn : txns ) {
+13             // Check if `txn ` committed successfully .                     We now explain additional implementation details required
+14             if ( txn -> status != TXN_COMMITTED ) {                         for constructing a centralized scheduling ghOSt policy.
+15                  Thread * next = GetThreadFromTID ( txn - > tid ) ;
+16                  // Transaction failed . Re - enqueue .                        One global agent with a single queue. For centralized
+17                  runqueue_ . Enqueue ( next ) ;                             scheduling, there is a single global agent polling a single
+18                  continue ;                                                 message queue and making scheduling decisions for all CPUs
+19   } } }
+20   vector < Transaction * > GlobalAgent :: Schedule (                        managed under ghOSt. If a designated CPU already runs a
+21     const map < Cpu , Thread * >& assignments ) {                           ghOSt thread, the transaction will preempt that previous
+22     vector < Transaction * > txns ;                                         thread in favor of the new one. A simplified example of
+23     for ( const auto & [ cpu , next ] : assignments ) {
+24       Transaction * txn = TXN_CREATE ( next - > tid , cpu ) ;               the scheduler’s code is depicted in Fig. 4. Intuitively, the
+25       txns . push_back ( txn ) ;                                            centralized policy may seem incapable of supporting 𝜇s-scale
+26     }                                                                       scheduling, though we show in §4 that ghOSt has comparable
+27     TXNS_COMMIT ( txns ) ;
+28     return txns ;                                                           or better overall performance on our production workloads.
+29   }                                                                            Avoiding preemption of the global agent. To support
+        Figure 4. A simplified example of a global agent.                      𝜇s-scale scheduling, the global agent must continuously run,
+                                                                               as any preemption will directly lead to scheduling delays.
+     and would affect the scheduling decision if the agent were                To prevent global agent preemption triggered by a higher
+     aware of it. The agent will only get a chance to inspect that             priority kernel scheduling class, ghOSt assigns all agents a
+     message on the next wakeup, which is too late. We now ex-                 high kernel priority, similar to real-time scheduling. In other
+     plain how to address this challenge via sequence numbers                  words, no other thread in the machine, whether ghOSt or
+     for the per-CPU example. We explain the slightly different                non-ghOSt, can preempt agent-threads. This priority assign-
+     case for centralized scheduling in §3.3.                                  ment, however, will destabilize the system unless handled
+        We resolve this challenge using the agent sequence num-                carefully. For example, most systems have per-CPU daemon
+     ber, 𝐴𝑠𝑒𝑞 . An agent polls for its 𝐴𝑠𝑒𝑞 by inspecting the agent-          worker threads that must run on their designated CPUs.
+     thread’s status word. Recall that 𝐴𝑠𝑒𝑞 is incremented when a                 ghOSt maintains the system’s stability in the following
+     new message is posted to the queue associated with the agent.             way. All inactive agents immediately yield, vacating their
+     The order of operations is: 1) Read 𝐴𝑠𝑒𝑞 ; 2) Read messages               CPUs. Whenever a non-ghOSt thread needs to run on the
+     from queue; 3) Make a scheduling decision; and 4) Send 𝐴𝑠𝑒𝑞               global agent’s CPU, 𝐶𝑃𝑈𝑔𝑙𝑜𝑏𝑎𝑙 , the global agent performs a
+     alongside the transaction to TXNS_COMMIT(). If the 𝐴𝑠𝑒𝑞 sent              “hot handoff” to an inactive agent on another CPU, 𝐶𝑃𝑈𝑖𝑑𝑙𝑒 .
+     with the transaction is older than the current 𝐴𝑠𝑒𝑞 observed              For example, if the kernel CFS scheduler tries to schedule
+     by the kernel (i.e., a new message was posted to the agent’s              a thread on 𝐶𝑃𝑈𝑔𝑙𝑜𝑏𝑎𝑙 , the global agent will first find an
+     queue), the transaction is considered “stale” and will fail with          idle CPU (𝐶𝑃𝑈𝑖𝑑𝑙𝑒 ) and then wake up the inactive agent on
+     an ESTALE error. The agent then drains its queue to retrieve              𝐶𝑃𝑈𝑖𝑑𝑙𝑒 to serve as the new global agent. Once 𝐶𝑃𝑈𝑖𝑑𝑙𝑒 runs
+     the newer messages and repeats the process.                               the global agent, the old global agent yields, allowing the
+        Accelerating scheduling with BPF. The user-level flex-                 CFS thread to run on 𝐶𝑃𝑈𝑔𝑙𝑜𝑏𝑎𝑙 .
+     ibility provided by ghOSt is not free: message delivery and                  Sequence numbers and centralized scheduling. At
+     group scheduling incur up to 5 𝜇s (see Table 3 in §4.1); in the           some point, the global agent may have an inconsistent view
+     centralized scheduling model, a thread might wait an entire               of a thread’s state. For example, a thread 𝑇 might post a
+     centralized-scheduling loop until a scheduling decision is                THREAD_WAKEUP message. The global agent receives this mes-
+     committed on its behalf (30 𝜇s in §4.4).                                  sage and decides to schedule 𝑇 on 𝐶𝑃𝑈 𝑓 . In the meantime,
+        ghOSt allows recovering that lost CPU time via a cus-                  some entity in the system invoked sched_setaffinity(),
+     tom BPF program, attached by the agent to the kernel’s                    leading to a THREAD_AFFINITY message, forbidding 𝑇 from
+     pick_next_task() function. When a CPU becomes idle and                    running on 𝐶𝑃𝑈 𝑓 . We need a mechanism to ensure that the
+     the agent has not already issued a transaction, the BPF pro-              transaction that schedules 𝑇 on 𝐶𝑃𝑈 𝑓 will fail.
+     gram issues its own transaction, picking a thread to run on                  In principle, we can use agent sequence numbers, as de-
+     that CPU. The BPF program communicates with the agent                     scribed above for the per-CPU example. However, the global
+
+
+
+                                                                         594
+          Linux CFS (kernel/sched/fair.c)      6,217 LOC                 agents while keeping the enclave infrastructure intact, or by
+          Shinjuku [25] (NSDI ’19)             3,900 LOC                 (b) destroying the enclave and starting from scratch.
+          Shenango [1] (NSDI ’19)             13,161 LOC                    Replacing agents and destroying enclaves. ghOSt sup-
+          ghOSt Kernel Scheduling Class       3,777 LOC                  ports updating an agent “in-place” without destroying the
+          ghOSt Userspace Support Library     3,115 LOC
+                                                                         enclave. Userspace code can query, and epoll on, whether
+          Shinjuku Policy (§4.2)                710 LOC
+          Shinjuku + Shenango Policy (§4.2)     727 LOC                  an agent is attached to an enclave. To upgrade an agent, we
+          Google Snap Policy (§4.3)             855 LOC                  run both old and new agents concurrently; the new agent
+          Google Search Policy (§4.4)           929 LOC                  blocks until the old agent crashes or exits and is no longer
+          Secure VM Kernel Policy (§4.5)      7,164 LOC                  attached. The new agent extracts the state of all threads in
+          Secure VM ghOSt Policy (§4.5)       4,702 LOC                  the enclave from the kernel and resumes scheduling. If this
+                                                                         process fails, either the kernel or userspace code can destroy
+ Table 2. Lines of code for ghOSt and compared systems.                  the enclave. Destroying the enclave kills all the agents in
+                                                                         that enclave, keeping other enclaves in the system intact,
+agent has to support many thousands of threads that con-                 and automatically moves all threads in the destroyed enclave
+tinuously post messages to the global queue, making it time              back to CFS. At this point, the threads are still functioning
+consuming to drain the queue. Unlike the local agent in the              normally but are scheduled by CFS instead of ghOSt.
+per-CPU example, the global agent is not giving up its own                  ghOSt watchdog. Scheduling bugs in ghOSt or in any
+CPU. The global agent must only verify that it is up-to-date             other kernel scheduler have system-wide consequences. For
+with respect to the thread 𝑇 being scheduled right now.                  example, a ghOSt thread may be preempted while holding
+   We solve this issue with thread sequence numbers. Recall              a kernel mutex, and if it is not scheduled for too long, it
+that every queued message 𝑀𝑇 is tagged with the thread se-               could transitively stall other threads including those in CFS
+quence number 𝑇𝑠𝑒𝑞 as (𝑀𝑇 ,𝑇𝑠𝑒𝑞 ). When the agent commits                or other ghOSt enclaves. Similarly, the machine will grind
+a transaction for thread 𝑇 , it sends the transaction along with         to a halt if critical threads such as garbage collectors and
+the most recent sequence number for 𝑇 it is aware of: 𝑇𝑠𝑒𝑞 .             I/O pollers are not scheduled. As a safety mechanism, ghOSt
+When the kernel receives the transaction, it verifies that 𝑇𝑠𝑒𝑞          automatically destroys enclaves with misbehaving agents.
+is up to date with respect to the thread in the transaction.             For example, the kernel will destroy an enclave when it
+Otherwise, the transaction fails with an ESTALE error.                   detects an agent has not scheduled a runnable thread within
+                                                                         a user-configurable number of milliseconds.
+3.4   Fault Isolation and Dynamic Upgrades
+Interaction with other kernel scheduling classes. One                    4     Evaluation
+of ghOSt’s design goals is enabling easy adoption on existing            Our evaluation of ghOSt focuses on three questions: (a) What
+systems. So even if a ghOSt policy is faulty, we still want              are the overheads of ghOSt-specific operations, which are
+ghOSt-managed threads to interact well with other threads                not present in classical schedulers (§4.1); (b) How do schedul-
+in the system. We want to avoid ghOSt threads causing un-                ing policies implemented with ghOSt perform in comparison
+intended consequences for other threads, such as starvation,             to prior work, such as Shinjuku [25] (§4.2); and (c) Is ghOSt
+priority inversion, deadlock, etc.                                       a viable solution for large-scale and low-latency produc-
+   We achieve this goal by assigning ghOSt’s kernel scheduler            tion workloads, including Google Snap (§4.3), Google Search
+class a lower priority (§2) than the default scheduler class —           (§4.4), and virtual machines (§4.5)?
+typically CFS — in the kernel’s scheduling class hierarchy.
+The result is that most threads in the system will preempt               4.1   Analysis of ghOSt Overheads and Scaling
+ghOSt threads. The preemption of a ghOSt thread leads to                 Lines of code: Table 2 presents the lines of code (LOC) for
+the creation of a THREAD_PREEMPT message, triggering the                 ghOSt and, for reference, related work such as the Linux CFS
+relevant agent (which is running in a different high priority            scheduler. ghOSt is production-ready and flexibly supports
+scheduling class) to make a scheduling decision. The agent               a range of scheduling policies for our production workloads
+further decides how to handle the preemption.                            with 40% less kernel code than CFS. The policies in this sec-
+   Dynamic upgrades and rollbacks. ghOSt enables rapid                   tion can be short (few 100s LOC) as they utilize common
+deployment, since updating the scheduling policy (i.e., the              functions from a userspace library. This reflects an advan-
+agents) does not require restarting the kernel or applications.          tage of working within higher-level languages for policy
+Many production services can take minutes to hours to start,             definition: more flexible abstractions, enabling complexity
+particularly to populate in-memory caches. Similarly, we                 to be focused on the scheduling decisions.
+want to minimize interruptions for client virtual machines.                 Experimental Setup: Unless otherwise noted, experi-
+These long-running applications continue to run correctly                ments run on Linux 4.15 with our ghOSt patches applied.
+during a planned agent update or an unplanned agent crash.               We run microbenchmarks on a 2-socket Intel Xeon Platinum
+ghOSt achieves dynamic upgrades by either (a) replacing the              8173M @ 2GHz, 28 cores per socket, 2 logical cores each.
+
+
+
+                                                                   595
+     1. Message Delivery to Local Agent             725 ns
+     2. Message Delivery to Global Agent            265 ns                                                                      ❸
+
+
+
+
+                                                                            1 Million Txns/Sec
+     3. Local Schedule (1 txn)                      888 ns                                       2
+     Remote Schedule (1 txn for 1 CPU)
+     4. Agent Overhead                              668 ns                                                   ❷
+     5. Target CPU Overhead                        1064 ns                                       1
+     6. End-to-End Latency                         1772 ns
+                                                                                                         ❶                      Haswell
+     Group Remote Schedule (10 txns for 10 CPUs)
+     7. Agent Overhead                             3964 ns
+                                                                                                                                Skylake
+                                                                                                 0
+     8. Target CPU Overhead                        1821 ns                                           0   20   40      60    80   100   120
+     9. End-to-End Latency                         5688 ns                                               Number of Scheduled CPUs
+     10. Syscall Overhead                            72 ns
+     11. pthread Minimal Context Switch Overhead    410 ns                     Figure 5. The scalability of a global agent.
+     12. CFS Context Switch Overhead                599 ns            the experiment on the default microbenchmarks machine,
+                                                                      which uses Skylake processors, as well as a 2-socket machine
+Table 3. ghOSt microbenchmarks. End-to-end latency is not             with Haswell processors (18 physical cores per socket, two
+equal to the sum of agent and target overheads as the two             logical cores each, 2.3 GHz).
+sides do some work in parallel and the IPI propagates through            The results are shown in Fig. 5. Both lines follow a simi-
+the system bus.                                                       lar pattern and we annotate the Skylake line in the figure:
+   Table 3 summarizes the overhead of basic operations that           The steep ramp-up ❶ shows that the global agent schedules
+are unique to ghOSt. We also report the overhead of equiva-           more transactions per second as more CPUs are available
+lent thread operations under CFS.                                     to schedule work on. The drop ❷ occurs when we co-locate
+   Message delivery overhead (lines 1-2). In the per-CPU              the global agent on the same physical core as a ghOSt thread
+example, delivery to the local agent consists of adding the           that executes work. The hyperthreads are contending for
+message to a queue, context switching to the local agent, and         resources in the physical core’s pipeline, which degrades
+dequeuing the message. The overhead (725 ns) is dominated             the global agent’s performance. Finally, the degradation ❸
+by the context switch (410 ns). In the centralized example,           comes from the global agent scheduling CPUs in the remote
+delivery to the global agent (265 ns) consists of adding the          socket. Scheduling these CPUs requires memory operations
+message to the queue and dequeuing the message within the             and sending interrupts across NUMA sockets which incur
+global agent, which is always spinning.                               higher overheads.
+   Local scheduling (line 3). In the per-CPU model, this is
+the overhead of committing a transaction and performing               4.2         Comparison to Custom Centralized Schedulers
+a context switch on the local CPU, until the target thread            We now compare ghOSt, a generic scheduling framework, to
+is running. The overhead (888 ns) is slightly higher than             a highly specialized scheduling system from recent academic
+CFS context switch overhead (599 ns) due to the transaction           research that uses centralized policies to schedule demanding
+commit, but still competitive.                                        𝜇s-scale workloads. The experiments run on a single socket
+   Remote scheduling (lines 4-9). In the centralized                  from a 2-socket Intel Xeon CPU E5-2658 (12 cores per socket,
+scheduling model, the agent-side commits the transaction              24 logical cores per socket, 2.2 GHz).
+and sends an inter-processor interrupt (IPI). The target CPU             Systems under comparison. We compared three imple-
+handles the IPI and performs the context switch. The agent’s          mentations of the scheduling approach in Shinjuku [25], all
+overhead (668 ns) sets a theoretical maximum throughput               serving a RocksDB workload [70]. We use one physical core
+per agent at 109 /668 = 1.5M scheduled threads per second.            for load generation with all systems. The Shinjuku system
+Grouping 10 transactions for different CPUs improves the              runs on Linux 4.4 as its Dune [35] driver fails to compile
+theoretical maximum to 10 ∗ 109 /3964 = 2.52M scheduled               for newer versions. The other systems under comparison
+threads per second, by amortizing the IPI overhead.                   (ghOSt-Shinjuku and CFS-Shinjuku) run on Linux 4.15 with
+   Given these numbers, a single agent can theoretically              our ghOSt patches applied.
+schedule roughly 25,200 threads per CPU per second for a                 (1) We used the original Shinjuku system [25]. It uses 20
+100 CPU server. The agent can keep 100 CPUs busy if threads           spinning worker threads pinned to 20 different hyperthreads
+are 40𝜇s long. Policy developers should keep this per-agent           and a spinning dispatcher thread, running on a dedicated
+scalability limit in mind as they design ghOSt policies. This         physical core. The spinning threads prevent any other thread
+limit is improved relatively linearly with more agents.               from running on their CPUs (Fig. 6c). The dispatcher man-
+   Global agent scalability (Fig. 5). To show how a global            ages arriving requests in a FIFO and assigns them to worker
+agent scales, we analyze a simple round-robin policy. The             threads. Each request runs up to a limited runtime, before it
+policy manages all threads in a FIFO runqueue, scheduling             is preempted and added to the back of the FIFO.
+them on CPUs as soon as CPUs become idle. The agent                      (2) We implemented the Shinjuku scheduling policy in
+groups as many transactions as possible per commit. We ran            ghOSt using the centralized model in 710 lines of userspace
+
+
+
+                                                                596
+                        1,500                                                          1,500                                                           1
+
+
+
+
+                                                                                                                                   Batch CPU Share
+                                        Shinjuku                                                                                                     0.8
+     99% Latency (𝜇s)
+
+
+
+
+                                                                    99% Latency (𝜇s)
+                        1,000        ghOSt-Shinjuku                                    1,000                                                         0.6
+                                      CFS-Shinjuku
+                                                                                                                                                     0.4
+                         500                                                            500
+                                                                                                                                                     0.2
+                           0                                                              0                                                            0
+                                0         100      200       300                               0         100      200       300                            0        100      200       300
+                                    RocksDB Throughput (1K req/s)                                  RocksDB Throughput (1K req/s)                               RocksDB Throughput (1K req/s)
+
+                  (a) Tail latency for dispersive loads.            (b) RocksDB co-located with a batch app.                                          (c) CPU share of the batch app.
+ Figure 6. ghOSt implements modern 𝜇s-scale preemptive policies and shares CPU resources without harming tail latency.
+
+code. The ghOSt-Shinjuku global agent starts out on its                                                          Shenango’s centralized scheduler monitors the load of a net-
+own physical core but is free to move (§3.3). We maintain                                                        work application, and when the app is under light load, the
+a pool of 200 worker threads that the load generator as-                                                         scheduler gives the spare CPU cycles to a batch app. However,
+signs requests to. The global agent maintains a FIFO queue                                                       Shenango is not suitable for requests with varying execution
+of runnable worker threads and schedules them to the re-                                                         times, and so the RocksDB workload would have far worse
+maining 20 CPUs. Note that ghOSt allows other loads in the                                                       tail latencies than with Shinjuku.
+system to use any idling CPUs, shown in Fig. 6b-c.                                                                  We extended our ghOSt-Shinjuku policy to implement
+   (3) For reference, we also implemented a non-preemptive                                                       Shenango-style scheduling with merely 17 more lines of
+version of Shinjuku that runs on Linux CFS. This CFS-                                                            code, bringing the policy to 727 lines in total (Shinjuku +
+Shinjuku version does not benefit from Shinjuku’s special-                                                       Shenango Policy in Table 2). The policy monitors the load
+ized data plane features, such as the use of virtualization                                                      to RocksDB and gives spare cycles to the batch app. Fig. 6b
+features and posted interrupts for preemption.                                                                   shows that our modified ghOSt policy produces the same tail
+   Single Workload Comparison. As in the Shinjuku [25]                                                           latencies as our original ghOSt policy. The major benefit is
+paper, we generate a workload in which each request in-                                                          shown in Fig. 6c. While keeping the RocksDB tail latencies
+cludes a GET query to an in-memory RocksDB key-value                                                             intact, ghOSt now shares spare CPU cycles with the batch
+store [70] (about 6 𝜇s) and performs a small amount of pro-                                                      app. The amount of compute the batch app can utilize is
+cessing. We assigned the following processing times: 99.5%                                                       similar to what it can achieve under CFS when running with
+of requests - 4 𝜇s, 0.5% of requests - 10 ms. The allotted time-                                                 a nice value of 19, while RocksDB has a nice value of -20. A
+slice per worker thread, before forcing a preemption and                                                         few lines of code in ghOSt combined the best of Shinjuku [25]
+returning back to the FIFO, is 30 𝜇s. CFS-Shinjuku is non-                                                       and Shenango [1], without any application changes.
+preemptive, so all requests run to completion.
+   Our results are depicted in Fig. 6a. ghOSt is competitive                                                     4.3    Google Snap
+with Shinjuku for 𝜇s-scale tail workloads, even though its                                                       We now evaluate ghOSt as a replacement for our soft real-
+Shinjuku policy is implemented in 82% fewer lines of code                                                        time kernel scheduler MicroQuanta [2] which manages the
+than the custom Shinjuku data plane system. ghOSt has                                                            worker threads for Snap [2], our userspace packet-processing
+slightly higher tail latencies than Shinjuku at high loads and                                                   framework.
+is within 5% of Shinjuku’s saturation throughput. The differ-                                                       Similar to DPDK [72], Snap maintains polling (worker)
+ence reflects the extra overhead ghOSt has for scheduling a                                                      threads that are responsible for interactions with NIC hard-
+thread for every request, whereas Shinjuku passes request                                                        ware and for running custom networking and security pro-
+descriptors between spinning threads. CFS-Shinjuku satu-                                                         tocols on behalf of important services. Snap may decide to
+rates about 30% sooner than the other two systems due to                                                         spawn/join worker threads as networking load changes.
+its lack of preemption.                                                                                             How are worker threads scheduled today? Snap main-
+   Multiple Workloads Comparison. In a production sce-                                                           tains at least one worker thread constantly polling. As bursts
+nario, when RocksDB load is low, it is appealing to use the                                                      of networking load arrive, Snap may wake up and subse-
+idling compute resources to serve low-priority batch applica-                                                    quently put to sleep additional worker threads. These fre-
+tions [1, 21, 71] or run serverless functions. The original Shin-                                                quent wakeups/sleeps require swift scheduler intervention
+juku system schedules requests and cannot manage any other                                                       to avoid added latency. Trying to guarantee low latency via
+native threads. Fig. 6c shows that when we co-locate a batch                                                     existing real-time schedulers, such as SCHED_FIFO, destabi-
+application with a RocksDB workload managed by Shinjuku,                                                         lizes the system, as it may starve other applications on the
+the batch application cannot get any CPU resources even                                                          same machine. Therefore, we deploy in production Micro-
+when the RockDB load is low.                                                                                     Quanta, a custom, soft real-time scheduler that guarantees
+   To enable the safe co-location of low-latency and batch                                                       that for any period, e.g., 1 ms, at most a quanta of time, e.g.,
+workloads, one might consider using a centralized sched-                                                         0.9 ms, is given to each packet processing worker. This policy
+uling system that is thread-oriented, such as Shenango [1].                                                      ensures worker threads receive runtime while not starving
+
+
+
+                                                                                                           597
+other threads. However, it also leads to networking blackouts                                   MicroQ 64B       ghOSt 64B    MicroQ 64kB        ghOSt 64kB
+                                                                                      3000
+of up to 0.1 ms.
+   Experimental setup. We used two machines, each with
+
+
+
+
+                                                                       Microseconds
+                                                                                      2000
+two Intel Xeon Platinum 8173M processors (28 physical cores
+per socket, 2 logical cores each, 2GHz), 383 GB of DRAM
+                                                                                      1000
+and a 100Gbps NIC and a matching switch. Our tests used a
+single socket, i.e., 56 logical CPUs per machine.
+                                                                                           0
+   The test workload. Our test workload is comprised of
+                                                                                                50%        90%       99%      99.9%     99.99%     99.999%
+six client threads, sending 10k messages/second to six server
+threads on the other machine and receiving a symmetrically                                           (a) Only networking load (quiet test).
+sized reply. The test is designed to stress thread scheduling
+and not the NIC. One client thread sends 64-byte messages,                            30
+which represents a worst-case scenario rather than a realistic
+
+
+
+
+                                                                       Milliseconds
+                                                                                      20
+load. Each of the other five client threads sends 64kB mes-
+sages. The total bandwidth achieved in all cases is 51.86Gbps.                        10
+In all experiments, the client and server threads are sched-
+uled by Linux CFS. In our ghOSt experiments, the worker                                0
+threads are scheduled with ghOSt instead of MicroQuanta.                                       50%        90%       99%       99.9%    99.99%      99.999%
+   We run tests in two modes. In the quiet mode, the clien-
+t/server threads are the only explicit workload on their ma-                                         (b) With additional load (loaded test).
+chines. In the loaded mode, the machines are also running              Figure 7. Google Snap latencies for 64B and 64kB messages.
+40 additional antagonist threads of a batch workload that              busy due to a server process thread. MicroQuanta, on the
+attempt to use idling CPU resources, unused by server or               other hand, has to wait for a blackout period.
+Snap threads, when network traffic is low.                                These results are very encouraging. A very simple ghOSt
+   ghOSt policy. We replace MicroQuanta with the follow-               policy performs similarly to a custom kernel scheduler with-
+ing ghOSt policy. The policy manages the worker threads                out needing to modify Snap. ghOSt allows rapid experimen-
+of Snap and the antagonist threads. It is a simple, yet effec-         tation and performance optimization, which is substantially
+tive centralized FIFO policy. The global agent tries to find           harder with kernel schedulers. We expect that additional
+an idle CPU to schedule its threads, giving Snap worker                improvements, such as including scheduling hints from the
+threads strict priority over antagonist threads. In quiet mode         worker threads, can further optimize performance.
+tests, the worker threads are frequently preempted by the
+client/server threads and other native threads scheduled by            4.4                 Google Search
+CFS (e.g., important but periodic daemons). In loaded mode             We now evaluate ghOSt as a replacement for the CFS sched-
+tests, Snap worker threads will preempt antagonist threads,            uler on machines that serve Google Search queries [73].
+but cannot preempt threads managed by CFS. Antagonist                     The test workload. The benchmark includes a query
+threads only run when there are spare resources from both              generator running on a separate machine (without ghOSt),
+CFS threads and Snap. We did not use any dedicated cores.              sending three different query types, denoted A, B, and C.
+   Tail latency comparison. Fig. 7 compares the round-trip             Query type A is a CPU and memory-intensive query serviced
+tail latencies for client requests given the two schedulers in         by worker threads which are woken up as needed. Query
+the machine. We present tail latencies separately for 64B and          type B needs little computation but does require access to the
+64kB messages. For 64B messages, ghOSt performs similar or             SSD, and is serviced by a collection of short-lived workers,
+10% better than the baseline when we consider up to 99.9th             also woken up as needed. Query type C is a CPU-intensive
+percentile latency. For 99.99% and above, ghOSt latencies are          load serviced by long-living worker threads.
+up to 1.7× worse. The 64B messages require little compute                 At packet ingress, all queries are first processed by one
+for packet processing. Hence, when traffic is bursty with              of several server threads, which create sub-queries to be
+many 64B messages, ghOSt’s overhead of scheduling events               processed by the worker threads referenced above. Some sub-
+is noticeable . For 64kB messages, ghOSt performs similarly            queries must be processed by specific worker threads tied to
+to the baseline for up to the 99th percentile latency (within          a NUMA node to take advantage of data locality. Since this
+15% in either direction). For 99.9th percentile and above,             workload is memory and CPU bound, queries are serviced
+ghOSt leads to tail latencies that are 5% to 30% lower. The            much faster if they are handled by worker threads running
+64kB messages require more processing (for copying data)               on the same socket where the data they access reside.
+and therefore lead to fewer scheduling events. The reason                 Experimental setup. The machines we evaluated ghOSt
+ghOSt performs better than MicroQuanta in some cases is                on have two AMD Zen Rome processors with 256 CPUs in
+that it can relocate a worker thread when a CPU becomes                total (2 sockets, 64 physical cores per socket, 2 logical cores
+
+
+
+                                                                 598
+each). AMD’s architecture brings new challenges because                 compared to CFS, and comparable tail latency for query type
+it clusters groups of 4 physical cores (8 logical cores) into           C. Prior to socket- and CCX-aware optimizations, the ghOSt
+CCXs (CPU Core Complexes), where each CCX has its own                   policy led to nearly 2x worse latency for query type A and
+L3 cache.                                                               was on par with CFS for query type B and C (i.e., within 10%).
+   ghOSt policy. We implement a policy using ghOSt’s cen-               Query type A is memory-bound and benefited the most from
+tralized model with a single global agent to schedule all 256           topology optimizations. Query type B accesses both memory
+CPUs. At startup, the global agent first generates a model              and SSD, while query type C is mostly compute-bound. For
+of the system topology, using sysfs. The global agent then              B and C, the ghOSt policy had an advantage to begin with
+uses the topology information to schedule threads based on              as the global agent spins and reacts quickly to changes in
+their NUMA preferences and, when possible, prefers running              capacity in the whole system, rebalancing threads across
+the threads on a CPU belonging to the last CCX the threads              CPUs on the order of microseconds. CFS on the other hand
+ran on. The global agent maintains a min-heap ordered by                only rebalances threads across CPUs at periodic intervals on
+thread runtime, where threads with the least elapsed run-               the order of milliseconds, harming query tail latencies.
+time are picked for execution before others. Threads run to                We can improve query C’s latency on ghOSt by further
+completion or until preempted by a CFS thread.                          refining our policy. The workload assigns nice values to
+   The NUMA- and CCX-aware heuristics for picking the                   threads to express relative priority ordering to CFS, which
+next idle CPU are only 57 lines of code due to ghOSt’s flexible         is important for ensuring that worker threads run with
+transaction API and use of the C++ standard library. When               higher priority than low-priority background threads (e.g.,
+a new worker thread is spawned, its cpumask is set (via                 for garbage collection). CFS makes more optimal decisions
+sched_setaffinity()) to the set of CPUs in the socket                   by using these nice values, and initial experiments show
+where its query data is located. This cpumask is included               that incorporating them into ghOSt’s policy will allow ghOSt
+as part of the THREAD_CREATED message that is sent to the               to beat CFS for query C’s tail latency.
+global agent. When the ghOSt global agent wants to run                     Our experience with rapid experimentation. ghOSt
+the next thread at the front of its runqueue, it intersects the         is a viable solution for our production fleet, capable of sched-
+thread’s cpumask with the set of idle CPUs. If the intersection         uling for large machines and realistic workloads, while en-
+is empty, the agent skips the thread and schedules the next             abling rapid development and roll-out of scheduling policies.
+thread in the runqueue, revisiting the skipped thread in the               When developing a kernel scheduler, the write-test-write
+next iteration of its scheduling loop.                                  cycle includes (a) compiling a kernel (up to 15 minutes), (b)
+   Search query performance improves when each thread                   deploying the kernel (10-20 minutes), and (c) running the
+runs on CPUs with warmed-up L1, L2, or L3 caches. For each              test (1 hour due to database initialization following a reboot).
+thread-scheduling event, our ghOSt policy assigns the thread            As a result, the enthusiastic kernel developer experiments
+to an idle CPU target that is closest to where the thread last          with 5 variants per day. With ghOSt, compiling, deploying
+ran. The policy first searches for available CPUs within the            and launching the new agent is comfortably done within one
+same L1 and L2 cache domain of the CPU where the thread                 minute. In fact, due to ghOSt’s ability to upgrade without a
+last ran. If no idle CPUs are found, the policy extends the             reboot, the test continues to run uninterrupted. This also has
+search to the CCX (L3 cache) domain. If this fails, too, then           an important secondary effect, as the scale and complexity
+it does a fan-out search for the nearest neighbor of the CCX            of this test can contribute non-trivial run-to-run variance
+where the thread last ran, to avoid expensive thread migra-             across a reboot, confounding optimization development.
+tion costs due to high inter-CCX communication latencies.                  This ease of experimentation allowed us to experiment
+   CFS vs. ghOSt. Fig. 8 compares normalized query latency              with bespoke optimizations, which would be extremely diffi-
+and throughput for the search benchmark using CFS and the               cult to discover otherwise. For example, due to high variance
+ghOSt policy over a period of 60 seconds. Fig. 8a-c shows               in intra-CCX and inter-CCX latencies in the Rome archi-
+that ghOSt offers comparable throughput to CFS. Both CFS                tecture, we found that if a thread’s preferred CCX cluster
+and ghOSt consider NUMA socket and CCX placement. The                   is unavailable, it is more efficient to temporarily keep the
+NUMA and CCX optimizations were critical in achieving                   thread pending for 100 𝜇s rather than migrate it to another
+parity with CFS as they delivered 27% and 10% through-                  CCX immediately.
+put improvements, respectively. Iteratively optimizing for
+NUMA and CCX placement in a short ghOSt policy is much                  4.5   Protecting VMs from L1TF/MDS Attacks
+easier than experimenting with changes in the kernel CFS                We now evaluate a ghOSt policy protecting virtual machines
+code. Every modification to the ghOSt agent requires merely             from cross-hyperthread speculative execution attacks, such
+restarting the agent’s process, whereas any modification to             as L1TF and MDS [27–32]. In these attacks, a malicious VM
+CFS would mandate a kernel installation and a reboot.                   exploits microarchitectural flaws to steal data from a differ-
+   Tail Latency. Fig. 8d-f shows that ghOSt leads to about              ent VM running on a sibling hyperthread. The attacks are
+40-45% reduction in tail latency for query types A and B,               mitigated by ensuring every physical core only runs virtual
+
+
+
+                                                                  599
+                                  1                                                                         1                                                                 1
+         Normalized QPS
+
+
+
+
+                                                                                   Normalized QPS
+
+
+
+
+                                                                                                                                                     Normalized QPS
+                                0.8                                                                       0.8                                                               0.8
+                                0.6                                                                       0.6                                                               0.6
+                                                                     CFS
+                                0.4                                                                       0.4                                                               0.4
+                                                                    ghOSt
+                                0.2                                                                       0.2                                                               0.2
+                                  0                                                                         0                                                                 0
+                                       0       20              40           60                                   0       20              40   60                                   0       20              40   60
+                                                    Time (s)                                                                  Time (s)                                                          Time (s)
+
+                                      (a) Query A throughput                                                    (b) Query B throughput                                            (c) Query C throughput
+       Normalized 99% Latency
+
+
+
+
+                                                                                 Normalized 99% Latency
+
+
+
+
+                                                                                                                                                   Normalized 99% Latency
+                                  1                                                                         1                                                                 1
+                                0.8                                                                       0.8                                                               0.8
+                                0.6                                                                       0.6                                                               0.6
+                                0.4                                                                       0.4                                                               0.4
+                                0.2                                                                       0.2                                                               0.2
+                                  0                                                                         0                                                                 0
+                                       0      20              40            60                                   0      20              40    60                                  0       20              40    60
+                                                   Time (s)                                                                  Time (s)                                                          Time (s)
+
+                                  (d) Query A 99% tail latency                                              (e) Query B 99% tail latency                                      (f) Query C 99% tail latency
+                                               Figure 8. Google Search benchmark results with CFS and ghOSt scheduling.
+CPUs (vCPUs) from the same VM. Microarchitectural buffers                                                                        prefers to select a thread in its NUMA-local runqueue. How-
+are flushed when a new VM is scheduled on a physical core.                                                                       ever, under high system load the policy allows spilling across
+   Mitigating cross-hyperthread attacks requires scheduling                                                                      runqueues, providing NUMA preference without the hard
+physical cores, with two logical CPUs each. Implementing                                                                         boundary imposed by a CPU affinity mask.
+core scheduling in a per-CPU model is challenging since                                                                             Evaluation. The experimental setup is identical to §4.3.
+the scheduler code can only run threads on the CPU it is                                                                         We scheduled 32 vCPUs on 25 physical cores with 50 log-
+currently executing on. In contrast, a ghOSt agent can easily                                                                    ical CPUs. We ran the bwaves benchmark from SPECCPU
+schedule an entire core by performing a synchronized group                                                                       2006, with three scheduling policies: 1) CFS, providing no
+commit for each physical core, i.e., issuing commits for both                                                                    security against speculative execution attacks; 2) In-kernel
+CPUs of a core which must either all succeed or all fail.                                                                        secure VM core scheduling; and 3) ghOSt secure VM core
+   Our per-core scheduling model is illustrated in Fig. 9. In                                                                    scheduling. The results are depicted in Table 4. CFS provides
+every core, both sibling CPUs post messages to the same                                                                          better overall performance, but no security. The ghOSt policy
+queue. At any time, only a single agent is active on a given                                                                     mitigates cross-hyperthread attacks and performs similar to
+physical core. The CPU that generates the message wakes                                                                          the in-kernel version of core scheduling, even in light of the
+up its corresponding agent to be the active agent; the other                                                                     additional context switching overheads in ghOSt.
+agent becomes inactive if necessary. The active agent makes                                                                      5        Future Work
+a scheduling decision for both CPUs and commits a group                                                                          Accelerating scheduling with BPF. Accelerating ghOSt
+transaction in a way such that there are no pending messages                                                                     by delegating some of the agent responsibilities to synchro-
+in the queue, as explained in §3.2. In this per-physical-core                                                                    nous BPF callbacks is an open research area. The global agent
+scheduling model, the ghOSt policy ensures the threads run-                                                                      scheduling loop in §4.4 takes 30 𝜇s, creating potential sched-
+ning on the physical core belong to the same VM. The VM’s                                                                        uling gaps. Indeed, some of the threads in our system run
+threads may occupy (a) both siblings or (b) only one sibling                                                                     for only 5-30 𝜇s before they block, leaving CPUs idle during
+while the other sibling runs an idle thread.                                                                                     these gaps. We can mitigate these scheduling gaps using an
+   Secure VM Core Scheduling Policy. We implement a                                                                              integrated BPF program, described in §3.2.
+VM-scheduling policy similar to Tableau [23] in both the                                                                            The BPF program communicates with userspace via
+kernel and in ghOSt. We designed this policy to ensure for-                                                                      shared memory with several multi-producer, multi-consumer
+ward progress, bound tail latency, and provide good average                                                                      ring buffers. The agent inserts runnable threads into the
+latency among all VMs. The policy ensures the former two                                                                         buffers and BPF tries to run them. The agent may revoke a
+by scheduling each runnable VM thread for c units of time                                                                        thread before BPF can schedule the thread. For example, the
+every period p. Specifically, we use a partitioned EDF scheme                                                                    global agent can use one ring buffer per NUMA node; the
+wherein each physical core dedicates guaranteed time for                                                                         global agent can then track each thread’s preferred NUMA
+each thread to run, bounding tail latency. Any excess time                                                                       node and load-balance the threads between the two rings.
+is shared fairly among runnable threads, improving average                                                                          Tick-less scheduling. When ghOSt is in centralized
+latency. The runqueues span a single NUMA node; when a                                                                           mode, timer ticks can be disabled across CPUs to avoid ex-
+physical core goes idle and looks for a new thread to run, it                                                                    pensive VM-exits in VM workloads. In a classic per-CPU
+
+
+
+                                                                                                                         600
+      Scheduling Policy           bwaves Rate   Total Time                    Agent        Inactive         Inactive         Agent
+      CFS (no security)              489        888 seconds                     0          Agent 1          Agent N           N+1
+      In-kernel Core Scheduling      464        937 seconds
+      ghOSt Core Scheduling          468        929 seconds                            0                               N/2
+
+Table 4. Secure VM Core Scheduling performance. SPEC-
+CPU 2006 bwaves, scheduling 32 vCPUs on 50 real/logical
+CPUs. Rate - higher is better. Time - lower is better.                        CPU 0          CPU 1             CPU N         CPU N+1
+scheduler, the ticks trigger the scheduler every millisecond                     Physical core 0                Physical core N/2
+to ensure round-robin preemption across all VMs. Unfortu-
+nately, these ticks cause a VM-exit to host kernel context.             Figure 9. ghOSt per-core scheduling. Each couple of sibling-
+   Since the global agent is continuously spinning and mak-             CPUs shares a single message queue. For each core, only a
+ing scheduling decisions, there is no need for these ticks.             single agent is active at a time.
+Eliminating these ticks across all CPUs will substantially
+reduce guest jitter. This type of optimization is not pos-              where scheduling is done by threads donating their runtime.
+sible with CFS. The closest option in CFS is to enable                  The donation model is less efficient and less expressive than
+CONFIG_NO_HZ_FULL, but that will only disable ticks when                ghOSt’s transactions. Each CPU’s root scheduler would do-
+there is no more than one runnable thread on a given CPU,               nate its runtime to another thread. That thread could also
+which is typically not the case under high utilization.                 be a scheduler, allowing for a hierarchy of schedulers, or
+                                                                        an application thread — elegantly solving priority inversion.
+6   Related Work                                                        These schedulers, like ghOSt agents, received messages about
+We briefly discuss additional prior work related to ghOSt.              thread and system events. The system’s dispatcher, analo-
+   Scheduler Activations and user-level threading.                      gous to ghOSt kernel code, handled mechanism: executing
+Scheduler Activations [74] provides an API for an individual            donations and sending messages. A donation is akin to a
+application to coordinate the scheduling of CPUs assigned to            ghOSt transaction to run the local CPU, but it cannot sched-
+it by the kernel. In contrast to ghOSt, Scheduler Activations           ule remote CPUs quickly. To do so, it must wake a scheduler
+allows an application to react to the assignment or removal             on the remote CPU and have it donate. Further, unlike ghOSt,
+of a CPU, but it does not allow the assignment of CPUs to ap-           each scheduler can only schedule a single CPU at a time.
+plications. One may use Activations to synchronize an appli-
+cation with ghOSt scheduling decisions. Similarly, userspace            7   Conclusion
+thread libraries and schedulers [13, 22, 48, 52–57, 59, 60, 75]         We presented ghOSt, a new platform for evaluating and im-
+multiplex userspace contexts on top of kernel threads but do            plementing thread scheduling policies for the modern data
+not control when or where kernel threads run.                           center. ghOSt transforms scheduler development from the
+   SmartNIC scheduling. Recent work explores the right                  realm of monolithic kernel implementations to a more flexi-
+policies and mechanisms to offload scheduling and appli-                ble userspace setting, allowing a wide range of programming
+cations from the host to a SmartNIC [19, 76–78]. ghOSt’s                languages and libraries to be applied. While intuitively, mov-
+shared-memory queue and transaction APIs were designed                  ing scheduling decisions to userspace might suggest exces-
+to work seamlessly with new coherent interconnect tech-                 sive coordination overhead, we have minimized synchronous
+nologies such as CXL [79], allowing ghOSt to be offloaded               costs in our APIs and our characterization shows most opera-
+in part or in full to a SmartNIC.                                       tions to be circa 𝜇s. What previously required extensive effort
+   Return of microkernels. An emerging trend is offload-                to optimize and deploy can now be often realized in less than
+ing kernel components to userspace, similar to microker-                a thousand lines of code. ghOSt allowed us to quickly develop
+nels [80]. DPDK [72], IX [34], and Snap [2] offload network             policies for our production software — rapidly testing and
+drivers and stacks to userspace. SPDK [81], ReFlex [82],                iterating — leading to competitive performance compared to
+FUSE [83], and DashFS [63] offload storage and file system              the status quo schedulers. We open-source ghOSt to serve
+operations. Linux Userspace I/O (UIO) [84] facilitates offload          as the basis of future lines of research for the new era of
+of kernel drivers. A new CPU design has even been proposed              user-driven resource management.
+to accelerate microkernels [85]. ghOSt continues this trend.
+   Prior work also suggested moving the scheduler to                    Acknowledgments
+userspace. Stoess developed a hierarchical, user-level sched-           We thank Eric Brewer, David Culler, Hank Levy, Amin Vah-
+uler for the L4 microkernel [86]. However, unlike ghOSt,                dat, Kostis Kaffes, Adam Belay, Josh Fried, David Mazières,
+Stoess requires modifying applications to implement the                 our shepherd Irene Zhang, Google Systems Infrastructure,
+custom scheduling policies.                                             Stanford Platform Lab, and the anonymous SOSP reviewers
+   CPU Inheritance Scheduling. Ford and Susarla’s CPU                   for their helpful feedback. Christos Kozyrakis was supported
+Inheritance Scheduling [87] is a user-level scheduling system           by Stanford Platform Lab.
+
+
+
+                                                                  601
+References                                                                           [15] Diego Didona and Willy Zwaenepoel. Size-aware sharding for im-
+ [1] Amy Ousterhout, Joshua Fried, Jonathan Behrens, Adam Belay, and                      proving tail latencies in in-memory key-value stores. In 16th USENIX
+     Hari Balakrishnan. Shenango: Achieving high CPU efficiency for                       Symposium on Networked Systems Design and Implementation (NSDI
+     latency-sensitive datacenter workloads. In 16th USENIX Symposium                     19), pages 79–94, Boston, MA, February 2019. USENIX Association.
+     on Networked Systems Design and Implementation (NSDI 19), pages                 [16] Kostis Kaffes, Neeraja J. Yadwadkar, and Christos Kozyrakis. Central-
+     361–378, Boston, MA, February 2019. USENIX Association.                              ized core-granular scheduling for serverless functions. In Proceedings
+ [2] Michael Marty, Marc de Kruijf, Jacob Adriaens, Christopher Alfeld,                   of the ACM Symposium on Cloud Computing, SoCC ’19, page 158–164,
+     Sean Bauer, Carlo Contavalli, Mike Dalton, Nandita Dukkipati,                        New York, NY, USA, 2019. Association for Computing Machinery.
+     William C. Evans, Steve Gribble, Nicholas Kidd, Roman Kononov,                  [17] Hang Zhu, Kostis Kaffes, Zixu Chen, Zhenming Liu, Christos Kozyrakis,
+     Gautam Kumar, Carl Mauer, Emily Musick, Lena Olson, Mike Ryan,                       Ion Stoica, and Xin Jin. Racksched: A microsecond-scale scheduler for
+     Erik Rubow, Kevin Springborn, Paul Turner, Valas Valancius, Xi Wang,                 rack-scale computers. In 14th USENIX Symposium on Operating Sys-
+     and Amin Vahdat. Snap: a microkernel approach to host networking.                    tems Design and Implementation (OSDI 20), pages 1225–1240. USENIX
+     In In ACM SIGOPS 27th Symposium on Operating Systems Principles,                     Association, November 2020.
+     New York, NY, USA, 2019.                                                        [18] Marios Kogias, George Prekas, Adrien Ghosn, Jonas Fietz, and Edouard
+ [3] Alexander Rucker, Muhammad Shahbaz, Tushar Swamy, and Kunle                          Bugnion. R2p2: Making rpcs first-class datacenter citizens. In 2019
+     Olukotun. Elastic rss: Co-scheduling packets and cores using pro-                    USENIX Annual Technical Conference (USENIX ATC 19), pages 863–880,
+     grammable nics. In Proceedings of the 3rd Asia-Pacific Workshop on                   Renton, WA, July 2019. USENIX Association.
+     Networking 2019, APNet ’19, page 71–77, New York, NY, USA, 2019.                [19] Jack Tigar Humphries, Kostis Kaffes, David Mazières, and Christos
+     Association for Computing Machinery.                                                 Kozyrakis. Mind the gap: A case for informed request scheduling at the
+ [4] Amy Ousterhout, Adam Belay, and Irene Zhang. Just in time deliv-                     nic. In Proceedings of the 18th ACM Workshop on Hot Topics in Networks,
+     ery: Leveraging operating systems knowledge for better datacenter                    HotNets ’19, page 60–68, New York, NY, USA, 2019. Association for
+     congestion control. In 11th USENIX Workshop on Hot Topics in Cloud                   Computing Machinery.
+     Computing (HotCloud 19), Renton, WA, July 2019. USENIX Association.             [20] Philipp Moritz, Robert Nishihara, Stephanie Wang, Alexey Tumanov,
+ [5] Esmail Asyabi, Azer Bestavros, Renato Mancuso, Richard West, and                     Richard Liaw, Eric Liang, Melih Elibol, Zongheng Yang, William Paul,
+     Erfan Sharafzadeh. Akita: A cpu scheduler for virtualized clouds, 2020.              Michael I. Jordan, and Ion Stoica. Ray: A distributed framework for
+ [6] Esmail Asyabi, Azer Bestavros, Erfan Sharafzadeh, and Timothy Zhu.                   emerging AI applications. In 13th USENIX Symposium on Operating
+     Peafowl: In-application cpu scheduling to reduce power consumption                   Systems Design and Implementation (OSDI 18), pages 561–577, Carlsbad,
+     of in-memory key-value stores. In Proceedings of the 11th ACM Sym-                   CA, October 2018. USENIX Association.
+     posium on Cloud Computing, SoCC ’20, page 150–164, New York, NY,                [21] Joshua Fried, Zhenyuan Ruan, Amy Ousterhout, and Adam Belay.
+     USA, 2020. Association for Computing Machinery.                                      Caladan: Mitigating interference at microsecond timescales. In 14th
+ [7] SCHED(7) Linux Programmer’s Manual, September 2020.                                  USENIX Symposium on Operating Systems Design and Implementation
+ [8] Weiwei Jia, Jianchen Shan, Tsz On Li, Xiaowei Shang, Heming Cui, and                 (OSDI 20), pages 281–297. USENIX Association, November 2020.
+     Xiaoning Ding. vsmt-io: Improving i/o performance and efficiency on             [22] Barret Rhoden, Kevin Klues, David Zhu, and Eric Brewer. Improving
+     SMT processors in virtualized clouds. In 2020 USENIX Annual Technical                per-node efficiency in the datacenter with new os abstractions. In
+     Conference (USENIX ATC 20), pages 449–463. USENIX Association, July                  Proceedings of the 2nd ACM Symposium on Cloud Computing, SOCC
+     2020.                                                                                ’11, New York, NY, USA, 2011. Association for Computing Machinery.
+ [9] Tim Harris, Martin Maas, and Virendra J. Marathe. Callisto: Co-                 [23] Manohar Vanga, Arpan Gujarati, and Björn B. Brandenburg. Tableau:
+     scheduling parallel runtime systems. In Proceedings of the Ninth Eu-                 A high-throughput and predictable vm scheduler for high-density
+     ropean Conference on Computer Systems, EuroSys ’14, New York, NY,                    workloads. In Proceedings of the Thirteenth EuroSys Conference, EuroSys
+     USA, 2014. Association for Computing Machinery.                                      ’18, New York, NY, USA, 2018. Association for Computing Machinery.
+[10] George Prekas, Marios Kogias, and Edouard Bugnion. Zygos: Achiev-               [24] Performance-driven dynamic resource management in e2 vms.
+     ing low tail latency for microsecond-scale networked tasks. In Proceed-              https://cloud.google.com/blog/products/compute/understanding-
+     ings of the 26th Symposium on Operating Systems Principles, SOSP ’17,                dynamic-resource-management-in-e2-vms. Last accessed: 2020-11-
+     page 325–341, New York, NY, USA, 2017. Association for Computing                     11.
+     Machinery.                                                                      [25] Kostis Kaffes, Timothy Chong, Jack Tigar Humphries, Adam Belay,
+[11] Kostis Kaffes, Dragos Sbirlea, Yiyan Lin, David Lo, and Christos                     David Mazières, and Christos Kozyrakis. Shinjuku: Preemptive sched-
+     Kozyrakis. Leveraging application classes to save power in highly-                   uling for 𝜇second-scale tail latency. In 16th USENIX Symposium on
+     utilized data centers. In Proceedings of the 11th ACM Symposium on                   Networked Systems Design and Implementation (NSDI 19), pages 345–
+     Cloud Computing, SoCC ’20, page 134–149, New York, NY, USA, 2020.                    360, Boston, MA, February 2019. USENIX Association.
+     Association for Computing Machinery.                                            [26] Amirhossein Mirhosseini, Brendan L. West, Geoffrey W. Blake, and
+[12] Adam Belay, George Prekas, Mia Primorac, Ana Klimovic, Samuel                        Thomas F. Wenisch. Q-zilla: A scheduling framework and core microar-
+     Grossman, Christos Kozyrakis, and Edouard Bugnion. The ix operating                  chitecture for tail-tolerant microservices. In 2020 IEEE International
+     system: Combining low latency, high throughput, and efficiency in a                  Symposium on High Performance Computer Architecture (HPCA), pages
+     protected dataplane. ACM Trans. Comput. Syst., 34(4), December 2016.                 207–219, 2020.
+[13] Henry Qin, Qian Li, Jacqueline Speiser, Peter Kraft, and John Ouster-           [27] Ofir Weisse, Jo Van Bulck, Marina Minkin, Daniel Genkin, Baris Kasikci,
+     hout. Arachne: Core-aware thread management. In 13th USENIX                          Frank Piessens, Mark Silberstein, Raoul Strackx, Thomas F. Wenisch,
+     Symposium on Operating Systems Design and Implementation (OSDI                       and Yuval Yarom. Foreshadow-NG: Breaking the Virtual Memory
+     18), pages 145–160, Carlsbad, CA, October 2018. USENIX Association.                  Abstraction with Transient Out-of-Order Execution. Technical report,
+[14] Hyeontaek Lim, Dongsu Han, David G. Andersen, and Michael Kamin-                     2018. See also USENIX Security paper Foreshadow [28].
+     sky. MICA: A holistic approach to fast in-memory key-value storage.             [28] Jo Van Bulck, Marina Minkin, Ofir Weisse, Daniel Genkin, Baris Kasikci,
+     In 11th USENIX Symposium on Networked Systems Design and Imple-                      Frank Piessens, Mark Silberstein, Thomas F. Wenisch, Yuval Yarom,
+     mentation (NSDI 14), pages 429–444, Seattle, WA, April 2014. USENIX                  and Raoul Strackx. Foreshadow: Extracting the keys to the intel SGX
+     Association.                                                                         kingdom with transient out-of-order execution. In 27th USENIX Secu-
+                                                                                          rity Symposium (USENIX Security 18), page 991–1008, Baltimore, MD,
+
+
+
+
+                                                                               602
+     August 2018. USENIX Association.                                                      Hundt, Dan Hurt, Julian Ibarz, Aaron Jaffey, Alek Jaworski, Alexan-
+[29] Michael Schwarz, Moritz Lipp, Daniel Moghimi, Jo Van Bulck, Julian                    der Kaplan, Harshit Khaitan, Andy Koch, Naveen Kumar, Steve Lacy,
+     Stecklina, Thomas Prescher, and Daniel Gruss. Zombieload: Cross-                      James Laudon, James Law, Diemthu Le, Chris Leary, Zhuyuan Liu,
+     privilege-boundary data sampling. In Proceedings of the 2019 ACM                      Kyle Lucke, Alan Lundin, Gordon MacKean, Adriana Maggiore, Maire
+     SIGSAC Conference on Computer and Communications Security, CCS ’19,                   Mahony, Kieran Miller, Rahul Nagarajan, Ravi Narayanaswami, Ray
+     page 753–768, New York, NY, USA, 2019. Association for Computing                      Ni, Kathy Nix, Thomas Norrie, Mark Omernick, Narayana Penukonda,
+     Machinery.                                                                            Andy Phelps, and Jonathan Ross. In-datacenter performance analysis
+[30] Zombieload: Cross privilege-boundary data leakage. https://www.                       of a tensor processing unit. 2017.
+     cyberus-technology.de/posts/2019-05-14-zombieload.html. Last ac-                 [44] ghOSt kernel code. https://github.com/google/ghost-kernel.
+     cessed: 2020-09-02.                                                              [45] ghOSt userspace code. https://github.com/google/ghost-userspace.
+[31] S. van Schaik, A. Milburn, S. Österlund, P. Frigo, G. Maisuradze,                [46] Claudio Canella, Daniel Genkin, Lukas Giner, Daniel Gruss, Moritz
+     K. Razavi, H. Bos, and C. Giuffrida. Ridl: Rogue in-flight data load. In              Lipp, Marina Minkin, Daniel Moghimi, Frank Piessens, Michael
+     2019 IEEE Symposium on Security and Privacy (SP), pages 88–105, 2019.                 Schwarz, Berk Sunar, Jo Van Bulck, and Yuval Yarom. Fallout: Leaking
+[32] Marina Minkin, Daniel Moghimi, Moritz Lipp, Michael Schwarz, Jo Van                   data on meltdown-resistant cpus. In Proceedings of the ACM SIGSAC
+     Bulck, Daniel Genkin, Daniel Gruss, Frank Piessens, Berk Sunar, and                   Conference on Computer and Communications Security (CCS). ACM,
+     Yuval Yarom. Fallout: Reading kernel writes from user space. CoRR,                    2019.
+     abs/1905.12701, 2019.                                                            [47] Dario Faggioli, Michael Trimarchi, Fabio Checconi, Marko Bertogna,
+[33] Jean-Pierre Lozi, Baptiste Lepers, Justin Funston, Fabien Gaud, Vivien                and Antonio Mancina. An implementation of the earliest deadline
+     Quéma, and Alexandra Fedorova. The linux scheduler: A decade of                       first algorithm in linux. In Proceedings of the 2009 ACM Symposium
+     wasted cores. In Proceedings of the Eleventh European Conference on                   on Applied Computing, SAC ’09, page 1984–1989, New York, NY, USA,
+     Computer Systems, EuroSys ’16, New York, NY, USA, 2016. Association                   2009. Association for Computing Machinery.
+     for Computing Machinery.                                                         [48] Folly: Facebook open-source library. https://github.com/facebook/
+[34] Adam Belay, George Prekas, Ana Klimovic, Samuel Grossman, Christos                    folly. Last accessed: 2020-11-10.
+     Kozyrakis, and Edouard Bugnion. IX: A protected dataplane operating              [49] Abseil. https://abseil.io/. Last accessed: 2020-11-29.
+     system for high throughput and low latency. In 11th USENIX Sym-                  [50] Paul E. McKenney. Exploiting Deferred Destruction: An Analysis of
+     posium on Operating Systems Design and Implementation (OSDI 14),                      Read-Copy-Update Techniques in Operating System Kernels. PhD thesis,
+     pages 49–65, Broomfield, CO, October 2014. USENIX Association.                        OGI School of Science and Engineering at Oregon Health and Sciences
+[35] Adam Belay, Andrea Bittau, Ali Mashtizadeh, David Terei, David Maz-                   University, 2004. Available: http://www.rdrop.com/users/paulmck/
+     ières, and Christos Kozyrakis. Dune: Safe user-level access to privi-                 RCU/RCUdissertation.2004.07.14e1.pdf [Viewed October 15, 2004].
+     leged CPU features. In 10th USENIX Symposium on Operating Systems                [51] Dick Sites. Data center computers: Modern challenges in cpu design.
+     Design and Implementation (OSDI 12), pages 335–348, Hollywood, CA,                    https://www.youtube.com/watch?v=QBu2Ae8-8LM. Last accessed:
+     October 2012. USENIX Association.                                                     2020-11-10.
+[36] Mingzhe Hao, Huaicheng Li, Michael Hao Tong, Chrisma Pakha, Riza O.              [52] P. Gadepalli, R. Pan, and G. Parmer. Slite: Os support for near zero-
+     Suminto, Cesar A. Stuardo, Andrew A. Chien, and Haryadi S. Gunawi.                    cost, configurable scheduling *. In 2020 IEEE Real-Time and Embedded
+     Mittos: Supporting millisecond tail tolerance with fast rejecting slo-                Technology and Applications Symposium (RTAS), pages 160–173, Los
+     aware os interface. In Proceedings of the 26th Symposium on Operating                 Alamitos, CA, USA, apr 2020. IEEE Computer Society.
+     Systems Principles, SOSP ’17, page 168–183, New York, NY, USA, 2017.             [53] Martin Karsten and Saman Barghi. User-level threading: Have your
+     Association for Computing Machinery.                                                  cake and eat it too. Proc. ACM Meas. Anal. Comput. Syst., 4(1), May
+[37] Ting Yang, Tongping Liu, Emery D. Berger, Scott F. Kaplan, and                        2020.
+     J. Eliot B. Moss. Redline: First class support for interactivity in com-         [54] The go programming language. https://golang.org/. Last accessed:
+     modity operating systems. In Proceedings of the 8th USENIX Conference                 2020-11-10.
+     on Operating Systems Design and Implementation, OSDI’08, page 73–86,             [55] Boost fiber. https://www.boost.org/doc/libs/1_68_0/libs/fiber/doc/
+     USA, 2008. USENIX Association.                                                        html/fiber/overview.html. Last accessed: 2020-11-10.
+[38] Yizhou Shan, Yutong Huang, Yilun Chen, and Yiying Zhang. Legoos: A               [56] Rob von Behren, Jeremy Condit, Feng Zhou, George C. Necula, and Eric
+     disseminated, distributed OS for hardware resource disaggregation. In                 Brewer. Capriccio: Scalable threads for internet services. In Proceedings
+     13th USENIX Symposium on Operating Systems Design and Implemen-                       of the Nineteenth ACM Symposium on Operating Systems Principles,
+     tation (OSDI 18), pages 69–87, Carlsbad, CA, October 2018. USENIX                     SOSP ’03, page 268–281, New York, NY, USA, 2003. Association for
+     Association.                                                                          Computing Machinery.
+[39] big.little - arm. https://www.arm.com/why-arm/technologies/big-little.           [57] Robert D. Blumofe, Christopher F. Joerg, Bradley C. Kuszmaul,
+     Last accessed: 2020-11-27.                                                            Charles E. Leiserson, Keith H. Randall, and Yuli Zhou. Cilk: An efficient
+[40] Kevin Lepak. The next generation amd enterprise server product                        multithreaded runtime system. In Proceedings of the Fifth ACM SIG-
+     architecture. In Proceedings of the IEEE Annual Symposium on Hot                      PLAN Symposium on Principles and Practice of Parallel Programming,
+     Chips, August 2017.                                                                   PPOPP ’95, page 207–216, New York, NY, USA, 1995. Association for
+[41] Aws nitro system. https://aws.amazon.com/ec2/nitro/. Last accessed:                   Computing Machinery.
+     2020-11-29.                                                                      [58] Kevin Alan Klues. OS and Runtime Support for Efficiently Managing
+[42] What’s a dpu? https://blogs.nvidia.com/blog/2020/05/20/whats-a-dpu-                   Cores in Parallel Applications. PhD thesis, University of California,
+     data-processing-unit/. Last accessed: 2020-11-29.                                     Berkeley, USA, 2015.
+[43] Norman P. Jouppi, Cliff Young, Nishant Patil, David Patterson, Gau-              [59] Lithe. http://lithe.eecs.berkeley.edu/. Last accessed: 2020-11-10.
+     rav Agrawal, Raminder Bajwa, Sarah Bates, Suresh Bhatia, Nan Bo-                 [60] Seastar. https://github.com/scylladb/seastar. Last accessed: 2020-11-
+     den, Al Borchers, Rick Boyle, Pierre luc Cantin, Clifford Chao, Chris                 10.
+     Clark, Jeremy Coriell, Mike Daley, Matt Dau, Jeffrey Dean, Ben Gelb,             [61] A thorough introduction to ebpf. https://lwn.net/Articles/740157/. Last
+     Tara Vazir Ghaemmaghami, Rajendra Gottipati, William Gulland,                         accessed: 2020-12-10.
+     Robert Hagmann, C. Richard Ho, Doug Hogberg, John Hu, Robert                     [62] Yu Jian Wu, Hongyi Wang, Yuhong Zhong, Asaf Cidon, Ryan Stutsman,
+                                                                                           Amy Tai, and Junfeng Yang. Bpf for storage: An exokernel-inspired
+
+
+
+
+                                                                                603
+     approach. In Proceedings of the 18th ACM Workshop on Hot Topics in              [81] Storage performance development kit. https://spdk.io/. Last accessed:
+     Operating Systems, HotOS ’21. Association for Computing Machinery,                   2020-08-20.
+     2021.                                                                           [82] Ana Klimovic, Heiner Litz, and Christos Kozyrakis. Reflex: Remote
+[63] Jing Liu, Andrea C. Arpaci-Dusseau, Remzi H. Arpaci-Dusseau, and                     flash ≈ local flash. In Proceedings of the Twenty-Second International
+     Sudarsun Kannan. File systems as processes. In 11th USENIX Workshop                  Conference on Architectural Support for Programming Languages and
+     on Hot Topics in Storage and File Systems (HotStorage 19), Renton, WA,               Operating Systems, ASPLOS ’17, page 345–359, New York, NY, USA,
+     July 2019. USENIX Association.                                                       2017. Association for Computing Machinery.
+[64] How esxi numa scheduling works. https://docs.vmware.com/en/                     [83] libfuse. https://github.com/libfuse/libfuse. Last accessed: 2020-08-15.
+     VMware-vSphere/7.0/com.vmware.vsphere.resmgmt.doc/GUID-                         [84] The userspace i/o howto. https://www.kernel.org/doc/html/v4.14/
+     BD4A462D-5CDC-4483-968B-1DCF103C4208.html. Last accessed:                            driver-api/uio-howto.html. Last accessed: 2021-01-11.
+     2020-11-02.                                                                     [85] Jack Tigar Humphries, Kostis Kaffes, David Mazières, and Christos
+[65] Bpf ring buffer. https://nakryiko.com/posts/bpf-ringbuf. Last accessed:              Kozyrakis. A Case against (Most) Context Switches, page 17–25. Asso-
+     2021-04-26.                                                                          ciation for Computing Machinery, New York, NY, USA, 2021.
+[66] The rapid growth of io_uring. https://lwn.net/Articles/810414/. Last            [86] Jan Stoess.      Towards effective user-controlled scheduling for
+     accessed: 2021-04-26.                                                                microkernel-based systems. ACM SIGOPS Oper. Syst. Rev., 41(4):59–68,
+[67] Nir Shavit and Dan Touitou. Software transactional memory. In                        2007.
+     Proceedings of the Fourteenth Annual ACM Symposium on Principles of             [87] Bryan Ford and Sai Susarla. CPU inheritance scheduling. In Karin
+     Distributed Computing, PODC ’95, page 204–213, New York, NY, USA,                    Petersen and Willy Zwaenepoel, editors, Proceedings of the Second
+     1995. Association for Computing Machinery.                                           USENIX Symposium on Operating Systems Design and Implementation
+[68] Philip A. Bernstein, Vassos Hadzilacos, and Nathan Goodman. Con-                     (OSDI), Seattle, Washington, USA, October 28-31, 1996, pages 91–105.
+     currency Control and Recovery in Database Systems. Addison-Wesley,                   ACM, 1996.
+     1987.
+[69] libbpf. https://github.com/libbpf/libbpf. Last accessed: 2020-08-25.
+[70] Rocksdb. https://rocksdb.org. Last accessed: 2020-11-27.
+[71] David Lo, Liqun Cheng, Rama Govindaraju, Parthasarathy Ran-
+     ganathan, and Christos Kozyrakis. Heracles: improving resource effi-
+     ciency at scale. In Deborah T. Marr and David H. Albonesi, editors,
+     Proceedings of the 42nd Annual International Symposium on Computer
+     Architecture, Portland, OR, USA, June 13-17, 2015, pages 450–462. ACM,
+     2015.
+[72] Data plane development kit. http://www.dpdk.org/. Last accessed:
+     2019-06-26.
+[73] Luiz Andre Barroso, Jeffrey Dean, and Urs Hölzle. Web search for a
+     planet: The google cluster architecture. IEEE Micro, 23:22–28, 2003.
+[74] Thomas E. Anderson, Brian N. Bershad, Edward D. Lazowska, and
+     Henry M. Levy. Scheduler activations: Effective kernel support for
+     the user-level management of parallelism. In Proceedings of the Thir-
+     teenth ACM Symposium on Operating Systems Principles, SOSP ’91,
+     page 95–109, New York, NY, USA, 1991. Association for Computing
+     Machinery.
+[75] Upthread. http://akaros.cs.berkeley.edu/parlib/upthread/. Last ac-
+     cessed: 2020-11-10.
+[76] Phitchaya Mangpo Phothilimthana, Ming Liu, Antoine Kaufmann,
+     Simon Peter, Rastislav Bodik, and Thomas Anderson. Floem: A pro-
+     gramming system for nic-accelerated network applications. In 13th
+     USENIX Symposium on Operating Systems Design and Implementa-
+     tion (OSDI 18), pages 663–679, Carlsbad, CA, October 2018. USENIX
+     Association.
+[77] Ming Liu, Tianyi Cui, Henry Schuh, Arvind Krishnamurthy, Simon
+     Peter, and Karan Gupta. Offloading distributed applications onto
+     smartnics using ipipe. In Proceedings of the ACM Special Interest Group
+     on Data Communication, SIGCOMM ’19, page 318–333, New York, NY,
+     USA, 2019. Association for Computing Machinery.
+[78] M. Sutherland, S. Gupta, B. Falsafi, V. Marathe, D. Pnevmatikatos, and
+     A. Daglis. The nebula rpc-optimized architecture. In 2020 ACM/IEEE
+     47th Annual International Symposium on Computer Architecture (ISCA),
+     pages 199–212, 2020.
+[79] Compute Express Link          https://docs.wixstatic.com/ugd/0c1418_
+     d9878707bbb7427786b70c3c91d5fbd1.pdf. Last accessed: 2019-06-26.
+[80] D. R. Engler, M. F. Kaashoek, and J. O’Toole. Exokernel: An operating
+     system architecture for application-level resource management. In
+     Proceedings of the Fifteenth ACM Symposium on Operating Systems Prin-
+     ciples, SOSP ’95, page 251–266, New York, NY, USA, 1995. Association
+     for Computing Machinery.
+
+
+
+
+                                                                               604
+

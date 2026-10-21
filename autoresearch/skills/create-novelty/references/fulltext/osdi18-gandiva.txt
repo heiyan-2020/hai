@@ -1,0 +1,1182 @@
+    Gandiva: Introspective Cluster Scheduling
+                for Deep Learning
+      Wencong Xiao, Beihang University & Microsoft Research; Romil Bhardwaj,
+ Ramachandran Ramjee, Muthian Sivathanu, and Nipun Kwatra, Microsoft Research;
+         Zhenhua Han, The University of Hong Kong & Microsoft Research;
+ Pratyush Patel, Microsoft Research; Xuan Peng, Huazhong University of Science and
+Technology & Microsoft Research; Hanyu Zhao, Peking University & Microsoft Research;
+          Quanlu Zhang, Fan Yang, and Lidong Zhou, Microsoft Research
+                https://www.usenix.org/conference/osdi18/presentation/xiao
+
+         This paper is included in the Proceedings of the
+      13th USENIX Symposium on Operating Systems Design
+                 and Implementation (OSDI ’18).
+                      October 8–10, 2018 • Carlsbad, CA, USA
+                                 ISBN 978-1-939133-08-3
+
+
+
+                                             Open access to the Proceedings of the
+                                         13th USENIX Symposium on Operating Systems
+                                                 Design and Implementation
+                                                   is sponsored by USENIX.
+             Gandiva: Introspective Cluster Scheduling for Deep Learning
+
+       Wencong Xiao†∗ , Romil Bhardwaj∗ , Ramachandran Ramjee , Muthian Sivathanu , Nipun Kwatra ,
+      Zhenhua Han , Pratyush Patel , Xuan Peng‡ , Hanyu Zhao§ , Quanlu Zhang , Fan Yang , Lidong Zhou
+                     † Beihang University,  Microsoft Research,  The University of Hong Kong,
+                        ‡ Huazhong University of Science and Technology, § Peking University
+
+
+
+
+Abstract                                                                An increasingly popular computing trend over the last
+                                                                        few years is deep learning [32]; it has already had signif-
+We introduce Gandiva, a new cluster scheduling frame-
+                                                                        icant impact; e.g., on widely-used personal products for
+work that utilizes domain-speciﬁc knowledge to improve
+                                                                        voice and image recognition, and has signiﬁcant poten-
+latency and efﬁciency of training deep learning models
+                                                                        tial to impact businesses. Hence, it is likely to be a vital
+in a GPU cluster.
+                                                                        and growing workload, especially in cloud data centers.
+   One key characteristic of deep learning is feedback-
+                                                                           However, deep learning is compute-intensive and
+driven exploration, where a user often runs a set of jobs
+                                                                        hence heavily reliant on powerful but expensive GPUs;
+(or a multi-job) to achieve the best result for a speciﬁc
+                                                                        a GPU VM in the cloud costs nearly 10x that of a regu-
+mission and uses early feedback on accuracy to dynam-
+                                                                        lar VM. Cloud operators and large companies that man-
+ically prioritize or kill a subset of jobs; simultaneous
+                                                                        age clusters of tens of thousands of GPUs rely on cluster
+early feedback on the entire multi-job is critical. A sec-
+                                                                        schedulers to ensure efﬁcient utilization of the GPUs.
+ond characteristic is the heterogeneity of deep learning
+jobs in terms of resource usage, making it hard to achieve                 Despite the importance of efﬁcient scheduling of deep
+best-ﬁt a priori. Gandiva addresses these two challenges                learning training (DLT) jobs, the common practice to-
+by exploiting a third key characteristic of deep learn-                 day [12, 28] is to use a traditional cluster scheduler, such
+ing: intra-job predictability, as they perform numerous                 as Kubernetes [14] or YARN [50], designed for handling
+repetitive iterations called mini-batch iterations. Gan-                big-data jobs such as MapReduce [17]; a DLT job is
+diva exploits intra-job predictability to time-slice GPUs               treated simply as yet another big-data job that is allo-
+efﬁciently across multiple jobs, thereby delivering low-                cated a set of GPUs at job startup and holds exclusive
+latency. This predictability is also used for introspect-               access to its GPUs until completion.
+ing job performance and dynamically migrating jobs to                      In this paper, we present Gandiva, a new scheduling
+better-ﬁt GPUs, thereby improving cluster efﬁciency.                    framework that demonstrates that a signiﬁcant increase
+   We show via a prototype implementation and micro-                    in cluster efﬁciency can be achieved by tailoring the
+benchmarks that Gandiva can speed up hyper-parameter                    scheduling framework to the unique characteristics of the
+searches during deep learning by up to an order of mag-                 deep learning workload.
+nitude, and achieves better utilization by transparently                   One key characteristic of DLT jobs is feedback-driven
+migrating and time-slicing jobs to achieve better job-to-               exploration (Section 2). Because of the inherent trial-
+resource ﬁt. We also show that, in a real workload of jobs              and-error methodology of deep learning experimenta-
+running in a 180-GPU cluster, Gandiva improves aggre-                   tion, users typically try several conﬁgurations of a job
+gate cluster utilization by 26%, pointing to a new way of               (a multi-job), and use early feedback from these jobs to
+managing large GPU clusters for deep learning.                          decide whether to prioritize or kill some subset of them.
+                                                                        Such conditional exploration, called hyper-parameter
+1    Introduction                                                       search, can either be manual or automated [10, 33, 41].
+All men schedulers make mistakes; only the wise learn from              Traditional schedulers run a subset of jobs to comple-
+their mistakes.                                                         tion while queueing others; this model is a misﬁt for
+                                        -Winston Churchill              multi-jobs, which require simultaneous early feedback
+    ∗ The ﬁrst two authors have equal contribution. This work is done   on all jobs within the multi-job. Also, along with multi-
+while Wencong Xiao, Zhenhua Han, Xuan Peng, and Hanyu Zhao are          jobs, other DLT jobs that have identiﬁed the right hyper-
+interns in Microsoft Research.                                          parameters, run for several hours to days, leading to
+
+
+
+USENIX Association                       13th USENIX Symposium on Operating Systems Design and Implementation                  595
+head-of-line-blocking, as long-running jobs hold exclu-      Traditional schedulers, for a good reason, treat a job as
+sive access to the GPUs until completion, while multi-       a black-box. However, by exploiting the dedicated na-
+jobs depending on early feedback wait in queue. Long         ture of GPU clusters, Gandiva customizes the scheduler
+queueing times force users to either use reserved GPUs,      to the speciﬁc workload of deep learning, thus providing
+or demand cluster over-provisioning, thus reducing clus-     the scheduler more visibility and control into a job, while
+ter efﬁciency.                                               still achieving generality to arbitrary DLT jobs.
+   Second, like any other cluster workload, DLT jobs            We have implemented Gandiva by modifying two
+are heterogeneous because of the diverse application do-     popular frameworks, PyTorch and Tensorﬂow, to pro-
+mains they target. Jobs widely differ in terms of memory     vide the necessary new primitives to the scheduler, and
+usage, GPU core utilization, sensitivity to interconnect     also implemented an initial scheduling policy manager
+bandwidth, and/or interference from other jobs. For ex-      on top of Kubernetes and Docker containers (Section 5).
+ample, certain multi-GPU DLT jobs may perform much           We evaluate Gandiva on a cluster of 180 heterogeneous
+better with afﬁnitized GPUs, while other jobs may not be     GPUs and show, through micro-benchmarks and real
+as sensitive to afﬁnity (Section 3). A traditional sched-    workloads, that (i) Gandiva improves the efﬁciency of
+uler that treats a job as a black-box will hence achieve     cluster scheduling by up to 26%, and (ii) Gandiva is re-
+sub-optimal cluster efﬁciency.                               active enough to time-slice multiple jobs dynamically on
+   To address the twin problems of high latency and          the same GPU, reducing the time to early feedback by as
+low efﬁciency, Gandiva exploits a powerful property of       much as 77%. We also show that, for a popular hyper-
+DLT jobs: intra-job predictability (Section 3). A job is     parameter search technique [10], Gandiva improves the
+comprised of millions of similar, clearly separated mini-    overall completion time of the hyper-parameter search by
+batch iterations. For example, the GPU RAM usage of          up to an order of magnitude while using same resources
+a DLT job follows a cyclic pattern aligned with mini-        (Section 6).
+batch boundaries, usually with more than 10x differ-            The key contributions of the paper are as follows.
+ence in GPU RAM usage within a mini-batch. Gandiva               • We illustrate various unique characteristics of the
+exploits this cyclic predictability to implement efﬁcient          deep learning workﬂow and map it to speciﬁc re-
+application aware time-slicing; in effect, it re-deﬁnes            quirements needed for cluster scheduling.
+the atom of scheduling from a job to automatically-              • We identify generic primitives that can be used
+partitioned micro-tasks. This enables the cluster to over-         by a DLT job scheduling policy, and provide
+subscribe DLT jobs and provide early feedback through              application-aware techniques to make primitives
+time-slicing to all DLT jobs, including all jobs that are          such as time-slicing and migration an order of mag-
+part of a multi-job.                                               nitude more efﬁcient and thus practical by leverag-
+   Gandiva also uses the predictability to perform proﬁle-         ing DL-speciﬁc knowledge of intra-job periodicity.
+driven introspection. It uses the mini-batch progress rate
+                                                                 • We propose and evaluate a new introspective
+to introspect its decisions continuously to improve clus-
+                                                                   scheduling framework that utilizes domain-speciﬁc
+ter efﬁciency (Section 4). For example, it packs multiple
+                                                                   knowledge of DLT jobs to reﬁne its scheduling de-
+jobs on the same GPU only when they have low memory
+                                                                   cision continuously, thereby signiﬁcantly improving
+and GPU utilization; it dynamically migrates a commu-
+                                                                   early feedback time and delivering high cluster efﬁ-
+nication intensive job to more afﬁnitized GPUs; it also
+                                                                   ciency.
+opportunistically “grows” the degree of parallelism of a
+job to make use of spare resources, and shrinks the job
+when the spare resources go away. The introspection pol-     2     Background
+icy we presently implement is a stateful trial-and-error
+policy that is feasible because of the predictability and    Deep learning is a type of representation learning that au-
+the limited state space of options we consider.              tomatically infers features from raw data in order to ac-
+   Beyond the speciﬁc introspection and scheduling pol-      complish tasks such as image classiﬁcation or language
+icy evaluated in this paper, the Gandiva framework pro-      translation [32]. Deep learning may be supervised (data
+vides the following APIs that any DLT scheduling pol-        with labels) or unsupervised (data only). In either case,
+icy can leverage: (a) efﬁcient suspend-resume or time-       the representation is a deep neural network model with
+slicing, (b) low-latency migration, (c) ﬁne-grained pro-     parameters called weights. These weights are carefully
+ﬁling, (d) dynamic intra-job elasticity, and (e) dynamic     arranged in layers and number typically in the millions.
+prioritization. The key to making these primitives ef-       These model weights are learned through training.
+ﬁcient and practical is the co-design approach of Gan-          Deep learning training operates on a few samples of
+diva that spans across both the scheduler layer and the      data at a time called a mini-batch. It computes a set
+DLT toolkit layer such as Tensorﬂow [8] or PyTorch [38].     of scores for each mini-batch by performing numerical
+
+
+
+596   13th USENIX Symposium on Operating Systems Design and Implementation                        USENIX Association
+      SamePCIeSw                SameSocket     DiffSocket   Local 4-GPU              2 * 2-GPU       4 * 1-GPU                                      LM     Other                                            1 Job   2 Jobs   4 Jobs
+                          1                                                 800                                                            1                                                           1
+
+
+
+
+                                                                                                                 Normalized Performance
+
+
+
+
+                                                                                                                                                                             Normalized performance
+Normalized performance
+                                                                            700
+                         0.9                                                                                                              0.9                                                         0.9
+                                                                            600
+
+
+
+
+                                                            Images/second
+                         0.8                                                500                                                           0.8                                                         0.8
+                                                                            400
+                         0.7                                                300                                                           0.7                                                         0.7
+                                                                            200                                                           0.6
+                         0.6                                                                                                                                                                          0.6
+                                                                            100
+                         0.5                                                  0                                                           0.5                                                         0.5
+                               VGG16         ResNet-50                            ResNet-50      InceptionV3                                      LM     GNMT ResNet-50                                    et-50    nV3    eech
+                                                                                                                                                 Models co-located with LM                             ResN Inceptio DeepSp
+  Figure 1: Intra-server locality.                           Figure 2: Inter-server locality. Figure 3: 1-GPU interference.                                                                    Figure 4: NIC interference.
+
+computations using the model weights, called the for-                                                                         would be unable to make effective training decisions oth-
+ward pass. Based on the desired task, an objective func-                                                                      erwise.
+tion is deﬁned that measures an error between the com-
+puted scores and desired scores. The error is populated
+via a backward pass over the model, where it ﬁrst com-                                                                        3                 DLT Job Characteristics
+putes a gradient for each weight (i.e., the impact of each
+weight on the error) and then applies a negative of the                                                                       In this section, we motivate the design of Gandiva by
+gradient, scaled by a parameter called the learning rate,                                                                     highlighting several unique characteristics of DLT jobs.
+to each weight to decrease the error. Both the forward
+and backward passes typically involve billions of ﬂoating                                                                     3.1                Sensitivity to locality
+point operations and thus leverage GPUs. Each forward-
+backward pass is called a mini-batch iteration. Typi-                                                                         The performance of a multi-GPU DLT job depends on
+cally, millions of such iterations are performed on large                                                                     the afﬁnity of the allocated GPUs. Different DLT jobs
+datasets to achieve high task accuracy.                                                                                       exhibit different levels of sensitivity to inter-GPU afﬁn-
+                                                                                                                              ity. Even for GPUs on the same machine, we observe dif-
+Feedback-driven exploration. One pre-requisite for                                                                            ferent levels of inter-GPU afﬁnity due to asymmetric ar-
+achieving high accuracy is model selection. Discovery                                                                         chitecture: two GPUs might be located in different CPU
+of new models such as ResNet [24] or Inception [46] is                                                                        sockets (denoted as DiffSocket), in the same CPU socket,
+mostly a trial-and-error process today, though ways to                                                                        but on different PCIe switches (denoted as SameSocket),
+automate it is an active area of research [36].                                                                               or on the same PCIe switch (denoted as SamePCIeSw).
+   Apart from the model structure, there are a number of                                                                         Figure 1 shows different sensitivity to intra-server lo-
+parameters, called hyper-parameters, that also need to                                                                        cality for two models VGG16 [44] and ResNet-50 [24].
+be speciﬁed as part of the DLT job. Hyper-parameters                                                                          When trained with two P100 GPUs using Tensorﬂow,
+include the number of layers/weights in the model, mini-                                                                      VGG16 suffers greatly under bad locality. With the worst
+batch size, learning rate, etc. These are typically chosen                                                                    locality, when two GPUs are located in different CPU
+today by the user based on domain knowledge and trial-                                                                        sockets, VGG16 achieves only 60% of the best locality
+and-error, and can sometimes even result in early train-                                                                      conﬁg, where two GPUs are placed under the same PCIe
+ing failure. Thus, early-feedback on DLT jobs is critical,                                                                    switch. On the other hand, the ResNet-50 is not affected
+especially in the initial stages of training.                                                                                 by GPU locality in this setting. This is because VGG16
+Multi-job. Once the user has identiﬁed a particular                                                                           is a larger neural model than ResNet-50, hence the model
+model to explore further, the user typically performs                                                                         synchronization in each mini-batch incurs a higher com-
+hyper-parameter search to improve task accuracy. This                                                                         munication load on the underlying PCIe bus.
+can be done using various searching techniques over the                                                                          We observe similar trends in a distributed setting. Fig-
+space of the hyper-parameters; that is, the user gener-                                                                       ure 2 shows the performance of a 4-GPU Tensorﬂow
+ates multiple DLT jobs or multi-jobs, each performing                                                                         job running with different inter-server locality, training
+full training using one set of hyper-parameters or con-                                                                       ResNet-50 and InceptionV3 [46] models. Even when
+ﬁguration. Because users typically explore hundreds of                                                                        interconnected with a 40G InﬁniBand network, the per-
+such conﬁgurations, this process is computationally ex-                                                                       formance difference is clearly seen when the job is as-
+pensive. Thus, sophisticated versions of hyper-parameter                                                                      signed to 4 GPUs, where they are evenly scattered across
+searches are available in the literature, such as Hyper-                                                                      4 servers (denoted as 4*1-GPU), 2 servers (denoted as
+Opt [10] and Hyperband [33]. For example, Hyperband                                                                           2*2-GPU), and all in one server (denoted as local 4-
+might initially spawn 128 DLT jobs and, in each round                                                                         GPU), though the sensitivity to locality of the two mod-
+(e.g., 100 mini-batch iterations), kill half of the jobs with                                                                 els is different.
+the lowest accuracy. Again, for these algorithms, early                                                                          Thus, a DLT scheduler has to take into account a job’s
+feedback on the entire set of jobs is crucial because they                                                                    sensitivity to locality when allocating GPUs.
+
+
+
+USENIX Association                                                           13th USENIX Symposium on Operating Systems Design and Implementation                                                                                     597
+3.2                          Sensitivity to interference                                                                            3.3    Intra-job predictability
+                                                                                                                                    A DLT job consists of numerous mini-batch iterations.
+When running in a shared execution environment, DLT
+                                                                                                                                    The total GPU memory used1 during a 20s snapshot
+jobs might interfere with each other due to resource con-
+                                                                                                                                    of training on ImageNet data when using ResNet-50
+tention. We again observe that different DLT jobs exhibit
+                                                                                                                                    model [24] on four K80 GPUs is shown in Figure 5(a).
+different degrees of interference.
+                                                                                                                                    The GPU memory used clearly follows a cyclic pattern.
+   Interference exists even for single-GPU jobs. When                                                                               Each of these cycles corresponds to the processing of a
+placing a Language Model [56] job (marked as LM) with                                                                               single mini-batch (about 1.5s), with the memory increas-
+another job under the same PCI-e switch, Figure 3 shows                                                                             ing during the forward pass and decreasing during the
+the performance degradation due to intra-server interfer-                                                                           backward pass. The maximum and minimum GPU mem-
+ence. When two LMs run together, both jobs suffer 19%                                                                               ory used is 23GB and 0.3GB, respectively, or a factor of
+slowdown. However, ResNet-50 does not suffer from                                                                                   77x. This ratio scales with the mini-batch size (typically
+GPU co-location with LM. Neural Machine Translation                                                                                 between 16 to 256; 128 in this case).
+(GNMT) [51] exhibits a modest degree of interference                                                                                   The total GPU memory used during a 20s snapshot of
+with LM. Similarly, we also observe various degrees of                                                                              training on WMT’14 English German language dataset
+interference for multi-GPU training with different types                                                                            when using GNMT model [51] on one K80 GPU is
+of training models. We omit the result due to space limi-                                                                           shown in Figure 5(b). While the mini-batch iterations
+tation.                                                                                                                             are not identical to each other as in the ImageNet exam-
+  Figure 4 shows inter-server interference on two 4-                                                                                ple (due to differing sentence lengths and the use of dy-
+GPU servers that are connected with a 40G InﬁniBand                                                                                 namic graphs in PyTorch), the graph has a similar cyclic
+network. When running multiple 2-GPU jobs, where                                                                                    nature. The difference between maximum and minimum
+each GPU is placed on different server, ResNet-50 shows                                                                             is smaller (3x) primarily due to larger model (0.4GB) and
+up to 47% slowdown, InceptionV3 shows 30% slow-                                                                                     smaller mini-batch size (16 in this example).
+down, while DeepSpeech [23] only shows 5% slowdown.                                                                                    Apart from image and language models shown here,
+                                                                                                                                    other training domains such as speech, generative
+   In summary, popular deep learning models across dif-
+                                                                                                                                    adverserial networks (GANs), and variational auto-
+ferent application domains such as vision, language, and
+                                                                                                                                    encoders all follow a similar cyclic pattern (not shown
+speech demonstrate different levels of sensitivity to lo-
+                                                                                                                                    due to space limitation) since the core of training is the
+cality and interference. To cater to these challenges,
+                                                                                                                                    gradient descent algorithm performing many mini-batch
+Gandiva leverages a key characteristic of DLT jobs,
+                                                                                                                                    iterations.
+which we elaborate next.
+                                                                                                                                    Leveraging predictability. This characteristic behavior
+                                                                                                                                    is exploited in Gandiva in multiple ways. First, a DLT
+ GPU Memory Used (GB)
+
+
+
+
+                                                               GPU Memory Used (GB)
+
+
+
+
+                        25                                                                5                                         job can be automatically split into mini-batch iterations
+                                                                                        4.5
+                        20                                                                4                                         and a collection of these iterations over 60 seconds, say
+                        15                                                              3.5
+                        10
+                                                                                          3                                         a micro-task, forms a scheduling interval. Second, by
+                                                                                        2.5
+                         5                                                                2
+                                                                                        1.5
+                                                                                                                                    performing the suspend operation at the minimum of the
+                         0                                                                1                                         memory cycle, the amount of memory to be copied from
+                             0     5       10     15      20                                  0      5        10     15        20
+                                     Time (seconds)                                                  Time (seconds)
+                                                                                                                                    GPU to be saved in CPU can be signiﬁcantly reduced,
+                                                                                                                                    thereby enabling suspend/resume and migration to be an
+                        (a) ResNet50/Imagenet                                   (b) GNMT/WMT’14 En-De
+                                                                                                                                    order of magnitude more efﬁcient than a naı̈ve imple-
+                                                                                                                                    mentation. Third, the mini-batch progress rate can be
+                              Figure 5: GPU memory usage during training.
+                                                                                                                                    proﬁled and used as a proxy to evaluate the effectiveness
+                                                                                                                                    of applying mechanisms such as packing or migration.
+                             Traditional GPU allocation                                   Gandiva: (2) Migration
+
+                                                                                          Job 1
+                             Job 1              Job 2                                     Job 2                    Job 2            4     Design
+                        GPU 0     GPU 1     GPU 2      GPU 3                          GPU 0       GPU 1      GPU 2          GPU 3
+
+        Gandiva: (1) Suspend-Resume/Packing                                               Gandiva: (3) Grow-Shrink                  High latency and low utilization in today’s cluster arises
+                          Job 1
+                                                Job 3                                     Job 1                    Job 2            because DLT jobs are assigned a ﬁxed set of GPUs ex-
+                                                Job 4
+                        GPU 0     GPU 1     GPU 2      GPU 3
+                                                                                                         Job 1                      clusively (Figure 6). Exclusive access to GPUs causes
+                                                                                                              Shrink
+                                                                                          Job 3                     Job 1
+                          Job 2                                                                                                        1 This is actual GPU memory used.
+                                                                                      GPU 0       GPU 1      GPU 2          GPU 3                                              Toolkits like Py-
+                                                                                                                                    Torch/Tensorﬂow use caching to avoid expensive GPU memory
+                                 Figure 6: GPU usage options in Gandiva.                                                            (de)allocations.
+
+
+
+
+598                          13th USENIX Symposium on Operating Systems Design and Implementation                                                                         USENIX Association
+head-of-line blocking, preventing early feedback and re-     accomplished in under 100ms, while for large language
+sulting in high queuing times for incoming jobs. Exclu-      translation jobs suspend-resume can take up to 1s. Given
+sive access to a ﬁxed set of GPUs also results in low GPU    a time-slicing interval of 1 minute, this amounts to an
+utilization when jobs are unable to utilize their assigned   overhead of 2% or less.
+GPUs fully.                                                     Note that suspend in Gandiva may be delayed by at
+                                                             most a mini-batch interval of the DLT job (typically, a
+                                                             few seconds or less), but we believe this is a worthwhile
+4.1   Mechanisms                                             trade-off as it results in signiﬁcantly less overhead due to
+In Gandiva, we address these inefﬁciencies by remov-         the reduced GPU-CPU copy cost and less memory used
+ing the exclusivity and ﬁxed assignment of GPUs to DLT       in the CPU. Further, useful work is accomplished during
+jobs in three ways (Figure 6). First, during overload, in-   this delay. The scheduler keeps track of this delay and
+stead of waiting for current jobs to depart, Gandiva al-     adjusts the time-slicing interval accordingly for fairness.
+lows incoming jobs to time-share GPUs with existing             An alternative to suspend-resume for time-slicing is to
+jobs. This is enabled using a custom suspend-resume          run multiple DLT jobs on a GPU simultaneously and let
+mechanism tailored for DLT jobs along with selective         the GPU time-share the jobs. We call this packing. Pack-
+packing. Second, Gandiva supports efﬁcient migration         ing in GPU is efﬁcient only when the packed jobs do
+of DLT jobs from one set of GPUs to another. Migra-          not exceed the GPU resources (cores, memory) and do
+tion allows time-sliced jobs to migrate to other (recently   not adversely impact each other. If jobs interfere, pack-
+vacated) GPUs or for de-fragmentation of the cluster so      ing can be signiﬁcantly worse than suspend-resume (Sec-
+that incoming jobs are assigned GPUs with good locality.     tion 6.1). We use proﬁling to monitor the resource and
+Third, Gandiva supports a GPU grow-shrink mechanism          progress of DLT jobs when they have exclusive access. If
+so that idle GPUs can be used opportunistically. In order    two jobs are identiﬁed as candidates for packing, we pack
+to support these mechanisms efﬁciently and enable ef-        them together and continue monitoring them. If a given
+fective resource management, Gandiva introspects DLT         packing results in adverse impact on jobs’ performance,
+jobs by continuously proﬁling their resource usage and       we unpack those jobs and revert to suspend-resume.
+estimating their performance. We now describe each of
+these mechanisms.                                            Migration. Migration is the mechanism Gandiva uses
+                                                             to change the set of GPUs assigned to a DLT job. Mi-
+Suspend-Resume and Packing. Suspend-resume is                gration is useful in several situations such as i) moving
+one mechanism Gandiva uses to remove exclusivity of          time-sliced jobs to vacated GPUs anywhere in the clus-
+a set of GPUs to a DLT job. Modern operating systems         ter; ii) migrating interfering jobs away from each other;
+support efﬁcient suspend-resume for CPU process time-        iii) de-fragmentation of the cluster so that incoming jobs
+slicing. Gandiva leverages this mechanism and adds cus-      get GPUs with good locality.
+tom support for GPU time-slicing.                               We evaluate two approaches for tackling DLT pro-
+   As shown in Figure 5(a), usage of GPU memory by           cess state migration. In the ﬁrst approach, we leverage a
+DLT jobs has a cyclic pattern with as much as 77x dif-       generic process migration mechanism such as CRIU [1].
+ference between the minimum and maximum memory               Because CRIU by itself does not support migration of
+usage. The key idea in Gandiva is to exploit this cyclic     processes that use the GPU device, we ﬁrst checkpoint
+behavior and suspend-resume DLT jobs when their GPU          GPU objects and remove all GPU state from the process
+memory usage is at their lowest. Thus, when a suspend        before CRIU is invoked. Because CRIU checkpoints and
+call is issued, the DLT toolkit waits until the minimum      restores the entire process memory, the size of the check-
+of the memory usage cycle, copies the objects stored in      point is on the order of GBs for these DLT jobs using Py-
+the GPU to the CPU, releases all its GPU memory alloca-      Torch. Thus, the resulting migration overhead is about 8-
+tions (including cache), and then invokes the classic CPU    10s for single GPU jobs and higher for multi-GPU jobs.
+suspend mechanism. Later, when the CPU resumes the              The second approach we consider is the use of
+job, the DLT framework ﬁrst allocates appropriate GPU        DLT jobs that are checkpoint-aware. DLT frame-
+memory, copies the stored objects back to the GPU, and       works such as Tensorﬂow already support APIs (e.g.,
+then resumes the job.                                        tensorflow.train.saver) that allow automatic
+   Suspend-resume may also initiate a change of GPU          checkpoint and restore of models. This API is used to-
+within the same server (e.g., in the case of six 1-GPU       day to ensure that long running jobs do not have to be
+jobs time-sharing 4-GPUs). While changing GPU is ex-         rerun due to server failures. We extend the framework
+pensive, we hide this latency from the critical path. As     to support migration of such jobs. By warming up the
+we show in our evaluation (Section 6.1), for typical im-     destination before migration and only migrating the nec-
+age classiﬁcation jobs, suspend-resume together can be       essary training state, we can reduce the migration over-
+
+
+
+USENIX Association                 13th USENIX Symposium on Operating Systems Design and Implementation             599
+head to as little as a second or two (Section 6.1). With           Job 6     Job 5                      Job 12      Job 11
+
+
+either approach, we ﬁnd that the overhead of inter-server          Job 1      Job 2    Job 3    Job 4   Job 7       Job 8    Job 9        Job 10
+
+migration is worthwhile compared to the beneﬁts it pro-           GPU 0     GPU 1     GPU 2    GPU 3    GPU 0      GPU 1     GPU 2    GPU 3
+vides in terms of higher overall GPU utilization.                          Server with 1-GPU Jobs                Server with 1-GPU Jobs
+
+Grow-Shrink. The third mechanism that Gandiva uses
+                                                                     Job 15                                            Job 17
+to remove the exclusivity of GPUs to a DLT job is
+grow-shrink. This mechanism primarily targets situa-                 Job 13              Job 14                        Job 16
+tions when the cluster may not be fully utilized, say, late       GPU 0     GPU 1     GPU 2    GPU 3    GPU 0      GPU 1     GPU 2    GPU 3
+                                                                           Server with 2-GPU Jobs                Server with 4-GPU Jobs
+at night. The basic idea is to grow the number of GPUs
+available to a job opportunistically during idle times and         Figure 7: Scheduling example in a 16-GPU Cluster.
+correspondingly also shrink the number of GPUs avail-
+able when the load increases.                                 changed), and a ﬂag indicating if the job is capable of
+   Many DLT jobs, especially in the image domain, see         grow-shrink. We assume the number of GPUs requested
+linear performance scaling as the number of GPUs is in-       by a job is a power of two (typical for DLT jobs today).
+creased. Gandiva applies this mechanism only to those         A cluster is composed of one or more servers, with each
+DLT jobs that speciﬁcally declare that they are adaptive      server having one or more GPUs. Further, we assume a
+                                                              dedicated GPU cluster for DLT jobs [28, 12].
+enough to take advantage of these growth opportunities.                                                     
+When multiple DLT jobs ﬁt this criteria, Gandiva uses            We deﬁne the height of a server as M/N , where M
+proﬁling information, discussed next, to estimate each        is the number of allocated GPUs and N is the number
+job’s progress rate and then allocate GPUs accordingly.       of total GPUs. Thus, the suspend/resume mechanism
+Proﬁling. Like any scheduler, Gandiva monitors re-            will only be used when the height of a server exceeds
+source usage such as CPU and GPU utilization,                 one. The height of a cluster is deﬁned as the maximum
+CPU/GPU memory, etc. However, what is unique                  height of all its servers. Overload occurs when the height
+to Gandiva is that it also introspects DLT jobs in            of the cluster is greater than one; i.e., the sum of re-
+an application-aware manner to estimate their rate of         quested/allocated GPUs of all jobs is greater than the to-
+progress. This introspection exploits the regular pattern     tal number of GPUs. We deﬁne the afﬁnity of a server
+exhibited by DLT jobs (Section 3) and uses the periodic-      as the type of jobs (based on GPUs required) assigned to
+ity to estimate their progress rate.                          that server. For example, initially servers have afﬁnity of
+   Gandiva estimates a DLT job’s mini batch time,             zero and, if a job that requires two GPUs is assigned to a
+the time to do one forward/backward pass over a batch         server, the afﬁnity of that server is changed to two. This
+of input data, as the time taken between two minimums         parameter is used by the scheduler to assign jobs with
+of the GPU memory usage cycles (Figure 5(a)). Be-             similar GPU requirements to the same server.
+cause DLT jobs typically perform millions of such mini        Goals: The primary design goal of the Gandiva sched-
+batch operations in their lifetime, the scheduler compares    uler is to provide early feedback to jobs. In prevalent
+the mini batch time of a DLT prior to and post a              schedulers, jobs wait in a queue during overload. In con-
+scheduling decision to determine its effectiveness.           trast, Gandiva supports over-subscription by allocating
+   For example, consider the example of packing two           GPUs to a new job immediately and using the suspend-
+DLT jobs in a GPU described earlier. By comparing the         resume mechanism to provide early results. A second de-
+mini batch time of each of the two DLT jobs before            sign goal is cluster efﬁciency. This is achieved through
+and after packing, Gandiva can decide whether packing         a continuous optimization process that uses proﬁling and
+is effective. Without such proﬁling, in order to make a       a greedy heuristic that takes advantage of mechanisms
+packing decision, one would have to model not only the        such as packing, migration, and grow-shrink. Cluster-
+two DLT jobs’ performance on various GPUs but also the        level fairness is not a design goal in Gandiva. While we
+various ways in which they may interfere with each other      believe achieving long-term fairness at the cluster level
+(e.g., caches, memory bandwidth, etc.), a non-trivial task    is feasible using the Gandiva mechanisms, in this paper,
+as evidenced by the varied performance of packing we          we focus only on providing fairness among jobs at each
+see in Section 6.1.                                           server using the suspend-resume mechanism and leave
+                                                              cluster-level fairness to future work.
+4.2    Scheduling Policy                                         To achieve these goals, the Gandiva scheduler oper-
+                                                              ates in two modes: reactive and introspective. By re-
+Deﬁnitions: Before we describe the details of the sched-      active mode, we refer to when the scheduler reacts to
+uler, we deﬁne some terminology. DLT jobs are encap-          events such as job arrivals, departures, machine failures
+sulated in containers (Section 5) and include the num-        etc. By introspective mode, we refer to a continuous pro-
+ber of GPUs required, their priority (can be dynamically      cess where the scheduler aims to improve cluster utiliza-
+
+
+
+600   13th USENIX Symposium on Operating Systems Design and Implementation                                          USENIX Association
+Algorithm 1 getNodes(in job, out nodes)                                   Server0       J0     J0                          D   J2   Server3
+
+
+ 1: nodes0 ← f indNodes( job.gpu, a f f inity ← job.gpu)                  Server1              D       J1                  D   J2   Server4
+ 2: nodes1 ← minLoadNodes(node0)
+ 3: nodes2 ← f indNodes( jog.gpu, a f f inity ← 0)                        Server2                             J1      J3            Server5
+ 4: nodes3 ← f indNodes( job.gpu)
+                                                                                  Job0 slot         DeepSpeech slot
+ 5: if nodes1 and height(nodes1) < 1:
+                                                                             J0                D
+                                                                                                                      J3            Server6
+                                                                                  OtherJob’s slot           Migrate
+ 6:      return nodes1       // Same afﬁnity with free GPUs
+ 7: if nodes2 and numGPUs(nodes2) ≥ job.gpu:                                  Figure 8: Job migration in a shared cluster.
+ 8:      return nodes2            // Unallocated GPU servers
+ 9: if nodes3:                                                    In addition, in Gandiva, we check whether the height of
+10:      return nodes3              // Relax afﬁnity constraint   the cluster can be reduced; e.g., by migrating a job that is
+11: elif nodes1:                                                  suspended to the newly vacated GPU. This job could be
+12:      return nodes1              // Allow over-subscription    from the same server or from any other server in the clus-
+13: else:
+                                                                  ter. Finally, job departures can also trigger migrations for
+14:      enqueue( job)                           // Job queued
+                                                                  improving locality, as discussed in the next section.
+                                                                     Gandiva’s job placement policy takes into account
+                                                                  two factors. First, unlike conventional schedulers, Gan-
+tion and job completion time. Note that the scheduler can
+                                                                  diva allows over-subscription. When a server is over-
+be operating in both modes at the same time. We discuss
+                                                                  subscribed, we do weighted round-robin scheduling to
+each of these modes next.
+                                                                  give each job its fair time-share. Second, unlike today’s
+                                                                  schedulers, where GPU allocation is a one-time event
+4.2.1   Reactive Mode                                             at job arrival, Gandiva uses the introspective mode, dis-
+The reactive mode is designed to take care of events such         cussed next, to improve cluster utilization continuously.
+as job arrivals, departures, and machine failures. Con-           Thus, Gandiva relies on a simple job placement policy
+ventional schedulers operate in this mode. Here we dis-           to allocate GPU resources quickly to new jobs, thereby
+cuss only our job placement policy since we follow the            enabling early feedback.
+conventional approach for failure handling.
+   When a new job arrives, the scheduler allocates                4.2.2    Introspective Mode
+servers/GPUs for the job. The node allocation policy
+used in Gandiva is shown in Algorithm 1. f indNodes               In the introspective mode, Gandiva continuously moni-
+is a function to return the node candidates that satisfy          tors and optimizes placement of jobs to GPUs in the clus-
+the job request with an optional parameter for afﬁnity            ter to improve the overall utilization and the completion
+constraint. Initially, Gandiva tries to ﬁnd nodes with the        time of DLT jobs.
+same afﬁnity as the new job and, among those, ones with           Packing. Packing is considered only during overload.
+the minimum loads. If such nodes exist and their height           The basic idea behind packing is to run two or more
+is less than one (lines 5–6), that node is assigned. Oth-         jobs simultaneously on a GPU to increase efﬁciency. If
+erwise, Gandiva tries to ﬁnd and assign un-afﬁnitized             the memory requirements of the packing jobs combined
+nodes (lines 7–8). If no such free servers are available,         are higher than GPU memory, the overhead of “paging”
+the third option is to look for nodes with free GPUs while        from CPU memory is signiﬁcantly high [16] that pack-
+ignoring afﬁnity (lines 9–10). This may result in frag-           ing is not effective. When the memory requirements of
+mented allocation across multiple nodes but, as we shall          two or more jobs are smaller than GPU memory, pack-
+see later, migration can be used for defragmentation. If          ing still may not be more efﬁcient than suspend-resume
+none of the above work, it implies that no free GPUs are          as we show in Section 6.1. For example, for some DLT
+available in the cluster. In this case, if nodes with the         jobs, packing increases efﬁciency, while for others pack-
+same afﬁnity exist, they are used with suspend-resume             ing can be worse than suspend-resume.
+(lines 11–12); if not, the job is queued (lines 13–14).              Analytically modeling performance of packing is a
+  For example, as shown in Figure 7, jobs that require            challenging problem given the heterogeneity of DLT
+1-GPU are placed together but jobs that require 2 or 4            jobs. Instead, Gandiva relies on a greedy heuristic to
+GPUs are placed on different servers. Further, we try to          pack jobs. When jobs arrive, we always run them in ex-
+balance the over-subscription load on each of the servers         clusive mode using suspend-resume and collect proﬁling
+by choosing the server with the minimum load (e.g., six           information (GPU utilization, memory and job progress
+1-GPU jobs on each of the two servers in the ﬁgure).              rate). Based on the proﬁling data, the scheduler main-
+   Conventional schedulers will use job departures to             tains a list of jobs sorted by their GPU utilization. The
+pick the next job from the waiting queue for placement.           scheduler greedily picks the job with the lowest GPU uti-
+
+
+
+USENIX Association                   13th USENIX Symposium on Operating Systems Design and Implementation                                     601
+lization and attempts to pack it on a GPU with the lowest     5     Implementation
+GPU utilization. We only do this when the combined
+memory utilization of the packed jobs do not exceed the       DLT jobs are encapsulated as Docker containers con-
+overall memory of the GPU. Packing is deemed success-         taining our customized versions of DL toolkits and a
+ful when the total throughput of packed jobs is greater       Gandiva client. These jobs are submitted to a Kuber-
+than time-slicing. If packing is unsuccessful, we undo        netes [14] system. Gandiva also implements a custom
+the packing and try the next lowest utilization GPU. If       scheduler that then schedules these jobs.
+the packing is successful, we ﬁnd the next lower utiliza-
+tion job and repeat this process. Based on our evaluation,
+                                                              5.1    Scheduler
+we ﬁnd that this simple greedy heuristic achieves 26%
+efﬁciency gains.                                              Gandiva consists of a custom central scheduler and also a
+                                                              client component that is part of every DLT job container.
+Migration. GPU locality can play a signiﬁcant role in         The scheduler is just another container managed by Ku-
+the performance of some jobs (Section 3.1). In Gandiva,       bernetes. Kubernetes is responsible for overall cluster
+we use migration to improve locality whenever a job de-       management, while the Gandiva scheduler manages the
+parts and also as a background process to “defrag” the        scheduling of DLT jobs. The Gandiva scheduler uses the
+cluster. To improve locality, we pick jobs that are not       Kubernetes API to get cluster node and container infor-
+co-located and try to ﬁnd a new co-located placement.         mation and, whenever a new container is submitted, the
+Figure 8 illustrates an example from a cluster experiment     scheduler assigns it to one or more of the GPUs in the
+(Section 6.4). When a multi-job with 4 jobs that requires     cluster based on the scheduling policy.
+2-GPUs each was scheduled, it had poor GPU afﬁnity;              When a container is scheduled on a node, initially only
+only J0 ’s two GPUs are colocated with the other 3 jobs       the Gandiva client starts executing. It then polls the Gan-
+in the multi-job (J1 , J2 , and J3 ,) assigned to separated   diva scheduler to identify which GPUs to make available
+GPUs. Three minutes later, a background training job,         for the DLT job and also controls the execution of the
+DeepSpeech, completes and releases its 8 GPUs. Three          DLT job using suspend/resume and migrate commands.
+of the 8 GPUs, marked as D in Figure 8 in three differ-       While scheduling of all the GPUs in our cluster is fully
+ent servers (server 1, 3, and 4), can improve the training    controlled by the central scheduler, a hierarchical ap-
+efﬁciency of the multi-job. Gandiva hence initiates the       proach may be needed if scalability becomes a concern.
+migration process, relocating J1 , J2 , and J3 to colocated
+GPUs. For de-fragmentation, we pick the server with the
+most free GPUs among all non-idle ones. We then try
+                                                              5.2    Modiﬁcations to DL toolkits
+to move the jobs running on that server to others. The        In the interest of space, we describe only the time-slicing
+job will be migrated to another server with fewer free        implementation for PyTorch and the migration imple-
+GPUs, as long as there is negligible performance loss.        mentation for Tensorﬂow.
+We repeat this until the number of free GPUs on every         PyTorch time-slicing. The Gandivaclient issues a SIGT-
+non-idle server is less than a threshold (3 out of 4 in our   STP signal to indicate that the toolkit must suspend the
+experiments) or if no job will beneﬁt from migration.         process. It also indicates whether or not the resume
+                                                              should occur in a new GPU via an in-memory ﬁle. Upon
+Grow-shrink. Grow-shrink is only triggered when the           receiving the signal, the toolkit sets a suspend ﬂag and
+cluster is under-utilized and the DLT jobs speciﬁcally        executes the suspend only at the end of a mini-batch
+identify themselves as amenable to grow-shrink. In our        boundary.
+current system, we only grow jobs to use up to the max-          In Tensorﬂow, a deﬁne-and-run toolkit, the mini-
+imum number of GPUs available in a single server. Fur-        batch boundaries are easily identiﬁed (end of
+ther, we trigger growth only after an idle period to avoid    session.run()).            In PyTorch, a deﬁne-by-run
+thrashing and shrink immediately when a new job might         toolkit, we identify the mini-batch boundary by tracking
+require the GPUs.                                             GPU memory usage cycles as part of PyTorch’s GPU
+                                                              memory manager (THCCachingAllocator) and looking
+Time-slicing. Finally, we support round robin schedul-        for a cycle minimum whenever GPU memory is freed.
+ing in each server to time-share GPUs fairly (Sec-               Once the minimum is detected, the toolkit i) copies
+tion 6.1). When jobs have multiple priority levels, higher    all stored objects from GPU to CPU, ii) frees up GPU
+priority jobs will never be suspended to accommodate          allocations, and iii) suspends the process. When Gan-
+lower priority jobs. If a server is fully utilized with       diva client issues a SIGCONT signal, the toolkit allo-
+higher priority jobs, the lower priority job will be mi-      cates GPU memory, copies stored objects from CPU to
+grated to another server, if feasible.                        GPU, and resumes the process. To handle device address
+
+
+
+602   13th USENIX Symposium on Operating Systems Design and Implementation                         USENIX Association
+change on resume, we track GPU objects in the toolkit
+and patch them with the new addresses. Changing GPU
+involves calling cudaDeviceReset and CudaInit, which
+can take 5-10s. We hide this latency by performing these
+actions in the background while “suspended”.
+Tensorﬂow migration. We make changes to Tensorﬂow
+(TF) with 400+ lines of Python/C++ code. With 200+
+line of additional code, we deploy a Migration Helper on
+each server to support on-demand checkpointing and mi-
+gration. When receiving a migration command from the
+scheduler, the destination Helper ﬁrst warms up the TF                 Figure 9: Time slicing six 1-GPU jobs on 4 GPUs.
+session and waits for the checkpoint. The source Helper
+then asks TF to save the checkpoint, moves the check-
+point to destination in case of cross-server migration, and
+ﬁnally resumes the training session. To speed up the mi-
+gration process, we adopt Ramdisk to keep the check-
+point in memory. In the cross-server case, the modiﬁed
+TF saves the checkpoint to the remote Ramdisk directly
+through the Network File System (NFS) protocol.
+   When the Migration Helper asks a job to perform
+checkpointing, the modiﬁed TF calls tf.Saver at the
+end of a mini-batch. For data parallelism, the checkpoint
+only includes the model in one GPU, regardless of the                    Figure 10: Packing jobs on single P40 GPU.
+number of GPUs used in the training. To speedup TF mi-
+gration further, we do not include the meta-graph struc-         used for training are defaults from their references. All
+ture in a checkpoint as it can be reconstructed based on         models take 6s or less per mini-batch in our evaluation.
+user code.                                                       Thus, we set the time-slicing interval to 60s in these
+   In the warm-up phase, the modiﬁed TF checks the               experiments.
+GPU conﬁguration and reconstructs the meta-graph. It
+further creates the Executor to run a warm-up opera-             6.1    Micro-benchmarks
+tion to ensure that the initialization is not deferred lazily.
+When resuming the training process, the modiﬁed TF               In this section, we evaluate the Gandiva mechanisms,
+loads the checkpoint, with multiple GPUs loading it in           viz., time-slicing, packing, grow-shrink, and migration.
+parallel, and continues the training.
+                                                                 Time-slicing. We use six 1-GPU jobs on a single server
+                                                                 with four P100 GPUs to illustrate time-slicing. These
+6   Evaluation
+                                                                 are ResNet-50 [24] models trained on the Cifar10 dataset
+In this section, we ﬁrst present micro-benchmark results         using the PyTorch toolkit. When six 1-GPU jobs share
+of the Gandiva mechanisms. We then evaluate the ben-             four GPUs, each job ideally should get four minutes of
+eﬁt Gandiva provides to multi-jobs. Finally, we present          GPU time out of every six.
+our evaluation results of the experiments on a 180-GPU              Figure 9 shows a trace with the progress rate of each
+cluster.                                                         of the jobs over time. Initially, four 1-GPU long jobs are
+   Our servers are 12-core Intel Xeon E5-                        running and at time t=25min, two 1-GPU short jobs are
+2690@2.60GHz with 448GB RAM and two 40Gbps                       scheduled at this server. One can see that the initial four
+links (no RDMA), running Ubuntu 16.04. Each server               1-GPU jobs now get 4/6th their previous share. When
+has either four P100 or four P40 GPUs. All servers are           the two short jobs depart, the long jobs return to their ear-
+connected to a network ﬁle-system called GlusterFS [3]           lier performance. Also, note that the aggregate through-
+with two-way replication on the server disks (SSDs).             put of all jobs (right scale) is only marginally affected
+For jobs that use more than one GPU, we only evaluate            (less than 2%) during the entire trace, demonstrating that
+data parallelism (as it is more common than model                time-slicing is an efﬁcient mechanism for providing early
+parallelism), and use synchronous updates (though we             feedback during over-subscription.
+can support asynchronous update as well). Our evalu-
+ation uses 18 models, 8 implemented in PyTorch 0.3               Packing. Table 1 shows the performance of packing
+and 10 implemented in TensorFlow 1.4. The batch size             multiple jobs on a single GPU for various DLT mod-
+
+
+
+USENIX Association                   13th USENIX Symposium on Operating Systems Design and Implementation                 603
+                             GPU     Time      Packing   Packing                            
+      Job                    Util    Slicing   Max       Gain                                     3UHLQLWLDOL]DWLRQ
+                                                                                               &8'$OD]\LQLWLDOL]DWLRQ         :DUPXS7LPH
+                             (%)     (mb/s)    (mb/s)    (%)                                      7HQVRUIORZOD]\LQLWLDOL]DWLRQ
+      VAE [29]                 8.7      81.8     419.3       412                               6DYLQJPHWDJUDSK
+
+
+
+
+                                                                        0LJUDWLRQ7LPH V
+                                                                                                                           (OLPLQDWHG 7LPH
+      SuperResolution [43]    14.1      40.3     145.2       260                                  6DYLQJH[WUDUHSOLFDV
+      RHN [58]                61.6      10.1      14.8        46                               6DYLQJFKHFNSRLQW        0LJUDWLRQ 7LPH
+                                                                                                  5HVWRULQJFKHFNSRLQW
+      SCRNN [37]              66.8      16.7      23.3        39                            
+      MI-LSTM [52]            76.2      22.2      25.9        17
+      LSTM [5]                87.2      63.8      53.0       -16                            
+      ResNet-50 [24]          94.0      10.3       9.0       -13                            
+      ResNext-50 [53]         98.9      83.6      74.4       -11
+                                                                                             
+Table 1: Packing multiple jobs on P40 (mb/s = minibatches/s).                                
+                                                                                                                                              
+                                                                                                                       RI*38V
+
+                                                                       Figure 12: The breakdown of TF migration overhead.
+
+                                                                   just the learning rate and the batch size depending on the
+                                                                   number of GPUs available. Figure 11 demonstrates this
+                                                                   mechanism in action. Initially, a 4-P100 server has three
+                                                                   jobs, 1-GPU growth-capable job, 1-GPU short job, and
+                                                                   a 2-GPU short job, all using ResNet-50 with PyTorch.
+                                                                   At time t=25min, the short job departs and after a time-
+                                                                   out period of no new jobs being allocated to this GPU,
+      Figure 11: Grow from 1 to 4 GPUs, Shrink to 1-GPU.           the long running job expands to use 2 GPUs. At time
+els using PyTorch toolkit. For small DLT jobs with low             t=45min, the second short job departs and the long run-
+GPU utilization, packing can provide signiﬁcant gains of           ning job expands to use all four GPUs. At time t=75min,
+as much as 412%. For DLT jobs with middling GPU uti-               a new 2-GPU job enters and the long job immediately
+lization, packing gains vary from model to model with              shrinks to use two GPUs and, when another new 1-GPU
+some showing gains of up to 46%, but some exhibiting a             job appears, the long job shrinks to use only 1 GPU.
+loss of 16%. Finally, for image processing jobs with high          This micro-benchmark demonstrates that idle GPU re-
+utilization, such as ResNet-50 or ResNext-50 on the Ci-            sources can be effectively used with a mechanism like
+far10 dataset, packing hurts performance by 11-13% .               grow-shrink.
+   Note that these packing results are without enabling
+NVIDIA’s multi-process service (MPS) [7]. We found                 Migration. We use a server with 8 P100 GPUs and
+that MPS results in signiﬁcant overhead in P40/P100                the Tensorﬂow toolkit to evaluate migration overhead.
+GPUs. However, hardware support for MPS in V100                    First, we migrate a ResNet-50 single-server training job
+GPUs [7] suggests that the use of MPS may be able to               from one server to another. Figure 12 shows the detailed
+increase further packing gains in V100 GPUs.                       breakdown with a varying number of GPUs. Using our
+   Based on these results, predicting packing perfor-              optimized implementation, we are able to eliminate or
+mance even with jobs of the same type appears chal-                hide the majority of the migration overhead. The ac-
+lenging, let alone when jobs of different types are packed         tual migration time, saving and restoring checkpoints, re-
+together. Instead, Gandiva adopts a proﬁling-based ap-             mains almost constant regardless of the number of GPUs
+proach to packing. Figure 10 shows a case where two                because we save only one copy of the model. The load-
+image super-resolution jobs [43] are initially being time-         ing of the in-memory checkpoint in each GPU runs in
+sliced on the same P40 GPU. After some time, the sched-            parallel and does not saturate the PCI-e bandwidth. The
+uler concludes that their memory and GPU core utiliza-             warm-up time and the cost due to meta-graph and check-
+tion is small enough that packing them is feasible and             points from other GPUs grow with the number of GPUs.
+schedules them together on the GPU. The scheduler con-             As a result, we are able to save 98% of the migration
+tinues to proﬁle their performance. Because their aggre-           overhead of 35s for 8-GPU jobs.
+gate performance improves, packing is retained; other-                Figure 13 shows the max, min, and average intra-
+wise (not shown), packing is undone and the jobs con-              server and inter-server migration time of a 1-GPU job
+tinue to use time-slicing.                                         with 10 different deep learning models (summarized in
+                                                                   Table 2) over 3 runs. Six of the 10 can be migrated within
+Grow-Shrink. Grow-shrink is useful primarily when                  1 second. Even the largest model (DeepSpeech [23] with
+the cluster is under-utilized. Gandiva uses grow-shrink            a 1.4GB checkpoint) can be migrated in about 3.5 sec-
+only for those jobs that speciﬁcally state that they can           onds, which is negligible compared to the long training
+make use of this feature because users may want to ad-             time that often lasts for hours or days.
+
+
+
+604     13th USENIX Symposium on Operating Systems Design and Implementation                                                           USENIX Association
+                             4
+
+      Migration Time (s)
+                                                                                                                   Neural model              Type     Dataset
+                           3.5          Intra-server Migration                                                     InceptionV3 [46]          CV       ImageNet [18]
+                             3          Inter-server Migration                            10%
+                                                                                                                   ResNet-50 [24]            CV       ImageNet
+                           2.5                                                                                     Alexnet [31]              CV       ImageNet
+                             2                                                                                     Vgg16 [44]                CV       ImageNet
+                           1.5                                                                                     Bi-Att-Flow [42]          NLP      SQuAD [40]
+                             1                                                                                     LanguageModel [56]        NLP      PTB [34]
+                           0.5                                                            60%
+                                                                                                                   GNMT [51]                 NLP      WMT16 [6]
+                             0
+                                      MB MB MB MB MB MB MB MB MB MB
+                                                                                                                   Transformer [49]          NLP      WMT16
+                                   t 8 42 91 98 36 52 28 45 03 05
+                                ene low V3 t-50 et 2 el 2 16 5 T 6 er 7 h 14              30%
+                                                                                                                   Wavenet [48]              Speech   VCTK [54]
+                             av F       n e     n    d g      M m c
+                           W Att- eptio esN Alex . Mo Vg GN sfor Spee                                              DeepSpeech [23]           Speech   CommonVoice [2]
+                              -                ng             an p
+                            Bi Inc      R
+                                             La             Tr Dee
+                                                                                           Table 2: Neural models and the ratios in the trace.
+                           Figure 13: Migration time of real workloads.
+                                                                                                                            Gandiva_4GPU
+                                                                                                                 200
+
+
+
+
+                                                                                           # of configurations
+                                                                                                                            Gandiva_16GPU
+6.2               Model exploration in a multi-job                                                                          Baseline_4GPU
+                                                                                                                 150        Baseline_16GPU
+AutoML, or automatic model exploration through hyper-                                                            100
+parameter search is an important way to help users iden-
+                                                                                                                 50
+tify good neural models [21]. Typically, AutoML in-
+                                                                                                                  0
+volves a hyper-parameter conﬁguration generator and a                                                                  30                    60                 90
+performance evaluator. The generator uses different al-
+                                                                                                                                      Time (min)
+gorithms [11, 33] to generate new candidate conﬁgura-
+                                                                                                                  Figure 14: Model exploration number.
+tions (DLT jobs), sometimes using the performance of
+prior conﬁguration runs as a signal. The evaluator uses                             experiment, AutoML continually generates new hyper-
+the early output of running jobs (e.g., the learning curve)                         parameter conﬁgurations based on Hyperopt [10] and
+to predict the jobs’ ﬁnal performance and decide whether                            leverages a curve-ﬁtting method [19] to evaluate and pre-
+to continue running a given job or terminate it early.                              dict the learning curve every 1,000 mini-batches (3% of
+   Compared to a traditional scheduler where the number                             the total mini-batches [19]). Jobs with no promise (less
+of conﬁgurations explored at any given time is limited by                           than 30% predicted accuracy) will be stopped early. The
+the number of GPUs available, Gandiva provides new                                  multi-job runs on 4 (or 16) P40 GPUs and each job re-
+primitives such as time-slicing and dynamic prioritiza-                             quires 1 GPU. In the experiment, AutoML schedules 2
+tion for AutoML algorithms to exploit. For example, the                             (or 8) more jobs every 1,000 mini-batches. In the base-
+conﬁguration generator is no longer limited by the num-                             line, jobs have to stay in a FIFO queue waiting for the
+ber of GPUs and can dynamically generate many more                                  running jobs to be terminated early or complete while in
+conﬁgurations. Similarly, the performance evaluator can                             Gandiva, they are scheduled with time-slicing and mi-
+not only decide whether to continue or terminate a job                              gration support.
+but also how much priority to give to each conﬁguration.                               Figure 14 shows the number of explored hyper-
+   In this section, we explore one particular instance of                           parameter conﬁgurations. Gandiva can explore almost
+using these new options enabled by Gandiva to highlight                             10 times the number in the baseline approach in both
+the potential beneﬁt for AutoML. Detailed analysis of                               the 4-GPU and 16-GPU cases. This is because, in the
+when and how many conﬁgurations to generate and/or                                  baseline approach, the GPUs can get “stuck” with a sub-
+how to best allocate priority among the various running                             optimal set of jobs that need to be run to completion, but
+conﬁgurations to utilize Gandiva features optimally is an                           in Gandiva, because of time-slicing, new conﬁgurations
+open problem that we leave for future work.                                         can be explored in parallel along with those jobs.
+   At a high level, Gandiva can beneﬁt an AutoML sys-                                  To demonstrate the beneﬁt of Gandiva in ﬁnding a
+tem in two ways. First, Gandiva can help AutoML                                     qualiﬁed model faster, we use Hyperopt to generate ran-
+explore more hyper-parameter conﬁgurations within a                                 domly the same set of 374 hyper-parameter conﬁgura-
+timespan, thereby enabling it to ﬁnd better models [10,                             tions for both the baseline and Gandiva. The experiment
+19, 11]. Alternatively, Gandiva can help AutoML ﬁnd                                 measures the time required to ﬁnd a conﬁguration with
+a qualiﬁed model faster given a set of conﬁgurations                                at least 84% accuracy2 . AutoML algorithms evaluate
+through prioritization.                                                             the jobs every 1,000 mini-batches and re-prioritize them
+   To demonstrate the beneﬁt of Gandiva in exploring                                based on the learning-curve prediction of their probabil-
+more conﬁgurations, we ﬁrst use AutoML to run a multi-                              ity to achieve 84% accuracy [19]. In Gandiva, the top M
+job to tune a LeNet-like CNN model with multiple con-                               jobs with the highest probabilities are then trained in the
+volution layers and fully connected layers, trained with                            GPUs exclusively. In this experiment, we set M to 2 and
+the Cifar10 dataset. The hyper-parameters we search                                 8 for 4-GPU and 16-GPU cases. Other jobs run in a time
+have 12 dimensions, including learning rate, dropout                                   2 The LeNet-like CNN model is small: 84% is the best accuracy we
+
+rate, number of layers, choice of optimization, etc. In this                        found in the generated conﬁgurations.
+
+
+
+
+USENIX Association                                           13th USENIX Symposium on Operating Systems Design and Implementation                                       605
+                         93th     187th    280th    365th             Accuracy       70%          80%             90%
+              Position
+                         (25%)    (50%)    (75%)    (98%)             Baseline       134.1       2849.1          5296.7
+              Baseline    691.5   1373.0   2067.2   2726.4            Gandiva        134.1        543.1           935.4
+       4
+              Gandiva     125.5    213.8    302.4    387.1            Speedup        1.00x        5.25x           5.66x
+      GPUs
+              Speedup     5.51x    6.42x    6.84x    7.04x            Position       15th         58th            87th
+              Baseline    253.0    492.7    731.7    970.0
+       16
+              Gandiva      74.4    103.7    135.4    162.6
+      GPUs
+              Speedup     3.40x    4.75x    5.40x    5.96x      Table 4: Model searching in ResNet-like network (minutes).
+
+  Table 3: Time to ﬁnd a qualiﬁed conﬁguration (minutes).
+
+slicing manner. Our baseline approach stays the same as
+in the previous experiment. The result shows that Gan-
+diva achieves 7x speedup compared to the baseline for
+the 4-GPU case and 6x for the 16-GPU case. More GPUs
+beneﬁt the baseline as it implicitly improves the degree
+of parallelism of the long running jobs. There are two
+factors contributing to these gains. First, with prioritiza-
+tion, Gandiva grants more computation resources to the
+promising jobs. Second, because of the ability to run                      Figure 15: Cluster GPU utilization.
+more conﬁgurations in parallel, Gandiva is able to ﬁnd
+promising jobs quickly based on early feedback.                6.3    Cluster experiments: time-slicing and
+   Further study shows the ﬁrst job with the qualiﬁed                 packing
+conﬁguration gets scheduled by Gandiva and the base-           In this section, we evaluate the Gandiva scheduler in a
+line in the 365th place. We move the ﬁrst qualiﬁed job         45 server, 180-GPU cluster with about an equal mix of
+from 365th place to the ﬁrst 25th percentile, 50th per-        P100 and P40 GPUs. The scheduler implements both
+centile, and 75th percentile scheduling place and rerun        the reactive and introspective modes described earlier.
+the experiment. Table 3 summarizes the result: the later       In order to understand the gains contributed by different
+the qualiﬁed conﬁguration shown, the larger gain Gan-          mechanisms in Gandiva, in this experiment, we only use
+diva has. In a typical AutoML experiment, quality mod-         time-slicing and packing, and disallow migrations. Fur-
+els usually show up later as those early-stopped jobs’         ther, none of the jobs are grow-shrink enabled. Thus, the
+conﬁgurations guide the system to ﬁnd the better con-          accuracy achieved during training is unaffected by the
+ﬁgurations.                                                    Gandiva mechanisms.
+   To understand the sensitivity of Gandiva’s perfor-             We use the eight DLT jobs from Table 1 for this ex-
+mance to the target accuracy of the model, we run Au-          periment and derive a mix of these jobs such that aver-
+toML with different target accuracies on a large state-of-     age GPU utilization is about 50%, similar to the average
+the-art ResNet-like model (the ofﬁcial ResNet example          GPU utilization numbers reported from a study of a large
+in Keras [4]) for Cifar10. We use Hyperopt to gener-           deep learning cluster [28]. DLT jobs 1 and 2 from Table 1
+ate 100 conﬁgurations, with the search space covering          (low utilization) are chosen with 0.3 probability, jobs 3,
+both the neural network architecture and various tunable       4, and 5 (mid utilization) are chosen with 0.25 probabil-
+hyper-parameters. The learning-curve prediction works          ity and jobs 6, 7, and 8 (high utilization) are chosen with
+as before; i.e., for every 3% of total mini-batches. The       probability of 0.45. Further, jobs 7 and 8 require either 2
+multi-job experiment runs on 16 P40 GPUs and every job         or 4 GPUs while the rest each uses 1-GPU.
+runs on 1 GPU.                                                    The number of mini-batches for each of these jobs are
+   Table 4 shows the time spent on ﬁnding a model that         chosen such that, in isolation on P40, they take between
+is better than target accuracy using the baseline and Gan-     30 and 45 minutes of GPU time. A total of 1,000 jobs
+diva respectively. For a higher target accuracy, the per-      drawn from the above distribution arrive in a uniformly
+formance gain of Gandiva is more notable. With 90%             random manner over two hours. Using the same work-
+speciﬁed as a goal, the qualiﬁed model that is found           load, we compare with Gandiva a baseline scheduler that
+achieves 92.62% validation accuracy. However, if the           does bin-packing but does not oversubscribe.
+target accuracy is low; e.g., 70%, a qualiﬁed model will          The primary goal of Gandiva is early feedback. We
+appear early. In this case, the time for completing a sin-     compute the average time to 100 mini-batches for all jobs
+gle qualiﬁed conﬁguration run dominates the total Au-          as a measure of early feedback (e.g., HyperBand [33]
+toML search time. Thus, Gandiva shows little bene-             uses 100 mini-batches to evaluate a job). We ﬁnd that
+ﬁt. We can see that when AutoML is used for achiev-            the average time to complete 100 mini-batches is 498s
+ing high accuracy models, Gandiva provides signiﬁcant          for Gandiva and 2,203s for the baseline, for a reduction
+gains over the baseline.                                       of 77%.
+
+
+
+606   13th USENIX Symposium on Operating Systems Design and Implementation                           USENIX Association
+                                                                                           Avg. JCT   Makespan
+   The second goal of Gandiva is cluster efﬁciency. Fig-                                    (mins)     (mins)
+ure 15 shows the average GPU utilization of the cluster                       Cap. Sche.     832       13371
+for the baseline scheduler and Gandiva, as well as the                         Gandiva       656       11349
+                                                                             Improvement    26.8%      17.8%
+cumulative number of successful packings by Gandiva
+(right y-axis). The result shows clearly that Gandiva is            Table 5: Full trace experiment with fast-forwarding
+able to use the cluster more efﬁciently than the baseline.        Table 5 shows the average job completion time and the
+The average utilization (computed over the stable regime       makespan for the two schedulers when replaying the syn-
+from 20 to 200 mins) achieved by Gandiva is 62.8%              thesized job trace in a cluster with 100 GPUs (50 P100,
+compared to baseline average of 50.1%, resulting in a          50 P40). We see that Gandiva improves average JCT by
+26% relative improvement. Further, the greedy packing          26.8% and the total makespan is reduced by 17.8%. Fig-
+heuristic employed by Gandiva can be seen to be mostly         ure 17 shows the CDF of the JCT of the two approaches:
+successful with only a few packing decisions that need to      it shows Gandiva has more jobs with a JCT less than
+be undone (the packing curve is mostly increasing with         around 100 mins. During the entire experiment, Gandiva
+only small occasional dips).                                   initiates migration 470 times; i.e., approximately once
+                                                               every 20 minutes.
+6.4    Cluster experiments: time-slicing and                   Multi-job performance in a shared cluster. To com-
+       migration                                               pare the AutoML performance of a multi-job in a shared
+                                                               environment, we run the synthesized trace the same way
+Trace. We collect a 9-day real-world job trace on a            as earlier in the same cluster with 100 GPUs. The trace-
+2,000 GPU production cluster at Microsoft. The trace in-       driven jobs act as background jobs, emulating a realis-
+cludes over 8,800 DLT jobs from three categories: com-         tic shared cluster environment. At the 5, 607th minute
+puter vision (CV) (10%), Natural Language Processing           (roughly in the middle of the trace), we launch two multi-
+(NLP) (60%), and Speech (30%), according to user sur-          jobs, each to ﬁnd a qualiﬁed CNN model described in
+vey and log analysis. However, the data/code used by           Section 6.2, trained on the Cifar10 dataset. Each multi-
+these jobs are not available to us, due to security and pri-   job is allocated 8 GPUs. For fair comparison, each multi-
+vacy regulations. In their place, we pick 10 state-of-the-     job is allowed to preempt other jobs to get 8 GPUs to
+art deep learning models from Github with 50,000+ stars        reduce the unpredictable resource sharing.
+in total. The models are summarized in Table 2.                   We are particularly interested in understanding the
+   To synthesize a trace with similar characteristics as the   effect of migration in Gandiva and therefore use a 2-
+production cluster, we mix these models with the same          GPU VGG-like model that is large and locality sensi-
+ratio as that in the trace. The number of mini-batches of      tive (Section 3.1). Each AutoML job runs for 100,000
+the jobs in the trace are set to follow the job running time   mini-batches and reports the learning curve every 3,000
+distribution of the 9-day real-world trace. We ensure          mini-batches (3%). Like the previous experiment, the
+that the synthesized trace closely follows the job run-        job can be early stopped if the learning shows no
+ning time distribution of the real-world trace, as shown       promise [19]. In this experiment, the AutoML algorithm
+in Figure 16. As before, none of the jobs are grow-shrink      tunes the learning rate of the model with 40 conﬁgura-
+enabled in this experiment, as the cluster is in high load.    tions. The multi-job completes if a job’s model achieves
+   We run the trace using Hadoop’s YARN capacity               99.5% training accuracy, with 91.3% validation accu-
+scheduler [50] and our Gandiva scheduler.                      racy. Again, the top M highest probability jobs run ex-
+Fast-forwarding. To speed up replaying the 9-day trace,        clusively while other jobs are time-sliced. In this experi-
+we leverage the predictability of the 10 models. We use        ment, we set M to 2 (i.e., 4 GPUs).
+the scheduler to instruct a running job to skip a number          As shown in Figure 18, with the capacity scheduler,
+of mini-batches (i.e., fast-forwarding) whenever there are     it takes 1,215.74 and 1,110.62 mins, respectively, to
+no scheduling events, including job arrival, departure,        ﬁnd the qualiﬁed conﬁguration for the two multi-jobs.
+and migration, etc. The time skipped is calculated by          Gandiva’s mechanisms like migration, time-slicing, and
+measuring the previous mini-batch performance when             dynamic priority help provide better locality, identify
+the job reaches a stable state.                                promising jobs earlier, and improve the training speed
+   We validate fast-forwarding by constructing a 3-hour        of high priority jobs. As a result, Gandiva achieves
+trace and compute average job completion time (JCT)            a speedup of 13.6 and 12.9, respectively. Based on a
+and the makespan (the running time for the entire exper-       micro-benchmark we did, we observed that time-slicing
+iment) for the full trace and the experiment with fast-        alone gave 7x gains for this AutoML experiment. Thus,
+forwarding enabled using the capacity scheduler and            the rest of the gains are attributable to improved locality
+Gandiva. The difference between the real and fast-             due to migration. A real example of migration observed
+forwarded experiment in all cases was less than 1%.            in this experiment was shown in Figure 8.
+
+
+
+USENIX Association                  13th USENIX Symposium on Operating Systems Design and Implementation                  607
+                                                           1
+
+
+
+
+                                                                                                 Multi-Job Completion Time (mins)
+         1
+       0.9                                               0.9                                                                                 Capacity Scheduler
+                                                                                                                                             Gandiva
+       0.8                                               0.8                                                                        1000
+       0.7                                               0.7
+       0.6                                               0.6
+
+
+
+
+                                                   CDF
+ CDF
+
+       0.5                                               0.5
+       0.4                                               0.4                                                                        100
+       0.3                                               0.3                 Cap. Sche.
+       0.2               Synthesized trace               0.2
+                                                         0.1                   Gandiva
+       0.1                      Real trace
+         0 0                                               0 0                                                                        10
+          10   101        102      103       104            10       101   102     103     104                                             Multi-Job-1            Multi-Job-2
+                     Runtime (min)                               Job Completion Time (min)
+ Figure 16: CDF of the synthesized trace           Figure 17: CDF of job completion time                              Figure 18: Multi-job completion time
+
+7      Related Work                                                          22]. Map/Reduce like tasks instantiated from the log-
+                                                                             ical DFG get scheduled dynamically according to the
+DLT job scheduling today. DLT jobs are scheduled                             job progress and the DFG dependency. Gandiva in-
+today by big data schedulers such as Kubernetes or                           stead relies on the micro-task boundary implicitly de-
+YARN [12, 28]. In these systems, a ﬁxed set of GPUs is                       ﬁned by the mini-batch boundary. The low-level mech-
+assigned exclusively for the lifetime of a DLT job. Thus,                    anisms of Gandiva such as time-slicing and migration
+job queueing times can vary from a few minutes [12] to                       also differ signiﬁcantly from those big data scheduling
+even hundreds of minutes [28] in these clusters.                             systems [13, 22, 25, 14], while being surprisingly simi-
+   An earlier study [28] shows that the average GPU uti-                     lar to a traditional operation system [47].
+lization in a production cluster was only around 52%.                        Time-slicing, suspend-resume, and process migra-
+Some jobs can inherently result in low GPU utilization                       tion. Gandiva adopts traditional OS process primitives to
+due to the use of small models [29] and/or the use of                        facilitate DLT scheduling [47]. Unlike the general pur-
+small batch sizes for better generalization [35]. Fur-                       pose OS mechanisms, Gandiva leverages the intra-job
+ther, jobs with inherently high GPU utilization can be                       predictability of DLT to achieve a highly efﬁcient im-
+adversely affected by poor GPU afﬁnity and/or interfer-                      plementation. Gandiva does not claim generality of the
+ence.                                                                        proposed techniques to other application domains.
+Scheduling policies for machine learning. Recent re-
+search [9, 15] also suggests that locality, interference,
+and GPU utilization are important performance factors                        8    Conclusion
+for GPU workloads. They develop analytical models to
+                                                                             We present Gandiva, a cluster scheduling framework for
+predict the performance of GPU workloads. A Gandiva
+                                                                             deep learning, which provides a set of efﬁcient, low-level
+scheduler may leverage such models to guide its schedul-
+                                                                             system primitives such as time-slicing, migration, intra-
+ing decisions. At its core, Gandiva framework is de-
+                                                                             job elasticity, and dynamic priority. Using these primi-
+signed to empower DLT schedulers with the primitives
+                                                                             tives, Gandiva can effectively support neural model ex-
+such as time-slicing and migration.
+                                                                             ploration in a multi-job, ﬁnding accurate neural mod-
+   SLAQ [57] proposes a scheduling policy that priori-
+                                                                             els up to an order of magnitude faster than using tra-
+tizes resources in a CPU-based cluster to Spark jobs with
+                                                                             ditional schedulers in a realistic shared cluster environ-
+high potentials (e.g., the one with a fast improving learn-
+                                                                             ment. Gandiva provides an efﬁcient implementation of
+ing curve). Gandiva can leverage the same policy for
+                                                                             the proposed mechanisms by exploiting the intra-job pre-
+DLT on GPU clusters. Optimus [39] derives a proper
+                                                                             dictability of DLT: our system prototype demonstrates
+number of parameter-servers and workers for MxNet-
+                                                                             that job suspend/resume and migration can be achieved
+based deep learning jobs, which complements Gandiva
+                                                                             under a second, even for cross-server migration for pop-
+in GPU cluster scheduling.
+                                                                             ular deep learning toolkits such as Tensorﬂow and Py-
+AutoML. Gandiva enables the co-design of DLT sched-
+                                                                             Torch. Combined with an introspective scheduling pol-
+ulers and AutoML algorithms like [10, 30]. Jobs in
+                                                                             icy, Gandiva improves overall cluster utilization by 26%.
+a multi-job can be promoted dynamically with more
+resource and/or better locality, accordingly to Au-
+toML speciﬁc algorithms. Google Vizier [21], Hyper-                          Acknowledgments
+Drive [41], and TuPAQ [45] focus more on the sys-
+tem design of AutoML. Gandiva empowers these sys-                            We thank our shepherd KyoungSoo Park and the anony-
+tems with lower level system primitives that can further                     mous reviewers for their valuable comments and sug-
+improve AutoML training experience in a multi-job, as                        gestions. We thank Bin Wang and Shuguang Liu from
+shown in the experiments.                                                    Bing search platform team and Daniel Li, Subir Sidhu,
+Big data cluster scheduling frameworks. Most recent                          and Chandu Thekkath from Microsoft AI Platform team
+big data scheduling frameworks assume jobs are mod-                          for providing access to the GPU clusters and Azure GPU
+eled after a data ﬂow graph (DFG) [26, 55, 13, 27, 20,                       VMs.
+
+
+
+608      13th USENIX Symposium on Operating Systems Design and Implementation                                                                       USENIX Association
+References                                                                     [19] D OMHAN , T., S PRINGENBERG , J. T., AND H UTTER , F. Speed-
+                                                                                    ing up automatic hyperparameter optimization of deep neural
+ [1] Checkpoint/restore in user space. https://criu.org/                            networks by extrapolation of learning curves. In IJCAI (2015),
+     Main_Page.                                                                     vol. 15, pp. 3460–8.
+ [2] Common voice dataset. https://voice.mozilla.org/.                         [20] G OG , I., S CHWARZKOPF, M., G LEAVE , A., WATSON , R.
+ [3] GlusterFS. https://docs.gluster.org/en/latest/.                                N. M., AND H AND , S. Firmament: Fast, centralized cluster
+ [4] Keras. https://github.com/keras-team/keras.                                    scheduling at scale. In 12th USENIX Symposium on Operating
+ [5] LSTM training on wikitext-2 dataset. https://github.                           Systems Design and Implementation (OSDI 16) (Savannah, GA,
+     com/pytorch/examples/tree/master/word_                                         2016), USENIX Association, pp. 99–115.
+     language_model.                                                           [21] G OLOVIN , D., S OLNIK , B., M OITRA , S., KOCHANSKI , G.,
+ [6] WMT16 dataset. http://www.statmt.org/wmt16/.                                   K ARRO , J., AND S CULLEY, D. Google Vizier: A service
+                                                                                    for black-box optimization. In Proceedings of the 23rd ACM
+ [7] Multi-process service, Oct 2017. https://docs.nvidia.
+                                                                                    SIGKDD International Conference on Knowledge Discovery and
+     com/deploy/pdf/CUDA_Multi_Process_Service_
+                                                                                    Data Mining (2017), KDD ’17, pp. 1487–1495.
+     Overview.pdf.
+                                                                               [22] G RANDL , R., K ANDULA , S., R AO , S., A KELLA , A., AND
+ [8] A BADI , M., BARHAM , P., C HEN , J., C HEN , Z., DAVIS , A.,
+                                                                                    K ULKARNI , J. GRAPHENE: Packing and dependency-aware
+     D EAN , J., D EVIN , M., G HEMAWAT, S., I RVING , G., I SARD ,
+                                                                                    scheduling for data-parallel clusters. In 12th USENIX Sympo-
+     M., ET AL . TensorFlow: A system for large-scale machine learn-
+                                                                                    sium on Operating Systems Design and Implementation (OSDI
+     ing. In 12th USENIX Symposium on Operating Systems Design
+                                                                                    16) (Savannah, GA, 2016), USENIX Association, pp. 81–97.
+     and Implementation (OSDI 16) (2016), vol. 16, USENIX Associ-
+     ation, pp. 265–283.                                                       [23] H ANNUN , A., C ASE , C., C ASPER , J., C ATANZARO , B., D I -
+                                                                                    AMOS , G., E LSEN , E., P RENGER , R., S ATHEESH , S., S EN -
+ [9] A MARAL , M., P OLO , J., C ARRERA , D., S EELAM , S., AND
+                                                                                    GUPTA , S., C OATES , A., ET AL . Deep speech: Scaling up
+     S TEINDER , M. Topology-aware GPU scheduling for learning
+     workloads in cloud environments. In Proceedings of the Interna-                end-to-end speech recognition. arXiv preprint arXiv:1412.5567
+     tional Conference for High Performance Computing, Network-                     (2014).
+     ing, Storage and Analysis (2017), ACM, p. 17.                             [24] H E , K., Z HANG , X., R EN , S., AND S UN , J. Deep residual learn-
+[10] B ERGSTRA , J., KOMER , B., E LIASMITH , C., YAMINS , D.,                      ing for image recognition. In Proceedings of the IEEE conference
+     AND C OX , D. D. Hyperopt: a Python library for model selec-                   on computer vision and pattern recognition (2016), pp. 770–778.
+     tion and hyperparameter optimization. Computational Science &             [25] H INDMAN , B., KONWINSKI , A., Z AHARIA , M., G HODSI , A.,
+     Discovery 8, 1 (2015), 014008.                                                 J OSEPH , A. D., K ATZ , R. H., S HENKER , S., AND S TOICA , I.
+[11] B ERGSTRA , J. S., BARDENET, R., B ENGIO , Y., AND K ÉGL ,                    Mesos: A platform for ﬁne-grained resource sharing in the data
+     B. Algorithms for hyper-parameter optimization. In Advances                    center. In NSDI (2011), vol. 11, pp. 22–22.
+     in Neural Information Processing Systems 24, J. Shawe-Taylor,             [26] I SARD , M., B UDIU , M., Y U , Y., B IRRELL , A., AND F ET-
+     R. S. Zemel, P. L. Bartlett, F. Pereira, and K. Q. Weinberger, Eds.            TERLY, D. Dryad: Distributed data-parallel programs from
+     Curran Associates, Inc., 2011, pp. 2546–2554.                                  sequential building blocks. In Proceedings of the 2Nd ACM
+[12] B OAG , S., D UBE , P., H ERTA , B., H UMMER , W., I SHAKIAN ,                 SIGOPS/EuroSys European Conference on Computer Systems
+     V., JAYARAM , K., K ALANTAR , M., M UTHUSAMY, V., NAG -                        2007 (New York, NY, USA, 2007), EuroSys ’07, ACM, pp. 59–
+     PURKAR , P., AND ROSENBERG , F. Scalable multi-framework                       72.
+     multi-tenant lifecycle management of deep learning training jobs.         [27] I SARD , M., P RABHAKARAN , V., C URREY, J., W IEDER , U.,
+     In Workshop on ML Systems, NIPS (2017).                                        TALWAR , K., AND G OLDBERG , A. Quincy: fair schedul-
+[13] B OUTIN , E., E KANAYAKE , J., L IN , W., S HI , B., Z HOU ,                   ing for distributed computing clusters. In Proceedings of the
+     J., Q IAN , Z., W U , M., AND Z HOU , L. Apollo: Scalable                      ACM SIGOPS 22nd symposium on Operating systems principles
+     and coordinated scheduling for cloud-scale computing. In 11th                  (2009), ACM, pp. 261–276.
+     USENIX Symposium on Operating Systems Design and Imple-                   [28] J EON , M., V ENKATARAMAN , S., Q IAN , J., P HANISHAYEE , A.,
+     mentation (OSDI 14) (Broomﬁeld, CO, 2014), USENIX Associ-                      X IAO , W., AND YANG , F. Multi-tenant GPU clusters for deep
+     ation, pp. 285–300.                                                            learning workloads: Analysis and implications. MSR-TR-2018-
+[14] B URNS , B., G RANT, B., O PPENHEIMER , D., B REWER , E.,                      13 (2018).
+     AND W ILKES , J. Borg, omega, and kubernetes. ACM Queue
+                                                                               [29] K INGMA , D. P., AND W ELLING , M. Stochastic gradient VB and
+     14 (2016), 70–93.                                                              the variational auto-encoder. In Second International Conference
+[15] C HEN , Q., YANG , H., G UO , M., K ANNAN , R. S., M ARS ,                     on Learning Representations, ICLR (2014).
+     J., AND TANG , L. Prophet: Precise QoS prediction on non-
+                                                                               [30] K LEIN , A., FALKNER , S., S PRINGENBERG , J. T., AND H UT-
+     preemptive accelerators to improve utilization in warehouse-
+                                                                                    TER , F. Learning curve prediction with bayesian neural networks.
+     scale computers. In Proceedings of the Twenty-Second Inter-
+     national Conference on Architectural Support for Programming              [31] K RIZHEVSKY, A., S UTSKEVER , I., AND H INTON , G. E. Im-
+     Languages and Operating Systems (New York, NY, USA, 2017),                     agenet classiﬁcation with deep convolutional neural networks.
+     ASPLOS ’17, ACM, pp. 17–32.                                                    In Advances in neural information processing systems (2012),
+                                                                                    pp. 1097–1105.
+[16] C HEN , T., X U , B., Z HANG , C., AND G UESTRIN , C. Train-
+     ing deep nets with sublinear memory cost. arXiv preprint                  [32] L E C UN , Y., B ENGIO , Y., AND H INTON , G. Deep learning. na-
+     arXiv:1604.06174 (2016).                                                       ture 521, 7553 (2015), 436.
+[17] D EAN , J., AND G HEMAWAT, S. Mapreduce: Simpliﬁed data                   [33] L I , L., JAMIESON , K., D E S ALVO , G., ROSTAMIZADEH ,
+     processing on large clusters. Communications of the ACM 51, 1                  A., AND TALWALKAR , A. Hyperband: A novel bandit-
+     (Jan. 2008), 107–113.                                                          based approach to hyperparameter optimization. arXiv preprint
+[18] D ENG , J., D ONG , W., S OCHER , R., L I , L.-J., L I , K., AND F EI -        arXiv:1603.06560 (2016).
+     F EI , L. Imagenet: A large-scale hierarchical image database.            [34] M ARCUS , M. P., M ARCINKIEWICZ , M. A., AND S ANTORINI ,
+     In Computer Vision and Pattern Recognition, 2009. CVPR 2009.                   B. Building a large annotated corpus of English: The penn tree-
+     IEEE Conference on (2009), IEEE, pp. 248–255.                                  bank. Computational linguistics 19, 2 (1993), 313–330.
+
+
+
+
+USENIX Association                            13th USENIX Symposium on Operating Systems Design and Implementation                                 609
+[35] M ASTERS , D., AND L USCHI , C. Revisiting small batch train-       [52] W U , Y., Z HANG , S., Z HANG , Y., B ENGIO , Y., AND
+     ing for deep neural networks. arXiv preprint arXiv:1804.07612            S ALAKHUTDINOV, R. R. On multiplicative integration with re-
+     (2018).                                                                  current neural networks. In Advances in Neural Information Pro-
+[36] M IIKKULAINEN , R., L IANG , J., M EYERSON , E., R AWAL ,                cessing Systems (2016), pp. 2856–2864.
+     A., F INK , D., F RANCON , O., R AJU , B., S HAHRZAD , H.,          [53] X IE , S., G IRSHICK , R., D OLL ÁR , P., T U , Z., AND H E , K. Ag-
+     NAVRUZYAN , A., D UFFY, N., ET AL . Evolving deep neural                 gregated residual transformations for deep neural networks. In
+     networks. arXiv preprint arXiv:1703.00548 (2017).                        Computer Vision and Pattern Recognition (CVPR), 2017 IEEE
+[37] M IKOLOV, T., J OULIN , A., C HOPRA , S., M ATHIEU , M., AND             Conference on (2017), IEEE, pp. 5987–5995.
+     R ANZATO , M. Learning longer memory in recurrent neural net-       [54] YAMAGISHI , J. English multi-speaker corpus for CSTR voice
+     works. arXiv preprint arXiv:1412.7753 (2014).                            cloning toolkit, 2012. URL http://homepages. inf. ed. ac.
+[38] PASZKE , A., G ROSS , S., C HINTALA , S., AND C HANAN , G.               uk/jyamagis/page3/page58/page58. html.
+     PyTorch, 2017.                                                      [55] Y U , Y., I SARD , M., F ETTERLY, D., B UDIU , M., E RLINGSSON ,
+                                                                              ., G UNDA , P. K., AND C URREY, J. DryadLINQ: A system for
+[39] P ENG , Y., BAO , Y., C HEN , Y., W U , C., AND G UO , C. Opti-
+                                                                              general-purpose distributed data-parallel computing using a high-
+     mus: An efﬁcient dynamic resource scheduler for deep learning
+                                                                              level language. In OSDI’08: Eighth Symposium on Operating
+     clusters. In Proceedings of the Thirteenth European Conference
+                                                                              System Design and Implementation (December 2008), USENIX.
+     on Computer Systems (2018), ACM.
+                                                                         [56] Z AREMBA , W., S UTSKEVER , I., AND V INYALS , O. Recurrent
+[40] R AJPURKAR , P., Z HANG , J., L OPYREV, K., AND L IANG , P.
+                                                                              neural network regularization. arXiv preprint arXiv:1409.2329
+     Squad: 100,000+ questions for machine comprehension of text.
+                                                                              (2014).
+     arXiv preprint arXiv:1606.05250 (2016).
+                                                                         [57] Z HANG , H., S TAFMAN , L., O R , A., AND F REEDMAN , M. J.
+[41] R ASLEY, J., H E , Y., YAN , F., RUWASE , O., AND F ONSECA , R.          SLAQ: Quality-driven scheduling for distributed machine learn-
+     HyperDrive: Exploring hyperparameters with POP scheduling.               ing. In Proceedings of the 2017 Symposium on Cloud Computing
+     In Proceedings of the 18th International Middleware Conference,          (2017), SoCC ’17, pp. 390–404.
+     Middleware (2017), vol. 17.
+                                                                         [58] Z ILLY, J. G., S RIVASTAVA , R. K., KOUTNIK , J., AND S CHMID -
+[42] S EO , M., K EMBHAVI , A., FARHADI , A., AND H AJISHIRZI , H.            HUBER , J. Recurrent highway networks. In International Con-
+     Bidirectional attention ﬂow for machine comprehension. arXiv             ference on Machine Learning (2017), pp. 4189–4198.
+     preprint arXiv:1611.01603 (2016).
+[43] S HI , W., C ABALLERO , J., H USZ ÁR , F., T OTZ , J., A ITKEN ,
+     A. P., B ISHOP, R., RUECKERT, D., AND WANG , Z. Real-time
+     single image and video super-resolution using an efﬁcient sub-
+     pixel convolutional neural network. In Proceedings of the IEEE
+     Conference on Computer Vision and Pattern Recognition (2016),
+     pp. 1874–1883.
+[44] S IMONYAN , K., AND Z ISSERMAN , A. Very deep convolu-
+     tional networks for large-scale image recognition. arXiv preprint
+     arXiv:1409.1556 (2014).
+[45] S PARKS , E. R., TALWALKAR , A., H AAS , D., F RANKLIN ,
+     M. J., J ORDAN , M. I., AND K RASKA , T. Automating model
+     search for large scale machine learning. In Proceedings of the
+     Sixth ACM Symposium on Cloud Computing (New York, NY,
+     USA, 2015), SoCC ’15, ACM, pp. 368–380.
+[46] S ZEGEDY, C., VANHOUCKE , V., I OFFE , S., S HLENS , J., AND
+     W OJNA , Z. Rethinking the inception architecture for computer
+     vision. In Proceedings of the IEEE Conference on Computer Vi-
+     sion and Pattern Recognition (2016), pp. 2818–2826.
+[47] TANENBAUM , A. Distributed operating systems. Prentice Hall,
+     1995.
+[48] VAN D EN O ORD , A., D IELEMAN , S., Z EN , H., S IMONYAN ,
+     K., V INYALS , O., G RAVES , A., K ALCHBRENNER , N., S E -
+     NIOR , A., AND K AVUKCUOGLU , K. Wavenet: A generative
+     model for raw audio. arXiv preprint arXiv:1609.03499 (2016).
+[49] VASWANI , A., S HAZEER , N., PARMAR , N., U SZKOREIT, J.,
+     J ONES , L., G OMEZ , A. N., K AISER , Ł., AND P OLOSUKHIN ,
+     I. Attention is all you need. In Advances in Neural Information
+     Processing Systems (2017), pp. 6000–6010.
+[50] VAVILAPALLI , V. K., M URTHY, A. C., D OUGLAS , C., AGAR -
+     WAL , S., KONAR , M., E VANS , R., G RAVES , T., L OWE , J.,
+     S HAH , H., S ETH , S., ET AL . Apache Hadoop YARN: Yet an-
+     other resource negotiator. In Proceedings of the 4th annual Sym-
+     posium on Cloud Computing (2013), ACM, p. 5.
+[51] W U , Y., S CHUSTER , M., C HEN , Z., L E , Q. V., N OROUZI ,
+     M., M ACHEREY, W., K RIKUN , M., C AO , Y., G AO , Q.,
+     M ACHEREY, K., ET AL . Google’s neural machine translation
+     system: Bridging the gap between human and machine transla-
+     tion. arXiv preprint arXiv:1609.08144 (2016).
+
+
+
+
+610    13th USENIX Symposium on Operating Systems Design and Implementation                                             USENIX Association
+

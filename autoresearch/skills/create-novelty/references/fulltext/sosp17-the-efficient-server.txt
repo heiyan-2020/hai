@@ -1,0 +1,1391 @@
+                                        The Efficient Server Audit Problem,
+                                      Deduplicated Re-execution, and the Web
+                                Cheng Tan, Lingfan Yu, Joshua B. Leners⋆, and Michael Walfish
+                           NYU Department of Computer Science, Courant Institute                      ⋆ Two Sigma Investments
+
+
+ABSTRACT                                                                             Problem. The general shape of this problem is as follows. A
+You put a program on a concurrent server, but you don’t trust                        principal supplies a program to an untrusted executor that is
+the server; later, you get a trace of the actual requests that                       supposed to perform repeated and possibly concurrent execu-
+the server received from its clients and the responses that                          tions of the program, on different inputs. The principal later
+it delivered. You separately get logs from the server; these                         wants to verify that the outputs delivered by the executor were
+are untrusted. How can you use the logs to efficiently verify                        produced by running the program. The verification algorithm,
+that the responses were derived from running the program                             or verifier, is given an accurate trace of the executor’s inputs
+on the requests? This is the Efficient Server Audit Problem,                         and delivered outputs. In addition, the executor gives the veri-
+which abstracts real-world scenarios, including running a                            fier reports, but these are untrusted and possibly spurious. The
+web application on an untrusted provider. We give a solution                         verifier must somehow use the reports to determine whether
+based on several new techniques, including simultaneous                              the outputs in the trace are consistent with having actually
+replay and efficient verification of concurrent executions. We                       executed the program. Furthermore, the verifier must make
+implement the solution for PHP web applications. For several                         this determination efficiently; it should take less work than
+applications, our verifier achieves 5.6–10.9× speedup versus                         re-executing the program on every input in the trace.
+simply re-executing, with <10% overhead for the server.                                 The requirement of a trace is fundamental: if we are audit-
+                                                                                     ing a server’s outputs, then we need to know those outputs.
+                                                                                     Of course, getting a trace may not be feasible in all cases.
+1     MOTIVATION AND CONTENTS                                                        In Dana’s case, the company can place a middlebox at the
+Dana the Deployer works for a company whose employees                                network border, to capture end-clients’ traffic to and from the
+use an open-source web application built from PHP and a SQL                          application. We discuss other scenarios later (§4.1, §7).
+database. The application is critical: it is a project manage-                          We emphasize that the Efficient Server Audit Problem is
+ment tool (such as JIRA), a wiki, or a forum. For convenience                        separate from—but complementary to—program verification,
+and performance, Dana wants to run the application on a                              which is concerned with developing bug-free programs. Our
+cloud platform, say AWS [1]. However, Dana has no visibil-                           concern instead is whether a given program is actually exe-
+ity into AWS. Meanwhile, undetected corrupt execution—as                             cuted as written. Neither guarantee subsumes the other.
+could happen from misconfiguration, errors, compromise, or                              The high-level consideration here is execution integrity,
+adversarial control at any layer of the execution stack: the                         a topic that has been well-studied in several academic com-
+language run-time, the HTTP server, the OS, the hypervisor,                          munities, with diverse solutions (§6.1). The novelty in our
+the hardware—would be catastrophic for Dana’s company. So                            variant is in combining three characteristics: (1) we make no
+Dana would like assurance that AWS is executing the actual                           assumptions about the failure modes of the executor, (2) we
+application as written. How can Dana gain this assurance?                            allow the executor to be concurrent, and (3) we insist on solu-
+   Dana’s situation is one example of a fundamental problem,                         tions that scale beyond toy programs and are compatible with
+which this paper defines and studies: the Efficient Server Audit                     (at least some) legacy programs.
+                                                                                        The contributions and work of this paper are as follows.
+Permission to make digital or hard copies of all or part of this work for
+personal or classroom use is granted without fee provided that copies are not        §2 Definition of the Efficient Server Audit Problem. We
+made or distributed for profit or commercial advantage and that copies bear             first present the problem in theoretical terms. We do this
+this notice and the full citation on the first page. Copyrights for components          to show the generality and the fundamental challenges.
+of this work owned by others than the author(s) must be honored. Abstracting
+with credit is permitted. To copy otherwise, or republish, to post on servers or
+                                                                                     §3 An abstract solution: SSCO. We exhibit a solution at
+to redistribute to lists, requires prior specific permission and/or a fee. Request      a theoretical level, so as to highlight the core concepts,
+permissions from permissions@acm.org.                                                   techniques, and algorithms. These include:
+SOSP ’17, October 28, 2017, Shanghai, China
+© 2017 Copyright held by the owner/author(s). Publication rights licensed to
+                                                                                         §3.1 SIMD [5]-on-demand. The verifier re-executes all
+Association for Computing Machinery.                                                       requests, in an accelerated way. For a group of re-
+ACM ISBN 978-1-4503-5085-3/17/10. . . $15.00                                               quests with the same control flow, the verifier executes
+https://doi.org/10.1145/3132747.3132760
+                                                                                                       online phase audit phase
+      a “superposition”: instructions with identical operands                                                    program
+      across requests are performed once, whereas instruc-                                        executor
+      tions with different operands are executed individually                       collector                                  verifier
+                                                                                                             …
+      and merged into the superposed execution. This solu-                     request                                     inputs + program
+      tion assumes that the workload has repeated traversal                                                      reports
+                                                                     clients                                                      ?
+                                                                                                         …                        =
+      of similar code paths—which is at least the case for                     response                                        outputs
+      some web applications, as observed by Poirot [52, §5].                                    shared objects
+    §3.3 Simulate-and-check. How can the verifier re-execute
+      reads of persistent or shared state? Because it re-executes                                       trace
+      requests out of order, it cannot physically re-invoke op-
+                                                                     Figure 1: The Efficient Server Audit Problem. The objects ab-
+      erations on such state, but neither can it trust reports
+                                                                     stract shared state (databases, key-value stores, memory, etc.).
+      that are allegedly the originally read values (§3.2). In-
+                                                                     The technical problem is to design the verifier and the reports
+      stead, the executor (purportedly) logs each operation’s        to enable the verifier, given a trace and a program, to efficiently
+      operands; during re-execution, the verifier simulates          validate (or invalidate) the contents of responses.
+      reads, using the writes in the logs, and checks the
+      logged writes opportunistically.                               and it gets additional discretion, in OROCHI, over the return
+    §3.5 Consistent ordering. The verifier must ensure that          values of non-deterministic PHP built-ins. Second, OROCHI
+      operations can be consistently ordered (§3.4). To this         is restricted to applications that do not interact much with
+      end, the verifier builds a directed graph with a node          other applications; nevertheless, there are suitable application
+      for every external observation or alleged operation, and       classes, for example LAMP [3]. Third, OROCHI requires mi-
+      checks whether the graph is acyclic. This step incorpo-        nor modifications in some applications, owing to the SSCO
+      rates an efficient algorithm for converting a trace into a     model. Finally, the principal can audit an application only
+      time precedence graph. This algorithm would acceler-           after activating OROCHI; if the server was previously running,
+      ate prior work [13, 50] and may be useful elsewhere.           the verifier has to bootstrap from the pre-OROCHI state.
+   SSCO has other aspects besides, and the unified whole was
+   difficult to get right (§7): our prior attempts had errors that
+                                                                     2    PROBLEM DEFINITION
+   came to light when we tried to prove correctness. This            This section defines the Efficient Server Audit Problem. The
+   version, however, is proved correct [81, Appx. A].                actors and components are depicted in Figure 1.
+                                                                        A principal chooses or develops a program, and deploys
+§4 A built system: OROCHI. We describe a system that im-
+                                                                     that program on a powerful but untrusted executor.
+   plements SSCO for PHP web applications. This is for the
+                                                                        Clients (the outside world) issue requests (inputs) to the
+   purpose of illustration, as we expect the system to general-
+                                                                     executor, and receive responses (outputs). A response is sup-
+   ize to other web languages, and the theoretical techniques
+                                                                     posed to be the output of the program, when the correspond-
+   in SSCO to apply in other contexts (§7). OROCHI includes
+                                                                     ing request is the input. But the executor is untrusted, so the
+   a record-replay system [33, 34] for PHP [26, 52]. The
+                                                                     response could be anything.
+   replayer is a modified language runtime that implements
+                                                                        A collector captures an ordered list, or trace, of requests
+   SIMD-on-demand execution using multivalue types that
+                                                                     and responses. We assume that the collector does its job
+   hold the program state for multiple re-executions. OROCHI
+                                                                     accurately, meaning that the trace exactly records the requests
+   also introduces mechanisms, based on a versioned data-
+                                                                     and the (possibly wrong) responses that actually flow into and
+   base [26, 40, 61, 80], to adapt simulate-and-check to
+                                                                     out of the executor.
+   databases and to deduplicate database queries.
+                                                                        The executor maintains reports whose purpose is to assist
+§5 Experimental evaluation of OROCHI. In experiments                 an audit; like the responses, the reports are untrusted.
+   with several applications, the verifier can audit 5.6–10.9×          Periodically, the principal conducts an audit; we often refer
+   faster than simple re-execution; this is a loose lower            to the audit procedure as a verifier. The verifier gets a trace
+   bound, as the baseline is very pessimistic for OROCHI (§5.1).     (from the accurate collector) and reports (from the untrusted
+   OROCHI imposes overhead of roughly 10% on the web                 executor). The verifier needs to determine whether executing
+   server. OROCHI’s reports, per-request, are 3%–11% of              the program on each input in the trace truly produces the
+   the size of a request-response pair. Most significantly, the      respective output in the trace.
+   verifier must keep a copy of the server’s persistent state.          Two features of our setting makes this determination chal-
+  The main limitations (§5.5) are that, first, in SSCO the ex-       lenging. First, the verifier is much weaker than the executor,
+ecutor has discretion over scheduling concurrent requests,           so it cannot simply re-execute all of the requests.
+   The second challenge arises from concurrency: the executor      3     A SOLUTION: SSCO
+is permitted to handle multiple requests at the same time (for     This section describes an abstract solution to the Efficient
+example, by assigning each to a separate thread), and the in-      Server Audit Problem, called SSCO (a rough abbreviation of
+voked program is permitted to issue operations to objects. An      the key techniques). SSCO assumes that there is similarity
+object abstracts state shared among executions, for example        among the executions, in particular that there are a relatively
+a database, key-value store, or memory cells (if shared). We       small number of control flow paths induced by requests (§3.1).
+will be more precise about the concurrency model later (§3.2).     SSCO also assumes a certain concurrency model (§3.2).
+For now, a key point is that, given a trace—in particular, given
+the ordering of requests and responses in the trace, and given     Overview and key techniques. In SSCO, the reports are:
+the contents of requests—the number of valid possibilities for
+                                                                   • Control flow groupings: For each request, the executor
+the contents of responses could be immense. This is because
+                                                                     records an opaque tag that purportedly identifies the control
+an executor’s responses depend on the contents of shared
+                                                                     flow of the execution; requests that induce the same control
+objects; as usual in concurrent systems, those contents de-
+                                                                     flow are supposed to receive the same tag.
+pend on the operation order, which depends on the executor’s
+internal scheduling choices.                                       • Operation logs: For each shared object, the executor main-
+   Somehow, the reports, though unreliable, will have to help        tains an ordered log of all operations (across all requests).
+the verifier efficiently tell the difference between valid and     • Operation counts: For each request execution, the executor
+invalid traces. In detail, the problem is to design the verifier     records the total number of object operations that it issued.
+and the reports to meet these properties:
+                                                                      The verifier begins the audit by checking that the trace is
+• Completeness. If the executor behaved during the time            balanced: every response must be associated with an earlier
+  period of the trace, meaning that it executed the given          request, and every request must have a single response or
+  program under the appropriate concurrency model, then            some information that explains why there is none (a network
+  the verifier must accept the given trace.                        reset by a client, for example). Also, the verifier checks that
+• Soundness. The verifier must reject if the executor misbe-       every request-response pair has a unique requestID; a well-
+  haved during the time period of the trace. Specifically, the     behaved executor ensures this by labeling responses. If these
+  verifier accepts only if there is some schedule S, meaning an    checks pass, we (and the verifier) can refer to request-response
+  interleaving or context-switching among (possibly concur-        pairs by requestID, without ambiguity.
+  rent) executions, such that: (a) executing the given program        The core of verification is as follows. The verifier re-executes
+  against the inputs in the trace, while following S, repro-       each control flow group in a batch; this happens via SIMD [5]-
+  duces exactly the respective outputs in the trace, and (b) S     on-demand execution (§3.1). During this process, re-executed
+  is consistent with the ordering in the trace. (Appx. A [81]      object operations don’t happen directly—they can’t, as re-
+  states Soundness precisely.) This property means that the        execution follows a different order from the original (§3.2).
+  executor can pass the audit only by executing the program        Instead, the operation logs contain a record of reads and
+  on the received requests—or by doing something externally        writes, and re-execution follows a discipline that we call
+  indistinguishable from that.                                     simulate-and-check (§3.3): re-executed read operations are
+                                                                   fed (or simulated) based on the most recent write entry in the
+• Efficiency. The verifier must require only a small fraction
+                                                                   logs, and the verifier checks logged write operations oppor-
+  of the computational resources that would be required to re-
+                                                                   tunistically. In our context, simulate-and-check makes sense
+  execute each request. Additionally, the executor’s overhead
+                                                                   only if alleged operations can be ordered consistent with ob-
+  must be only a small fraction of its usual costs to serve
+                                                                   served requests and responses (§3.4); the verifier determines
+  requests (that is, without capturing reports). Finally, the
+                                                                   whether this is so using a technique that we call consistent
+  solution has to work for applications of reasonable scale.
+                                                                   ordering verification (§3.5).
+   We acknowledge that “small fraction” and “reasonable               At the end, the verifier compares each request’s produced
+scale” may seem out of place in a theoretical description. But     output to the request’s output in the trace, and accepts if and
+these characterizations are intended to capture something es-      only if all of them match, across all control flow groups.
+sential about the class of admissible solutions. As an example,       The full audit logic is described in Figures 3, 5, and 6, and
+there is a rich theory that studies execution integrity (§6.1),    proved correct in our extended version [81, Appx. A].
+but the solutions (besides not handling concurrency) are so far
+from scaling to the kinds of servers that run real applications    3.1   SIMD-on-demand execution
+that we must look for something qualitatively different.           We assume here that requests do not interact with shared
+                                                                   objects; we remove that assumption in Section 3.2. (As we
+         6                    3                      1           6
+        7                    3                   1           7
+    8                    3                  1            8                       3              1    Condition (1) holds because these applications are in a sense
+                                                                                                     routine (they do similar things for different users) and because
+                                                                                                     the programming language is high-level (for example, string
+             -                    +                                  -                +
+                                                                                                     operations or calls like sort() or max() induce the same control
+                     3                 4                                     3                       flow [52]). Condition (2) holds because the logical outputs
+                 4                    4                                  4
+             5                    4                                  5                4              have a lot of overlap: different users wind up seeing similar-
+                                           min                                                 min   looking web pages, which implies that the computations that
+                                                     1                                               produce these web pages include identical data flows. This
+                                                 1
+                                            1                                                   1    commonality was previously observed by Poirot [52], and
+                                  +                                                   +              our experiments confirm it (§5.2). Condition (3) is achieved,
+                                                                                                     in OROCHI, by augmenting the language run-time with mul-
+                                       8                                                   8         tivalue versions of basic datatypes, which encapsulate the
+                                      9                                                   9
+                                 10                                                  10              different values of a given operand in the separate executions.
+            repeated executions                                  SIMD-on-demand                      Re-execution moves dynamically between a vector, or SIMD,
+                                                                                                     mode (which operates on multivalues) and a scalar mode
+Figure 2: Abstract depiction of SIMD-on-demand, for a simple                                         (which operates on normal program variables).
+computation. Rectangles represent program variables, circles
+represent instructions. On the right, thick lines represent explic-
+itly materialized outputs; thin lines represent collapsed outputs.
+                                                                                                     3.2   Confronting concurrency and shared objects
+                                                                                                     As noted earlier, a key question is: how does the verifier re-
+have just done, we will sometimes use “request” as shorthand                                         execute an operation that reads from a shared object? An
+for “the execution of the program when that request is input.”)                                      approach taken elsewhere [26, 52] is to record the values that
+    The idea in SIMD-on-demand execution is that, for each                                           had been read by each request, and then to supply those values
+control flow group, the verifier conducts a single “superposed”                                      during re-execution. One might guess that, were we to apply
+execution that logically executes all requests in that group                                         this approach to our context where reports are untrusted, the
+together, at the same time. Instructions whose operands are                                          worst thing that could happen is that the verifier would fail to
+different across the separate logical executions are performed                                       reproduce the observed outputs in the trace—in other words,
+separately (we call this multivalent execution of an instruc-                                        the executor would be incriminating itself. But the problem is
+tion), whereas an instruction executes only once (univalently)                                       much worse than that: the reported values and the responses
+if its operands are identical across the executions. The concept                                     could both be bogus. As a result, if the verifier’s re-execution
+is depicted in Figure 2.                                                                             dutifully incorporated the purported read values, it could end
+    The control flow groupings are structured as a map C from                                        up reproducing, and thereby validating, a spurious response
+opaque tag to set-of-requestIDs. Of course, the map is part of                                       from a misbehaved executor; this violates Soundness (§2).
+the untrusted report, so the verifier does not trust it. However,
+                                                                                                     Presentation plan. Below, we define the concurrency model
+if the map is incorrect (meaning, two requests in the same
+                                                                                                     and object semantics, as necessary context. We then cover the
+control flow group diverge under re-execution), then the veri-
+                                                                                                     core object-handling mechanisms (§3.3–§3.5). However, that
+fier rejects. Furthermore, if the map is incomplete (meaning,
+                                                                                                     description will be incomplete, in two ways. First, we will not
+not including particular requestIDs), then the re-generated
+                                                                                                     cover every check or justify each line of the algorithms. Sec-
+responses will not match the outputs in the trace. The verifier
+                                                                                                     ond, although we will show with reference to examples why
+can filter out duplicates, but it does not have to do so, since
+                                                                                                     certain alternatives fail, that will be intuition and motivation,
+re-execution is idempotent (even with shared objects, below).
+                                                                                                     only; correctness, meaning Completeness and Soundness (§2),
+    Observe that this approach meets the verifier’s efficiency
+                                                                                                     is actually established end-to-end, with a chain of logic that
+requirement (§2), if (1) the number of control paths taken
+                                                                                                     does not enumerate or reason about all the ways in which
+is much smaller than the number of requests in the audit,
+                                                                                                     reports and responses could be invalid [81, Appx. A].
+(2) most instructions in a control flow group execute univa-
+lently, and (3) it is inexpensive to switch between multivalent                                      Concurrency model and object semantics. In a well-behaved
+and univalent execution, and to decide which to perform. (We                                         executor, each request induces the creation of a separate
+say “if” and not “only if” because there may be platforms                                            thread that is destroyed after the corresponding response
+where, for example, condition (1) alone is sufficient.)                                              is delivered. A thread runs concurrently with the threads of
+                                                                                                     any other requests whose responses have not yet been deliv-
+System preview. The first two conditions hold in the setting                                         ered. Each thread sequentially performs instructions against
+for our built system, OROCHI (§4): LAMP web applications.                                            an isolated execution context: registers and local memory.
+Input Trace Tr         Input Reports R         Global OpMap : (requestID, opnum) → (i, seqnum)
+    Components of the reports R:                                                  24: procedure R E E XEC()
+C : CtlFlowTag → Set(requestIDs) // purported groups; §3.1                        25:    Re-execute Tr in groups according to C:
+OLi : N+ → (requestID, opnum, optype, opcontents) // purported op logs; §3.3 26:
+M : requestID → N // purported op counts; §3.3                                    27:        (1) Initialize a group as follows:
+                                                                                  28:           Read in inputs for all requests in the group
+                                                                                  29:           Allocate program structures for each request in the group
+ 1: procedure SSCO _ AUDIT()
+                                                                                  30:           opnum ← 1          // opnum is a per-group running counter
+ 2:     // Partially validate reports (§3.5) and construct OpMap
+                                                                                  31:
+ 3:     ProcessOpReports()            // defined in Figure 5
+                                                                                  32:        (2) During SIMD-on-demand execution (§3.1):
+ 4:
+                                                                                  33:
+ 5:     return ReExec() // line 24
+                                                                                  34:           if execution within the group diverges: return REJECT
+ 6:                                                                               35:
+ 7: procedure C HECKO P(rid, opnum, i, optype, opcontents)                        36:           When the group makes a state operation:
+ 8:     if (rid, opnum) not in OpMap: REJECT                                      37:               optype ← the type of state operation
+ 9:                                                                               38:               for all rid in the group:
+10:     î, s ← OpMap[rid, opnum]                                                 39:                   i, oc ← state op parameters from execution
+11:           ˆ ← (OLi [s].optype, OLi [s].opcontents)
+        ôt, oc                                                                   40:                   s ← CheckOp(rid, opnum, i, optype, oc) // line 7
+12:                                                 ˆ
+        if i , î or optype , ôt or opcontents , oc:                             41:                   if optype = RegisterRead:
+13:          REJECT                                                               42:                       state op result ← SimOp(i, s, optype, oc) // line 16
+14:     return s                                                                  43:               opnum ← opnum + 1
+15:                                                                               44:
+16: procedure S IM O P(i, s, optype, opcontents)                                  45:        (3) When a request rid finishes:
+17:     ret ← ⊥                                                                   46:           if opnum < M(rid): return REJECT
+18:     writeop ← walk backward in OLi from s; stop when                          47:
+19:          optype=RegisterWrite                                                 48:        (4) Write out the produced outputs
+20:     if writeop doesn’t exist:                                                 49:
+21:          REJECT                                                               50:    if the produced outputs from (4) are exactly the responses in Tr:
+22:     ret = writeop.opcontents                                                  51:        return ACCEPT
+23:     return ret                                                                52:    return REJECT
+
+Figure 3: The SSCO audit procedure. The supplied trace Tr must be balanced (§3), which the verifier ensures before invoking
+SSCO _ AUDIT . A rigorous proof of correctness is in the extended version of this paper [81, Appx. A].
+
+
+As stated earlier, threads perform operations on shared ob-                         What the verifier does. The core re-execution logic is con-
+jects (§2). These operations are blocking, and the objects                          tained in ReExec (Figure 3, line 24). The verifier feeds re-
+expose atomic semantics. We assume for simplicity in this                           executed reads by identifying the latest write before that
+section that objects expose a read-write interface; they are                        read in the log. Of course, the logs might be spurious, so for
+thus atomic registers [54]. Later, we will permit more complex                      write operations, the verifier opportunistically checks that the
+interfaces, such as SQL transactions (§4.4).                                        operands (produced by re-execution) match the log entries.
+                                                                                       In more detail, when re-executing an operation (rid, opnum),
+3.3     Simulate-and-check                                                          the verifier uses OpMap (as defined in Fig. 3) to identify the
+The reports in SSCO include the (alleged) operations them-                          log entry; it then checks that the parameters (generated by pro-
+selves, in terms of their operands. Below, we describe the                          gram logic) match the logs. Specifically, the verifier checks
+format and how the verifier uses these operation logs.                              that the targeted object corresponds to the (unique) log that
+                                                                                    holds (rid, opnum) (uniqueness is ensured by checks in Fig-
+Operation log contents. Each shared object is labeled with                          ure 5), and that the produced operands (such as the value to
+an index i. The operation log for object i is denoted OLi , and                     be written) are the same as in the given log entry (lines 37–40,
+it has the following form (N+ denotes the set {1, 2, . . .}):                       Figure 3). If the re-executed operation is a read, the verifier
+      OLi : N+ → (requestID, opnum, optype, opcontents).                            feeds it by identifying the write that precedes (rid, opnum);
+                                                                                    this is done in SimOp.
+The opnum is per-requestID; a correct executor tracks and                              Notice that an operation that reads a given write might
+increments it as requestID executes. An operation is thus                           re-execute long before the write is validated. The intuition
+identified with a unique (rid, opnum) pair. The optype and                          here is that a read’s validity is contingent on the validity of
+opcontents depend on the object type. For registers, optype                         all prior write operations in the log. Meanwhile, the audit
+can be RegisterRead (and opcontents are supposed to be                              procedure succeeds only if all checks—including the ones of
+empty) or RegisterWrite (and opcontents is the value to write).
+                                                                       r1 req                      r2        r1
+           r1                            r2                                                OLA                       …
+                                                                    r1: 1
+
+
+
+
+                                                                                executor
+                                                                                                  read     write 1
+                                                                      r2 req                                                     a
+  f(){                          g(){                                                               r2        r1      …
+                                                                    r2: 0                  OLB
+    …………………………                    …………………………                                                     write 1    read
+    …………………………                    write(B,1)
+                                                                      r1 req                       r2        r1
+    write(A,1)                    …………………………                                               OLA                       …
+                                                                      r2 req                      read     write 1
+
+
+
+
+                                                                                executor
+    …………………………                    …………………………
+                                                                    r1 0
+                                                                      :                                                          b
+    …………………………                    read(A) ! y                                                      r1        r2
+    read(B) ! x                                                     r2: 0                  OLB                       …
+                                  …………………………                                                      read     write 1
+    …………………………                    …………………………
+    output(x)                     …………………………                          r1 req
+                                                                                                   r         r2      …
+  }                               output(y)                           r2 req                      1
+                                                                                           OLA write
+
+
+
+
+                                                                                executor
+                                                                                                     1      read
+                                }                                   r1: 1                                                        c
+                                                                                                   r2        r1      …
+                                                                    r2: 1                  OLB
+                                                                                                 write 1    read
+
+
+Figure 4: Three examples to highlight the verifier’s challenge and to motivate consistent ordering verification (§3.5). As explained in
+the text, a correct verifier (meaning Complete and Sound; §2) must reject examples a and b, and accept c. In these examples, r1 and r2
+are requestIDs in different control flow groups, and their executions invoke different subroutines of the given program. For simplicity,
+there is only one request per control flow group, and objects are assumed to be initialized to 0. What varies among examples are the
+timing of requests and responses, the contents of the executor’s responses, and the alleged operation logs for objects A and B (denoted
+OLA , OLB ). The opnum component of the log entries is not depicted.
+
+
+write operations—succeed, thereby retroactively discharging            which is consistent with no schedule. So accepting b would
+the assumption underlying every read.                                  also violate Soundness.
+   What prevents the executor from justifying a spurious re-              In c, r1 and r2 are again concurrent. This time, the executor
+sponse by inserting into the logs additional operations? Vari-         delivered (1, 1), which a well-behaved executor can produce,
+ous checks in the algorithm would detect this and other cases.         by executing the two writes before either read. Therefore,
+For example, the op count reports M enforce certain invariants,        rejecting c would violate Completeness (§2).
+and interlocking checks in the algorithms validate M.                     Now, if the verifier used only simulate-and-check (Fig-
+                                                                       ure 3), the verifier would accept in all three of the examples.
+                                                                       We encourage curious readers to convince themselves of this
+3.4   Simulate-and-check is not enough                                 behavior by inspecting the verifier’s logic and the examples.
+To show why simulate-and-check is insufficient by itself, and          Something to note is that in a and b, the operation logs and
+to illustrate the challenge of augmenting it, this section walks       responses are both spurious, but they are arranged to be con-
+through several simple examples. This will give intuition for          sistent with each other.
+the techniques in the next section (§3.5).                                Below are some strawman attempts to augment simulate-
+   The examples are depicted in Figure 4 and denoted a, b,             and-check, by analyzing all operation logs prior to re-execution.
+c. Each of them involves two requests, r1 and r2 . Each ex-             • What if the verifier (i) creates a global order O of requests
+ample consists of a particular trace—or, equivalently, a par-             that is consistent with the real-time order (in a, r1 would be
+ticular request-response pattern—and particular reports. As               prior to r2 in O; in b and c, either order is acceptable), and
+a shorthand, we notate the delivered responses with a pair                (ii) for each log, checks that the order of its operations is
+(r1resp, r2resp); for example, the responses in a are (1, 0).             consistent with O? This would rightly reject a (r1 is before
+   A correct verifier must reject a, reject b, and accept c.              r2 in O but not in the logs), rightly reject b (regardless of
+   To see why, note that in a, the executor delivers a response           the choice of O, one of the two logs will violate it), and
+to r1 before r2 arrives. So the executor must have executed               wrongly reject c (for the same reason it would reject b).
+r1 and then executed r2 . Under that schedule, there is no way            This approach would be tantamount to insisting that entire
+to produce the observed output (1, 0); in fact, the only output           requests execute atomically (or transactionally)—which is
+consistent with the observed events is (0, 1). Thus, accepting            contrary to the concurrency model.
+a would violate Soundness (§2).                                         • What if the verifier creates only a partial order O′ on re-
+   In b, r1 and r2 are concurrent. A well-behaved executor                quests that is consistent with the real-time order, and then
+can deliver any of (0, 1), (1, 0), or (1, 1), depending on the            insists that, for each log, the order of operations is consis-
+schedule that it chooses. Yet, the executor delivered (0, 0),             tent with O′? That is, operations from concurrent requests
+  can interleave in the logs. This would rightly reject a and        1: Global Trace Tr, Reports R, Graph G, OpMap OpMap
+                                                                     2: procedure P ROCESS O P R EPORTS()
+  rightly accept c. But it would wrongly accept b.
+                                                                     3:
+• Now notice that the operations in b cannot be ordered: con-        4:    GTr ← CreateTimePrecedenceGraph()                // defined in Figure 6
+  sidering log and program order, the operations form a cycle,       5:    SplitNodes(GTr )
+  depicted in Figure 4. So what if the verifier (a) creates a        6:    AddProgramEdges()
+                                                                     7:
+  directed graph whose nodes are all operations in the log           8:    CheckLogs()                 // also builds the OpMap
+  and whose edges are given by log order and program order,          9:    AddStateEdges()
+  and (b) checks that there are no cycles? That would rightly       10:
+  reject b and accept c. But it would wrongly accept a.             11:    if CycleDetect(G):              // standard algorithm; see [31, Ch. 22]
+                                                                    12:        REJECT
+  The verifier’s remaining techniques, described next, can be       13:
+understood as combining the preceding failed attempts.              14: procedure S PLIT N ODES(Graph GTr )
+                                                                    15:    G.Nodes ← { }, G.Edges ← { }
+                                                                    16:    for each node rid ∈ GTr .Nodes:
+3.5   Consistent ordering verification                              17:        G.Nodes += { (rid, 0), (rid, ∞) }
+At a high level, the verifier ensures the existence of an implied   18:    for each edge ⟨rid1 , rid2 ⟩ ∈ GTr .Edges:
+schedule that is consistent with external observations and          19:        G.Edges += ⟨(rid1 , ∞), (rid2 , 0)⟩
+alleged operations. Prior to re-executing, the verifier builds      20:
+                                                                    21: procedure A DD P ROGRAM E DGES()
+a directed graph G with a node for every event (an observed
+                                                                    22:    for all rid that appear in the events in Tr:
+request or response, or an alleged operation); edges represent      23:        for opnum = 1, . . . , R.M(rid):
+precedence [54]. The verifier checks whether G is acyclic. If       24:            G.Nodes += (rid, opnum)
+so, then all events can be consistently ordered, and the implied    25:            G.Edges += ⟨(rid, opnum − 1), (rid, opnum)⟩
+schedule is exactly the ordering implied by G’s edges. Note,        26:        G.Edges += ⟨(rid, R.M(rid)), (rid, ∞)⟩
+however, that the verifier does not follow that order when          27:
+re-executing nor does the verifier consult G again.                 28: procedure C HECK L OGS()
+                                                                    29:    for log = R.OL1 , . . . , R.OLn :
+   Figures 5 and 6 depict the algorithms. G contains nodes          30:        for j = 1, . . . , length(log):
+labeled (rid, opnum), one for each alleged operation in the         31:            if log[j].rid does not appear in Tr or
+logs. G also contains, for each request rid in the trace, nodes     32:                log[j].opnum ≤ 0 or
+(rid, 0) and (rid, ∞), representing the arrival of the request      33:                log[j].opnum > R.M(log[j].rid) or
+and the departure of the response, respectively. The edges in       34:                (log[j].rid, log[j].opnum) is in OpMap:
+                                                                    35:                REJECT
+G capture program order via AddProgramEdges and alleged             36:
+operation order via AddStateEdges.                                  37:            let curr_op = (log[j].rid, log[j].opnum)
+                                                                    38:            OpMap[curr_op] ← (i, j) // i is the index such that log = R.OLi
+Capturing time precedence. To be consistent with external           39:
+observations, G must also capture time precedence. (This is         40:    for all rid that appear in the events in Tr:
+what was missing in the final attempt in §3.4.) We say that r1      41:        for opnum = 1, . . . , R.M(rid):
+precedes r2 (notated r1 <Tr r2 ) if the trace Tr shows that r1      42:            if (rid, opnum) is not in OpMap: REJECT
+departed from the system before r2 arrived [54]. If r1 <Tr r2 ,     43:
+                                                                    44: procedure A DD S TATE E DGES()
+then the operations issued by r1 must occur in the implied          45:    // Add edge to G if adjacent log entries are from different
+schedule prior to those issued by r2 .                              46:    // requests. If they are from the same request, check that the
+   Therefore, the verifier needs to construct edges that capture    47:    // intra-request opnum increases
+the <Tr partial order, in the sense that r1 <Tr r2 ⇐⇒ G has         48:    for log = R.OL1 , . . . , R.OLn :
+a directed path from (r1 , ∞) to (r2 , 0). How can the verifier     49:        for j = 2, . . . , length(log):
+                                                                    50:            let curr_r, curr_op, prev_r, prev_op =
+construct these edges from the trace? Prior work [13] gives         51:              (log[j].rid, log[j].opnum, log[j−1].rid, log[j−1].opnum)
+an offline algorithm for this problem that runs in time O(X ·       52:            if prev_r , curr_r:
+log X + Z), where X is the number of requests, and Z is the         53:                G.Edges += ⟨(prev_r, prev_op), (curr_r, curr_op)⟩
+minimum number of time-precedence edges needed (perhaps             54:            else if prev_op > curr_op: REJECT
+counter-intuitively, more concurrency leads to higher Z).
+   By contrast, our solution runs in time O(X + Z) [81, §A.8],      Figure 5: ProcessOpReports ensures that events (request ar-
+and works in streaming fashion. The key algorithm is Create-        rival, departure of response, and operations) can be consistently
+TimePrecedenceGraph, given in Figure 6 and proved correct           ordered. It does this by constructing a graph G—the nodes are
+                                                                    events; the edges reflect request precedence in Tr, program or-
+in our extended version [81, Lemma 2]. The algorithm tracks
+                                                                    der, and the operation logs—and ensuring that G has no cycles.
+a “frontier”: the set of latest, mutually concurrent requests.      OpMap is constructed here as an index of the operation logs.
+ 1: procedure C REATE T IME P RECEDENCE G RAPH()                          semantics in SSCO (§3.2). Each object type requires adapt-
+ 2:    // “Latest” requests; “parent(s)” of any new request               ing simulate-and-check (§3.3) and, possibly, modifying
+ 3:    Frontier ← { }                                                     the application to respect the interfaces of these objects.
+ 4:    GTr .Nodes ← { }, GTr .Edges ← { }
+ 5:                                                                  • Incorporate the capture (and ideally validation) of certain
+ 6:    for each input and output event in Tr, in time order:           sources of non-determinism, such as PHP built-ins.
+ 7:        if the event is REQUEST(rid):
+ 8:            GTr .Nodes += rid                                      The above items represent the main work of our system,
+ 9:            for each r in Frontier:                              OROCHI . We describe the details in Sections 4.3–4.7.
+10:                GTr .Edges += ⟨r, rid⟩
+11:        if the event is RESPONSE(rid):                           4.1     Applicability of OROCHI, theory vs. practice
+12:            // rid enters Frontier, evicting its parents
+                                                                    OROCHI is relevant in scenarios besides Dana’s. As an exam-
+13:            Frontier −= { r | ⟨r, rid⟩ ∈ GTr .Edges }
+14:            Frontier += rid                                      ple, Pat the Principal runs a public-facing web application
+15:    return GTr                                                   on local hardware and is worried about compromise of the
+                                                                    server, but trusts a middlebox in front of the server to collect
+                                                                    the trace. We describe other scenarios later (§7).
+Figure 6: Algorithm for explicitly materializing the time-             OROCHI is implemented for PHP-based HTTP applications
+precedence partial order, <Tr , in a graph. The algorithm con-      but in principle generalizes to other web standards. Also,
+structs GTr so that r1 <Tr r2 ⇐⇒ GTr has a directed path from
+                                                                    OROCHI verifies an application’s interactions with its clients;
+r1 to r2 . Tr is assumed to be a (balanced; §3) list of REQUEST
+                                                                    verifying communication with external services requires addi-
+and RESPONSE events in time order.
+                                                                    tional mechanism (§5.5). Ultimately, OROCHI is geared to ap-
+                                                                    plications with few such interactions. This is certainly restric-
+Every new arrival descends from all members of the frontier.
+                                                                    tive, but there is a useful class within scope: the LAMP [3]
+Once a request leaves, it evicts all of its parents from the
+                                                                    stack. The canonical LAMP application is a PHP front-end to
+frontier. This algorithm may be of independent interest; for
+                                                                    a database, for example a wiki or bug database.
+example, it could be used to accelerate prior work [13, 50].
+                                                                       The model in Sections 2 and 3 was very general and
+   Overall, the algorithms in Figures 5 and 6 cost O(X +Y +Z)
+                                                                    abstracted away certain considerations that are relevant in
+time and O(Y ) space [81, §A.8], with good constants (Fig. 9;
+                                                                    OROCHI ’s setting. We describe these below:
+§5.2); here, Y is the number of object operations in the logs.
+                                                                       Persistent objects. The verifier needs the server’s objects
+                                                                    as they were at the beginning of the audited period. If audit
+4      A BUILT SYSTEM: OROCHI                                       periods are contiguous, then the verifier in OROCHI produces
+The prior two sections described the Efficient Server Audit         the required state during the previous audit (§4.5).
+Problem, and how it can be solved with SSCO. This section              Server-client collusion. In Section 2, we made no assump-
+applies the model to an example system that we built.               tions about the server and clients. Here, however, we assume
+   Consider again Dana, who wishes to verify execution of a         that the server cannot cause end-clients to issue spurious
+SQL-backed PHP web application running on AWS. In this              requests; otherwise, the server might be able to “legally” in-
+context, the program is a PHP application (and the separate         sert events into history. This assumption fits Dana’s situation
+PHP scripts are subroutines). The executor is the entire remote     though is admittedly shakier in Pat’s.
+stack, from the hardware to the hypervisor and all the way up          Differences in stack versions. The verifier’s and server’s
+to and including the PHP runtime; we often call the executor        stacks need not be the same. However, it is conceivable that
+just the server. The requests and responses are the HTTP            different versions could cause the verifier to erroneously re-
+requests and responses that flow in and out of the application.     ject a well-behaved server (the inverse error does not arise:
+The collector is a middlebox at the edge of Dana’s company,         validity is defined by the verifier’s re-execution). If the ver-
+and is placed to inspect and capture end-clients’ requests          ifier wanted to eliminate this risk, it could run a stack with
+and the responses that they receive. An object can be a SQL         precise functional equivalence to the server’s. Another option
+database, per-client data that persists across requests, or other   is to obtain the server-side stack in the event of a divergent
+external state accessed by the application.                         re-execution, so as to exonerate the server if warranted.
+   We can apply SSCO to this context, if we:                           Modifications by the network. Responses modified en route
+                                                                    to the collector appear to OROCHI to be the server’s responses;
+    • Develop a record-replay system for PHP in which replay        modifications between the collector and end-clients—a real
+      is batched according to SIMD-on-demand (§3.1).                concern in Pat’s scenario, given that ISPs have hosted ad-
+    • Define a set of object types that (a) abstract PHP state      inserting middleboxes [30, 91]—can be addressed by Web
+      constructs (session data, databases, etc.) and (b) obey the   Tripwires (WT) [69], which are complementary to OROCHI.
+4.2   Some basics of PHP                                           Primitive types. When the operands of an instruction or func-
+PHP [4] is a high-level language. When a PHP script is run         tion are primitive multivalues, acc-PHP executes that instruc-
+by a web server, the components of HTTP requests are ma-           tion or function componentwise. Also, if there are mixed
+terialized as program variables. For example, if the end-user      multivalue and univalue operands, acc-PHP performs scalar
+submits http://www.site.org/s.php?a=7, then the web                expansion (as in Matlab, etc.): it creates a multivalue, all of
+server invokes a PHP runtime that executes s.php; within the       whose components are equal to the original univalue. As an
+script s.php, $_GET['a'] evaluates to 7.                           example, consider:
+   The data types are primitive (int, double, bool, string);       1    $sum = $_GET['x'] + $_GET['y'];
+container (arrays, objects); reference; class; resource (an        2    $larger = max ($sum , $_GET['z']);
+abstraction of an external resource, such as a connection          3    $odd = ( $larger % 2) ? "True" : " False ";
+to a database system); and callables (closures, anonymous          4    echo $odd;
+functions, callable objects).
+   The PHP runtime translates each program line to byte code:      r1: /prog.php?x=1&y=3&z=10
+one or more virtual machine (VM) instructions, together with       r2: /prog.php?x=2&y=4&z=10
+their operands. (Some PHP implementations, such as HHVM,
+support JIT, though OROCHI’s verifier does not support this           There are two requests: r1 and r2. Each has three in-
+mode.) Besides running PHP code, the PHP VM can call               puts: x, y, and z, which are materialized in the program as
+built-in functions, written in C/C++.                              $_GET['x'], etc. Acc-PHP represents these inputs as mul-
+                                                                   tivalues: $_GET['x'] evaluates to [1, 2], and $_GET['y']
+                                                                   evaluates to [3, 4]. In line 1, both operands of + are multi-
+                                                                   values, and $sum receives the elementwise sum: [4, 6]. In
+4.3   SIMD-on-demand execution in OROCHI                           line 2, $larger receives [10, 10], and acc-PHP merges the
+The server and verifier run modified PHP runtimes. The             multivalue to make it a univalue. As a result, lines 3 and 4
+server’s maintains an incremental digest for each execution.       execute once, rather than once for each request.
+When the program reaches a branch, this runtime updates the           A multivalue can comprise different types. For example,
+digest based on the type of the branch (jump, switch, or itera-    in two requests that took the same code path, a program
+tion) and the location to which the program jumps. The digest      variable was an int in one request and a float in the other. Our
+thereby identifies the control flow, and the server records it.    acc-PHP implementation handles an int-and-float mixture.
+   The verifier’s PHP runtime is called acc-PHP; it performs       However, if acc-PHP encounters a different mixture, it retries,
+SIMD-on-demand execution (§3.1), as we describe below.             by separately re-executing the requests in sequence.
+   Acc-PHP works at the VM level, though in our examples           Containers. We use the example of a “set” on an object:
+and description below, we will be loose and often refer to the     $obj->$key = $val. Acc-PHP handles “gets” similarly,
+original source. Acc-PHP broadens the set of PHP types to          and likewise other containers (arrays, arrays of arrays, etc.).
+include multivalue versions of the basic types. For example,          Assume first that $obj is a multivalue. If either of $key
+a multivalue int can be thought of as a vector of ints. A con-     and $val are univalues, acc-PHP performs scalar expansion
+tainer’s cells can hold multivalues; and a container can itself    to create a multivalue for $key and $val. Then, acc-PHP
+be a multivalue. Analogously, a reference can name a mul-          assigns the ith component of $val to the property named by
+tivalue; and a reference can itself be a multivalue, in which      the ith component of $key in the ith object in $obj.
+case each of the references in the vector is logically distinct.      Now, if $obj is a univalue and $key is a multivalue, acc-PHP
+A variable that is not a multivalue is called a univalue.          expands the $obj into a multivalue, performs scalar expan-
+   All requests in a control flow group invoke the same PHP        sion on $val (if a univalue), and then proceeds as in the
+script s. At the beginning of re-executing a control flow group,   preceding paragraph. The reason for the expansion is that in
+acc-PHP sets the input variables in s to multivalues, based on     the original executions, the objects were no longer equivalent.
+the inputs in the trace. Roughly speaking, instructions with          When $obj and $key are univalues, and $val is a mul-
+univalue operands produce univalues, and instructions with         tivalue, acc-PHP assigns $val to the given object’s given
+multivalue operands produce multivalues. But when acc-PHP          property. This is similar to the way that acc-PHP set up
+produces a multivalue whose components are identical, re-          $_GET['a'] as a multivalue in the example above.
+flecting a variable that is the same across executions, acc-PHP
+collapses it down to a univalue; this is crucial to deduplica-     Built-in functions. For acc-PHP’s re-execution to be correct,
+tion (§5.2). A collapse is all or nothing: every multivalue has    PHP’s built-in functions (§4.2) would need to be extended to
+cardinality equal to the number of requests being re-executed.     understand multivalues, perform scalar expansion as needed,
+                                                                   etc. But there are thousands of built-in functions.
+   To avoid modifying them all, acc-PHP does the following.                       a mechanism for efficiently re-executing operations on the
+When invoking a built-in function, it checks whether any of                       object. We showed the solution for registers in §3.3. But that
+the arguments are multivalues (if the function is a built-in                      technique would not be efficient for databases or key-value
+method, it also checks whether $this is a multivalue). If so,                     stores: to re-execute a DB “select” query, for example, could
+acc-PHP splits the multivalue argument into a set of univalues;                   require going backward through the entire log.
+assume for ease of exposition that there is only one such
+multivalue argument. Acc-PHP then clones the environment                          4.5   Adapting simulate-and-check to databases
+(argument list, function frame); performs a deep copy of any                      Given a database object d—OROCHI handles key-value stores
+objects referenced by any of the arguments; and executes the                      similarly—the verifier performs a versioned redo pass over
+function, once for each univalue. Finally, acc-PHP returns the
+                                                                                  OLd at the beginning of the audit: it issues every transaction
+separate function results as a multivalue and maintains the                       to a versioned database [26, 40, 61, 80], setting the version
+object copies as multivalues. The reason for the deep copy                        to be the sequence number in OLd . During re-execution, the
+is that the built-in function could have modified the object                      verifier handles a “write” query (UPDATE, etc.) by checking
+differently in the original executions.                                           that the program-generated SQL matches the opcontents field
+                                                                                  in the corresponding log entry. The verifier handles “read”
+4.4     Concurrency and shared objects in OROCHI
+                                                                                  queries (SELECT, etc.) by issuing the SQL to the versioned
+SSCO’s concurrency model (§3.2) fits PHP-based applications,                      DB, specifying the version to be the log sequence number
+which commonly have concurrent threads, each handling a                           of the current operation. The foregoing corresponds to an
+single end-client request sequentially. OROCHI supports sev-                      additional step in SSCO _ AUDIT and further cases in SimOp
+eral objects that obey SSCO’s required semantics (§3.2) and                       (Figure 3); the augmented algorithms are in Appendix A [81].
+that abstract key PHP programming constructs:                                        As an optimization, OROCHI applies read query deduplica-
+• Registers, with atomic semantics [54]. These work well                          tion. If two SELECT queries P and Q are lexically identical
+  for modeling per-user persistent state, known as “session                       and if the parts of the DB covered by P and Q do not change
+  data.” Specifically, PHP applications index per-user state                      between the redo of P and Q, then it suffices to issue the query
+  by browser cookie (this is the “name” of the register) and                      once during re-execution. To exploit this fact, the verifier, dur-
+  materialize the state in a program variable. Constructing                       ing re-execution, clusters all queries in a control flow group
+  this variable is the “read” operation; a “write” is performed                   and sorts each cluster by version number. Within a cluster, it
+  by PHP code, or by the runtime at the end of a request.                         de-duplicates queries P and Q if the tables that P and Q touch
+                                                                                  were not modified between P’s and Q’s versions.
+• Key-value stores, exposing a single-key get/set interface,
+                                                                                     To speed the versioned redo pass, the verifier directs update
+  with linearizable semantics [45]. This models various PHP
+                                                                                  queries to an in-memory versioned database M, which acts as
+  structures that provide shared memory to requests: the
+                                                                                  a buffer in front of the audit-time versioned database V. When
+  Alternative PHP Cache (APC), etc.
+                                                                                  the log is fully consumed, the verifier migrates the final state
+• SQL databases, which support single-query statements and                        of M to V using a small number of transactions: the verifier
+  multi-query transactions. To make a SQL database behave                         dumps each table in M as a single SQL update statement
+  as one atomic object, we impose two restrictions. First, the                    that, when issued to V, reproduces the table. The migration
+  database’s isolation level must be strict serializability [21,                  could also happen when M reaches a memory limit (although
+  62].1 Second, a multi-statement transaction cannot enclose                      we do not implement this). This would require subsequently
+  other object operations (such as a nested transaction).                         re-populating M by reading records from V.
+   The first DB restriction can be met by configuration, as
+many DBMSes provide strict serializability as an option. How-                     4.6   Non-determinism
+ever, this isolation level sacrifices some concurrency com-                       OROCHI includes non-determinism that is not part of the SSCO
+pared to, say, MySQL’s default [6]. The second DB restriction                     model: non-deterministic PHP built-ins (time, getpid, etc.),
+sometimes necessitates minor code changes, depending on                           non-determinism in a database (e.g., auto increment ids), and
+the application (§5.4).                                                           whether a given transaction aborts.
+   To adapt simulate-and-check to an object type, OROCHI                             Replay systems commonly record non-determinism during
+must first collect an operation log (§3.3). To that end, some                     online execution and then, during replay, supply the recorded
+entity (this step is untrusted) wraps relevant PHP statements,                    information in response to a non-deterministic call (see §6.3
+to invoke a recording library. Second, OROCHI’s verifier needs                    for references). OROCHI does this too. Specifically, OROCHI
+1 Confusingly, our required atomicity is, in the context of ACID databases,       adds a fourth report type (§3): non-deterministic information,
+not the “A” but the kind of “I” (isolation); see Bailis [16] for an untangling.   such as the return values of certain PHP built-in invocations.
+OROCHI component                Base       LOC written/changed          acc-PHP encounters such cases, it re-executes requests sep-
+Server PHP (§4.3)               HHVM [7]   400 lines of C++             arately. In addition, acc-PHP runs with a maximum number
+Acc-PHP (§4.3–§4.6)             HHVM [7]   13k lines of C++             of requests in a control flow group (3,000 in our implementa-
+Record library (§4.4, §4.6)     N/A        1.6k lines of PHP            tion); this is because the memory consumed by larger sizes
+DB logging (§4.4)               MySQL      320 lines of C++             would cause thrashing and slow down re-execution.
+In-memory versioned DB (§4.5)   SQLite     1.8k lines of C++
+                                                                           In OROCHI, the server must be drained prior to an audit, but
+Other audit logic (§3, §4)      N/A        2.5k lines of C++/PHP/Bash
+Rewriting tool (§4.7)           N/A        470 lines of Python, Bash    this is not fundamental; natural extensions of the algorithms
+                                                                        would handle prefixes or suffixes of requests’ executions.
+           Figure 7: OROCHI’s software components.
+                                                                        5   EVALUATION OF OROCHI
+The server collects these reports by wrapping the relevant              This section answers the following questions:
+PHP statements (as in §4.4).                                            • How do OROCHI’s verifier speedup and server overhead
+   But, because reports are untrusted, OROCHI’s verifier also             compare to a baseline of simple re-execution? (§5.1)
+checks the reported non-determinism against expected behav-
+ior. For example, the verifier checks that queries about time           • What are the sources of acceleration? (§5.2)
+are monotonically increasing and that the process id is con-            • What is the “price of verifiability”, meaning OROCHI’s
+stant within requests. For random numbers, the application                costs compared to the legacy configuration? (§5.3)
+could seed a pseudorandom number generator, and the seed                • What kinds of web applications work with OROCHI? (§5.4)
+would be the non-deterministic report, though we have not
+implemented this.                                                       Applications and workloads. We answer the first two ques-
+   Unfortunately, we cannot give rigorous guarantees about              tions with experiments, which use three applications: Me-
+the efficacy of these checks, as our definitions and proofs [81,        diaWiki (a wiki used by Wikipedia and others), phpBB (an
+Appx. A] do not capture this kind of non-determinism. This              open source bulletin board), and HotCRP (a conference re-
+is disappointing, but the issue seems fundamental, unless we            view application). These applications stress different work-
+pull the semantics of PHP into our proofs. Furthermore, this            loads. Also, MediaWiki and phpBB are in common use,
+issue exists in all systems that “check” an untrusted lower             and HotCRP has become a reference point for systems se-
+layer’s return values for validity [14, 17, 28, 46, 95].                curity publications that deal with PHP-based web applica-
+   Beyond that, the server gets discretion over the thread              tions [26, 52, 67, 68, 72, 93]. Indeed, MediaWiki and HotCRP
+schedule, which is a kind of non-determinism, albeit one that           are the applications evaluated by Poirot [52] (§6.3). Our ex-
+is captured by our definitions and proofs [81, Appx. A]. As             perimental workloads are as follows:
+an example, if the web service performs a lottery, the server              MediaWiki (v1.26.2). Our workload is derived from a 2007
+could delay responding to a collection of requests, invoke the          Wikipedia trace, which we downsampled to 20,000 requests to
+random number library, choose which request wins, and then              200 pages, while retaining its Zipf distribution (β = 0.53) [85].
+arrange the reports and responses accordingly.                          We used a 10 year-old trace because we were unable to find
+                                                                        something more recent; we downsampled because the original
+4.7   Implementation details                                            has billions of requests to millions of pages, which is too large
+Figure 7 depicts the main components of OROCHI.                         for our testbed (on the other hand, smaller workloads produce
+   A rewrite tool performs required PHP application modifi-             fewer batching opportunities so are pessimistic to OROCHI).
+cations: inserting wrappers (§4.4, §4.6), and adding hooks to              phpBB (v3.2.0). On September 21, 2017, we pulled posts
+record control flow digests and maximum operation number.               created over the preceding week from a real-world phpBB
+Given some engineering, this rewriting can be fully automatic;          instance: CentOS [2]. We chose the most popular topic. There
+our implementation sometimes needs manual help.                         were 63 posts, tens to thousands of views per post, and zero
+   OROCHI ’s versioned DB implementation (§4.5) borrows                 to tens of replies per post. We assume that the ratio of page
+Warp’s [26] schema, and uses the same query rewriting tech-             views from registered users (who log in) to guests (who do
+nique (see also §6.2). We implemented OROCHI’s audit-time               not) is 1:40, based on sampling reports from the forum (4–9
+key-value store as a new component (in acc-PHP) to provide              registered users and 200–414 guests were online). We create
+a versioned put/get interface.                                          83 users (the number of distinct users in the posts) to view
+   Acc-PHP has several implementation limitations. One is               and reply to the posts. The workload contains 30k requests.
+the limited handling of mixed types, mentioned earlier (§4.3);             HotCRP. We build a workload from 269 papers, 58 review-
+another is that an object that points to itself (such as $a->b->a)      ers, and 820 reviews, with average review length of 3625 char-
+is not recognized as such, if the object is a multivalue. When          acters; the numbers are from SIGCOMM 2009 [8, 63]. We
+                                                                                                     1200
+                                                                                                                baseline
+                                                                                                     1000       Orochi
+           audit server CPU avg           reports (per request)        DB overhead
+
+
+
+
+                                                                                      latency (ms)
+                                                                                                      800
+App       speedup overhead request baseline OROCHI OROCHI ovhd       temp permanent
+                                                                                                      600
+MediaWiki 10.9×      4.7%     7.1KB 0.8KB     1.7KB      11.4%       1.0×      1×                     400
+phpBB      5.6×      8.6%     5.7KB 0.1KB     0.3KB       2.7%       1.7×      1×
+                                                                                                      200
+HotCRP     6.2×      5.9%     3.2KB 0.0KB     0.4KB      10.9%       1.5×      1×
+                                                                                                        0
+                                                                                                            0   50     100    150      200   250   300
+                                                                                                                      throughput (req/sec)
+Figure 8: OROCHI compared to simple re-execution (§5.1). Left table: “Audit speedup” is the ratio of audit-time CPU costs, assuming
+(conservatively) that auditing in simple re-execution is the same cost as serving the legacy application, and (perhaps optimistically)
+that simple re-execution and OROCHI are given HTTP requests and responses from the trace collector. “Server CPU overhead” is
+the CPU cost added by OROCHI, conservatively assuming that the baseline imposes no server CPU costs. The reports are compressed
+(OROCHI’s overheads include the CPU cost of compression/decompression; the baseline is not charged for this). “OROCHI ovhd” in
+those columns is the ratio of (the trace plus OROCHI’s reports) to (the trace plus the baseline’s reports). “Temp” DB overhead refers
+to the ratio of the size of the on-disk versioned DB (§4.5) to the size of a non-versioned DB. Right graph: Latency vs. server throughput
+for phpBB (the other two workloads are similar). Points are 90th (bars are 50th and 99th) percentile latency for a given request rate,
+generated by a Poisson process. The depicted data are the medians of their respective statistics over 5 runs.
+
+
+impose synthetic parameters: one registered author submits                We capture this baseline’s audit-time CPU cost by mea-
+one valid paper, with a number of updates distributed uni-             suring the legacy server CPU costs; in reality, an audit not
+formly from 1 to 20; each paper gets 3 reviews; each reviewer          designed for acceleration would likely proceed more slowly.
+submits two versions of each review; and each reviewer views           We assume this baseline has no server CPU overhead; in
+100 pages. In all, there are 52k requests.                             reality, the baseline would have some overhead. We capture
+   As detailed later (§5.4), we made relatively small modifica-        the baseline’s report size with OROCHI’s non-deterministic re-
+tions to these applications. A limitation of our investigation is      ports (§4.6), because record-replay systems need non-deterministic
+that all modeled clients use the same browser; however, our            advice; in reality, the baseline would likely need additional
+preliminary investigation indicates that PHP control flow is           reports to reconstruct the thread schedule. Finally, we assume
+insensitive to browser details.                                        that the baseline tolerates arbitrary database configurations
+   Setup and measurement. Our testbed comprises two ma-                (unlike OROCHI; §4.4), although we assume that the baseline
+chines connected to a switch. Each machine has a 3.3GHz                needs to reconstruct the database (as in OROCHI).
+Intel i5-6600 (4-core) CPU with 16GB memory and a 250GB
+SSD, and runs Ubuntu 14.04. One of the machines alternates             Comparison. Figure 8 compares OROCHI to the aforemen-
+between the roles of server (running Nginx 1.4.6) and verifier;        tioned baseline. At a high level, OROCHI accelerates the audit
+the other generates load. We measure CPU costs from Linux’s            compared to the baseline (we delve into this in §5.2) but in-
+/proc. We measure throughput and latency at the client.                troduces some server CPU cost, with some degradation in
+                                                                       throughput, and minor degradation in latency.
+                                                                          The throughput reductions are respectively 13.0%, 11.1%
+5.1   OROCHI versus the baseline                                       and 17.8% for phpBB, MediaWiki, and HotCRP. The through-
+What is the baseline? We want to compare OROCHI to a                   put comparison includes the effect of requiring strict serializ-
+system that audits comprehensively without trusting reports.           ability (§4.4), because the baseline’s databases are configured
+A possibility is probabilistic proofs [20, 23, 32, 65, 75, 89],        with MySQL’s default isolation level (repeatable read).
+but they cannot handle our workloads, so we would have to                 The report overhead depends on the frequency of object
+estimate, and the estimates would yield outlandish speedups            operations (§4.4) and non-deterministic calls (§4.6). Still, the
+for OROCHI (over 106 ×). Another option is untrusted full-             report size is generally a small fraction of the size of the
+machine replay, as in AVM [43]. However, AVM’s imple-                  trace, as is OROCHI’s “report overhead” versus the baseline.
+mentation supports only single-core servers, and handling              OROCHI ’s audit-time DB storage requirement is higher than
+untrusted reports and concurrency in VM replay might re-               the baseline’s, because of versioning (§4.5), but after the audit,
+quire research (§7).                                                   OROCHI needs only the “latest” state.
+   Instead, we evaluate against a baseline that is less expensive
+than both of these approaches, and hence is pessimistic to             5.2    A closer look at acceleration
+OROCHI: the legacy application (without OROCHI), which can             Figure 9 decomposes the audit-time CPU costs. The “DB
+be seen as a lower bound on hypothetical simple re-execution.          query” portion illustrates query deduplication (§4.5). Without
+                700                                                                                                                        10                                            unmodified PHP                multivalent fixed
+
+
+
+
+                                                                                                            normalized to unmodified PHP
+                              DB                                                                                                                                                         univalent                     multivalent marginal
+                600
+ CPU time taken (s)
+
+
+
+
+                             query
+                                                         DB                                                                                 8
+                500                                     query
+
+
+
+
+                                                                                                                   (lower is better)
+                                                                                    DB
+
+                400
+                                                                                   query
+                                                                                                                                            6
+                300           PHP
+
+
+
+
+                                                                     er 4. 7s
+
+
+
+
+                                                                                                er 7. 2s
+                                                         PHP                                                                                4
+
+
+
+
+                                                                 th o 2.
+
+
+
+
+                                                                                            th o 2.
+                                                                       4. 2s
+                200
+                                          er 1. 0s
+
+
+
+
+                                                                                                  5. 9s
+                                                                O red ep
+
+
+
+
+                                                                                           O red ep
+                                                                         9s
+                                      th o 1.
+
+
+
+
+                                                                 B R
+
+
+
+
+                                                                                                    3s
+                                            3. 8s
+
+
+
+                                                                                    PHP
+
+
+
+
+                                                                                            B R
+                                                                D cOp
+                                     O red ep
+
+
+
+
+                                                                                           D cOp
+                                              2s
+                                      B R
+
+
+
+
+                100
+                                     D cOp
+
+
+
+
+                                                                   o
+
+
+
+
+                                                                                              o
+                                                                Pr
+                                                                                                                                            2
+
+
+
+
+                                                                                           Pr
+                                        o
+                                     Pr
+
+
+
+
+                                                                                                                                                    24        32        4        6       5       22     58       50          8        25
+                      0
+                          baseline     Orochi        baseline     Orochi        baseline     Orochi                                         0
+
+
+
+
+                                                                                                                                                                                                                        e
+
+
+
+                                                                                                                                                                                                                                            y
+                                                                                                                                                                                                                                  t
+                                                                                                                                                                                                                      tim
+
+                                                                                                                                                                                                                                 en
+
+                                                                                                                                                                                                                                           rra
+                                                                                                                                                                                                   et
+                                                                                                                                                         ly
+
+
+
+
+                                                                                                                                                                                                             n
+                             MediaWiki                  phpBB                       HotCRP
+
+
+
+
+                                                                                                                                                                                          al
+
+                                                                                                                                                                                                 yS
+
+                                                                                                                                                                                                        tio
+                                                                                                                                                               at
+
+
+
+
+                                                                                                                                                                                                                            em
+                                                                                                                                                    tip
+
+
+
+
+                                                                                                                                                                                                                                      A
+                                                                                                                                                                                                                 ro
+                                                                                                                                                                             p
+
+                                                                                                                                                                                         V
+                                                                                                                                                              nc
+
+
+
+
+                                                                                                                                                                                                                                  ew
+                                                                                                                                                                    t
+
+
+
+
+                                                                                                                                                                                               rra
+
+                                                                                                                                                                                                       ra
+                                                                                                                                                ul
+
+
+
+
+                                                                                                                                                                             m
+
+
+
+
+                                                                                                                                                                                                                 ic
+
+                                                                                                                                                                                                                            cr
+                                                                                                                                                                    se
+
+
+
+
+                                                                                                                                                                                     et
+                                                                                                                                                          Co
+
+
+
+
+                                                                                                                                                                                                      Ite
+                                                                                                                                                M
+
+
+
+
+                                                                                                                                                                            Ju
+
+
+
+
+                                                                                                                                                                                                             M
+
+                                                                                                                                                                                                                       In
+                                                                                                                                                                   Is
+
+
+
+
+                                                                                                                                                                                     G
+
+                                                                                                                                                                                             A
+
+
+
+
+                                                                                                                                                                                                                                 N
+Figure 9: Decomposition of audit-time CPU costs. “PHP” (in
+                                                                                                           Figure 10: Cost of various instructions in unmodified PHP and
+OROCHI ) is the time to perform SIMD-on-demand execu-
+                                                                                                           acc-PHP (§4.3). Execution times are normalized clusterwise to
+tion (§3.1,§4.3) and simulate-and-check (§3.3,§4.4). “DB query”
+                                                                                                           unmodified PHP, for which the absolute time is given (in µs).
+is the time spent on DB queries during re-execution (§4.5). “Pro-
+                                                                                                           See text for interpretation.
+cOpRep” is the time to execute the logic in Figures 5 and 6.
+“DB redo” is the time to reconstruct the versioned storage (§4.5).
+“Other” includes miscellaneous costs such as initializing inputs
+as multivalues, output comparison, etc.
+
+this technique, every DB operation would have to be re-issued
+during re-execution. (OROCHI’s verifier re-issues every regis-
+ter and key-value operation, but these are inexpensive.) Query
+deduplication is more effective when the workload is read-
+dominated, as in our MediaWiki experiment.
+   We now investigate the sources of PHP acceleration; we
+wish to know the costs and benefits of univalent and mul-
+tivalent instructions (§3.1, §4.3). We divide the 100+ PHP
+byte code instructions into 10 categories (arithmetic, con-
+tainer, control flow, etc.); choose category representatives;
+and run a microbenchmark that performs 107 invocations
+of the instruction and computes the average cost. We run
+each microbenchmark against unmodified PHP, acc-PHP with                                                   Figure 11: Characteristics of control flow groups in the Medi-
+univalent instructions, and acc-PHP with multivalent instruc-                                              aWiki workload. Each bubble is a control flow group; the center
+                                                                                                           of a bubble gives the group’s n (number of requests in the group)
+tions; we decompose the latter into marginal cost (the cost of
+                                                                                                           and α (proportion of univalent instructions); the size of a bub-
+an additional request in the group) and fixed cost (the cost if
+                                                                                                           ble is proportional to ℓ (number of instructions in the group).
+acc-PHP were maintaining a multivalue with zero requests).                                                 This workload has 527 total groups (bubbles), 237 groups with
+   Figure 10 depicts the results. The fixed cost of multiva-                                               n > 1, and 200 unique URLs. All groups have α > 0.95; only the
+lent instructions is high, and the marginal cost is sometimes                                              occupied portion of the x-axis is depicted.
+worse than the unmodified baseline. In general, multivalent
+execution is worse than simply executing the instruction n                                                    To confirm the hypothesis, we analyze all of the control
+times!2 So how does OROCHI accelerate? We hypothesize                                                      flow groups in our workloads. Each group c is assigned a triple
+that (i) many requests share control flow, and (ii) within a                                               (nc , α c , ℓc ), where nc is the number of requests in the group,
+shared control flow group, the vast majority of instructions are                                           α c is the proportion of univalent instructions in that group,
+executed univalently. If this holds, then the gain of SIMD-on-                                             and ℓc is the number of instructions in the group. (Note that if
+demand execution comes not from the “SIMD” part but rather                                                 nc = 1, then α c = 1.0.) Figure 11 depicts these triples for the
+from the “on demand” part: the opportunistic collapsing of                                                 MediaWiki workload. There are many groups with high nc ,
+multivalues enables a lot of deduplication.                                                                and most groups have very high α c (the same holds for the
+                                                                                                           other two workloads), confirming our hypothesis. Something
+2 One might wonder: would it be better to batch by control flow and identical
+                                                                                                           else to note is a slight negative correlation between nc and α c
+inputs? No; that approach still produces multivalent executions because of
+shared object reads and non-determinism, and the batch sizes are smaller.
+                                                                                                           within a workload, which is not ideal for OROCHI.
+5.3   The price of verifiability                                        We also modified phpBB (270 lines, of 300k total and 44k
+We now take stock of OROCHI’s total overhead by comparing            invoked), to address a SQL parsing difference between the
+OROCHI to the legacy configuration. OROCHI introduces a              actual database (§4.4) and the in-memory one (§4.5) and to
+modest cost to the server: 4.7%–8.6% CPU overhead (Fig-              create more audit-time acceleration opportunities (by reduc-
+ure 8) and temporary storage for trace and reports. But the          ing the frequency of updates to login times and page view
+main price of verifiability is the verifier’s resources:             counters). We modify HotCRP (67 lines, of 53k total and
+   CPU. Since the verifier’s audit-time CPU costs are between        37k invoked), mainly to rewrite select * from queries to
+1/5.6 and 1/10.9 those of the server’s costs (per §5.1, Figure 8),   request individual columns; the original would fetch the be-
+OROCHI requires that the verifier have 9.1%–18.0% of the             gin/end timestamp columns in the versioned DB (§4.5, §4.7).
+CPU capacity that the server does.
+   Storage. The verifier has to store the database between           5.5   Discussion and limitations of OROCHI
+audits, so the verifier effectively maintains a copy of the
+                                                                     Below we summarize OROCHI and discuss its limitations.
+database. During the audit, the verifier also stores the trace,
+                                                                        Guarantees. OROCHI is based on SSCO, which has prov-
+reports, and additional DB state (the versioning information).
+                                                                     able properties. However, OROCHI does not provide SSCO’s
+   Network. The verifier receives the trace and reports over the
+                                                                     idealized Soundness guarantee (§2), because of the leeway
+network. Note that in the Dana (§1) and Pat (§4.1) scenarios,
+                                                                     discussed earlier (§4.6). And observable differences in the
+the principal is already paying (on behalf of clients or the
+                                                                     verifier’s and server’s stacks (§4.1) would make OROCHI fall
+server, respectively) to send requests and responses over the
+                                                                     short of SSCO’s idealized Completeness guarantee.
+wide area network—which likely swamps the cost of sending
+                                                                        Performance and price. Relative to a pessimistic baseline,
+the same data to the verifier over a local network.
+                                                                     OROCHI ’s verifier accelerates by factors between 5.6–10.9×
+                                                                     in our experiments, and server overhead is below 10% (§5.1).
+5.4   Compatibility                                                  The CPU costs introduced by OROCHI are small, compared to
+We performed an informal survey of popular PHP applications          what one sometimes sees in secure systems research; one rea-
+to understand the effect of OROCHI’s two major compatibility         son is that OROCHI is not based on cryptography. And while
+restrictions: the non-verification of interactions with other        the biggest percentage cost for the verifier is storage (because
+applications (§4.1) and the non-nesting of object operations         the verifier has to duplicate it; §5.3), storage is generally
+inside DB transactions (§4.4).                                       inexpensive in dollar terms.
+    We sorted GitHub Trending by stars in decreasing order,             Compatibility and usability. On the one hand, OROCHI is
+filtered for PHP applications (filtering out projects that are       limited to a class of applications, as discussed (§4.1, §5.4). On
+libraries or plugins), and chose the top 10: Wordpress, Pi-          the other hand, the applications in our experiments—which
+wik, Cachet, October, Paperwork, Magento2, Pagekit, Lychee,          were largely chosen by following prior work (discussed early
+Opencart, and Drupal. We inspected the code (and its config-         in §5)—did not require much modification (§5.4). Best of
+uration and documentation), ran it, and logged object oper-          all, OROCHI is fully compatible with today’s infrastructure: it
+ations. For eight of them, the sole external service is email;       works with today’s end-clients and cloud offerings as-is.
+the other two (Magento2 and Opencart) additionally interact             Of course, OROCHI would benefit from extensions. All
+with a payment server. Also, all but Drupal and October are          of the applications we surveyed make requests of an email
+consistent with the DB requirement.                                  server (§5.4). We could verify those requests—but not the
+    This study does not imply that OROCHI runs with these            email server itself; that is future work—with a modest addi-
+applications out of the box. It generally takes some adjustment      tion to OROCHI, namely treating external requests as another
+to fit an application to OROCHI, as we outline below.                kind of response. This would require capturing the requests
+    MediaWiki does not obey the DB requirement. We modi-             themselves; that could be done, in Pat’s scenario (§4.1), by
+fied it so that requests read in the relevant APC keys (which        the trace collector or, in Dana’s scenario (§1), by redirecting
+we obtain through static inspection plus a dynamic list of           email to a trusted proxy on the verifier.
+needed keys, itself stored in the APC), execute against a local         Another extension is adding a file abstraction to our three
+cache of those keys, and flush them back to the APC. This            object types (§4.4). This isn’t crucial—many applications,
+gives up some consistency in the APC, but MediaWiki any-             including five of the 10 in our survey (§5.4), can be config-
+way assumes that the APC is providing loose consistency. We          ured to use alternatives such as a key-value store—but some
+made several other minor modifications to MediaWiki; for             deployers might prefer a file system back-end. Another ex-
+example, changing an absolute path (stored in the database)          tension is filtering large objects from the trace, before it is
+to a relative one. In all, we modified 346 lines of MediaWiki        delivered to the verifier. A possible solution is to leverage
+(of 410k total and 74k invoked in our experiments).                  browser support for Resource Integrity: the verifier would
+check that the correct digest was supplied to the browser,          6.2   Related techniques
+leaving the actual object check to the browser. Other future        Computation deduplication. Delta execution [84] validates
+work is HTTPS; one option is for the server to record non-          patches in C programs by running the patched and unpatched
+deterministic cryptographic input, and the verifier uses it to      code together; it attempts to execute only the deltas, using
+recover the plaintext stream.                                       copy-on-write fork and merging. In incremental computation
+   A more fundamental limitation is that if OROCHI’s verifier       (see data-triggered threads [83], iThreads [22], UNIC [82],
+does not have a trace from a period (for example, before            and citations therein), a program runs once and, when the
+OROCHI was deployed on a given server), then OROCHI can             input changes, only the dependent parts rerun. In contrast,
+verify only by getting the pre-OROCHI collection of objects         SIMD-on-demand (§3.1) works at a higher level of abstrac-
+from the server (requiring a large download) and treating           tion; this exposes deduplication opportunities [52] and allows
+those objects as the true initial state (requiring trust).          the verifier and executor to run separate implementations of
+                                                                    the same logical program (§7). Also, SIMD-on-demand re-
+6     RELATED WORK                                                  executes multiple requests simultaneously, which composes
+6.1   Efficient execution integrity                                 easily with query deduplication (§4.5).
+                                                                       Consistency testing. Anderson et al. [13] give an algo-
+Efficient execution integrity—giving some principal confi-          rithm that checks whether a trace of operations on a key-value
+dence that an executor’s outputs are consistent with an ex-         store obeys register semantics [54]; the algorithm builds a
+pected program, without requiring the principal to re-execute       graph with time and precedence edges, and checks whether it
+the program—is a broad topic. The Efficient Server Audit
+                                                                    is acyclic. (See EVE [50] for a related algorithm, and Gibbons-
+Problem (§2) combines for the first time: (1) no assumptions
+                                                                    Korach [39] and others [41, 90] for consistency testing in gen-
+about the executor (though our verifier gets a trace of request-    eral; see also [9, 10, 76] for related algorithms that analyze
+s/responses), (2) a concurrent executor, and (3) a requirement      programs for memory consistency.) The time edges and cycle
+of scaling to real applications, including legacy ones.             detection in SSCO (Fig. 5) are reminiscent of Anderson et al.;
+   A classic solution is Byzantine replication [25]; the princi-    however, SSCO captures time edges more efficiently, as noted
+pal needs no verification algorithm but assumes that a super-
+                                                                    in §3.5. More significantly, SSCO solves a different problem:
+majority of nodes operates fault-free. Another classic tech-        it validates whether a request trace meets complex applica-
+nique is attestation: proving to the principal that the executor    tion semantics (requests are permitted to be intermingled and
+runs the expected software. This includes TPM-based ap-             invoke multiple operations), and reports are untrusted.
+proaches [27, 44, 58, 59, 66, 71, 74, 79] and systems [14, 17,         Time travel databases. As noted (§4.7), OROCHI’s ver-
+48, 73, 77] built on SGX hardware [49]. But attesting to a          sioned DB borrows from Warp [26] (see also [40, 61, 80]).
+(possibly vulnerable) stack does not guarantee the execution
+                                                                    However, OROCHI constructs that DB only during audit, which
+integrity of the program atop that stack. Using SGX, we can         enables the techniques in §4.5. Also, OROCHI handles multi-
+place the program in its own enclave, but it is difficult to rig-   statement transactions, which Warp does not implement.
+orously establish that the checks performed by the in-enclave
+code on the out-enclave code [14, 17, 77] comprehensively
+detect deviations from expected behavior (though see [78]).         6.3   Deterministic record-replay
+   EVE [50] spot-checks for storage consistency violations          Record-replay is a mature field [33, 34]. SSCO (with OROCHI
+but assumes correct application execution. Like OROCHI (§4),        as an instantiation) is the first record-replay system to achieve
+Verena [51] targets web applications; it doesn’t require a trace    the following combination: (a) the recorder is untrusted (and
+but does assume a trusted hash server. Verena’s techniques are      the replayer has an input/output trace), (b) replay is acceler-
+built on authenticated data structures with a restricted API; it    ated versus re-executing, and (c) there are concurrent accesses
+does not support general-purpose or legacy web applications.        to shared objects. We elaborate below.
+   Execution integrity has long been studied by theorists [15,         Untrusted recorder. In AVM [43], an untrusted hypervisor
+37, 38, 42, 60], and these ideas have been refined and imple-       records alleged network I/O and non-deterministic events.
+mented [19, 32, 65, 75] (see [89] for a survey and [12, 18, 88,     A replayer checks this log against the ground truth network
+96] for recent developments). This theory makes no assump-          messages and then re-executes, using VM replay [24, 35].
+tions about the executor or the workload. But it doesn’t handle     In Ripley [87], a web server re-executes client-side code to
+a concurrent executor. Also, because these works generally          determine whether the output matches what the client claimed.
+represent programs as static circuits in which state operations     In both cases, the replayer does not trust the recorder, but in
+exhaust a very limited “gate budget”, and because the execu-        neither case is re-execution accelerated.
+tor’s overhead is generally at least six orders of magnitude,          Accelerated replay. Poirot [52] accelerates the re-execution
+they are for now unsuited to legacy web applications.               of web applications. OROCHI imitates Poirot: we borrow the
+observation that web applications have repeated control flow               environment while the verifier can re-execute the logic how-
+and the notion of grouping re-execution accordingly, and                   ever it wants, as long as it gets appropriate reports.
+we follow some of Poirot’s implementation and evaluation                      Future work is to instantiate SSCO for other web languages,
+choices (§4.7, §5). But there is a crucial distinction. Poirot             create variations of SSCO for other concurrency models, and
+analyzes patches in application code; its techniques for ac-               extend SSCO to multiple interacting servers. In addition, we
+celeration (construct templates for each claimed control flow              think that the techniques of SSCO have wider applicability. For
+group) and shared objects (replay “reads”) fundamentally                   example, a direction to explore is applying query deduplica-
+trust the language runtime and all layers below [52, §2.4].                tion (§4.5) and simultaneous replay (§3.1) to general-purpose
+   Shared objects and concurrency. We focus on solutions                   or lower-level record-replay systems.
+that enable an offline replayer to deterministically re-execute               Another interesting problem is to produce a multiprocessor
+concurrent operations. First, the replayer can be given a thread           record-replay system that works in a setting in which reports
+schedule explicitly [56, 86]. Second, the replayer can be given            are untrusted. This problem provides some intuition for our
+information to reconstruct the thread schedule, for example                original challenge (§2), so we conclude the paper by pointing
+operation precedence using CREW protocols [29, 36, 53, 55,                 out why this problem is difficult.
+94]. Third, the replayer can be given information to approx-                  Suppose that the offline replayer expects an explicit thread
+imately reconstruct the thread schedule, for example, syn-                 schedule from the recorder. Then the recorder could supply
+chronization precedence or sketches [11, 64, 70].3 Closest                 a schedule that is inconsistent with any valid execution (for
+to simulate-and-check (§3.3) is LEAP [47] (see also [92]),                 example, a schedule that ignores user-level synchronization).
+which is in the second category: for each shared Java variable,            By correlating bogus outputs and a bogus schedule (similar
+LEAP logs the sequence of thread accesses. But SSCO’s logs                 to §3.4), the recorder could cause the replayer to reproduce
+also contain operands. Simulate-and-check relates to record-               illegal executions, violating Soundness (§2). If instead the
+replay speculation [56]: it is reminiscent of the way that the             replayer gets sparse constraints from the recorder [11, 64]
+epoch-parallel processors in DoublePlay [86] check the start-              and expects to synthesize a schedule itself, this would violate
+ing conditions of optimistically executing future splices.                 Completeness (§2): an adversarial recorder can make the re-
+                                                                           player search in vain for a schedule, which means the replayer
+7    FUTURE WORK AND CONCLUSION                                            needs to bound its searching, which means that some valid
+To recap, we defined a general problem of execution integrity              executions will be rejected for lack of search time.
+for concurrent servers (§2); exhibited an abstract solution,                  The fundamental difficulty here is that concurrency ne-
+SSCO , based on new kinds of replay (§3); and described a                  cessitates reports (for Completeness), but if the reports are
+system, OROCHI, that instantiates SSCO for web applications                untrusted, the replayer could be misled (compromising Sound-
+and runs on today’s cloud infrastructure (§4–§5).                          ness). Efficiency adds a further complication. This problem—
+   OROCHI applies in scenarios beyond those of Dana (§1)                   designing the reports and a procedure that validates them even
+and Pat (§4.1). As an example, consider Adrian the AWS                     as it exploits them—was more challenging than we expected.
+User who deploys a public-facing web application. To use
+OROCHI , Adrian needs a trace. Perhaps Adrian trusts AWS                   OROCHI ’s source code will be released at:
+to gather it (in which case Adrian’s threat model is a remote              https://github.com/naizhengtan/orochi
+attacker, not a cloud insider). Or perhaps AWS lets Adrian use             Acknowledgments
+an SGX enclave, within which Adrian runs the trace collector
+together with an HTTPS proxy that holds Adrian’s TLS keys;                 This paper was substantially improved by detailed comments
+this enforces trace collection and does not trust AWS but does             from Marcos K. Aguilera, Sebastian Angel, Trinabh Gupta,
+trust the attested trace collection software.                              Brad Karp, Jinyang Li, Ioanna Tzialla, Riad Wahby, and the
+   Another use case is patch-based auditing, proposed in                   OSDI16 and SOSP17 anonymous reviewers. We thank Chao
+Poirot [52] (see also [57, 84]); here, one replays prior re-               Xie and Shuai Mu for advice, and our shepherd Jason Flinn
+quests against patched code to see if the responses are now                for insightful discussions and close readings that improved
+different. OROCHI can audit the effect of a patch at any layer,            the paper. Three people were particularly influential: Curtis
+not just in PHP code (as in Poirot).                                       Li assisted with the development and evaluation of a previ-
+   An interesting aspect of SSCO is that the verifier and the              ous version of OROCHI; Alexis Gallagher provided critical
+server need not run the same program—only the same logic.                  perspective and suggestions on the paper’s structure and ex-
+For example, the executor can be a complex, replicated cloud               position; and Brad Karp supplied essential wisdom and sanity.
+                                                                           This work was supported by NSF grants CNS-1423249 and
+3 DoublePlay [86] and Respec [56] use these techniques but do so online,   CNS-1514422, ONR grant N00014-16-1-2154, and AFOSR
+while searching for a thread schedule to give to an offline replayer.      grant FA9550-15-1-0302.
+REFERENCES                                                                       [22] P. Bhatotia, P. Fonseca, U. A. Acar, B. B. Brandenburg, and
+ [1] Amazon Web Services (AWS). https://aws.amazon.com/.                              R. Rodrigues. iThreads: A threading library for parallel incremental
+ [2] CentOS forum. https://www.centos.org/forums/.                                    computation. In ACM International Conference on Architectural
+ [3] LAMP (software bundle).                                                          Support for Programming Languages and Operating Systems
+     https://en.wikipedia.org/wiki/LAMP_(software_bundle).                            (ASPLOS), Mar. 2015.
+ [4] PHP manual. http://php.net/manual/en/index.php.                             [23] B. Braun, A. J. Feldman, Z. Ren, S. Setty, A. J. Blumberg, and
+ [5] SIMD. https://en.wikipedia.org/wiki/SIMD.                                        M. Walfish. Verifying computations with state. In ACM Symposium on
+ [6] Transaction isolation levels. https://dev.mysql.com/doc/refman/5.6/en/           Operating Systems Principles (SOSP), Nov. 2013.
+     innodb-transaction-isolation-levels.html.                                   [24] T. C. Bressoud and F. B. Schneider. Hypervisor-based fault-tolerance.
+ [7] A virtual machine designed for executing programs written in Hack                ACM Transactions on Computer Systems (TOCS), 14(1):80–107, 1996.
+     and PHP. https://github.com/facebook/hhvm.                                  [25] M. Castro and B. Liskov. Practical Byzantine fault tolerance and
+ [8] The process of ACM Sigcomm 2009. http://www.sigcomm.org/                         proactive recovery. ACM Transactions on Computer Systems (TOCS),
+     conference-planning/the-process-of-acm-sigcomm-2009.                             20(4):398–461, 2002.
+ [9] J. Alglave, D. Kroening, V. Nimal, and D. Poetzl. Don’t sit on the          [26] R. Chandra, T. Kim, M. Shah, N. Narula, and N. Zeldovich. Intrusion
+     fence: A static analysis approach to automatic fence insertion. In               recovery for database-backed web applications. In ACM Symposium on
+     Computer Aided Verification (CAV), July 2014.                                    Operating Systems Principles (SOSP), Oct. 2011.
+[10] J. Alglave and L. Maranget. Stability in weak memory models. In             [27] C. Chen, P. Maniatis, A. Perrig, A. Vasudevan, and V. Sekar. Towards
+     Computer Aided Verification (CAV), July 2011.                                    verifiable resource accounting for outsourced computation. In ACM
+[11] G. Altekar and I. Stoica. ODR: output-deterministic replay for                   Virtual Execution Environments (VEE), Mar. 2013.
+     multicore debugging. In ACM Symposium on Operating Systems                  [28] X. Chen, T. Garfinkel, E. C. Lewis, P. Subrahmanyam, C. A.
+     Principles (SOSP), Oct. 2009.                                                    Waldspurger, D. Boneh, J. Dwoskin, and D. R. K. Ports. Overshadow:
+[12] S. Ames, C. Hazay, Y. Ishai, and M. Venkitasubramaniam. Ligero:                  a virtualization-based approach to retrofitting protection in commodity
+     Lightweight sublinear arguments without a trusted setup. In ACM                  operating systems. ACM International Conference on Architectural
+     Conference on Computer and Communications Security (CCS), Oct.                   Support for Programming Languages and Operating Systems
+     2017.                                                                            (ASPLOS), Mar. 2008.
+[13] E. Anderson, X. Li, M. A. Shah, J. Tucek, and J. J. Wylie. What             [29] Y. Chen and H. Chen. Scalable deterministic replay in a parallel
+     consistency does your key-value store actually provide? In USENIX                full-system emulator. In ACM Symposium on Principles and Practice
+     Workshop on Hot Topics in System Dependability (HotDep), Oct. 2010.              of Parallel Programming (PPoPP), Feb. 2013.
+     Full version: Technical Report HPL-2010-98, Hewlett-Packard                 [30] J. Cheng. NebuAd, ISPs sued over DPI snooping, ad-targeting program.
+     Laboratories, 2010.                                                              Ars Technica, Nov. 2008. https://arstechnica.com/tech-policy/2008/11/
+[14] S. Arnautov, B. Trach, F. Gregor, T. Knauth, A. Martin, C. Priebe,               nebuad-isps-sued-over-dpi-snooping-ad-targeting-program/.
+     J. Lind, D. Muthukumaran, D. O’Keeffe, M. L. Stillwell, D. Goltzsche,       [31] T. H. Cormen, C. E. Leiserson, R. L. Rivest, and C. Stein. Introduction
+     D. Eyers, R. Kapitza, P. Pietzuch, and C. Fetzer. SCONE: Secure                  to Algorithms, third edition. The MIT Press, Cambridge, MA, 2009.
+     Linux containers with Intel SGX. In Symposium on Operating Systems          [32] G. Cormode, M. Mitzenmacher, and J. Thaler. Practical verified
+     Design and Implementation (OSDI), Nov. 2016.                                     computation with streaming interactive proofs. In Innovations in
+[15] L. Babai, L. Fortnow, L. A. Levin, and M. Szegedy. Checking                      Theoretical Computer Science (ITCS), Jan. 2012.
+     computations in polylogarithmic time. In ACM Symposium on the               [33] F. Cornelis, A. Georges, M. Christiaens, M. Ronsse, T. Ghesquiere,
+     Theory of Computing (STOC), May 1991.                                            and K. D. Bosschere. A taxonomy of execution replay systems. In
+[16] P. Bailis. Linearizability versus serializability.                               International Conference on Advances in Infrastructure for Electronic
+     http://www.bailis.org/blog/linearizability-versus-serializability/, Sept.        Business, Education, Science, Medicine, and Mobile Technologies on
+     2014.                                                                            the Internet, 2003.
+[17] A. Baumann, M. Peinado, and G. Hunt. Shielding applications from an         [34] C. Dionne, M. Feeley, and J. Desbiens. A taxonomy of distributed
+     untrusted cloud with Haven. In Symposium on Operating Systems                    debuggers based on execution replay. In Proceedings of the
+     Design and Implementation (OSDI), Oct. 2014.                                     International Conference on Parallel and Distributed Processing
+[18] E. Ben-Sasson, I. Ben-Tov, A. Chiesa, A. Gabizon, D. Genkin,                     Techniques (PDPTA), Aug. 1996.
+     M. Hamilis, E. Pergament, M. Riabzev, M. Silberstein, E. Tromer, and        [35] G. W. Dunlap, S. T. King, S. Cinar, M. A. Basrai, and P. M. Chen.
+     M. Virza. Computational integrity with a public random string from               ReVirt: Enabling intrusion analysis through virtual-machine logging
+     quasi-linear PCPs. In Annual International Conference on the Theory              and replay. In Symposium on Operating Systems Design and
+     and Applications of Cryptographic Techniques (EUROCRYPT), Apr.                   Implementation (OSDI), Dec. 2002.
+     2017.                                                                       [36] G. W. Dunlap, D. Lucchetti, P. M. Chen, and M. Fetterman. Execution
+[19] E. Ben-Sasson, A. Chiesa, D. Genkin, E. Tromer, and M. Virza.                    replay for multiprocessor virtual machines. In ACM Virtual Execution
+     SNARKs for C: Verifying program executions succinctly and in zero                Environments (VEE), Mar. 2008.
+     knowledge. In IACR International Cryptology Conference (CRYPTO),            [37] R. Gennaro, C. Gentry, and B. Parno. Non-interactive verifiable
+     Aug. 2013.                                                                       computing: Outsourcing computation to untrusted workers. In IACR
+[20] E. Ben-Sasson, A. Chiesa, E. Tromer, and M. Virza. Succinct                      International Cryptology Conference (CRYPTO), Aug. 2010.
+     non-interactive zero knowledge for a von Neumann architecture. In           [38] R. Gennaro, C. Gentry, B. Parno, and M. Raykova. Quadratic span
+     USENIX Security, Aug. 2014.                                                      programs and succinct NIZKs without PCPs. In Annual International
+[21] P. A. Bernstein, D. W. Shipman, and W. S. Wong. Formal aspects of                Conference on the Theory and Applications of Cryptographic
+     serializability in database concurrency control. IEEE Transactions on            Techniques (EUROCRYPT), May 2013.
+     Software Engineering, SE-5(3), May 1979.                                    [39] P. B. Gibbons and E. Korach. Testing shared memories. SIAM Journal
+                                                                                      on Computing, 26(4):1208–1244, 1997.
+[40] A. Goel, K. Farhadi, K. Po, and W. Feng. Reconstructing system state      [60] S. Micali. Computationally sound proofs. SIAM Journal on
+     for intrusion analysis. ACM SIGOPS Operating Systems Review,                   Computing, 30(4):1253–1298, 2000.
+     42(3):21–28, Apr. 2008.                                                   [61] Oracle flashback technology. http://www.oracle.com/technetwork/
+[41] W. Golab, X. Li, and M. Shah. Analyzing consistency properties for             database/features/availability/flashback-overview-082751.html.
+     fun and profit. In PODC, June 2011.                                       [62] C. H. Papadimitriou. The serializability of concurrent database updates.
+[42] S. Goldwasser, Y. T. Kalai, and G. N. Rothblum. Delegating                     Journal of the ACM, 26(4), Oct. 1979.
+     computation: Interactive proofs for muggles. Journal of the ACM,          [63] D. Papagiannaki and L. Rizzio. The ACM SIGCOMM 2009 Technical
+     62(4):27:1–27:64, Aug. 2015. Prelim version STOC 2008.                         Program Committee Process. ACM CCR, 39(3):43–48, July 2009.
+[43] A. Haeberlen, P. Aditya, R. Rodrigues, and P. Druschel. Accountable       [64] S. Park, Y. Zhou, W. Xiong, Z. Yin, R. Kaushik, K. H. Lee, and S. Lu.
+     virtual machines. In Symposium on Operating Systems Design and                 PRES: probabilistic replay with execution sketching on
+     Implementation (OSDI), Oct. 2010.                                              multiprocessors. In ACM Symposium on Operating Systems Principles
+[44] C. Hawblitzel, J. Howell, J. R. Lorch, A. Narayan, B. Parno, D. Zhang,         (SOSP), Oct. 2009.
+     and B. Zill. Ironclad apps: End-to-end security via automated             [65] B. Parno, C. Gentry, J. Howell, and M. Raykova. Pinocchio: Nearly
+     full-system verification. In Symposium on Operating Systems Design             practical verifiable computation. In IEEE Symposium on Security and
+     and Implementation (OSDI), Oct. 2014.                                          Privacy, May 2013.
+[45] M. P. Herlihy and J. M. Wing. Linearizability: A correctness condition    [66] B. Parno, J. M. McCune, and A. Perrig. Bootstrapping Trust in
+     for concurrent objects. ACM Transactions on Programming Languages              Modern Computers. Springer, 2011.
+     and Systems (TOPLAS), 12(3), July 1990.                                   [67] B. Parno, J. M. McCune, D. Wendlandt, D. G. Andersen, and A. Perrig.
+[46] O. S. Hofmann, S. Kim, A. M. Dunn, M. Z. Lee, and E. Witchel.                  CLAMP: Practical prevention of large-scale data leaks. In IEEE
+     InkTag: secure applications on an untrusted operating system. ACM              Symposium on Security and Privacy, May 2009.
+     International Conference on Architectural Support for Programming         [68] R. A. Popa, C. Redfield, N. Zeldovich, and H. Balakrishnan. CryptDB:
+     Languages and Operating Systems (ASPLOS), pages 265–278, Mar.                  protecting confidentiality with encrypted query processing. In ACM
+     2013.                                                                          Symposium on Operating Systems Principles (SOSP), Oct. 2011.
+[47] J. Huang, P. Liu, and C. Zhang. LEAP: The lightweight deterministic       [69] C. Reis, S. D. Gribble, T. Kohno, and N. C. Weaver. Detecting in-flight
+     multi-processor replay of concurrent Java programs. In ACM                     page changes with Web Tripwires. In Symposium on Networked
+     Symposium on the Foundations of Software Engineering (FSE), Feb.               Systems Design and Implementation (NSDI), Apr. 2008.
+     2010.                                                                     [70] M. Ronsse and K. D. Bosschere. RecPlay: a fully integrated practical
+[48] T. Hunt, Z. Zhu, Y. Xu, S. Peter, and E. Witchel. Ryoan: A distributed         record/replay system. ACM Transactions on Computer Systems
+     sandbox for untrusted computation on secret data. In Symposium on              (TOCS), 17(2):133–152, 1999.
+     Operating Systems Design and Implementation (OSDI), Nov. 2016.            [71] R. Sailer, X. Zhang, T. Jaeger, and L. van Doorn. Design and
+[49] Intel. Intel software guard extensions programming reference. https://         implementation of a TCG-based integrity measurement architecture. In
+     software.intel.com/sites/default/files/managed/48/88/329298-002.pdf.           USENIX Security, Aug. 2004.
+[50] S. Jana and V. Shmatikov. EVE: Verifying correct execution of             [72] D. Schultz and B. Liskov. Ifdb: decentralized information flow control
+     cloud-hosted web applications. In USENIX HotCloud Workshop, June               for databases. In European Conference on Computer Systems
+     2011.                                                                          (EuroSys), Apr. 2013.
+[51] N. Karapanos, A. Filios, R. A. Popa, and S. Capkun. Verena:               [73] F. Schuster, M. Costa, C. Fournet, C. Gkantsidis, M. Peinado,
+     End-to-end integrity protection for web applications. In IEEE                  G. Mainar-Ruiz, and M. Russinovich. VC3: Trustworthy data analytics
+     Symposium on Security and Privacy, May 2016.                                   in the cloud using SGX. In IEEE Symposium on Security and Privacy,
+[52] T. Kim, R. Chandra, and N. Zeldovich. Efficient patch-based auditing           May 2015.
+     for web applications. In Symposium on Operating Systems Design and        [74] A. Seshadri, M. Luk, E. Shi, A. Perrig, L. van Doorn, and P. Khosla.
+     Implementation (OSDI), Oct. 2012.                                              Pioneer: Verifying integrity and guaranteeing execution of code on
+[53] O. Laadan, N. Viennot, and J. Nieh. Transparent, lightweight                   legacy platforms. In ACM Symposium on Operating Systems
+     application execution replay on commodity multiprocessor operating             Principles (SOSP), Oct. 2005.
+     systems. In SIGMETRICS, June 2010.                                        [75] S. Setty, R. McPherson, A. J. Blumberg, and M. Walfish. Making
+[54] L. Lamport. On interprocess communication, parts I and II.                     argument systems for outsourced computation practical (sometimes).
+     Distributed Computing, 1(2):77–101, 1986.                                      In Network and Distributed System Security Symposium (NDSS), Feb.
+[55] T. J. LeBlanc and J. M. Mellor-Crummey. Debugging parallel                     2012.
+     programs with Instant Replay. IEEE Transactions on Computers,             [76] D. Shasha and M. Snir. Efficient and correct execution of parallel
+     C-36(4):471–482, 1987.                                                         programs that share memory. ACM Transactions on Programming
+[56] D. Lee, B. Wester, K. Veeraraghavan, S. Narayanasamy, P. M. Chen,              Languages and Systems (TOPLAS), 10(2):282–312, Apr. 1988.
+     and J. Flinn. Respec: Efficient online multiprocessor replay via          [77] S. Shinde, D. Le Tien, S. Tople, and P. Saxena. Panoply: Low-tcb linux
+     speculation and external determinism. In ACM International                     applications with sgx enclaves. In Network and Distributed System
+     Conference on Architectural Support for Programming Languages and              Security Symposium (NDSS), Feb. 2017.
+     Operating Systems (ASPLOS), Mar. 2010.                                    [78] R. Sinha, M. Costa, A. Lal, N. P. Lopes, S. Rajamani, S. A. Seshia, and
+[57] M. Maurer and D. Brumley. Tachyon: tandem execution for efficient              K. Vaswani. A design and verification methodology for secure isolated
+     live patch testing. USENIX Security, pages 617–630, Aug. 2012.                 regions. June 2016.
+[58] J. M. McCune, Y. Li, N. Qu, Z. Zhou, A. Datta, V. Gligor, and             [79] E. G. Sirer, W. de Bruijn, P. Reynolds, A. Shieh, K. Walsh,
+     A. Perrig. TrustVisor: Efficient TCB reduction and attestation. In IEEE        D. Williams, and F. B. Schneider. Logical attestation: An authorization
+     Symposium on Security and Privacy, May 2010.                                   architecture for trustworthy computing. In ACM Symposium on
+[59] J. M. McCune, B. J. Parno, A. Perrig, M. K. Reiter, and H. Isozaki.            Operating Systems Principles (SOSP), Oct. 2011.
+     Flicker: An execution infrastructure for TCB minimization. In             [80] R. T. Snodgrass and I. Ahn. Temporal databases. IEEE Computer,
+     European Conference on Computer Systems (EuroSys), Apr. 2008.                  19(9):35–42, Sept. 1986.
+[81] C. Tan, L. Yu, J. B. Leners, and M. Walfish. The efficient server audit
+     problem, deduplicated re-execution, and the web (extended version).
+     arXiv:1709.08501, http://arxiv.org/abs/1709.08501, Sept. 2017.
+[82] Y. Tang and J. Yang. Secure deduplication of general computations. In
+     USENIX Annual Technical Conference, July 2015.
+[83] H.-W. Tseng and D. M. Tullsen. Data-triggered threads: Eliminating
+     redundant computation. In IEEE International Symposium on High
+     Performance Computer Architecture (HPCA), Feb. 2011.
+[84] J. Tucek, W. Xiong, and Y. Zhou. Efficient online validation with delta
+     execution. In ACM International Conference on Architectural Support
+     for Programming Languages and Operating Systems (ASPLOS), Mar.
+     2009.
+[85] G. Urdaneta, G. Pierre, and M. Van Steen. Wikipedia workload
+     analysis for decentralized hosting. Computer Networks,
+     53(11):1830–1845, 2009.
+[86] K. Veeraraghavan, D. Lee, B. Wester, J. Ouyang, P. M. Chen, J. Flinn,
+     and S. Narayanasamy. DoublePlay: Parallelizing sequential logging
+     and replay. ACM Transactions on Computer Systems (TOCS), 30(1):3,
+     2012.
+[87] K. Vikram, A. Prateek, and B. Livshits. Ripley: Automatically securing
+     web 2.0 applications through replicated execution. In ACM Conference
+     on Computer and Communications Security (CCS), Nov. 2009.
+[88] R. S. Wahby, Y. Ji, A. J. Blumberg, abhi shelat, J. Thaler, M. Walfish,
+     and T. Wies. Full accounting for verifiable outsourcing. In ACM
+     Conference on Computer and Communications Security (CCS), Oct.
+     2017.
+[89] M. Walfish and A. J. Blumberg. Verifying computations without
+     reexecuting them: from theoretical possibility to near practicality.
+     Communications of the ACM (CACM), 58(2):74–84, Feb. 2015.
+[90] J. M. Wing and C. Gong. Testing and verifying concurrent objects.
+     Journal of Parallel and Distributed Computing, 17:164–182, 1993.
+[91] R. Wray. BT drops plan to use Phorm targeted ad service after outcry
+     over privacy. The Guardian, July 2009. https://www.theguardian.com/
+     business/2009/jul/06/btgroup-privacy-and-the-net.
+[92] Z. Yang, M. Yang, L. Xu, H. Chen, and B. Zang. ORDER: Object
+     centRic DEterministic Replay for Java. In USENIX Annual Technical
+     Conference, June 2011.
+[93] A. Yip, X. Wang, N. Zeldovich, and M. F. Kaashoek. Improving
+     application security with data flow assertions. In ACM Symposium on
+     Operating Systems Principles (SOSP), Oct. 2009.
+[94] C. Zamfir, G. Altekar, and I. Stoica. Automating the debugging of
+     datacenter applications with ADDA. In Dependable Systems and
+     Networks (DSN), June 2013.
+[95] F. Zhang, J. Chen, H. Chen, and B. Zang. Cloudvisor: retrofitting
+     protection of virtual machines in multi-tenant cloud with nested
+     virtualization. In ACM Symposium on Operating Systems Principles
+     (SOSP), Oct. 2011.
+[96] Y. Zhang, D. Genkin, J. Katz, D. Papadopoulos, and C. Papamanthou.
+     vSQL: Verifying arbitrary SQL queries over dynamic outsourced
+     databases. In IEEE Symposium on Security and Privacy, May 2017.
+

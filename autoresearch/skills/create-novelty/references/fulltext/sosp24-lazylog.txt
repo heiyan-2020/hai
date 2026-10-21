@@ -1,0 +1,1239 @@
+        LazyLog: A New Shared Log Abstraction for Low-Latency Applications
+                    Xuhao Luo                                           Shreesha G. Bhat2                                         Jiyu Hu2
+    University of Illinois Urbana-Champaign University of Illinois Urbana-Champaign University of Illinois Urbana-Champaign
+
+                                      Ramnatthan Alagappan                                         Aishwarya Ganesan
+                               University of Illinois Urbana-Champaign University of Illinois Urbana-Champaign
+                                        and VMware Research                     and VMware Research
+Abstract. Shared logs offer linearizable total order across                                   (§2). The key problem is that they eagerly order records in the
+storage shards. However, they enforce this order eagerly                                      critical path before acknowledging appends. That is, by the
+upon ingestion, leading to high latencies. We observe that in                                 time an append completes, the record is eagerly bound to a po-
+many modern shared-log applications, while linearizable or-                                   sition in the shared log. Many shared logs [1, 12, 36, 41, 51, 57]
+dering is necessary, it is not required eagerly when ingesting                                store records on multiple storage shards and provide a lin-
+data but only later when data is consumed. Further, readers                                   earizable total order across the shards. Thus, to bind records
+are naturally decoupled in time from writers in these appli-                                  to positions, global coordination across the shards is neces-
+cations. Based on this insight, we propose LazyLog, a novel                                   sary, which leads to high latencies. For example, in Scalog,
+shared log abstraction. LazyLog lazily binds records (across                                  upon appends, records are first stored and locally ordered
+shards) to linearizable global positions and enforces this be-                                within the shards. Then, after batching many records, the
+fore a log position can be read. Such lazy ordering enables                                   shards coordinate with a global ordering layer to bind records
+low ingestion latencies. Given the time decoupling, LazyLog                                   to global positions, after which appends are acknowledged.
+can establish the order well before reads arrive, minimizing                                  Thus, ingestion incurs many roundtrips and batching de-
+overhead upon reads. We build two LazyLog systems that                                        lays. Scalog reports append latencies of 1-2 ms, even in low-
+provide linearizable total order across shards. Our experi-                                   throughput regimes [41]. Corfu’s [36] append path differs
+ments show that LazyLog systems deliver significantly lower                                   from that of Scalog, but fundamentally, it also eagerly orders
+latencies than conventional, eager-ordering shared logs.                                      records upon ingestion, incurring high latency.
+                                                                                                 Low-latency ingestion, however, is critical for many real-
+1     Introduction                                                                            world shared-log applications. For instance, databases built
+Shared logs [35, 36, 38, 41] have emerged as a crucial building                               atop shared logs require quick logging for updates [5, 53];
+block for datacenter applications. At its core, a shared log is a                             similarly, high-availability journals [58] built atop shared
+fault-tolerant, ordered sequence of records that many clients                                 logs need low-latency ingestion. More broadly, in a recent
+can simultaneously operate on. The interface to the shared                                    survey by RedPanda [18, 19], a third of 300 practitioners
+log is simple. Applications ingest records via an append API,                                 rated ingestion latency as the most critical latency metric in
+upon which they are linearizably [55] ordered and durably                                     their shared log deployments. Today’s shared logs, due to
+stored. Applications retrieve data via a read API, which takes                                their high ingestion latencies, cannot satisfy the demands
+a position and returns the record at that position.                                           of these applications. Given that such high latency is rooted
+   This simple interface and the powerful abstraction make                                    in eager ordering, this paper asks: Can a shared log avoid
+shared logs useful in a variety of modern applications. For                                   eager ordering, yet also provide the linearizable ordering
+instance, shared logs are used to record and analyze web                                      guarantee that applications require from shared logs?
+accesses [8, 41], build databases [53], log events for debug-                                 Insight. At first sight, it may seem like one cannot avoid es-
+ging [8, 90], communicate between microservices [10], jour-                                   tablishing the order eagerly, before acknowledging appends.
+nal state for fault-tolerance [58], and stream data [15, 52, 89].                             However, we observe that in many shared-log applications,
+   Unfortunately, today’s shared logs incur high latencies                                    while linearizable order is necessary, it is not required right
+     2 equal contribution
+                                                                                              away upon ingestion but only later during reads; further,
+                                                                                              readers and writers in these applications are naturally decou-
+                                                                                              pled in time. This allows a shared log to establish the order
+                                                                                              in the background after acknowledging appends but before
+                                                                                              reads arrive. Consider distributed databases built atop shared
+                                                                                              logs that separate readers from writers [5, 53, 74]. While
+                                                                                              readers must process database updates in linearizable or-
+This work is licensed under a Creative Commons Attribution International 4.0 License.         der [53], updates need not be eagerly ordered when writers
+SOSP ’24, November 4ś6, 2024, Austin, TX, USA
+                                                                                              log them. Further, the readers in such databases consume
+© 2024 Copyright held by the owner/author(s).
+ACM ISBN 979-8-4007-1251-7/24/11.                                                             updates at their own pace [53], much later than when updates
+https://doi.org/10.1145/3694715.3695983                                                       are logged. We identify several real-world applications (§3.1),
+
+
+
+                                                                                        296
+including activity logging [59], event-sourcing [75], message        coordination in 1RTT. The high-level intuition is that if an
+queues [14], journaling [58], and log-aggregation [90], where        append 𝑏 follows another append 𝑎 in real time, then 𝑏’s
+linearizable order is required but not eagerly upon ingestion,       information will naturally appear after 𝑎’s in all sequencing
+and reads are naturally decoupled in time from writes.               replicas, while only information of concurrent appends will
+LazyLog Abstraction. Based on the above insight, we pro-             appear in different orders. Thus, despite sequencing-replica
+pose LazyLog, a novel shared log abstraction. LazyLog makes          failures, records can be bound to their linearizable positions.
+a small yet powerful change to the shared log interface: in             Erwin-■ (§4) aims to work with unmodified shards (e.g.,
+LazyLog, appending a record does not eagerly bind it to a log        Kafka shards or standard primary-backup shards). If clients
+position; it only provides durability and a guarantee that the       write to such unmodified shards, they will incur the over-
+record will be eventually bound to its correct position that         head to order within the shard, preventing 1RTT appends.
+respects linearizability [55]. While LazyLog binds records           Records must also be globally ordered, further increasing
+to positions lazily, it enforces this binding before the log         latency. Erwin-■ hides both these overheads by writing the
+positions can be read. Lazy binding hides the overhead to es-        records in the critical path only to the sequencing layer,
+tablish global order across shards (and the local order within       which then orders and pushes the records to shards in the
+shards), reducing ingestion latency. However, LazyLog pre-           background. This design allows one to bolt-on Erwin-■’s
+serves the ordering guarantees of the conventional shared            sequencing layer atop existing per-shard-order systems like
+log abstraction and enforces the correct order before reads.         Kafka and achieve low-latency total order across shards.
+   Given that reads are decoupled in time from writes in             Erwin-■ offers high throughput for small records; however,
+many shared-log applications, LazyLog can comfortably es-            since records pass through the sequencing layer, it quickly
+tablish the order in the background before reads arrive; thus,       becomes the bottleneck for bigger (e.g., 4KB) records.
+reads do not incur overhead. Some applications, however,                Erwin-st (§5) alleviates this bottleneck by writing only
+can read records immediately after appends and thus incur            metadata that identifies the records to the sequencing layer
+overhead. However, even when many reads take such a slow             and the actual records directly to the shards. For low latency,
+path, LazyLog would preserve the overall performance of              Erwin-st writes data and metadata in parallel. Internally,
+conventional shared logs: while conventional logs incur or-          the metadata writes happen without coordination. For data
+dering cost upon appends, LazyLog shifts this cost to reads.         writes, if unmodified shards are used, the writes would see
+   LazyLog is inspired by the general idea of deferring work         the shard-internal ordering overhead. To avoid this, Erwin-st
+until needed, which has been explored in different contexts [46,     modifies the shards: Erwin-st realizes that since the informa-
+77, 78]. Skyros [49] applies this idea to defer ordering re-         tion (i.e., the metadata) from the sequencing layer provides
+quired for replication within a single shard. LazyLog, like          the correct order in the background, shards need to only
+Skyros, defers shard-internal ordering, but critically, it also      provide durability for record-data in the critical path. Thus,
+defers global ordering across shards, a key cause of high la-        clients perform the data writes to the shard replicas in paral-
+tencies in shared logs. Occult [73] enforces order upon reads        lel without coordination. Overall, all writes ś the metadata
+across shards. However, it only provides causal ordering             to sequencing replicas and the data to the shard replicas ś
+across shards, a weaker model than linearizability that Lazy-        are done without coordination, completing appends in 1RTT.
+Log provides. Our work is the first to build a shared log that          The two versions show that the LazyLog abstraction can
+offers linearizable order across shards with low latency by          be implemented in disparate shared log architectures. The
+deferring ordering until needed. This end is enabled by our          two versions are architecturally different because Erwin-■
+new observations about modern shared-log applications.               uses Corfu-style position-to-shard mapping, while Erwin-st,
+LazyLog Systems. We build two systems that implement                 like Scalog, allows clients to choose shards. As a result, like
+the LazyLog abstraction: Erwin-■ (black-box) and Erwin-              Corfu, Erwin-■ can spread data across shards evenly, while
+st (scalable throughput). Both offer linearizable total order        Erwin-st, like Scalog, can seamlessly add/remove shards.
+across multiple shards. However, unlike conventional shared          Results. We show (§6) that when operating at the same
+logs, they lazily bind records to shared log positions. Further,     throughput levels, LazyLog systems reduce append latencies
+they avoid the cost for local ordering within a shard in the         by ∼4× over our Corfu implementation and two orders of
+critical path that impacts existing systems like Scalog. Thus,       magnitude over open-source Scalog [17]. We run several
+appends in LazyLog systems complete in 1RTT.                         experiments to show that reads rarely incur overhead in
+   The main challenge is to establish the linearizable order         LazyLog systems. Erwin-■ offers ∼1M small record append-
+after appends have been acknowledged. The key idea to solve          s/s, but its throughput flattens with big records. Erwin-st
+this, in both systems, is to write enough information about          scales throughput with shards for big records with low la-
+the records on a fault-tolerant sequencing layer, using which        tencies. We show Erwin-■’s black-box ability by enabling
+the order can be established in the background. Clients write        total order across off-the-shelf Kafka shards with low la-
+this information to the sequencing-layer replicas without            tency. We also demonstrate that Erwin-st can seamlessly
+
+
+
+
+                                                               297
+                                                                                                                clients                                           Note: only
+add shards like Scalog and that the sequencing layer can be                                                                       batch
+                                                                                                                primary                                           one shard
+
+
+
+
+                                                                                              (Paxos) shard-i
+quickly reconfigured upon failures. We finally build three
+
+
+
+
+                                                                                 (a) Scalog
+                                                                                                                                  batch                           shown.
+applications (key-value store, log aggregation, and journaled                                                   backup
+
+                                                                                                                leader
+
+
+
+
+                                                                                              ordering
+stream-processing), and demonstrate that LazyLog can de-
+liver significant benefits for these end applications.                                                          followers
+   LazyLog systems are not without limitation. While Erwin-                                                                   records          bound to    appends
+                                                                                                                          A                B             C
+                                                                                                                              replicated       positions   complete
+st can scale like Corfu, it cannot match the scalability level of
+                                                                                                            clients
+Scalog. Scalog achieves scalability at the cost of latency [41];                                           sequencer
+
+
+
+
+                                                                                 (b) Corfu
+Erwin-st trades off some scalability for low latencies. This
+
+
+
+
+                                                                                                   storage
+                                                                                                                replica
+trade-off suits many applications that need reasonably high                                                     replica
+                                                                                                                                               replicated and bound,
+throughput but at low latencies [18, 19].                                                                                                      append completes
+Contributions. This paper makes four contributions.                          Figure 1. Append Path in Eager-Ordering Shared Logs.
+• We make new observations about modern shared-log ap-
+   plications that present a new opportunity for a shared log              latencies. This high latency is rooted in the eager-ordering na-
+   to defer ordering, enabling low-latency ingestion.                      ture of shared logs. Upon an append, existing eager-ordering
+• We present LazyLog, a novel shared log abstraction that                  shared logs replicate records to storage servers within a
+   builds upon this opportunity.                                           shard. More importantly, they also determine the global posi-
+• We design two LazyLog systems, Erwin-■ and Erwin-st,                     tion for the record and confirm that order, binding the record
+   that lazily establish global order, and avoid ordering cost             to that position. Both replicating the records and binding
+   within shards; our work is the first to offer linearizable              them incur coordination overhead, leading to high latencies.
+   total order in shared logs with low latency (specifically,                 Figure 1(a) shows Scalog’s append path [41]. Clients first
+   1RTT) by deferring ordering until needed.                               write records to the primary of a shard. The primary logs and
+• We show the benefits of LazyLog systems via experiments.                 replicates the records in FIFO order to its backup. Replication
+                                                                           finishes when the backup logs the records (A in Figure 1(a)).
+2    Motivation                                                            At this point, the records are durable and locally ordered but
+We explain how eager ordering in shared logs leads to high                 their global position is yet to be determined. Periodically,
+latencies and discuss the need for low-latency ingestion.                  all shard servers batch records and send their log lengths
+2.1 Shared Logs: Background                                                to a Paxos-based global ordering layer. The ordering layer
+The shared log offers a powerful abstraction with a simple                 determines the log prefix that is durable, i.e., stored on both
+interface [35ś37, 41, 57]. Applications ingest records via an              shard replicas. It establishes the global łcutž, i.e., global order
+append API, upon which the shared log assigns positions                    of durable records across shards, and makes this cut fault-
+for the records and stores them durably. Shared logs provide               tolerant (via Paxos). The records are now bound to global
+linearizable ordering [55]: if a record append 𝐵 starts in real            positions (B). The ordering layer sends the cut to the shard
+time after another record append 𝐴 completes, then 𝐵 is guar-              primaries, which then acknowledges appends of records for
+anteed to be ordered after 𝐴. Applications read records via                which global ordering has been established (C). Thus, an
+read, which takes a position and returns the record at that po-            append sees the replication latency within the shard3 , the
+sition. checkTail finds the log tail and trim garbage collects a           batching delay, and the coordination latency in the ordering
+log prefix. Many applications like distributed databases [53],             layer to bind records to positions. Scalog reports a mean
+streaming [89], metadata stores [37], and state machine repli-             append latency of 1-2 ms, even in low-throughput regimes.
+cation (SMR) [37] can be built using the above interface.                     Figure 1(b) shows Corfu’s append path [36, 37]. A client
+   Shared logs have gained significant attention in research               first obtains a position from a sequencer. The client then
+and practice alike. Prior research has built many shared                   writes the record to the storage servers responsible for the
+logs [36, 37, 41, 57]. On the practical front, all cloud providers         position via a client-driven chain protocol, where it updates
+offer a shared log service (e.g., Kinesis [31], PubSub [54]);              the replicas serially one after the other. When the record is
+hyper-scalers use them for metadata [35]; open-source sys-                 written at the tail of the chain, it is durable and is also bound
+tems like Kafka [28] and others [12, 29, 83] offer the shared              to the position obtained. Thus, appends incur multiple RTTs,
+log functionality [41]. While some systems [28, 35, 83] only               leading to high latencies. Note that merely getting a position
+offer ordering within a shard, many practical and research                 from the sequencer does not bind the record to the position.
+implementations [1, 12, 36, 37, 41, 51, 57] offer total ordering           Corfu’s sequencer is merely an optimization [37, §2.2]; the
+where records across shards are linearizably ordered.                      record is bound to the obtained position only after the record
+                                                                           has been written at the position on the storage servers.
+2.2 Eager Ordering Considered Harmful
+Despite years of research and the ubiquity of shared logs, all                 3 Although the shard primary does not wait for the backup’s response,
+
+existing shared logs today, unfortunately, suffer from high                Scalog still incurs latency to coordinate replication via the primary.
+
+
+
+
+                                                                     298
+   Systems that offer per-shard ordering [28, 83] eagerly or-             later after updates are logged. Thus, a shared log can defer
+der as well. To reduce latency, these systems provide an op-              ordering upon appends, achieving low latency; it will also
+tion to finish appends after writing to one replica [7]. While            have ample time to establish the order before reads arrive.
+this reduces latency (by 10× in Kafka), it leads to undesirable           Event sourcing [9, 13, 75]. With event sourcing, data is
+guarantees for applications: data could be lost upon failures.            solely stored as a sequence of change events on a shared log,
+2.3 Need For Low-Latency Ingestion                                        instead of storing the objects themselves and performing in-
+Low-latency ingestion is critical for many shared-log ap-                 place updates on them. Downstream services enable queries
+plications. For example, databases built atop shared logs                 by building views via replaying the events. The shared log
+need quick durability for updates [5, 53]. Similarly, high-               itself also serves as audit trails [20]. While downstream ser-
+availability journal [58] requires low-latency ingestion. Fur-            vices and audits must see the events in correct order, events
+ther, in a 2023 survey [18, 19], a third of 300 practitioners             need not be eagerly ordered when the data changes. Further,
+rated ingestion latency as the most critical latency metric               event sourcing systems [33, 62] adopt a popular software
+in their shared log deployments. Today’s shared logs, unfor-              design pattern called command-query responsibility segre-
+tunately, cannot satisfy the demands of these applications.               gation or CQRS [32, 74, 88] that intends to avoid write-read
+Scalog’s authors note this problem [41, §7]: Scalog doesn’t               interference, making readers typically lag behind writers.
+serve applications that require low append latencies well.                Message queues [10, 14]. Components of an application
+                                                                          communicate or queue work through a shared log [50, 65].
+Summary. Low-latency ingestion is critical for applications.              Messages and work items must be stored safely and delivered
+Unfortunately, however, existing shared logs incur high la-               in the correct order. However, messages or items need not be
+tencies. Given that eager ordering is the cause for high laten-           eagerly bound to positions within the queue when senders
+cies, we ask: Can a shared log avoid eager ordering, yet also             add them. Further, consumers often are time decoupled from
+preserve the ordering guarantees of conventional shared logs?             producers [42, 44]: ł[messages are] consumed at a later time
+We answer this question affirmatively in the next section.                or at a much lower rate than it is producedž [42].
+3   LazyLog Insight and Abstraction                                       High-availability journal [58]. An application is made
+                                                                          fault-tolerant by logging its state changes to a shared log;
+We explain our key insight and observations about modern
+                                                                          a fail-over instance can reload the changes and continue,
+shared-log applications, and how the LazyLog abstraction
+                                                                          should the application fail [58]. State changes must appear
+leverages the insight to realize low latencies.
+                                                                          in linearizable order in the log so that correct state can be
+3.1 Insight and Applications                                              reconstructed. However, ordering needs to be enforced only
+Our key insight to avoid eager ordering is that although                  when the log is read upon fail-over and not necessarily when
+linearizable ordering is necessary, in many shared-log appli-             recording state changes. For example, Samza [16], a stream-
+cations, it is not required right away upon appends but only              processing framework using Kafka for high-availability jour-
+later during reads. Specifically, many real-world applications            naling, does not require the order when it performs check-
+do not require to know the indexes of the appended records                pointing. Further, given that the journal is accessed only
+immediately. Further, readers are naturally decoupled in time             upon fail-over, there is a long gap between writes and reads.
+from writers in these applications. This offers a shared log              Activity logging [41, 59]. Applications log user activity to
+an opportunity to defer ordering upon appends but establish               a shared log for analytics. For example, marketplaces [41]
+it before reads arrive, reducing ingestion latencies without              log product views and purchases for recommendations. The
+incurring overhead upon reads. We now present many real                   ordering of activities need not be established during logging
+applications, where the above observation holds.                          and can be deferred until analytics engines process them. If
+Distributed DB with decoupled readers [5, 53]. Mod-                       the analytics jobs run in an offline fashion (e.g., every hour or
+ern distributed databases separate readers from writers to                so), reads will lag significantly behind writes. Even when the
+scale reads and writes independently, avoid fate sharing, and             analytics jobs run alongside ingestion, they still lag behind
+minimize interference [5, 53]. Shared logs ease this sepa-                to avoid interference between readers and writers [41]. For
+ration: writers ingest new updates to the log and readers                 instance, in marketplaces [41, §5.1], to avoid interference,
+independently process them from the log. In these databases,              the writers append new records to active shards, while the
+writers need to only achieve quick durability, while readers              analytics jobs read data from finalized shards.
+must process updates in a linearizable order [5]. For exam-               Log aggregation [2, 86, 90]. Components of a distributed
+ple, in Firescroll [5], a distributed database, writers expect to         application record events to a shared log for postmortem
+durably record updates to the shared log but do not require or            debugging and analysis. While the log must ensure correct
+use the indexes at which the records are appended [48]. Thus,             order of events to enable reliable debugging (e.g., after an
+the order need not be established eagerly when logging up-                incident), the position of events need not be determined
+dates but only when readers consume them. Further, readers                eagerly during logging. For example, Log4j-Kafka [72], a
+in these databases consume at łtheir own pacež [53], much                 Kafka-based logging framework, does not require the order
+
+
+
+                                                                    299
+     // append to log; returns true if record is durable                                   read (fast) read (slow) append (always fast)
+     bool append(record r);
+     // read ‘len’ records starting at ‘from’
+     list<record> read(logpos_t from, uint64_t len);                                    …
+     // returns the number of durable records in the log
+     uint64_t checkTail();                                                                                background ordering
+     // trim the log upto ‘index’
+     bool trim(logpos_t index);                                                      durable & ordered durable but yet-to-be ordered
+
+                  Figure 2. LazyLog API.                                Figure 3. Lazily Ordered Log. The figure shows the ordered and
+                                                                        unordered portions in LazyLog, and append and read latency characteristics.
+during logging. Further, the records are accessed much later:
+after a failure or a performance anomaly that needs analysis.           minimizing slow reads. Some applications, however, can
+   Besides the above, other applications such as ETL (ex-               (and do) immediately read after appending and thus incur
+tract, transform, load) pipelines [4] and resynchronization             overhead. For instance, SMR [36, 37] appends commands
+logs [60] also do not eagerly require order upon ingestion              and reads them back until the tail to apply all committed
+but only upon reads, and reads are decoupled in time from               commands to the state machine; this can result in many slow
+writes. Due to space constraints, we omit discussing them.              reads. However, in practice, a LazyLog system can minimize
+                                                                        this overhead. Specifically, if the records are ordered in large
+3.2 The LazyLog Abstraction
+                                                                        batches (in the background), then only the first read to the
+Based on our observations, we propose the LazyLog abstrac-              unordered portion would incur overhead; subsequent reads
+tion. LazyLog does not eagerly bind a record to a position              will be fast. Even in cases where batching opportunities do
+upon an append; it only makes the record durable immedi-                not exist, LazyLog would offer the same overall performance
+ately and provides a guarantee that the record will be even-            as a conventional shared log: while the latter incurs ordering
+tually bound to its correct linearizable position. Although             cost upon appends, LazyLog would do so upon reads.
+LazyLog binds records to positions lazily, it enforces the or-
+                                                                        Summary. In many applications, eager ordering upon in-
+dering before the positions can be read. Lazy binding enables
+                                                                        gestion is unnecessary; thus, LazyLog fits these applications
+LazyLog to avoid coordination in the critical path, reducing
+                                                                        and enables them to realize low-latency ingestion. Further,
+latency. However, it binds records to their correct positions
+                                                                        in these applications, reads are time decoupled from writes
+before they can be consumed, preserving the linearizable or-
+                                                                        and thus LazyLog would not incur overhead on reads. For
+dering guarantee of the conventional shared log abstraction.
+                                                                        applications that read immediately after appends, a LazyLog
+   To end applications, LazyLog still provides the same ab-
+                                                                        system can minimize slow-path reads, and in the worst case,
+straction of a fault-tolerant, linearizably ordered sequence
+                                                                        preserve the performance of an eager-ordering shared log.
+of records, with the only change that the order is not eagerly
+determined upon appends. Figure 2 shows the LazyLog in-                 4    Erwin-■ Design
+terface. An append makes the record durable, but it does
+                                                                        Our LazyLog systems offer linearizable total order across
+not eagerly bind the record to a position. Thus, unlike the
+                                                                        multiple shards. They do so with low latencies by only lazily
+conventional interface, append does not return a position
+                                                                        binding records to global positions. Further, they avoid the
+but only a flag denoting whether or not the record was made
+                                                                        cost for local ordering within a shard in the critical path,
+durable. This modified interface suits real-world applications
+                                                                        enabling 1RTT appends. This section describes how Erwin-
+because, as we discussed above, these applications do not
+                                                                        ■ achieves this goal and the next Erwin-st. For brevity, we
+require or utilize the index (typically returned by conven-
+                                                                        will sometimes refer to Erwin-■ as simply Erwin. We first
+tional shared logs). The read, checkTail, and trim calls are
+                                                                        provide an overview and explain the append path (§4.1). We
+identical to those of the conventional interface. Applications
+                                                                        then explain how Erwin ensures and establishes linearizable
+can invoke them in the same way as they usually would.
+                                                                        order (§4.2, §4.3), and serves reads (§4.4). We then describe
+   A LazyLog system must bind a record to a position before
+                                                                        how Erwin handles failures correctly (§4.5).
+that position can be read. However, doing this on demand
+upon every read is inefficient. A practical system would thus           4.1 Design Rationale, Overview, and Append Path
+keep ordering in the background. Thus, as shown in Figure 3,            The practical benefit of Erwin-■ (over Erwin-st) is that it
+the lazily ordered log has two parts: one for which the order           treats the shards as black boxes; internally, the shards could
+has been established and another for which the order is yet             use any standard replication scheme like primary-backup [39]
+to be confirmed. If a read accesses the ordered portion, it is          or Paxos [66, 70]; a shard could be even a per-shard-ordering
+served quickly. Conversely, if a read accesses positions in             shared log like Kafka (as we show in §6). This section de-
+the unordered portion, it takes a slow path: it is served after         scribes how Erwin works with primary-backup shards.
+establishing the order at least up to the requested position.              Erwin requires shards to support the following operations:
+   However, reads predominantly take the fast path in the               append an entry and read the entry at a specified index.
+applications we discussed, given the gap between writes and             Additionally, during view changes (which we explain later
+reads. Thus, the system can comfortably order the records               (§4.5)), a shard must be able to overwrite entries at the tail
+in the background before a position is read, avoiding or                of the log portion that it stores. To change the tail, shards
+
+
+
+                                                                  300
+                                                   sequencing layer            critical path
+                                                                               background                 storage required in the sequencing layer is far less than the
+                                nd             a     c    b   ...     leader
+                           appe                                                                           shards and so the records can be maintained in memory (on
+                       1
+                                               a     b    c   ... follower-1
+                                                                                                          multiple replicas). In contrast, storage shards must provide
+
+
+
+
+                                                                                        unordered
+         clients
+
+
+
+
+                                                                               b
+                                               a     b    c   ... follower-2                              long-term durability, requiring them to write eventually to
+                           2 ack
+
+
+
+
+                                                                               c
+                                                          5 gc records                                    the disk. Thus, the sequencing layer can run at much higher
+
+
+
+
+                                                                               a
+                  3 bg ordering                                     4 ack                                 throughput than a single shard (whose performance is lim-
+
+
+
+
+                                                                               z
+
+                                                                                     1 2 3
+                                                                                      ordered
+                                                                                                          ited by the disk) and thus support multiple shards.
+
+
+
+
+                                                                               x y
+        primary    x                 y                               z
+                                                    ...                                                      Erwin’s approach of writing to multiple memories in the
+        backup     x                 y                               z
+
+        (black-box) shard-1          shard-2                         shard-n
+                                                                                                          critical path for durability with eventually writing to disks
+                                                                                                          is a standard practice in high-performance replicated sys-
+Figure 4. Erwin Architecture. x,y, and z have been ordered; a, b, and
+c are durable but unordered yet and thus reside in the sequencing layer.
+                                                                                                          tems [70, 80, 87, 95, 96]. Similar to these systems, Erwin
+                                                                                                          can tolerate up to 𝑓 simultaneous failures. In the unlikely
+are not required to physically overwrite records; they only                                               case where more than 𝑓 replicas fail simultaneously, Erwin
+need to support a logical way to do so. For example, with                                                 correctly remains unavailable, preserving safety.
+Kafka shards, this can be achieved by deleting tail records                                                  The main challenge is to correctly bind records in the yet-
+and then appending new entries.                                                                           to-be-ordered portion to their linearizable positions in the
+   Figure 4 shows Erwin’s architecture. Erwin has a set of                                                background (even in the face of failures). Another challenge
+unmodified primary-backup shards and a sequencing layer.                                                  is to handle reads that may access either the ordered portion
+If clients directly write records to such black-box shards                                                or the unordered portion of the log. The remainder of this
+in the critical path, then they will see the coordination to                                              section describes how Erwin solves these challenges.
+replicate within the shard, i.e., records will first be written
+to the shard primary, which would then replicate to the                                                   4.2 Ensuring Linearizable Ordering
+shard backup. In addition, records must be ordered across                                                 Because there is no cross-replica coordination in the sequenc-
+shards, increasing latencies further. Erwin avoids both these                                             ing layer, records from clients could appear in different orders
+overheads by writing records only to the sequencing layer                                                 across the replicas. For example, in Figure 4, records 𝑎, 𝑏,
+in the critical path. The sequencing layer is fault-tolerant: it                                          and 𝑐 (which have been acknowledged) appear in different
+contains a few replicas, usually 𝑓 +1 to tolerate 𝑓 failures. It is                                       orders across the replicas. How does the sequencing layer
+coordination-free: the replicas do not coordinate among them;                                             then establish the correct linearizable order?
+clients write to the replicas in parallel without coordination.                                              The main intuition is that if the append for a record 𝑏
+   Figure 4 shows Erwin’s append path. Erwin clients directly                                             starts in real time after an append of another record 𝑎 has
+write the records to the sequencing-layer replicas in parallel                                            completed, then it is guaranteed that 𝑏 will appear after 𝑎 in
+without any coordination (step-1). Each replica appends in-                                               all the sequencing replica logs. This is true because when ap-
+coming records to a local log and directly responds to clients.                                           pend(a) completes, 𝑎 will be present on all logs. If append(b)
+Once the client gets a response from all sequencing replicas,                                             starts after this, then 𝑏 is guaranteed to appear after 𝑎 in all
+the append completes in 1RTT (step-2). The records are now                                                logs. As a result, only records that are concurrently appended
+durable, but their global positions are yet to be determined.                                             may (but not necessarily) appear in different orders across
+Since there is no coordination, the records on the sequencing                                             the logs. For example, in Figure 4, the actual real-time order-
+replicas can appear in different orders. However, as we ex-                                               ing is: append(a) completes and then append(b) and append(c)
+plain in next subsection, the sequencing layer can construct                                              happen concurrently with each other. The sequencing logs
+the linearizable order despite this (even if 𝑓 sequencing repli-                                          capture this ordering correctly: 𝑎 appears before 𝑏 and 𝑐 in
+cas fail). In the background, the sequencing layer establishes                                            all the logs, while 𝑏 and 𝑐 appear in different orders.
+the linearizable order and pushes the records to the shards                                                  Erwin must order concurrently appended records in some
+(step-3). The shards store the records and acknowledge (step-                                             way to produce a total order. For this purpose, Erwin treats
+4). Once safe on the shards, the records are garbage collected                                            one of the sequencing replicas as the leader and others as
+on the sequencing replicas (step-5).                                                                      followers. The leader’s log is used to establish the order in
+   The Erwin shared log has two distinct parts for acknowl-                                               the failure-free case. For example, in Figure 4, positions up to
+edged records (as shown in Figure 4): a portion for which                                                 3 are ordered; thus, Erwin would try to bind 𝑎 to position 4,
+order is established and another for which order is yet to                                                𝑐 to 5, and 𝑏 to 6 because this is the leader’s order (although
+be determined. The ordered portion resides on the shards,                                                 the followers have these records in different orders).
+while the yet-to-be-ordered portion on the sequencing layer.                                                 Note that the leader’s order cannot be exposed to clients
+   The sequencing replicas provide only short-term durabil-                                               until that order is finalized. This is because if the leader
+ity: once records are safe on the shards, they are garbage                                                fails, then the records could be ordered differently. Upon
+collected from the sequencing layer. Thus, the amount of                                                  a leader failure, Erwin chooses any one follower’s log to
+                                                                                                          assign order for unordered records. This is safe because all
+
+
+
+                                                                                                    301
+replica logs would respect the real-time dependencies and                           must read a particular position 𝑝. Upon receiving a read,
+only concurrently appended records may appear in different                          a shard server first checks if records up to 𝑝 are stable (by
+orders; §4.5 expands on how Erwin handles failures.                                 checking if 𝑝 ≤ stable-gp). If yes, the shard quickly serves the
+4.3 Establishing the Order in the Background                                        read; this is a fast-path read. Otherwise, the server waits until
+Erwin establishes the order in the background. At a high                            the log is stable at least up to 𝑝 (i.e., stable-gp advances up to
+level, the sequencing leader assigns records to positions (ac-                      𝑝) and then serves the record; this is a slow-path read. This
+cording to its local log) and pushes them to the appropriate                        check is critical because binding is complete only up to the
+shards. Erwin uses a deterministic function to map positions                        stable-gp. The order for positions greater than stable-gp could
+to shards similar to Corfu [36], where a shared log position 𝑝                      change if the sequencing leader fails. For the same reason,
+is assigned to shard p mod n, where 𝑛 is the number of shards∗ .                    the reads cannot be served from the sequencing leader.
+Each shard uses standard primary-backup to replicate the                               Usually, applications keep track of the last read position
+records. Once safe on the shards, the records are garbage                           and keep advancing this to read more records. Some appli-
+collected at the sequencing replicas. For performance, Er-                          cations require reading from the current position until the
+win does this background work in batches, ordering many                             tail. Such applications invoke checkTail to know how many
+records at once. We explain these steps in detail below.                            records are durable in the log and then read up to that point.
+   Since the sequencing leader’s log provides the required                          Erwin serves the checkTail from the sequencing leader.
+ordering, the leader initiates the background ordering. Every
+                                                                                    4.5 Failures, Views, and Reconfiguration
+sequencing replica maintains a counter called last-ordered-gp:
+the last global position in the log up to which the order has                       Failures within a shard are masked by standard techniques.
+been established that the replica knows of. Periodically, the                       Shards in Erwin use primary-backup; a Paxos/VR or Raft-
+leader takes a batch of unordered records from its local log                        based ensemble could also mask the failures within a shard.
+and assigns them to positions starting from its last-ordered-                          However, Erwin must carefully handle failures in the se-
+gp+1. It uses the deterministic function to map and push                            quencing layer. First, intermittent failures such as network
+the records to appropriate shards. Each shard replicates its                        blips are easily handled by having clients retry the operation
+records and acknowledges the sequencing leader. Once all                            until they are able to write to all sequencing replicas. If the
+shards acknowledge, the sequencing leader garbage collects                          retries result in duplicates, Erwin correctly filters them using
+the records from its log and updates its last-ordered-gp. It                        request-ids. Second, Erwin handles failures such as crashes
+then instructs and waits for the followers to garbage collect                       via views and a reconfiguration protocol. The sequencing
+the records and update their last-ordered-gp 2 .                                    layer operates in a series of monotonically increasing views.
+   After this, the sequencing leader sets another counter                           Upon a replica failure, the view advances and the system
+called the stable-gp to its last-ordered-gp. Erwin maintains                        moves to a new configuration. Erwin does this in a sequence
+the following invariant with respect to the stable-gp: records                      of steps: first, a control plane detects the failure, upon which
+for all positions up to the stable-gp are stable and will remain                    it seals the current view; then, the unordered records in the
+unchanged regardless of future failures. Intuitively, when the                      sealed view are flushed to the shards; next, a new view starts
+stable-gp is set, the binding for positions up to the stable-gp                     with a new configuration and normal processing can resume.
+is complete. After this, the binding for the next batch starts.                     Detection. Erwin detects sequencing replica failures using a
+The shards are also informed about the stable-gp. The shards                        standard technique used by many systems [57, 91]: a control
+can then safely serve reads to positions up to this stable-gp.                      plane that consists of a Zookeeper instance [30] and a con-
+Allowing reads only up to the stable-gp is critical to ensure                       troller. The controller itself is stateless and a new one can be
+correctness (as we soon discuss, §4.5).                                             started if the current one fails. We ensure that only one active
+   If the sequencing leader fails, any follower’s log can be                        controller exists using ZooKeeper. Each record-sequencing
+used to determine the order for the unordered records. How-                         replica maintains a session with Zookeeper. A failure is de-
+ever, Erwin must maintain the stable-gp invariant, i.e., the                        tected when a replica’s session with Zookeeper breaks and
+order for the log portion that was previously stabilized (and                       the controller is notified (via Zookeeper watches [21]).
+thus could have been exposed to readers) does not change.                           Sealing the view. Once notified, the controller seals the old
+We soon discuss how Erwin’s recovery ensures this (§4.5).                           view to ensure that new records cannot be appended in that
+                                                                                    view. This sealing protocol resembles that of Delos [35] and
+4.4 Log Reads                                                                       Boki [57]. The controller sends a seal command to all the
+Erwin clients submit reads to the shard servers. Clients use                        sequencing replicas. A sealed replica rejects new requests.
+the deterministic mapping to find from which shard they                             Once a replica is sealed, new records cannot commit in that
+    ∗ Like Corfu, adding shards won’t require moving existing records [36].         view. This is because a client waits for acknowledgments
+    2 A subtle case is when a client request reaches a sequencing follower          from all sequencing replicas in the same view.
+after the leader has informed to garbage collect that record. Erwin handles         Flushing unordered records. The controller then flushes
+this request as a duplicate and filters it.                                         unordered records in the sealed view. First, Erwin chooses
+
+
+
+                                                                              302
+any of the available sequencing replicas from the sealed view                       advancing stable-gp, the recovery replica may overwrite the
+as the recovery replica. Then, the recovery replica flushes its                     order written by the old leader, but that is safe. In the ex-
+log to the shards, assigning records to positions starting                          ample, suppose the leader fails before garbage collection on
+from its last-ordered-gp+1. This is the most critical step in                       the followers and a recovery replica has [𝑎, 𝑏, 𝑐] with its last-
+the recovery; we now explain why this procedure is correct.                         ordered-gp as 3. The recovery replica will flush its records
+Correctness Sketch: Choosing any replica as the recovery                            starting at position 4 (its last-ordered-gp+1), overwriting the
+replica will maintain durability of records committed in the                        old leader’s order [4 : 𝑎, 5 : 𝑐, 6 : 𝑏]. However, this is safe
+old view; this is because records are replicated to all replicas                    because no client could have read any position greater than
+during normal operation. The recovery replica may not con-                          3; this is because stable-gp could have been at most 3.
+tain some records that were part of the old leader (e.g., due                       Starting a new view. Once the recovery replica’s log has
+to client failures); however, such records wouldn’t have been                       been flushed, the last-ordered-gp on all replicas are set ap-
+acknowledged and thus need not be recovered. On the flip                            propriately and all local logs are cleared. Only replicas that
+side, it is also possible that the recovery replica may contain                     have cleared the logs from the old view and set their last-
+records that were not part of the old leader; these wouldn’t                        ordered-gp will be part of the new configuration. Thus, any
+be acknowledged as well, but it is harmless to recover them.                        failed sequencing replica will be removed from the new con-
+   Erwin must also ensure linearizable ordering of the recov-                       figuration. Erwin can also add new replicas to the new con-
+ered records. As we discussed, any two appends that have                            figuration; new replicas will start with empty logs and last-
+real-time order between them will appear in the correct order                       ordered-gp set correctly. The new configuration is stamped
+on all the sequencing replicas; only concurrent appends may                         with the new view number and written to Zookeeper; then,
+appear in different orders. Thus, the recovery replica’s log                        stable-gp is advanced and sent to the shards. Writing the
+will correctly capture the real-time ordering dependencies.                         new configuration before advancing the stable-gp prevents
+However, to guarantee linearizability, Erwin must ensure                            any partitioned replica from overwriting records potentially
+that any order that has been exposed to readers does not                            exposed if a failure happens during reconfiguration. The
+change. That is, it must maintain the stable-gp invariant.                          controller then sends a StartView message to replicas in the
+   Not maintaining the invariant violates linearizability. Con-                     new configuration; the system can now accept new requests.
+sider the state in Figure 4. Suppose the sequencing leader
+tries to establish the order [4 : 𝑎, 5 : 𝑐, 6 : 𝑏] by writing 𝑎, 𝑐,                 5   Erwin-st Design
+and 𝑏 at log positions 4, 5, and 6, respectively on the shards.                     Erwin-■ aims to work with unmodified shards. Thus, to avoid
+Assume an incorrect protocol where stable-gp is advanced                            incurring shard-internal coordination, it funnels records
+before sequencing replicas garbage collect the records and                          through the sequencing layer. However, this has a downside:
+set their last-ordered-gp. Now, suppose a client reads the or-                      the sequencing layer can become the bottleneck. For small
+der [4 : 𝑎, 5 : 𝑐, 6 : 𝑏] from the shards. Suppose the leader                       records (∼100 bytes) which are common in practice [47],
+now fails and follower-1 becomes the recovery replica. If                           Erwin-■ can still offer high throughput. However, with big-
+follower-1’s local order ([𝑎, 𝑏, 𝑐]) is flushed starting at posi-                   ger records (4KB [36, 41]), the sequencing layer can be quickly
+tion 4 (last-ordered-gp +1), a subsequent reader will see an                        saturated, limiting throughput. Erwin-st solves this problem.
+order ([4 : 𝑎, 5 : 𝑏, 6 : 𝑐]) inconsistent with the previous read.
+   Erwin prevents the above scenario by carefully orchestrat-                       5.1 Main Idea and Overview
+ing background ordering and reads (§4.2). Erwin allows reads                        Erwin-st’s main idea is to split a record into data and a piece
+to a position 𝑝 only after ensuring that the order up to 𝑝 will                     of metadata that identifies the record. Clients then write
+not change in the future. Erwin ensures this by advancing                           record-data to the shards directly and only the metadata to
+the stable-gp only after all sequencing replicas have garbage                       the sequencing layer. With this design, the record-data does
+collected their records and advanced their last-ordered-gp 2 .                      not pass through the sequencing layer, improving scalability.
+   Two cases are possible. (i) If the leader fails after stable-                       To achieve low latency, clients write the data and metadata
+gp advances, then it is not possible for the recovery replica                       in parallel. The individual metadata writes to the sequenc-
+to change the order, ensuring correctness. In the above ex-                         ing replicas themselves are done in parallel as well (i.e., the
+ample, if the leader fails after stable-gp advances to 6, then                      sequencing layer is coordination-free). The metadata helps
+the followers’ logs would be empty and their last-ordered-gp                        establish the total linearizable order in the background. How-
+would be 6. Thus, the order [4 : 𝑎, 5 : 𝑐, 6 : 𝑏] established                       ever, data writes to shards will incur coordination latency
+by the failed leader will prevail. (ii) If the leader fails before                  within the shards if the shards use standard replication. To
+                                                                                    avoid this, Erwin-st modifies the shards. Erwin-st realizes
+    2 An alternate design is to advance stable-gp before garbage collection         that since the metadata from the sequencing layer provides
+and have the new leader flush only entries that are not on the shards yet.          the ordering information, shards need to only provide dura-
+However, updating stable-gp after garbage collection made the protocol              bility for record-data in the critical path. Thus, clients per-
+simpler and the added time for garbage collection is anyway negligible.             form the record-data writes to the shard replicas in parallel
+
+
+
+                                                                              303
+ a bcd
+
+
+a cdb
+
+
+
+                        metadata       data    sequencing layer (only metadata)
+                                                                                              a global position is later assigned for the record by the se-
+                             append                a   b   c   d e       leader
+                                                                                              quencer during background ordering. So, a client cannot
+                    client                         a   c d     b e      followers
+                                                                                              directly determine the shard to read given a log position.
+                      ack                                        bg ordering
+                                                                                                 Erwin-st solves this problem by storing the metadata log
+                                                                                              that the sequencing leader sends during background order-
+                      primary          a   e           c               d b                    ing on the shards. A reading client can find the shard for a
+                      backup           a e             c               b d                    position by contacting any shard server and then perform the
+                                      blue shard   green shard       yellow shard             actual read at the target shard. Erwin-st amortizes this cost
+             Figure 5. Erwin-st Architecture and Append Flow.                                 by having the clients fetch the position-to-shard mapping for
+                                                                                    a         many positions at a time and then cache it; for subsequent
+         without coordination, achieving durability in 1RTT.                                  reads, clients look up their local cache to find the shard and
+            In summary, by lazily sequencing only metadata, Erwin-st                          read the record from there. Again, similar to Erwin-■, a shard
+         scales throughput even for bigger records. Further, by writ-                         can serve reads only up to the stable-gp. If the stable-gp is
+         ing data to the shard replicas in parallel, Erwin-st achieves                        not high enough, then the read takes a slow path waiting for
+         durability in 1RTT. By writing metadata in the same RTT,                             stable-gp to advance at least up to the requested position.
+         Erwin-st completes appends in 1RTT.
+                                                                                              5.4 Failure Handling and Correctness
+            Figure 5 shows the architecture and flow of appends. A
+         client directly writes a record to a shard of its choice (like                       Failures within a shard are handled by replacing the failed
+         Scalog). In parallel, it also writes the metadata, which is a                        replica with a new one after copying both ordered and un-
+         tuple of <record-id, shard-id>3 to the sequencing replicas.                          ordered records from a live node to the new one. Erwin-st
+         In the example, clients have appended four records 𝑎, 𝑏, 𝑐,                          handles sequencing replica failures in a way similar to Erwin-
+         and 𝑑 to the different shards. 𝑏 and 𝑑 have arrived in different                     ■. In particular, it maintains the same invariant: order estab-
+         orders on the yellow shard’s primary and backup; the correct                         lished up to stable-gp is guaranteed to remain unchanged.
+         order will be determined by the sequencing layer. Now, a                             All the steps (detection, sealing, etc) are identical to Erwin-
+         client is appending 𝑒; it writes the data to the blue-shard                          ■ with the only difference that when flushing unordered
+         replicas, and the metadata to the sequencing replicas. Once                          records during reconfiguration, only metadata is flushed.
+         all of them acknowledge, the append completes in 1RTT.                                  Additionally, Erwin-st must handle client failures that in-
+                                                                                              troduce two problems due to data-metadata separation. First,
+         5.2 Background Ordering                                                              the sequencing leader receives the metadata, while the shard
+         The background ordering in Erwin-st is identical to Erwin-                           primary does not receive the data. Second, the shard primary
+         ■, except that only the metadata identifiers are sent to the                         receives the data but there is no corresponding metadata at
+         shards and the data already exists on the shards. Periodically,                      the sequencing leader. The latter is not a serious issue: it
+         the sequencing leader tries to establish the order of records                        just creates orphaned (uncommitted) records on the shards,
+         by assigning metadata identifiers to positions; it then pushes                       which can be garbage collected via periodic scrubbing. In
+         the metadata along with the assigned positions to the shard                          contrast, the former case needs more care. When the meta-
+         primaries. Each shard primary then processes this informa-                           data reaches the shard during background ordering and the
+         tion, and orders the records accordingly. For example, in                            record is not present, the shard primary first waits for a time-
+         Figure 5, the yellow-shard primary receives the ordering in-                         out to receive the record from the client (in case this is due to
+         formation [1 : 𝑎, 2 : 𝑏, 3 : 𝑐, 4 : 𝑑, 5 : 𝑒], of which only [𝑏, 𝑑]                  a network delay). If it is a client failure, then the timeout will
+         concern the yellow shard. Then, the shard primary assigns                            happen on the shard primary, upon which it sets the record
+         and writes 𝑏 to global position 2 and 𝑑 to 4 (although it re-                        to a special no-op record. The shard primary also instructs
+         ceived them in a different order from clients). It then informs                      the backup to replace its record with a no-op. Clients ignore
+         the shard backup to do the same. The shard primary then ac-                          no-ops during reads. Setting to no-op is correct because the
+         knowledges the sequencing leader. Once all shards complete                           record would not have been acknowledged. The request may
+         this process, the metadata identifiers are garbage collected                         arrive after the no-op has been set. Erwin-st handles this
+         from the sequencing layer and stable-gp is advanced, after                           correctly by rejecting the delayed request at the shard.
+         which shards can serve reads up to the stable-gp.
+                                                                                              5.5 Limitations of LazyLog Systems
+         5.3 Reads                                                                            Our LazyLog implementations have three potential limita-
+         In Erwin-■, records are assigned to shards in a determinis-                          tions. First, since they require writing to all sequencing-layer
+         tic manner; thus, locating the shard to read a record from                           replicas, a reconfiguration is required upon failures. However,
+         is straightforward. However, in Erwin-st, clients write the                          this is not a big concern in practice and more importantly, it
+         record to a target shard of their choice (similar to Scalog);                        is not a fundamental limitation. First, our reconfigurations
+                                                                                              are quick (§6). Second, our implementations could adopt
+            3 record-id is a combination of client-id and request-id.                         an approach where clients write only to a supermajority
+
+
+
+                                                                                        304
+                             Corfu        Erwin                                Corfu         Erwin                                      Scalog        Erwin                                  Scalog        Erwin
+                   100                                               100                                                         104                                               100
+    Latency (us)
+
+
+
+
+                                                                                                                  Latency (us)
+                    80                                                80                                                                                                            80
+                                                                                                                                 103
+
+
+
+
+                                                                                                                                                                         CDF (%)
+                                                           CDF (%)
+                    60                                                60                                                                                                            60
+                    40                                                                                                           102                                                40
+                                                                      40
+                    20                                                                                                           101                                                20
+                                                                      20
+                     0                                                 0                                                         100                                                 0
+                           mean p99        mean p99
+                                                                           0         50           100
+                                                                                                                                         mean p99        mean p99                        1    10    100 1000
+                             1-shard        5-shards                                                                                       1-shard        5-shards                              Latency (us)
+                                                                                 Latency (us)
+                          @30K appends/s @150K appends/s
+                                                                                @150K appends/s
+                                                                                                                                        @34K appends/s @140K appends/s                        @140K appends/s
+                         (a) Average and p99                                      (b) CDF                                              (a) Average and p99                                     (b) CDF
+                         Figure 6. Append Latency: Erwin vs. Corfu                                                                Figure 7. Append Latency: Erwin vs. Scalog
+of sequencing replicas that prior 1RTT replication proto-                                                     replication. A shard stores its log portion across multiple
+cols [49, 82] use to recover linearizable order upon failures.                                                files, each with a fixed number of entries. Thus, it can easily
+This design can tolerate more failures at the cost of increased                                               locate the target file to satisfy a read. Files are cached when
+recovery complexity; we leave this as an avenue for future                                                    read and thus subsequent reads are served from memory.
+work. Writing to all sequencing replicas can increase the
+tail latencies in the presence of straggler replicas. LazyLog                                                 6            Evaluation
+implementations can deal with persistent stragglers by re-                                                    In our evaluation, we ask the following questions:
+configuring the sequencing layer to remove them. To tolerate                                                  • What are the latency benefits of a lazy-ordering shared
+transient slowness, Erwin could use the above supermajority                                                      log compared to eagerly ordering shared logs? (§6.1)
+technique, minimizing stragglers’ effects.                                                                    • How do reads perform in a lazy-ordering shared log com-
+   Second, Erwin-st scales like Corfu: both systems scale with                                                   pared to an eagerly ordering one? (§6.2)
+shards and are limited by the sequencing-layer. However,                                                      • How does periodically reading affect latencies? (§6.3)
+Erwin-st cannot provide the scalability level of Scalog. Scalog                                               • How does the append rate impact read latency? (§6.4)
+improves scalability by having shards contact the ordering                                                    • How does record size impact Erwin-■’s throughput? (§6.5)
+layer in a batched manner. Such improved scalability is fun-                                                  • How well does Erwin-st scale compared to Erwin-■? (§6.6)
+damentally at odds with low latencies. This is because, in                                                    • How do reads perform in Erwin-st? (§6.7)
+Scalog, the shards must batch and contact the ordering layer                                                  • Can Erwin-■ enable total order across existing per-shard-
+in the critical path; deferring these steps to the background                                                    ordering shared logs with low latencies? (§6.8)
+will violate append linearizability. While Scalog trades off                                                  • Can Erwin-st seamlessly add shards like Scalog? (§6.9)
+latency, Erwin-st forgoes some scalability for low latencies                                                  • What is the impact of sequencing replica failures? (§6.10)
+(but is still as scalable as Corfu). This trade-off suits many                                                • Do end applications benefit from LazyLog? (§6.11)
+applications that need reasonably high throughput but at                                                      Setup. We run our experiments on a xl170 [3] CloudLab [85]
+lower latencies [18, 19]. Achieving Scalog’s scalability with                                                 cluster. Each machine has an Intel 10-Core E5-2640v4 CPU,
+the low latencies of LazyLog remains an open challenge.                                                       64GB DRAM, a 25Gb Mellanox ConnectX-4 NIC, and a 480GB
+   Finally, LazyLog systems may not suit applications where                                                   SATA SSD. We do not have access to many machines in this
+writers need to know their records’ positions immediately.                                                    cluster and can run only five shards at a time. However, for
+However, this is not a fundamental limitation. LazyLog sys-                                                   the scaling experiments (§6.6), we use a different cluster,
+tems can be easily augmented with an appendSync interface                                                     where we have more machines. Our sequencing layer has
+that eagerly orders records (albeit at the cost of latency).                                                  three replicas (one leader and two followers). Each storage
+                                                                                                              shard has one primary and one or two backups. At places,
+5.6 Implementation                                                                                            we refer to Erwin-■ as Erwin for brevity.
+Erwin code-base is mainly composed of a client library, se-                                                   6.1 Benefit of Lazy Ordering
+quencing layer, and storage shard, all of which are imple-                                                    We first demonstrate the benefit of lazy ordering by compar-
+mented in C++ (∼8K LOC). Our code is publicly available [11].                                                 ing Erwin against Corfu and Scalog. We implement Corfu
+The client uses eRPC [61] to issue requests to the sequenc-                                                   from scratch. For Scalog, we use the publicly available arti-
+ing layer and shards. On the sequencing layer, the log is                                                     fact [17]. We run an append-only workload with 4KB records.
+implemented as a ring buffer with a head and tail pointer.                                                    We run each shard at about 30K appends/s, and compare the
+New entries or metadata identifiers are added at the tail. For                                                average and p99 latencies with one and five shards.
+background ordering, we run a separate process that reads                                                     Comparison to Corfu. We run both Corfu and Erwin with
+unordered log portion and pushes the entries or the metadata                                                  three replicas within each shard. Figure 6 shows the mean
+identifiers to the shards. For efficiency, our implementation                                                 and p99 latencies and the latency distribution. At the same
+runs this process separately and uses RDMA reads to access                                                    throughput (shown in the bottom), Erwin reduces latencies
+the ring buffer without interrupting the sequencing leader’s                                                  significantly (by up to 3.8×). This is because Corfu eagerly or-
+CPU. To garbage collect, this process uses RDMA write to                                                      ders by first obtaining positions from the sequencer and then
+modify the head pointers on the sequencing replicas, free-                                                    binding records to positions via the client-driven chain pro-
+ing space in the ring buffer. Our shards use primary-backup                                                   tocol, incurring 4RTTs with three replicas. Erwin, in contrast,
+
+
+
+                                                                                                        305
+                                                                                                                                                         Corfu        Erwin                                 60
+
+
+
+
+                                                                                                                            Avg. latency (us)
+                  Avg. latency (us)               Corfu            Erwin                                                                         75                                                                              20K
+
+
+
+
+                                                                                                                                                                                             Latency (us)
+                                                                                                                                                                                                            50
+                                          75                                                                                                     60                                                                              32K
+                                                                                                                                                                                                            40
+                                          60                                                                                                     45                                                         30
+                                          45                                                                                                     30                                                         20
+                                          30                                                                                                     15
+                                          15                                                                                                                                                                10
+                                                                                                                                                  0                                                          0
+                                           0                                                                                                          appendread   appendread   appendread
+                                               appendread     appendread        appendread                                                                                                                       0   0.5   1   1.5   2   2.5   3
+                                                                                                                                                         45K          30K          15K
+                                                  45K              30K                15K                                                                Read and Append Rate (ops/s)                                      Period (ms)
+                                                  Read and Append Rate (ops/s)
+ Figure 8. Reads Lagging Behind Appends. Figure 9. No Lag b/w Appends and Reads. Figure 10. Periodicity vs Latency.
+                mean latency                              avg ord. batch size
+                                                                                  150                       100
+                150                                                                                                                                                three different rates and measure append and read latencies.
+                                                                                        Avg. batch size
+                125                                                               120                           80
+ Latency (us)
+
+
+
+
+                100
+                                                                       Ra > Rr 90
+                                                                                                                60                                                 With Time Lag. Figure 8 shows the results when reads
+
+                                                                                                          CDF
+                                                        Ra == Rr
+                 75
+                 50
+                                                                                  60                            40
+                                                                                                                                                45K                lag behind appends by a small window (3 ms) at different
+                                                                                  30
+                 25                                                                                             20                               5K                rates. At all rates, Erwin offers lower append latencies than
+                  0                                                               0                             0
+                                      0    5 10 15 20 25 30 35 40 45                                                 1   10 100 1000
+                                                                                                                                                                   Corfu as expected. Since reads lag behind appends, Erwin
+                                            Append rate (K appends/s)                                                    Latency (us)                              completes the ordering in the background by the time reads
+                (a) Read Latency and Batch Size                                         (b) Read Latency Distribution                                              arrive. Thus, reads do not incur overhead: the read latency of
+                                          Figure 11. Append Rate vs. Read Latency.                                                                                 Erwin approximates Corfu’s. The small increase compared
+                                                                                                                                                                   to Corfu is because reads contend with background writes
+completes appends in 1RTT by writing to the sequencing                                                                                                             (which happen in batches in Erwin) at the storage shards.
+replicas without coordination and establishes the order in the                                                                                                     Overall, Erwin offers significantly lower append latencies
+background. This is the fundamental benefit of lazy ordering.                                                                                                      while providing almost the same read latencies as Corfu.
+Comparison to Scalog. We next compare against Scalog.                                                                                                              Without Lag. Figure 9 shows the result when there is no
+Since Scalog shards use one primary and one backup, we                                                                                                             time lag between appends and reads; readers aggressively
+run our shards also with two replicas. Scalog’s performance                                                                                                        read as records are appended. Again, Erwin reduces append
+depends upon interleaving interval [41], which determines                                                                                                          latencies. However, since there is no lag, reads in Erwin incur
+how often shards contact the ordering layer. We set this to                                                                                                        overhead: they see the cost of ordering. However, when the
+0.1 ms as in the Scalog paper. For correct comparison, we run                                                                                                      append rate is moderately high (45K), Erwin has batching
+the Scalog and Erwin shards in a comparable performance                                                                                                            opportunities: it can order many records in a big batch. Thus,
+regime. When writing to the shards in isolation (without the                                                                                                       only the first read that accesses the unordered log portion
+rest of the system involved), the performance of a shard are                                                                                                       incurs overhead; subsequent reads are faster. Reads are thus
+almost identical in the two systems: latency (693us in Scalog                                                                                                      only slightly slower than in Corfu. However, with fewer
+vs. 772us in Erwin shards) and throughput (34.3KOps/s in                                                                                                           batching opportunities, more reads take the slow path. How-
+Scalog vs. 32.3KOps/s in Erwin).                                                                                                                                   ever, even in such scenarios, Erwin preserves the overall
+   Figure 7 shows end-to-end append latencies. Erwin re-                                                                                                           performance of Corfu: while Corfu eagerly orders and pays
+duces mean and p99 latencies by two orders of magnitude.                                                                                                           the overhead on appends, Erwin pays this cost upon reads.
+Scalog incurs high latency due to eager ordering: overhead
+for locally ordering within a shard, batching records before                                                                                                       6.3 Performance With Periodic Reads
+contacting the ordering layer, and global ordering. In con-                                                                                                        We now analyze how reads perform in applications that
+trast, although Erwin’s shards have almost the same latency                                                                                                        periodically read records up to the current tail. Here, the
+as Scalog shards, Erwin hides shard-internal coordination                                                                                                          application periodically does a checkTail and then reads up
+latency and also defers global ordering, offering low latency.                                                                                                     to the obtained tail. We vary the period and measure read
+   We note that there are implementation differences be-                                                                                                           latencies. As shown in Figure 10, with 20K rate, for longer
+tween Erwin and the Scalog artifact (e.g., Scalog uses gRPC [6],                                                                                                   periods (e.g., 3 ms), latencies are very low. This is because
+while Erwin uses eRPC [61]). Thus, the absolute latencies in                                                                                                       many appends accumulate with longer periods (with only
+a better Scalog implementation will be lower. However, even                                                                                                        records near the tail being unordered). However, by the time
+such an implementation will incur Scalog’s fundamental                                                                                                             the application reads the tail, the background ordering or-
+overheads mentioned above. Thus, Erwin will offer signifi-                                                                                                         ders those unordered records. With short periods, not many
+cant latency benefits over such an implementation as well.                                                                                                         appends accumulate between two consecutive checkTail-s,
+                                                                                                                                                                   and therefore many reads take the slow path. A similar pat-
+6.2 Read Latencies: Lazy vs. Eager Ordering                                                                                                                        tern holds for the 32K rate as well, but the latencies are lower
+We now compare read latencies of Erwin and Corfu under                                                                                                             because of more batching opportunities at this higher rate.
+two cases: (i) where reads lag behind appends, reflecting                                                                                                          6.4 Impact of Append Rate
+many applications in §3.1 (ii) where there is no lag between                                                                                                       The previous two experiments showed that append rates (and
+appends and reads, which is a bad case for Erwin. In both                                                                                                          background batch sizes) affect read latencies, which we now
+cases, appends and reads run at the same rate. We examine                                                                                                          analyze further. To do so, we run reads alongside appends,
+
+
+
+                                                                                                                                                             306
+                                                                        Erwin 4K           Erwin 8K                                    #shards=10; record-size=4KB
+Throughput (KOps/s)
+
+                      1000                                                                                                 100
+                                                                      Erwin−st 4K        Erwin−st 8K
+
+
+
+
+                                                Throughput (KOps/s)
+                       800                                                                                                                                                                                  120
+                                                                                                                                                                  Erwin
+
+
+
+
+                                                                                                                                                                                             Latency (us)
+                                                                                                            Latency (us)
+                                                                                                                            80                                                                              100
+                       600                                            600                                                                                       Erwin−st
+                       400                                                                                                  60                             not enough machines                               80
+                                                                      400                                                   40                              to add more shards
+                                                                                                                                                                                                             60
+                       200
+                         0                                            200                                                   20                                                                               40
+                             100 512 1K 4K 8K                           0                                                    0                                                                               20
+                                   Size (B)                                   1     3    5        7    10                        0                  150   300     450    600       750                        0
+                                                                                        #shards                                                      Throughput (KOps/s)                                                                lag (1s)   lag (3ms)     no-lag
+Figure 12. Record Size vs.                                                  (a) Throughput vs. shards                       (b) Throughput vs. Latency
+Tput in Erwin-■.                                                            Figure 13. Scalable Throughput with Erwin-st.                                                                      Figure 14. Reads in Erwin-st.
+                                                                                                                                                    105                Kafka stand-alone
+and readers aggressively read whatever records are available.
+
+
+
+
+                                                                                                                                                                                                                  Throughput (KOps/s)
+                                                                                                                                                                Erwin with Kafka shard(s)                                               600
+
+
+
+
+                                                                                                                                     Latency (us)
+                                                                                                                                                    104                 no
+A single reader can run at 37K reads/s, beyond which the                                                                                            103             total order
+                                                                                                                                                                   across shards
+                                                                                                                                                                                                                                        450
+                                                                                                                                                                                                                                                                adding a
+                                                                                                                                                                                      total order                                       300                    new shard
+reader is unable to keep up with appends. If the append rate                                                                                        102
+                                                                                                                                                      1
+                                                                                                                                                                                     across shards
+                                                                                                                                                                                                                                        150
+                                                                                                                                                    10
+(𝑅𝑎 ) is lower than this, the read rate (𝑅𝑟 ) also matches the                                                                                      100
+                                                                                                                                                                                                                                          0
+                                                                                                                                                                                                                                               7       9        11         13
+append rate. Thus, as shown in Figure 11(a), there are two                                                                                                   1-shard
+                                                                                                                                                            @70KOp/s
+                                                                                                                                                                                3-shards
+                                                                                                                                                                               @128KOp/s                                                                Time (s)
+regions: 𝑅𝑎 == 𝑅𝑟 and 𝑅𝑎 > 𝑅𝑟 (the gray region).                                                                                     Figure 15. Erwin-■: Total Or- Figure 16. Erwin-st: Seam-
+Ra > Rr . In this region, reads run at a lower rate behind                                                                           der with Kafka Shards.                                                       lessly Adding a Shard.
+appends, mimicking message queues where consumers run
+at a lower rate than producers [42]. Here, by the time a log                                                                         enough machines to run more than 10 shards. Erwin-st’s
+position is read, the records are already ordered. Thus, almost                                                                      throughput is limited by the sequencing layer (like Corfu).
+all reads take the fast path, resulting in low latencies.                                                                            Our sequencing layer can run at 1.34M metadata-appends/s.
+Ra == Rr . Here, reads catch up with appends. So, more reads                                                                         More shards will enable Erwin-st to scale up to that point.
+can be slow. But, even in this unfavorable region, Erwin’s                                                                           Erwin-st achieves high throughput with low latencies as
+latencies are low at high append rates. This is because with                                                                         shown in Figure 13(b) because Erwin-st writes metadata and
+high append rates, the background-ordering batch sizes are                                                                           data without any coordination in 1RTT. For instance, at 700K
+larger (see right y-axis of 11(a)). When the rate is low (5K),                                                                       appends/s, Erwin-st’s latency is 29𝜇s.
+the batch size is small, many reads take the slow path, result-                                                                  6.7 Erwin-st Reads
+ing in high latencies. Figure 11(b) shows this: at 5K, almost                                                                    We now analyze reads in Erwin-st. We compare read la-
+all reads take the slow path (compared to all reads taking the                                                                   tencies with and without lag between appends and reads.
+fast path at 45K). The read latency at such low rates must ide-                                                                  Similar to §6.2, the appends and reads run at the same rate
+ally match the append latencies of an eager-ordering system                                                                      but the absolute rate is higher (200K). Figure 14 shows the
+(e.g., 70 𝜇s that Corfu incurs in Figure 9). We see higher laten-                                                                result. First, when reads lag by 1s (lag-1s), no reads take
+cies than this because our background-ordering is optimized                                                                      the slow path, resulting in low latencies. Even in the no-lag
+for bigger batches to improve throughput. However, this is                                                                       case, very few reads are slow, making it only slightly worse
+not fundamental: our implementation could be modified to                                                                         than lag-1s. The absolute latencies are higher than in §6.2
+optimize for latency with small batches; thus, the absolute                                                                      because, here, we read 25 records at a time. When reading
+read latencies (in these worst cases) would be lower.                                                                            one record at a time, we notice that the latency of Erwin-st
+6.5 Erwin-■: Record Size vs. Throughput                                                                                          closely matches that of Erwin-■ (recall that Erwin-st clients
+                                                                                                                                 cache the position-to-shard map to avoid a roundtrip (§5.3)).
+So far, we have measured latencies. We now measure the
+append throughput of Erwin-■. As shown in Figure 12, with                                                                            6.8 Total Order across Kafka Shards
+small records, Erwin-■ offers high throughput (∼1M append-                                                                           Erwin-■ enables total order at low latencies across per-shard-
+s/s with 100-bytes); Erwin-■ can be useful in deployments                                                                            order off-the-shelf shared logs like Kafka. To demonstrate
+that use small records [47]. However, because data itself                                                                            this, we run an append-only benchmark on stand-alone
+passes through the sequencing layer, it quickly becomes the                                                                          Kafka and Erwin-■ with Kafka as its shards. As shown in
+throughput bottleneck, limiting Erwin-■’s throughput with                                                                            Figure 15, with one shard, Erwin-■ reduces latency by three
+larger records. We next show how Erwin-st solves this.                                                                               orders of magnitude. With three shards, Erwin-■ offers simi-
+                                                                                                                                     lar latency benefits while enabling linearizable total order.
+6.6 Scalability of Erwin-st over Erwin-■
+To measure scaling with more than five shards, we use a                                                                          6.9 Seamlessly Adding Shards in Erwin-st
+different (c6525-25g [3]) CloudLab cluster. As shown in Fig-                                                                     Scalog can seamlessly add/remove shards (unlike Corfu) [41];
+ure 13(a), Erwin-■’s throughput flattens quickly with large                                                                      this is enabled by allowing clients to choose shards instead of
+records. In contrast, by writing only metadata to the sequenc-                                                                   using a fixed position-to-shard mapping. Since Erwin-st also
+ing layer, even with large records, Erwin-st scales well. With                                                                   allows clients to choose shards, it can seamlessly add/remove
+4KB records and 10 shards, it offers ∼700K appends/s. Erwin-                                                                     shards as well. Figure 16 illustrates this: in the middle of a
+st can scale beyond this point; however, we do not have                                                                          workload, we add a shard without downtime; clients start
+
+
+
+                                                                                                                    307
+                                                                                                                                                                                                                  500
+Throughput (KOps/s)
+
+                      100                                      detect               flush                                       KV-Corfu                           60           LogAgg-Corfu                             Journal-Corfu              1.17x
+                                                                 seal           new-view                   45
+
+
+
+
+                                                                                                                                                                                                   Latency (us)
+                                                                                            Latency (us)
+
+
+
+
+                                                                                                                                                    Latency (us)
+                       80                                                                                                       KV-Erwin                                        LogAgg-Erwin                      400    Journal-Erwin
+                                                                           15                                                                                      45
+                       60                                                                                  30                                                              1.8x                                   300
+                                                                           12                                                                                      30
+
+
+
+
+                                                               Time (ms)
+                       40                                                                                                                                                                                         200                      1.32x
+                                                                            9                              15       3.41x       2.56x      1.04x                                                                                  1.53x
+                       20                                                                                                                                          15                       2.9x                  100    1.66x
+                        0                                                   6
+                                                                                                           0                                                                                                        0
+                            4.6   4.8      5       5.2   5.4                                                    write-only write-heavy read-heavy                  0                                                    500      1000     2000     5000
+                                                                            3                                                                                           write            read
+                                                                                                                                                                                                                                  Batch size
+                                        Time (s)                            0
+                                                                                                (b) Log Aggregation   (a) KV Store     (c) Journaling
+ (a) Performance under failure (b) Reconfiguration Figure 18. Applications. The figure shows Erwin’s benefits for applications. (a) shows the average
+                                    breakdown      request latency in a shared-log-based KV store. (b) shows the average transaction latency in log aggregation.
+   Figure 17. Reconfiguration in Erwin.            (c) shows the average record-processing latency for a journaled, streaming word-count application.
+
+writing to the new shard, increasing the throughput.            log with one shard (with three replicas). Keys are 24 bytes and
+                                                                values 1KB in size. Figure 18(a) plots the average KV request
+6.10 Sequencing-Layer Reconfiguration
+                                                                latency. For the write-only workload, all operations benefit
+We next examine how quickly Erwin reconfigures after sequencing-from low latency; thus, Erwin offers the most benefit here:
+replica failures. To do so, we crash a sequencing replica dur-  3.4× lower latency than Corfu. With write-heavy workloads,
+ing a workload. As shown in Figure 17(a), the workload is       the benefits are still considerable (∼2.5×). With read-heavy
+impacted for a small period (∼15 ms) after which it resumes.    workloads, Erwin does not offer much benefit because reads
+However, as shown in 17(b), a big portion of the reconfigura-   incur the same cost in Corfu and Erwin. Since the most
+tion time comes from failure detection and writing the new      significant part of a Put is appending to the shared log, Erwin
+view’s configuration, both of which involve ZooKeeper and       offers the maximum benefit for this application.
+suffer from its inefficiencies. The core recovery takes only     Log Aggregation. We next build audit-logging for a transaction-
+600 𝜇s. Using a faster alternative to ZooKeeper could cut       processing application. The application allows clients to per-
+reconfiguration time to ∼1 ms, which aligns with fail-over      form write operations like account creations, withdrawals,
+times for microsecond-scale applications [26].                  deposits, and transfers, and read operations like balance and
+6.11 Applications                                               transaction-status queries. The application shards accounts
+We now demonstrate that end applications can benefit from       across a set of servers; each server processes transactions
+LazyLog. To do so, we have built a writer-reader decoupled      for accounts in its shard against a local database. Addition-
+key-value (KV) store, a log-aggregation application, and a      ally, the servers also log information about transactions for
+journaled stream-processing application.                        audits to a shared log. Since audits are critical, logging hap-
+   These applications represent different points in the spec-   pens synchronously [71]. Each transaction server uses a local
+trum of the ratio between shared-log interaction and other      RocksDB [45] instance to store data and run transactions.
+computation the application performs to satisfy an end re-         We run a workload with 50% read transactions and 50%
+quest. In the KV store, shared-log interaction is the most      write  transactions, and measure the average transaction la-
+significant part in processing a user-level write request (like tency.  Note that irrespective of transaction type, operations
+in real databases such as Firescroll [48]). In log-aggregation, on  the underlying shared log is write-only. The shared log is
+the application performs other significant computation (such    read  in this application only in an offline fashion, which our
+as processing a transaction) in addition to interacting with    workload     does not exercise. Figure 18(b) shows the result.
+the shared log. Finally, in journaling, the computation can     As  shown,    Erwin offers latency benefits over Corfu for both
+be much more significant than shared-log interaction.           application-level     writes and reads. However, compared to
+ KV Store. Modeled after Firescroll [5], we build a shared-     the  KV   store,  the  benefits are smaller because this applica-
+log-based key-value store, where readers and writers are        tion  performs    transaction   processing in addition to logging
+decoupled. The store supports put-s and get-s. Put-s are han-   to shared    log.  The  benefits  vary depending on the type of
+dled by write-processing servers, which receive and validate    operation.    Specifically,  the  execution  latency for writes is
+requests from end clients, serialize the KV pairs and append    more   significant   than that of reads: writes incur ∼23𝜇s, while
+them to the shared log, and finally acknowledge clients. A      reads  only   take  ∼4𝜇s; thus,  the logging overhead  for reads is
+set of read servers consume the log at their own pace, con-     much more significant. As a result, Erwin offers more benefit
+struct local state, and serve reads. In KV stores that decouple for logging read transactions than write transactions.
+readers from writers, readers do not synchronize with the        Journaling for Stream Processing. Finally, we have built
+log before every read and thus reads are typically eventually   a stream-processing word-count application, where the task
+consistent [34, 75]. Our store also follows the same design.    workers use a shared log for checkpointing their state. In
+   We run the store atop two shared logs: Corfu and Erwin.      stream processing, checkpointing is a commonly used ap-
+We use three YCSB [40] workloads: Load (write-only), YCSB-      proach to provide fault-tolerance and exactly-once seman-
+A (write-heavy: 50% updates, 50% reads), and YCSB-B (read-      tics [27, 63, 92]. In particular, before a task worker produces
+heavy: 5% updates, 95% reads). We configure the store with      a record (e.g., for the next stage), it durably stores the pro-
+one writer and one reader server, and the underlying shared     duced state in a log. For example, Samza uses Kafka for this
+
+
+
+
+                                                                                                                                  308
+purpose [16, 63]. Should a task worker fail, it can use the log           needed has similarities to deferring IO in local [78] and dis-
+to recover its state without violating exactly-once semantics.            tributed [77] file systems, and execution in databases [46].
+   We run a word-count task with five workers. The workers                Skyros [49] and Occult [73] defer ordering until reads in dis-
+process inputs and emit word counts. Before emitting, the                 tributed data stores. However, LazyLog differs from them in
+workers durably store their state to the shared log. Stream-              important ways. Skyros hides the coordination for replicat-
+processing frameworks (like MillWheel [27]) do this for a                 ing within a single shard by deferring ordering and execution
+batch of inputs. Our implementation also does the same. Sim-              of so-called nil-externalizing operations until reads. Lazy-
+ilar to prior systems [27], we measure the latency for records            Log systems avoid shard-internal overheads like Skyros, but
+to be processed and emitted. This latency internally consists             importantly, they also hide the cost of global ordering across
+of reading the record from an input source, processing it,                shards. Occult does not enforce ordering on writes but does
+checkpointing it to the shared log, and finally emitting.                 so upon reads, and works with multiple shards. However, it
+   Figure 18(c) shows the result. As shown, with big batches              only provides causal ordering across shards, a weaker model
+(5K), the fraction of time spent in logging compared to com-              than linearizability that LazyLog provides.
+putation is smaller. Since Erwin optimizes only the check-                Ordering. Consensus protocols like Paxos [66] and oth-
+pointing portion, the improvement with big batches is small               ers [70, 79] can be used to order requests in 2RTTs. However,
+(only 1.17× lower latency than with Corfu). However, with                 they offer a different interface than shared logs. Further,
+smaller batches, logging becomes a more significant portion               while they can order log entries in a shard, when the shared
+and thus Erwin offers more benefits; for example, with a                  log itself is partitioned, these protocols cannot be used to
+batch size of 500, Erwin offers 1.66× lower latency.                      establish a total order for log entries across shards. Specu-
+Applications Summary. LazyLog offers benefits to end                      lation [64, 82, 94] and network ordering [69] provide 1RTT
+applications by reducing the logging latency. The benefit                 ordering for consensus but only within a shard. Eris [68]
+varies based on portion of time spent in interacting with the             uses network ordering for multi-shard transactions but re-
+shared log compared to the the overall execution required                 quires special hardware. Prior approaches that exploit com-
+to satisfy an end-application request.                                    mutativity [76, 81] need not wait for ordering (similar to
+                                                                          LazyLog) when writes commute. However, log appends do
+7   Related Work                                                          not commute, so this approach does not work for shared
+Shared Logs. Corfu scales throughput with shards. Scalog                  logs. Kronos [43] is an event-ordering service that provides
+improves over Corfu by providing more scalability and the                 efficient ordering; however, it only provides a partial order.
+ability to seamlessly add/remove shards. Erwin-st can scale               Metadata Separation. Gnothi [93], a block store, separates
+like Corfu but cannot achieve the scalability level that Scalog           the replication of data blocks and metadata; this separation
+achieves via batching, which is fundamentally at odds with                has similarities to Erwin-st. However, unlike Gnothi, Erwin-
+low latency. Erwin-st forgoes some scalability for low laten-             st writes data and metadata in parallel without coordination
+cies, a trade-off that suits many applications (§5.5). However,           and lazily sequences the metadata. Such data-metadata sep-
+unlike Corfu, Erwin-st offers Scalog’s ability to seamlessly              aration has been useful in storage systems as well [67, 84].
+add/remove shards (§6.9). Mason [56] is a recent system that
+has many similarities to Scalog, but it additionally supports
+the notion of multi-sequencing and service execution. How-
+                                                                          8   Conclusion
+ever, it still eagerly orders records. Boki [57] and FlexLog [51]         Today’s shared logs eagerly order, leading to high latencies.
+build shared logs for serverless computing. Boki’s architec-              We identify that in many shared-log applications, such eager
+ture resembles Scalog’s and it introduces the idea of a meta-             ordering is unnecessary and order can be enforced later upon
+log that simplifies reads compared to Scalog. However, Boki               reads; further, reads are time decoupled from writes. LazyLog
+has the same ordering overheads, incurring high latencies.                exploits this insight by deferring ordering and establishing
+FlexLog avoids Paxos overhead in the ordering layer, but, it              it upon reads. Our work shows that linearizable total order
+still eagerly orders and further assumes reliable broadcast,              across shards can be achieved in a shared log system with
+which requires coordination or programmable switches.                     low ingestion latencies and little to no overhead upon reads.
+   Kafka [28] and other systems [29, 83] offer linearizable
+order only within a shard and they incur high latency due                 Acknowledgments
+to eager ordering. LogDevice [12] and DistributedLog [1]                  We thank our shepherd and the SOSP ’24 reviewers for their
+provide total order. LogDevice is similar to Corfu, but it                insightful comments. We greatly appreciate Mahesh Balakr-
+uses a different data-placement policy [41]. DistributedLog               ishnan for his early feedback on the idea and the paper. We
+forwards data via a single-writer. This has similarities to               thank Vijay Chidambaram for his comments on the paper
+Erwin-■; however, Erwin-■ makes records durable on the                    draft. We also thank the other DASSL members for their
+sequencing layer in 1RTT, and lazily establishes the order.               discussions. This work was funded by NSF CNS-2340218 and
+Defer Until Needed. LazyLog’s idea to defer work until                    CNS-2339784, and an IIDAI grant.
+
+
+
+                                                                    309
+References                                                                        [32] AWS.    CQRS pattern.        https://docs.aws.amazon.com/
+ [1] Apache DistributedLog.    https://github.com/apache/                              prescriptive-guidance/latest/modernization-data-
+     distributedlog.                                                                   persistence/cqrs-pattern.html.
+ [2] Apache Log4j Kafka Appender.  https://logging.apache.                        [33] AWS. Event Sourcing Pattern. https://docs.aws.amazon.com/
+     org/log4j/log4j-2.4/manual/appenders.html#                                        prescriptive-guidance/latest/modernization-data-
+     KafkaAppender.                                                                    persistence/service-per-team.html.
+ [3] Cloudlab Hardware. https://docs.cloudlab.us/hardware.                        [34] AWS. Event Sourcing Pattern. https://docs.aws.amazon.
+     html.                                                                             com/prescriptive-guidance/latest/cloud-design-
+ [4] ETL pipeline.        https://redpanda.com/guides/kafka-                           patterns/event-sourcing.html#:~:text=Eventual%
+     tutorial/etl-pipeline.                                                            20consistency%3A%20Data,the%20current%20state.
+ [5] FireScroll. https://github.com/FireScroll/FireScroll.                        [35] Mahesh Balakrishnan, Jason Flinn, Chen Shen, Mihir Dharamshi,
+ [6] gRPC. https://grpc.io/.                                                           Ahmed Jafri, Xiao Shi, Santosh Ghosh, Hazem Hassan, Aaryaman
+ [7] Kafka Configuration.          https://kafka.apache.org/22/                        Sagar, Rhed Shi, et al. Virtual Consensus in Delos. In Proceedings of
+     generated/producer_config.html.                                                   the 14th USENIX Conference on Operating Systems Design and Imple-
+ [8] Kafka Use Cases. https://kafka.apache.org/uses.                                   mentation (OSDI ’20) [24].
+ [9] Kafka Use Cases - Event Sourcing. https://kafka.apache.org/                  [36] Mahesh Balakrishnan, Dahlia Malkhi, Vijayan Prabhakaran, Ted Wob-
+     uses#uses_eventsourcing.                                                          ber, Michael Wei, and John D. Davis. CORFU: A Shared Log Design
+[10] Kafka Use Cases - Messaging. https://kafka.apache.org/                            for Flash Clusters. In Proceedings of the 9th Symposium on Networked
+     uses#uses_messaging.                                                              Systems Design and Implementation (NSDI ’12), San Jose, CA, April
+[11] LazyLog Code Repository. https://github.com/dassl-uiuc/                           2012.
+     LazyLog-Artifact.                                                            [37] Mahesh Balakrishnan, Dahlia Malkhi, Ted Wobber, Ming Wu, Vijayan
+[12] LogDevice: distributed storage for sequential data. https://                      Prabhakaran, Michael Wei, John D Davis, Sriram Rao, Tao Zou, and
+     logdevice.io/.                                                                    Aviad Zuck. Tango: Distributed Data Structures over a Shared Log. In
+[13] Pattern: Event sourcing.          https://microservices.io/                       Proceedings of the 24th ACM Symposium on Operating Systems Principles
+     patterns/data/event-sourcing.html.                                                (SOSP ’13) [22].
+[14] RabbitMQ. https://www.rabbitmq.com/.                                         [38] Philip A Bernstein, Colin W Reid, and Sudipto Das. Hyder ś A Trans-
+[15] Real-Time Analytics Explained. https://rockset.com/real-                          actional Record Manager for Shared Flash. In CIDR, volume 11, pages
+     time-analytics-explained/.                                                        9ś20, 2011.
+[16] Samza        -    Kafka      Checkpoint.              https:                 [39] Navin Budhiraja, Keith Marzullo, Fred B Schneider, and Sam Toueg.
+     //github.com/apache/samza/blob/                                                   The Primary-backup Approach. Distributed systems, 2, 1993.
+     2eb556a5bcfb4aff83f3ba00fc221108d6cba0b2/samza-                              [40] Brian F. Cooper, Adam Silberstein, Erwin Tam, Raghu Ramakrishnan,
+     kafka/src/main/scala/org/apache/samza/checkpoint/                                 and Russell Sears. Benchmarking Cloud Serving Systems with YCSB.
+     kafka/KafkaCheckpointManager.scala/#L176-L177.                                    In Proceedings of the ACM Symposium on Cloud Computing (SOCC ’10),
+[17] Scalog Github Repository. https://github.com/scalog.                              Indianapolis, IN, June 2010.
+[18] The State of Streaming Data Report 2023-24.           https:                 [41] Cong Ding, David Chu, Evan Zhao, Xiang Li, Lorenzo Alvisi, and
+     //go.redpanda.com/state-of-streaming-data-report-                                 Robbert Van Renesse. Scalog: Seamless Reconfiguration and Total
+     2023-24.                                                                          Order in a Scalable Shared Log. In Proceedings of the 17th Symposium
+[19] The State of Streaming Data Report 2023-24.           https:                      on Networked Systems Design and Implementation (NSDI ’20), Santa
+     //anonymous.4open.science/r/2023datastreaming-                                    Clara, CA, February 2020.
+     survey-report-DCF1/.                                                         [42] Philippe Dobbelaere and Kyumars Sheykh Esmaili. Kafka versus
+[20] Why are CQRS and Event Sourcing good options for instant pay-                     rabbitmq: A comparative study of two industry reference publish/-
+     ments?   https://iconsolutions.com/blog/cqrs-event-                               subscribe implementations: Industry paper. In Proceedings of the 11th
+     sourcing/.                                                                        ACM international conference on distributed and event-based systems,
+[21] ZooKeeper Programmer’s Guide. https://zookeeper.apache.                           pages 227ś238, 2017.
+     org/doc/current/zookeeperProgrammers.html#sc_                                [43] Robert Escriva, Ayush Dubey, Bernard Wong, and Emin Gün Sirer.
+     zkDataMode_watches.                                                               Kronos: The Design and Implementation of an Event Ordering Service.
+[22] Farmington, Pennsylvania, October 2013.                                           In Proceedings of the EuroSys Conference (EuroSys ’14), Amsterdam,
+[23] Boston, MA, February 2019.                                                        The Netherlands, April 2014.
+[24] Banff, Canada, November 2020.                                                [44] Patrick Th Eugster, Pascal A Felber, Rachid Guerraoui, and Anne-Marie
+[25] Virtual, October 2021.                                                            Kermarrec. The many faces of publish/subscribe. ACM computing
+[26] Marcos K. Aguilera, Naama Ben-David, Rachid Guerraoui, Virendra J.                surveys (CSUR), 35(2):114ś131, 2003.
+     Marathe, Athanasios Xygkis, and Igor Zablotchi. Microsecond Consen-          [45] Facebook. RocksDB. http://rocksdb.org/.
+     sus for Microsecond Applications. In Proceedings of the 14th USENIX          [46] Jose M Faleiro, Alexander Thomson, and Daniel J Abadi. Lazy Eval-
+     Conference on Operating Systems Design and Implementation (OSDI ’20)              uation of Transactions in Database Systems. In Proceedings of the
+     [24].                                                                             2014 ACM SIGMOD International Conference on Management of Data
+[27] Tyler Akidau, Alex Balikov, Kaya Bekiroğlu, Slava Chernyak, Josh                  (SIGMOD ’14), Snowbird, UT, June 2014.
+     Haberman, Reuven Lax, Sam McVeety, Daniel Mills, Paul Nordstrom,             [47] Eric Falk, Vijay K Gurbani, and Radu State. Query-able kafka: An agile
+     and Sam Whittle. Millwheel: Fault-tolerant Stream Processing at                   data analytics pipeline for mobile wireless networks. Proceedings of
+     iInternet Scale. Proceedings of the VLDB Endowment, 6(11), 2013.                  the VLDB Endowment, 10(12), 2017.
+[28] Apache. Kakfa. http://kafka.apache.org/.                                     [48] FireScroll. FireScroll - Source Code. https://github.com/
+[29] Apache. Pulsar. https://pulsar.apache.org/.                                       FireScroll/FireScroll/blob/main/api/handler.go#
+[30] Apache. ZooKeeper. https://zookeeper.apache.org/.                                 L96.
+[31] AWS. Amazon Kinesis. https://aws.amazon.com/kinesis/.
+
+
+
+
+                                                                            310
+[49] Aishwarya Ganesan, Ramnatthan Alagappan, Andrea C. Arpaci-                    [70] Barbara Liskov and James Cowling. Viewstamped Replication Revis-
+     Dusseau, and Remzi H. Arpaci-Dusseau. Exploiting Nil-Externality                   ited. 2012.
+     for Fast Replicated Storage. In Proceedings of the 28th ACM Symposium         [71] Log4j. Log4j as An Audit Logging Framework. https://logging.
+     on Operating Systems Principles (SOSP ’21) [25].                                   apache.org/log4j/2.x/manual/async.html.
+[50] Jimena Garbarino. Communicate Between Microservices with Apache               [72] Kafka Log4j.           https://github.com/apache/kafka/
+     Kafka. https://developer.okta.com/blog/2022/09/15/                                 blob/9db5c2481f8cefb5ec9a97d6e715a350dbc929c7/
+     kafka-microservices.                                                               log4j-appender/src/main/java/org/apache/kafka/
+[51] Dimitra Giantsidi, Emmanouil Giortamis, Nathaniel Tornow, Florin                   log4jappender/KafkaLog4jAppender.java#L359.
+     Dinu, and Pramod Bhatotia. FlexLog: A Shared Log for Stateful Server-         [73] Syed Akbar Mehdi, Cody Littley, Natacha Crooks, Lorenzo Alvisi,
+     less Computing. In Proceedings of the 32nd International Symposium on              Nathan Bronson, and Wyatt Lloyd. I Can’t Believe It’s Not Causal!
+     High-Performance Parallel and Distributed Computing, pages 195ś209,                Scalable Causal Consistency with No Slowdown Cascades. In Pro-
+     2023.                                                                              ceedings of the 14th Symposium on Networked Systems Design and
+[52] Ken Goodhope, Joel Koshy, Jay Kreps, Neha Narkhede, Richard Park,                  Implementation (NSDI ’17), Boston, MA, March 2017.
+     Jun Rao, and Victor Yang Ye. Building linkedin’s real-time activity           [74] Microsoft. CQRS pattern. https://learn.microsoft.com/en-
+     data pipeline. IEEE Data Eng. Bull., 35(2):33ś45, 2012.                            us/azure/architecture/patterns/cqrs.
+[53] Dan Goodman. Serving low-latency data in 32 regions with FireScroll           [75] Microsoft. Event Sourcing Pattern. https://learn.microsoft.
+     and Redpanda. https://redpanda.com/blog/multi-region-                              com/en-us/azure/architecture/patterns/event-
+     deployment-redpanda-firescroll.                                                    sourcing.
+[54] Google. Pub/Sub. https://cloud.google.com/pubsub.                             [76] Iulian Moraru, David G Andersen, and Michael Kaminsky. There is
+[55] Maurice P. Herlihy and Jeannette M. Wing. Linearizability: A Correct-              More Consensus in Egalitarian Parliaments. In Proceedings of the 24th
+     ness Condition for Concurrent Objects. ACM Trans. Program. Lang.                   ACM Symposium on Operating Systems Principles (SOSP ’13) [22].
+     Syst., 12(3), July 1990.                                                      [77] Edmund B Nightingale, Peter M Chen, and Jason Flinn. Speculative
+[56] Christopher Hodsdon, Theano Stavrinos, Ethan Katz-Bassett, and Wy-                 Execution in a Distributed File System. October 2005.
+     att Lloyd. MASON: Scalable, Contiguous Sequencing for Building                [78] Edmund B Nightingale, Kaushik Veeraraghavan, Peter M Chen, and
+     Consistent Services. Journal of Systems Research (JSys), 3(1), 2023.               Jason Flinn. Rethink the sync. In Proceedings of the 7th Symposium on
+[57] Zhipeng Jia and Emmett Witchel. Boki: Stateful Serverless Computing                Operating Systems Design and Implementation (OSDI ’06), Seattle, WA,
+     with Shared Logs. In Proceedings of the 28th ACM Symposium on                      November 2006.
+     Operating Systems Principles (SOSP ’21) [25].                                 [79] Diego Ongaro and John Ousterhout. In Search of an Understandable
+[58] Kafka. Kafka Documentation - Compaction. https://kafka.                            Consensus Algorithm. In 2014 USENIX Annual Technical Conference
+     apache.org/documentation.html#compaction.                                          (USENIX ATC 14), Philadelphia, PA, June 2014.
+[59] Kafka. Kafka Documentation - Website Activity Tracking. https:                [80] John Ousterhout, Arjun Gopalan, Ashish Gupta, Ankita Kejriwal,
+     //kafka.apache.org/uses#uses_website.                                              Collin Lee, Behnam Montazeri, Diego Ongaro, Seo Jin Park, Henry
+[60] Kafka. Kafka Use Cases - Commit Logs. https://kafka.apache.                        Qin, Mendel Rosenblum, et al. The ramcloud storage system. ACM
+     org/uses#uses_commitlog/.                                                          Transactions on Computer Systems (TOCS), 33(3):7, 2015.
+[61] Anuj Kalia, Michael Kaminsky, and David Andersen. Datacenter RPCs             [81] Seo Jin Park and John Ousterhout. Exploiting Commutativity For
+     can be general and fast. In Proceedings of the 16th Symposium on                   Practical Fast Replication. In Proceedings of the 16th Symposium on
+     Networked Systems Design and Implementation (NSDI ’19) [23].                       Networked Systems Design and Implementation (NSDI ’19) [23].
+[62] Joe Karlsson. Event sourcing with Kafka. https://www.tinybird.                [82] Dan RK Ports, Jialin Li, Vincent Liu, Naveen Kr Sharma, and Arvind
+     co/blog-posts/event-sourcing-with-kafka.                                           Krishnamurthy. Designing Distributed Systems Using Approximate
+[63] Martin Kleppmann and Jay Kreps. Kafka, Samza and the Unix Philos-                  Synchrony in Data Center Networks. In Proceedings of the 12th Sym-
+     ophy of Distributed Data. 2015.                                                    posium on Networked Systems Design and Implementation (NSDI ’15),
+[64] Ramakrishna Kotla, Lorenzo Alvisi, Mike Dahlin, Allen Clement, and                 Oakland, CA, May 2015.
+     Edmund Wong. Zyzzyva: Speculative Byzantine Fault Tolerance. In               [83] RedPanda. RedPanda. https://redpanda.com/.
+     ACM SIGOPS Operating Systems Review, volume 41, pages 45ś58. ACM,             [84] Kai Ren, Qing Zheng, Swapnil Patil, and Garth Gibson. IndexFS:
+     2007.                                                                              Scaling File System Metadata Performance with Stateless Caching and
+[65] ASC LAB. LAB Insurance Sales Portal - A Simplified Insurance                       Bulk Insertion. In SC’14: Proceedings of the International Conference for
+     Sales System. https://github.com/asc-lab/micronaut-                                High Performance Computing, Networking, Storage and Analysis, pages
+     microservices-poc/.                                                                237ś248. IEEE, 2014.
+[66] Leslie Lamport. Paxos Made Simple. ACM Sigact News, 32(4):18ś25,              [85] Robert Ricci, Eric Eide, and CloudLab Team. Introducing CloudLab:
+     2001.                                                                              Scientific infrastructure for advancing cloud architectures and appli-
+[67] Lanyue Lu and Thanumalayan Sankaranarayana Pillai and Andrea C.                    cations. USENIX ;login:, 39(6), 2014.
+     Arpaci-Dusseau and Remzi H. Arpaci-Dusseau. WiscKey: Separating               [86] Splunk. Log Aggregation: Everything You Need to Know for Aggregat-
+     Keys from Values in SSD-conscious Storage. In 14th USENIX Conference               ing Log Data. https://www.splunk.com/en_us/blog/learn/
+     on File and Storage Technologies (FAST 16), Santa Clara, CA, February              log-aggregation.html.
+     2016.                                                                         [87] Michael Stonebraker, Samuel Madden, Daniel J Abadi, Stavros Hari-
+[68] Jialin Li, Ellis Michael, and Dan RK Ports. Eris: Coordination-free                zopoulos, Nabil Hachem, and Pat Helland. The end of an architectural
+     Consistent Transactions using In-Network Concurrency Control. In                   era: It’s time for a complete rewrite. In Making Databases Work: the
+     Proceedings of the 26th ACM Symposium on Operating Systems Principles              Pragmatic Wisdom of Michael Stonebraker, pages 463ś489. 2018.
+     (SOSP ’17), Shanghai, China, October 2017.                                    [88] Event Store. CQRS pattern. https://www.eventstore.com/
+[69] Jialin Li, Ellis Michael, Naveen Kr Sharma, Adriana Szekeres, and                  cqrs-pattern.
+     Dan RK Ports. Just Say No to Paxos Overhead: Replacing Consensus              [89] Gang Tao. Realizing low latency streaming analytics with Timeplus
+     with Network Ordering. In Proceedings of the 12th USENIX Conference                and Redpanda. https://redpanda.com/blog/low-latency-
+     on Operating Systems Design and Implementation (OSDI ’16), Savannah,               streaming-analytics-timeplus-redpanda.
+     GA, November 2016.
+
+
+
+
+                                                                             311
+[90] Nitish Tiwari. JVM-free centralized logging with Redpanda and                  [94] Benjamin Wester, James A Cowling, Edmund B Nightingale, Peter M
+     Parseable. https://redpanda.com/blog/unify-log-data-                                Chen, Jason Flinn, and Barbara Liskov. Tolerating Latency in Repli-
+     parseable-redpanda.                                                                 cated State Machines Through Client Speculation. In Proceedings of
+[91] Robbert Van Renesse and Fred B Schneider. Chain Replication for                     the 6th Symposium on Networked Systems Design and Implementation
+     Supporting High Throughput and Availability. In Proceedings of the                  (NSDI ’09), Boston, MA, April 2009.
+     6th Symposium on Operating Systems Design and Implementation (OSDI             [95] Irene Zhang, Naveen Kr Sharma, Adriana Szekeres, Arvind Krishna-
+     ’04), San Francisco, CA, December 2004.                                             murthy, and Dan RK Ports. Building consistent transactions with
+[92] Stephanie Wang, John Liagouris, Robert Nishihara, Philipp Moritz,                   inconsistent replication. In Proceedings of the 25th ACM Symposium on
+     Ujval Misra, Alexey Tumanov, and Ion Stoica. Lineage Stash: Fault Tol-              Operating Systems Principles (SOSP ’15), Monterey, California, October
+     erance off the Critical Path. In Proceedings of the 27th ACM Symposium              2015.
+     on Operating Systems Principles (SOSP ’19), Huntsville, ON, Canada,            [96] Irene Zhang, Naveen Kr Sharma, Adriana Szekeres, Arvind Krishna-
+     October 2019.                                                                       murthy, and Dan RK Ports. When is Operation Ordering Required in
+[93] Yang Wang, Lorenzo Alvisi, and Mike Dahlin. Gnothi: Separating Data                 Replicated Transactional Storage? IEEE Data Eng. Bull., 39(1):27ś38,
+     and Metadata for Efficient and Available Storage Replication. In 2012               2016.
+     USENIX Annual Technical Conference (USENIX ATC 12), Boston, MA,
+     June 2012.
+
+
+
+
+                                                                              312
+

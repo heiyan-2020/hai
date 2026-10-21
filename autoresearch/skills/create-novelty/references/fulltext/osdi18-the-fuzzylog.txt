@@ -1,0 +1,1105 @@
+  The FuzzyLog: A Partially Ordered Shared Log
+Joshua Lockerman, Yale University; Jose M. Faleiro, UC Berkeley; Juno Kim, UC San Diego;
+Soham Sankaran, Cornell University; Daniel J Abadi, University of Maryland, College Park;
+          James Aspnes, Yale University; Siddhartha Sen, Microsoft Research;
+                  Mahesh Balakrishnan, Yale University / Facebook
+                https://www.usenix.org/conference/osdi18/presentation/lockerman
+
+
+
+
+           This paper is included in the Proceedings of the
+        13th USENIX Symposium on Operating Systems Design
+                   and Implementation (OSDI ’18).
+                         October 8–10, 2018 • Carlsbad, CA, USA
+                                    ISBN 978-1-939133-08-3
+
+
+
+                                               Open access to the Proceedings of the
+                                           13th USENIX Symposium on Operating Systems
+                                                   Design and Implementation
+                                                     is sponsored by USENIX.
+                      The FuzzyLog: A Partially Ordered Shared Log
+
+        Joshua Lockerman               † Jose M. Faleiro                 † Juno Kim           † Soham Sankaran
+
+            Yale University                 UC Berkeley                 UC San Diego           Cornell University
+
+       Daniel J. Abadi               James Aspnes                Siddhartha Sen             † Mahesh Balakrishnan
+
+     University of Maryland,         Yale University            Microsoft Research          Yale University / Facebook
+          College Park
+                                        † Work done while authors were at Yale University
+
+
+                       Abstract                                    with fixed APIs such as key-value stores, while custom
+The FuzzyLog is a partially ordered shared log abstrac-            solutions can require melding application code with a
+tion. Distributed applications can concurrently append             medley of distributed protocols such as Paxos [29] and
+to the partial order and play it back. FuzzyLog appli-             Two-Phase Commit (2PC) [21], which are individually
+cations obtain the benefits of an underlying shared log            complex, slow/inefficient when layered, and difficult to
+– extracting strong consistency, durability, and failure           merge [40, 60].
+atomicity in simple ways – without suffering from its                 A recently proposed class of designs centers on the
+drawbacks. By exposing a partial order, the FuzzyLog               shared log abstraction, funneling all updates through a
+enables three key capabilities for applications: linear            globally shared log to enable fault-tolerant databases [9–
+scaling for throughput and capacity (without sacrificing           11, 19, 51], metadata and coordination services [8, 12],
+atomicity), weaker consistency guarantees, and tolerance           key-value and object stores [3, 41, 57], and filesystem
+to network partitions. We present Dapple, a distributed            namespaces [50, 56]. Services built over a shared log
+implementation of the FuzzyLog abstraction that stores             are simple, compact layers that map a high-level API to
+the partial order compactly and supports efficient ap-             append/read operations on the shared log, which acts as
+pends / playback via a new ordering protocol. We im-               the source of strong consistency, durability, failure atom-
+plement several data structures and applications over the          icity, and transactional isolation. For example, a shared
+FuzzyLog, including several map variants as well as a              log version of ZooKeeper uses 1K lines of code, an order
+ZooKeeper implementation. Our evaluation shows that                of magnitude lower than the original system [8].
+these applications are compact, fast, and flexible: they              Unfortunately, the simplicity of a shared log requires
+retain the simplicity (100s of lines of code) and strong           imposing a system-wide total order that is expensive,
+semantics (durability and failure atomicity) of a shared           often impossible, and typically unnecessary. Previous
+log design while exploiting the partial order of the Fuzzy-        work showed that a centralized, off-path sequencer can
+Log for linear scalability, flexible consistency guarantees        make such a total order feasible at intermediate scale
+(e.g., causal+ consistency), and network partition toler-          (e.g., a small cluster of tens of machines) [7, 8]. How-
+ance. On a 6-node Dapple deployment, our FuzzyLog-                 ever, at larger scale – in the dimensions of system size,
+based ZooKeeper supports 3M/sec single-key writes, and             throughput, and network bandwidth/latency – imposing a
+150K/sec atomic cross-shard renames.                               total order becomes expensive: ordering all updates via a
+                                                                   sequencer limits throughput and slows down operations
+1   Introduction                                                   if machines are scattered across the network. In addi-
+Large-scale data center systems rely on control plane ser-         tion, for deployments that span geographical regions, a
+vices such as filesystem namenodes, SDN controllers,               total order may be impossible: a network partition can
+coordination services, and schedulers. Such services               cut off clients from the sequencer or a required quorum
+are often initially built as single-server systems that            of the servers implementing the log. On the flip side, a
+store state in local in-memory data structures. Proper-            total order is often unnecessary: updates to disjoint data
+ties such as durability, high availability, and scalability        (e.g., different keys in a map) do not need to be ordered,
+are retrofitted by distributing service state across ma-           while updates that touch the same data may commute
+chines. Distributing state for such services can be dif-           because the application requires weak consistency guar-
+ficult; their requirement for low latency and high respon-         antees (e.g., causal consistency [5]). In this paper, we
+siveness precludes the use of external storage services            explore the following question: can we provide the sim-
+
+
+
+USENIX Association                 13th USENIX Symposium on Operating Systems Design and Implementation                   357
+  remote blue chain (half-propagated)                             app           Applications built over the FuzzyLog API are nearly
+                                              N …               servers     as simple as conventional shared log systems. As shown
+                                                      append
+    F                L           M
+                                                      sync                  in Figure 1, FuzzyLog clients are application servers that
+                                                                            maintain in-memory copies or views of shared objects.
+                                                  …                 F   J
+                                                                A       L
+                                                      sync
+   A                 G                        J                     G   H
+                                                                            To perform an operation on an object, the application
+  local blue chain                                             blue shard
+                                 H                                          appends an entry to the FuzzyLog describing the muta-
+   B                 D                        I   …   append
+                                                                    E   I
+                                                                            tion; it then plays forward the FuzzyLog, retrieving new
+  local red chain                                     sync
+                                                                B
+                                                                    H
+                                                                        C
+                                                                        D   entries from other clients and applying them to its lo-
+                                                                            cal view, until it encounters and executes the appended
+   C                 E            J           K   …   sync     red shard
+                                                                            entry. The local views on the application servers consti-
+  remote red chain (half-propagated)                                        tute soft state that can be reconstructed by replaying the
+               FuzzyLog append / play order
+                                                                            FuzzyLog. A FuzzyLog application that uses only a sin-
+Figure 1: In the FuzzyLog, each color contains updates                      gle color for its updates and runs within a single region is
+to a data shard, while each chain contains updates from                     identical to its shared log counterpart; the FuzzyLog de-
+a geographical region.                                                      generates to a totally ordered shared log, and the simple
+                                                                            protocol described above provides linearizability [23],
+                                                                            durability, and failure atomicity for application state.
+plicity of a shared log without imposing a total order?                         By simply marking each update with colors corre-
+   We propose the FuzzyLog abstraction: a durable, iter-                    sponding to data shards, FuzzyLog applications achieve
+able, and extendable order over updates in a distributed                    scalability and availability. They can use a color per
+system. Crucially, a FuzzyLog provides a partial order                      shard to scale linearly within a data center; transac-
+as opposed to the total order of a conventional shared                      tionally update multiple shards via multi-color appends;
+log. The FuzzyLog is a directed acyclic graph (DAG) of                      obtain causal consistency [5] within a shard by using
+nodes representing updates to a sharded, geo-replicated                     a color across regions; and toggle between strong and
+system (see Figure 1). The FuzzyLog materializes a                          weak consistency when the network partitions and heals
+happens-after relation between updates: an edge from A                      by switching between regions.
+to B means that A must execute after B.                                         Implementing the FuzzyLog abstraction in a scalable
+   The FuzzyLog captures two sources of partial ordering                    and efficient manner requires a markedly different design
+in distributed systems: data sharding and geo-replication.                  from existing shared log systems. We describe Dapple, a
+Internally, nodes in the FuzzyLog are organized into                        system that realizes the FuzzyLog API over a collection
+colors, where each color contains updates to a single                       of in-memory storage servers. Dapple scales throughput
+application-level data shard. A color is a set of inde-                     linearly by storing each color on a different replica set
+pendent, totally ordered chains, where each chain con-                      of servers, so that appends to a single color execute in a
+tains updates originating in a single geographical region.                  single phase, while appends that span colors execute in
+Chains within a color are connected by cross-links that                     two phases (in the absence of failures) that only involve
+represent update causality. The entire DAG – consisting                     the respective replica sets. Dapple achieves this via a
+of multiple colors (one per shard) and chains within each                   new fault-tolerant ordering algorithm that provides linear
+color (one per region) – is fully replicated at every re-                   scaling for single-color appends, serializable isolation
+gion and lazily synchronized, so that each region has the                   for multi-color appends, and failure atomicity. Across
+latest copy of its own chain, but some stale prefix of the                  regions, a lazy synchronization protocol propagates each
+chains of other regions. Figure 1 shows a FuzzyLog de-                      color’s local chain to remote regions.
+ployment with two data shards (i.e,. two colors) and two                        We implemented a number of applications over the
+regions (i.e., two chains per color).                                       FuzzyLog abstraction and evaluated them on Dapple.
+   The FuzzyLog API is simple: a client can append a                        AtomicMap (201 lines of C++) is a linearizable, durable
+new node by providing a payload describing an update                        map that supports atomic cross-shard multi-puts, scal-
+and the color of the shard it modifies. The new node is                     ing to over 5.5M puts/sec and nearly 1M 2-key multi-
+added to the tail of the local chain for that color, with                   puts/sec on a 16-server Dapple deployment. CRDTMap
+outgoing cross-links to the last node seen by the client in                 (284 LOC) provides causal+ consistency by layering a
+each remote chain for the color. The client can synchro-                    CRDT over the FuzzyLog. CAPMap (424 LOC) of-
+nize with a single color, playing forward new nodes in the                  fers strong consistency in the absence of network par-
+local region’s copy of that color in a reverse topological                  titions, but degenerates to causal+ consistency during
+sort order of the DAG. A node can be appended atomi-                        partitions. We implemented a ZooKeeper clone over
+cally to multiple colors, representing a transactional up-                  the FuzzyLog in 1881 LOC that supports linear scaling
+date across data shards.                                                    across shards and supports atomic cross-shard renames.
+
+
+
+358     13th USENIX Symposium on Operating Systems Design and Implementation                                      USENIX Association
+We also implemented a map that provides Red-Blue con-           their views with it on reads. The shared log also provides
+sistency [32], as well as a transactional CRDT [6].             durability: clients can recover views after crashes simply
+   Existing implementations of these applications are           by replaying the shared log. It acts as a source of failure
+monolithic and complex; they often re-implement com-            atomicity and isolation for transactions: the shared log is
+mon mechanisms for storing, propagating, and order-             literally the serializable order of transactions.
+ing updates (such as protocols for atomic commit, con-
+sensus, and causality tracking). The FuzzyLog imple-            2.2    The drawbacks of a total order
+ments this common machinery efficiently under an ex-            The shared log approach achieves a total order over all
+plicit abstraction, hiding the details of protocol imple-       updates in a distributed system. We argue that such a to-
+mentation while giving applications fine-grained control        tal order can be expensive or impossible to achieve when
+over sharding and geo-replication. As a result, appli-          services scale beyond the confines of a small cluster.
+cations can express different ordering requirements via            Total ordering is expensive. The traditional way to
+simple invocations on the FuzzyLog API without imple-           impose a total order is via a leader that receives up-
+menting low-level distributed protocols.                        dates from clients and sequences them; however, this
+Contributions: We propose the novel abstraction of a            limits the throughput of the system at the I/O band-
+FuzzyLog (§3): a durable, iterable DAG of colored nodes         width of a single machine [16]. CORFU [7] uses an
+representing the partial order of updates in a distributed      off-path sequencer – instead of a leader – that issues
+system. We argue that this abstraction is useful (§4), de-      tokens or contiguous positions in an address space to
+scribing and evaluating application designs that obtain         clients. To append data, a client first obtains a token
+the simplicity of the shared log approach while scaling         from the sequencer – effectively reserving an address
+linearly with atomicity, obtaining weaker consistency,          in the address space – and then writes the payload di-
+and tolerating network partitions. We show that the ab-         rectly to a stripe of storage servers responsible for stor-
+straction is practically feasible (§5), describing and eval-    ing that address. This allows clients to totally order
+uating a scalable, fault-tolerant implementation called         updates to a cluster of storage servers without pushing
+Dapple.                                                         all I/O through a single machine; instead, the aggregate
+                                                                throughput of the system is limited by the speed at which
+2     Motivation
+                                                                the sequencer can update a counter and hand out tokens
+The shared log approach makes distributed services sim-         (roughly 600K ops/sec in CORFU [8]). To leverage the
+ple to build by deriving properties such as durability, con-    total order without requiring all clients to play back ev-
+sistency, failure atomicity, and concurrency control via        ery entry, runtimes built over CORFU such as Tango [8]
+simple append/read operations on a shared log abstrac-          and vCorfu [57] support selective playback via streams
+tion. We describe the pros and cons of this approach.           and materialized streams, respectively. This requires se-
+                                                                quencer state to be more complex than a single counter
+2.1    The simplicity of a shared log                           (e.g., per-stream backpointers [8] or additional stream-
+In the shared log approach, application state resides in        specific counters [57]).
+the form of in-memory objects backed by a durable,                 While an off-path sequencer works well for small clus-
+fault-tolerant shared log. In effect, an object exists in two   ters (e.g., 20 servers in two adjacent racks [8]), it does
+forms: an ordered sequence of updates stored durably in         not scale along a number of key dimensions. One such
+the shared log; and any number of views, which are full         dimension is network diameter: since the sequencer lives
+or partial copies of the data structure in its conventional     in a fixed point in the network, far-away clients must in-
+form – such as a tree or a map – stored in DRAM on              cur expensive round-trips on each append. A second di-
+clients (i.e., application servers). Importantly, views con-    mension is network bandwidth; sequencers are not I/O-
+stitute soft state and are instantiated, reconstructed, and     bound or easily parallelizable, and cannot keep pace with
+updated on clients as required by playing the shared log        recent order-of-magnitude increases in I/O bandwidth.
+forward. A client modifies an object by appending a new         On 1 Gbps networks, a sequencer that runs at 600K ops/s
+update to the log; it accesses the object by first synchro-     can support a 20-server CORFU deployment (1 Gbps per
+nizing its local view with the log.                             server or 30K 4KB appends/sec); however, on a 40 Gbps
+   As described in prior work [7, 8], this design simpli-       network, supporting 20 servers will require the sequencer
+fies the construction of distributed systems by extracting      to run at 24M ops/s. A third dimension is payload gran-
+key properties via simple appends/reads on the shared           ularity: shared log applications do not store large pay-
+log, obviating the need for complex distributed protocols.      loads (in the limit, these could be 64-bit pointers to big-
+Specifically, the shared log is the source of consistency:      ger items stored in some external blob store). With 100-
+clients implement state machine replication [46] by fun-        byte payloads, the same sequencer will now have to run
+neling writes through the shared log and synchronizing          at nearly 1 billion ops/s. A final dimension is system size:
+
+
+
+USENIX Association                  13th USENIX Symposium on Operating Systems Design and Implementation               359
+                                                                                                     client
+// constructs a new handle for playing a color                                                        view
+                                                                  B            D           H                    B             D         H
+FL ptr new instance(colorID color , snapID snap=NULL);
+                                                                 local chain                                   local chain
+// appends a node to a set of colors                                                                 region
+int append(FL ptr handle, char ⇤buf, size t bufsize ,             C             E          J                    C             E          J          K
+       colorset ⇤nodecolors) ;                                   remote chain (half-propagated)                 remote chain (half-propagated)
+// synchronizes with the log                                    1) client calls sync                           2) remote nodes added (K) / propagated (J)
+snapId sync(FL ptr handle , void (⇤ callback ) (char ⇤buf,
+       size t bufsize ) ) ;                                       B            D           H               I    B             D         H           I
+// trims the color                                               local chain                                   local chain
+
+int trim(FL ptr handle , snapID snap) ;                           C             E                               C             E          J          K
+                                                                                           J               K
+                                                                 remote chain (half-propagated)                 remote chain (half-propagated)
+             Figure 2: The FuzzyLog API.
+                                                                3) client appends I with cross-edge to E       4) client calls sync
+
+                                                                                           storageof
+                                                                         Figure 3: The evolution   servers
+                                                                                                     a single color.
+if we want to support 40 servers, we now need 2 billion
+ops/s from the sequencer.
+   Published numbers for sequencers in fully functional        the same logical data partition – can occur concurrently.
+systems include: roughly 200K ops/sec (CORFU [7]),                A FuzzyLog is a type of directed acyclic graph (DAG)
+250K ops/sec (NOPaxos [33]), and 600K ops/sec                  that can be constructed and traversed concurrently by
+(Tango [8]). Stand-alone sequencers (i.e., simple coun-        multiple clients. For clarity, we use the term ‘node’ ex-
+ters without per-stream state) are faster; e.g., an RDMA-      clusively to refer to nodes in the FuzzyLog DAG. Each
+based counter runs at 122M ops/sec (80X faster than the        node in the DAG is tagged with one or more colors.
+next highest in the literature) [25]. Even at this speed,      Colors divide an application’s state into logical shards;
+the largest cluster supported at 100 Gbps and a 512-byte       nodes tagged with a particular color correspond to up-
+payload would have just four servers.                          dates against the corresponding logical shard.
+   Some approaches bypass the sequencer throughput                Each color is a set of totally ordered chains, one
+cap at the cost of increasing append latency, either by        per region, with cross-edges between them that indicate
+aggressive batching [51] or writing out-of-order in the        causality. Every region has a full but potentially stale
+shared log address space and waiting for preceding holes       copy of each color; the region’s copy has the latest up-
+to be filled [41]. The added append latency can be unten-      dates of its own chain for the color, but stale prefixes of
+able for control plane services.                               the other per-region chains for that color. Clients interact
+   Total ordering is impossible. Regardless of how the         only with their own region’s local copy of the DAG; they
+total order is generated, it is fundamentally vulnerable       can modify this copy by appending to their own region’s
+to network partitions. Any protocol that provides a to-        chain for a color.
+tal order consistent with a linearizable order (i.e, if an        Figure 2 shows the FuzzyLog API. A client creates an
+update B starts in real time after another update A com-       instance of the FuzzyLog with the new instance call,
+pletes, then B occurs after A in the total order) is subject   supplying a single color to play forward. It can play
+to unavailability during network partitions [14].              nodes of this color with the sync call. It can append
+   We find ourselves at a seeming impasse: a shared log        a node to a set of colors. We first describe the operation
+enables simplicity and strong semantics for distributed        of these calls in a FuzzyLog deployment with a single
+systems, but imposes a total order that is expensive and       color (i.e., an application with a single data shard).
+sometimes impossible. We break this impasse with a par-           The sync call is used by the client to synchronize its
+tially ordered shared log abstraction.                         state with the FuzzyLog. A sync takes a snapshot of the
+                                                               set of nodes currently present at the local region’s copy
+3     The FuzzyLog Abstraction                                 of a color, and plays all new nodes since the last sync
+The FuzzyLog addresses the ordering limitations in Sec-        invocation. Once all new nodes have been provided to
+tion 2 via an expressive partial ordering API. The Fuzzy-      the application via a passed-in callback, the sync returns
+Log’s API captures two general patterns via which ap-          with an opaque ID describing the snapshot. The nodes
+plications partially order operations. First, applications     are seen in a reverse topological sort order of the DAG.
+partition their state across logical data shards, such that    Nodes in each chain are seen in the reverse order of edges
+updates against different shards are processed concur-         in the chain. Nodes in different chains are seen in an or-
+rently. Second, when deployed across geographical re-          der that respects cross-edges. Nodes in different chains
+gions, applications weaken consistency to avoid syn-           that are not ordered by cross-edges can be seen in any
+chronous cross-region coordination on the critical path        order. Note that each node effectively describes a list of
+of requests; as a result, updates across regions – even to     nodes – via its position in a totally ordered chain, and via
+
+
+
+360    13th USENIX Symposium on Operating Systems Design and Implementation                                               USENIX Association
+explicit pointers for cross-edges – that must be seen be-     operations are to a single color within the region (i.e., on
+fore it. Figure 3 shows the client synchronizing with the     a single chain); it does not necessarily respect real-time
+region in panel 1; trailing behind in panels 2 and 3; and     ordering when append operations span multiple colors.
+synchronizing once again in panel 4. Snapshot IDs re-            Discussion: Designing the FuzzyLog API required
+turned by sync calls at different clients can be compared     balancing the power of the API against its simplicity and
+to check if one subsumes the other.                           the feasibility of implementing it. In earlier candidates
+   When a client appends a node to a color with append,       for the API, we directly exposed chains to programmers
+an entry is inserted into the local region’s chain for that   and allowed append/sync on any subset of them with
+color. The entry becomes the new tail of the chain, and it    a choice of consistency guarantees. This API rendered
+has an edge in the DAG pointing to the previous tail; we      a scalable implementation much more difficult; for ex-
+define the tail as the only node in a non-empty chain with    ample, guaranteeing a topological sort order for nodes
+no incoming edge. The local region chain imposes a total      in a subset of chains required us to potentially traverse
+order over all updates generated at that region. Further,     every chain in the system. In addition, the consistency
+outgoing cross-edges are added from the new node to the       choices required programmers to reason about the per-
+last node played by the client from every other per-region    formance and availability of different combinations (e.g.,
+chain for the color. In effect, the newly appended node is    strongly consistent multi-appends on chains in different
+ordered after every node of that color seen by the client.    regions can block due to network partitions). We were
+For example, in Figure 3 (panel 3), a client appends a        able to drastically simplify the API once we realized the
+new node I to the region’s local chain (after node H),        equivalence between colors and shards: for example, it
+with a cross-edge to E, which is the latest node in the       makes sense for clients to play a single color since doing
+remote chain seen by the client.                              otherwise negates the scaling benefit of sharding; and to
+   To garbage collect the FuzzyLog, clients can call trim     obtain causal consistency within a color since it is geo-
+on a snapshot ID to indicate that the nodes in it are         replicated across regions that can partition.
+no longer required (e.g., because the client stored the
+corresponding materialized view in some durable exter-        4   FuzzyLog Applications
+nal store). A snapshot ID can also be provided to the         This section describes how applications can use the
+new instance call, in which case playback skips nodes         FuzzyLog API with a case study of an in-memory
+within the snapshot; this allows a new client to join the     key-value storage service. In this section, the term
+system without playing the FuzzyLog from the begin-           ‘server’ refers exclusively to application servers storing
+ning.                                                         in-memory copies of the key-value map, which in turn
+   While the sync and trim calls operate over a single        are FuzzyLog clients. We start with a simple design
+color, the FuzzyLog supports appending to multiple col-       called LogMap that runs over a single color within a sin-
+ors. An append to a set of colors atomically appends the      gle region (i.e., it effectively runs over a single totally
+entry to the local chains for each color. The new node is     ordered shared log). Each LogMap server has a local in-
+reflected by sync calls on any one of the colors involved.    memory copy of the map and supports put/get/delete
+If a node is in multiple colors, trimming it in one color     operations on keys. The server continuously executes a
+does not remove it from the other colors it belongs to.       sync on the log in the background and applies updates
+   Semantics: Operations to a single color across regions     to keep its local view up-to-date. A get operation at the
+are causally consistent. In other words, two append op-       server simply waits for a sync to complete that started
+erations to the same color issued by clients in different     after it was issued, before accessing the local view and
+regions are only ordered if the node introduced by one        returning; this ensures that any updates that were ap-
+of them has already been seen by the client issuing the       pended to the FuzzyLog before the get was issued are
+other one. In this case, an edge exists in the DAG from       reflected in the local view, providing linearizability. A
+the second node to the first one. The internal structure      put/delete operation appends a node to the FuzzyLog
+of the DAG ensures that the copies at each region con-        describing the update; it then waits for a sync to apply
+verge even though concurrent updates can be applied in        the update to the local view, at which point it returns.
+different orders to them: since the clients at each region       This basic LogMap design – implemented in just
+modify a disjoint part of the DAG (i.e., they append to       193 lines of code – enables durability, high availabil-
+their own per-region chain), there are never any conflicts    ity, strong consistency, concurrency control and failure
+when the copies are synchronized.                             atomicity. It is identical to previously described de-
+   Operations within a single region are serializable. All    signs [7] over a conventional shared log. However, its
+append and sync operations issued by clients within a         reliance on a single total order comes at the cost of scal-
+region execute in a manner consistent with some serial        ability, performance, and availability. The remainder of
+execution. This serialization order is linearizable if the    this section describes how LogMap can be modified to
+
+
+
+USENIX Association                 13th USENIX Symposium on Operating Systems Design and Implementation              361
+                                                                                                        NYC data center
+  shard                                        replica    NYC data center                     replica
+                                                                                                        (primary)
+                                       blue
+                                       shard
+                                                                                                                                          Joining Node
+
+                                       red
+                                                                                                          SF data center
+                                       shard                                                              (secondary)
+  shard                                        replica                                        replica
+                                                          SF data center                                                   Forking Node
+
+ AtomicMap: distributed transactions           CRDTMap: causal+ consistency                   CAPMap: network partition tolerance
+
+                        Figure 4: FuzzyLog capabilities: AtomicMap, CRDTMap, and CAPMap.
+
+
+use the FuzzyLog to circumvent each of these limita-                       pending an intention for a transaction T until it plays the
+tions.                                                                     node, it is guaranteed to have seen all transactions that
+                                                                           could appear before T in the serial order. As a result, fu-
+4.1       Scaling with atomicity within a region                           ture transactions must appear later in the serial order, en-
+We first describe applications that run within a single                    suring strict serializability. In a multi-color transaction,
+region and need to scale linearly. In ShardedMap (193                      we need to ensure that all transactions in all the colors
+LOC), each server stores a shard of the map; each shard                    involved that could appear before T have been seen. A
+corresponds to a FuzzyLog color. Updates to a particular                   decision node conveys two things: that all such transac-
+shard are appended as nodes of the corresponding color                     tions in a color have been seen; and whether they con-
+to the FuzzyLog; each server syncs its local state with                    flict with the transaction. As in Tango [8], our protocol
+the color of its shard. This simple change to LogMap –                     requires at least one application server to be available for
+requiring just the color parameter to be set appropriately                 each shard in order to generate decision records.
+on calls to the FuzzyLog – provides linear scalability for
+linearizable put/get operations.                                           4.2    Weaker consistency across regions
+    The FuzzyLog supports atomicity across shards. If the
+atomic operation required is a simple blind multi-put
+                                                                       Applications can often tolerate weaker consistency guar-
+that doesn’t return a value, all we require is a simple
+                                                                       antees. One example is causal consistency [5], which
+change to append an update to a set of colors instead
+                                                                       roughly requires the following: if a server performs an
+of a single one, corresponding to the shards it modifies.
+                                                                       update U1 after having seen an update U0 , then any other
+AtomicMap (201 LOC, Figure 4 (Left)) realizes this de-
+                                                                       server in the system must see U0 before U1 . If U1 and
+sign. One subtle point is that since FuzzyLog multi-color
+                                                                       U2 were performed independently by servers that did not
+appends are serializable, AtomicMap is also serializable,
+                                                                       see each other’s update, they can be seen in any order.
+not linearizable or strictly serializable.
+    To implement read/write transactions with stronger                        CRDTMap implements a causally consistent map. In
+isolation levels, we use a protocol identical to the one                   Figure 4 (Middle), the map is replicated across two re-
+used by Tango [8]. In TXMap (417 LOC), each server                         gions, one in NYC and another in SF. CRDTMap simply
+executes read-write transactions speculatively [8, 10],                    uses a single color for all updates to a map; in each re-
+tracking read-sets and buffering write-sets. To commit,                    gion, put operations are appended to the local chain for
+the server appends a speculative intention node into the                   the color and propagated asynchronously to the other re-
+FuzzyLog to the set of colors corresponding to the shards                  gion. Since the partial order within a color is exactly the
+being read and written. When a server encounters the in-                   causal order of updates, each server playing the color ob-
+tention node in the color it is playing, it appends a sec-                 serves updates in a causally consistent order.
+ond node with a yes/no decision to the set of colors. To
+generate this decision, the server examines the sub-part                      To achieve convergence when servers see causally in-
+of the transaction touching its own shard and indepen-                     dependent updates in different orders, we employ a de-
+dently (but deterministically) validates it (e.g., checking                sign for CRDTMap based on the Observed-Remove set
+for read-write conflicts when providing strict serializabil-               CRDT [47], which exploits commutativity to execute
+ity). A server only applies the transaction to its local state             concurrent updates in conflicting orders without requir-
+if it encounters both the original intention and a decision                ing rollback logic. The CRDT design achieves this by
+marked yes for each color involved.                                        predicating deletions performed by a server on put oper-
+    Interestingly, this protocol provides strict serializabil-             ations that the server has already seen; accordingly, each
+ity even though the FuzzyLog itself is only serializable.                  delete node in the DAG lists the put operations that it
+Intuitively, within a single color, if a client waits after ap-            subsumes.
+
+
+
+362       13th USENIX Symposium on Operating Systems Design and Implementation                                       USENIX Association
+4.3    Tolerating network partitions                          changes after the forking node and replays the nodes in
+                                                              the forked region of the DAG, applying updates in the
+While CRDTMap can provide availability during net-            primary fork before re-applying the secondary fork. Our
+work partitions, it does so by sacrificing consistency        CAPMap implementation realizes this speculative copy
+even when there is no partition in the system. CAPMap         by cloning state on a fork, and throwing away the clone
+(named after the CAP conjecture [14]) provides strong         when the partition heals; but more efficient copy-on-
+consistency in the absence of network partitions and          write mechanisms could be used as well.
+causal consistency during them (see Figure 4 (Right)).
+                                                                 As a result, we obtain causal+ consistency [35] dur-
+    As with our other map designs, CAPMap appends en-         ing network partitions and linearizability otherwise. Im-
+tries on put operations and then syncs until it sees the      portantly, CAPMap achieves these properties via simple
+appended node. Unlike them, CAPMap requires servers           append and playback policies over the structure and con-
+to communicate with each other, albeit in a simple way:       tents of the FuzzyLog.
+servers route FuzzyLog appends through proxies in other
+regions. To perform a put in the absence of network par-      4.4    Other designs
+titions, the server routes its append through a proxy in a
+                                                              TXCRDTMap: Two properties discussed so far –
+primary region; it then syncs with its own region’s copy
+                                                              transactions within a single region and weak consis-
+of the FuzzyLog until it sees the new node, before com-
+                                                              tency across regions – can be combined to provide
+pleting the put. As a result, a total order is imposed on
+                                                              geo-distributed transactions. By changing 80 LOC in
+all updates (via the primary region’s chain for the color),
+                                                              CRDTMap, we can obtain a transactional CRDT that
+and the map is linearizable.
+                                                              provides cross-shard failure atomicity [6] (or equiva-
+    When a secondary region is partitioned away from the      lently, an isolation guarantee similar to Parallel Snapshot
+primary region, servers switch over to appending to the       Isolation [48]).
+FuzzyLog in the local region, effectively ‘forking’ the to-      RedBlueMap: The FuzzyLog can support RedBlue
+tal order. CAPMap sets a flag on these updates to mark        consistency [32], in which blue operations commute with
+them as secondary nodes (i.e., appends occurring at the       each other and with all red operations, while red opera-
+secondary). Updates that were in-flight during the net-       tions have to be totally ordered with respect to each other,
+work partition event may be re-appended to the local          but not blue operations. RedBlue consistency can be im-
+region, appearing in the DAG as identical nodes in the        plemented with a single color. One of the regions is des-
+primary and secondary forks. When the network parti-          ignated a primary, and ‘Red’ operations are routed to the
+tion heals, servers at the secondary stop appending lo-       primary via a proxy (and thus totally ordered, similar to
+cally and resume routing appends through the proxy at         CAPMap). ‘Blue’ operations are performed at the local
+the primary. Every routed append includes the snapshot        region. We implemented RedBlueMap in 330 LOC.
+ID of the last sync call at the secondary client; the proxy      COPSMap: While CRDTMap can be scaled by
+blocks the append until it sees a subsuming snapshot ID       sharding system state across different per-color in-
+on a sync, ensuring that all the nodes seen by the sec-       stances, an end-client interacting with such a store will
+ondary client have also been seen by the proxy and are        not get causal consistency across shards [35, 36]. Con-
+available at the primary region.                              cretely, in a system with two regions and two colors, an
+    The FuzzyLog explicitly captures the effects of a net-    end-client in one region may issue a put on a red server,
+work partition, including concurrent activity in the re-      and subsequently issue a put on a blue server. Once the
+gions and duplicate updates. As a result, CAPMap can          blue put propagates to the remote region, a different end-
+relax and reimpose strong consistency via a simple play-      client may issue a get on a blue server, and subsequently
+back policy over the FuzzyLog. Any server playing             a get on a red server. If the end-client sees the blue put,
+the DAG after the partition heals enforces a determin-        it must also see the red put, since they are causally re-
+istic total order over nodes in the forked section: when      lated. To provide such a guarantee, the map server can
+it encounters any secondary nodes, it buffers them un-        return a snapshot ID with each operation; the end-client
+til the next primary node (i.e., the joining node). All       can maintain a set of the latest returned snapshot IDs for
+buffered nodes are then applied immediately before the        each color and provide it to the map server on each oper-
+joining node (ignoring duplicate updates), ensuring that      ation, which in turn can include it in the appended node.
+all servers observe the same total order and converge to      In such a scheme, when the blue server in the remote re-
+the same state.                                               gion sees the blue put, it contacts a red server to make
+    Secondary servers that experience a network parti-        sure the causally preceding red node has been seen by it
+tion continue operating over the local fork, applying         and exists in the region. Such a design requires servers
+changes to a speculative copy of state. When the partition    playing different colors to gossip the last snapshot IDs
+heals, each secondary server throws away its speculative      they have seen for their respective colors. We leave the
+
+
+
+USENIX Association                 13th USENIX Symposium on Operating Systems Design and Implementation              363
+COPSMap implementation for future work.                        itives: log-append, which appends an entry to a log;
+                                                               log-snapshot, which accepts a set of logs and returns
+4.5    Garbage collection                                      their current tail positions; and log-read, which returns
+As with shared log systems, GC is enormously simplified        the log entry at a given position.
+by the nature of the workload: the log is used to store a          Clients implement the sync on a color via a
+history of commands rather than first-class data, and can      log-snapshot on the logs for that color, followed
+be trimmed in increasing prefixes. At any time, the appli-     by a sequence of log-reads. The return value of
+cation can store its current in-memory state (and the as-      log-snapshot acts as a vector timestamp for the color,
+sociated snapshot ID) durably on some external storage         summarizing the set of nodes present for that color in the
+system, or alternatively ensure that enough application        local region; this is exactly the snapshot ID returned by
+servers have a copy of it. Once it does so, it can issue the   the sync call. The client library fetches new nodes that
+trim command on the snapshot ID. Clients that are lag-         have appeared since its last sync via log-read calls.
+ging behind may encounter an already trimmed error,            When the application calls append on a color, the client
+in which case they must retrieve the latest durable state      library calls log-append on the local log for that color.
+from the external store, and then continue playing the log     It includes the vector timestamp of nodes seen thus far in
+from that point.                                               the new entry; as a result, each appended entry includes
+                                                               pointers to the set of nodes it causally depends on (these
+5     Dapple Design / Implementation                           are the cross-edges in the FuzzyLog DAG). On a sync,
+Dapple is a distributed implementation of the FuzzyLog         the client library checks each entry it reads for dependen-
+abstraction, designed with a particular set of require-        cies and recursively fetches them before delivering them
+ments in mind. The first is scalability: reads and appends     to the application. In this manner, the client ensures that
+must scale linearly with the number of colors used by the      playback of a single color happens in DAG order.
+application and the number of servers deployed by Dap-             Each chainserver periodically synchronizes with its
+ple, assuming that load is balanced evenly across colors.      counterparts in remote regions, updating the shadow logs
+The second requirement is space efficiency: the Fuzzy-         with new entries that originated in those regions. To fetch
+Log partial order has to be stored compactly, with edges       updates, the chainserver itself acts as a client to the re-
+represented with low overhead. A third requirement is          mote chainserver and uses a sync call; this ensures that
+performance: the append and sync operations must in-           cross-chain dependencies are respected when it receives
+cur low latency and I/O overhead.                              remote nodes. Copied-over entries are reflected in sub-
+   Dapple implements the FuzzyLog abstraction over a           sequent sync calls by clients and played; new entries ap-
+collection of storage servers called chainservers, each        pended by the clients then have cross-edges to them.
+of which stores multiple in-memory log-structured ad-              Dapple replicates each partition via chain replica-
+dress spaces. Dapple partitions the state of the FuzzyLog      tion. Each log-append operation is passed down
+across these chainservers: each color is stored on a sin-      the chain and acknowledged by the tail replica, while
+gle partition. Each partition is replicated via chain repli-   log-snapshot is sent directly to the tail. Once the client
+cation [54]. Our current implementation assumes for            obtains a snapshot, subsequent log-read operations can
+durability that storage servers are outfitted with battery-    be satisfied by any replica in the chain. The choice of
+backed DRAM [17, 24]. We first describe operations             replication protocol is orthogonal to the system design:
+against a single color on an unreplicated chainserver.         we could equally use Multi-Paxos.
+
+5.1    Single-color operation                                  5.2    Multi-color operation
+Recall that each FuzzyLog color consists of a set of to-       The FuzzyLog API supports appending a node to multi-
+tally ordered chains, one per region; each region has the      ple colors. In Dapple, this requires atomically appending
+latest copy of its own local chain, but a potentially stale    a node to multiple logs: one log per color corresponding
+copy of the other regions’ chains. Dapple stores each          to its local region chain. To do so, Dapple uses a classical
+chain on a single log, such that the order of the entries      total ordering protocol called Skeen’s algorithm (which
+in the log matches the chain order (i.e., if a chain con-      is unpublished but described verbatim in other papers,
+tains an edge from B to A, B appears immediately after         e.g., Section 4 in Guerraoui et al. [22]) to consistently
+A in the corresponding log). In a deployment with R re-        order appends.
+gions, each region stores R logs, one per chain. Clients          Skeen’s original algorithm produces a serializable or-
+in the region actively write to one of these (the local        der for operations by multiple clients across different
+log), while the remaining are asynchronously replicated        subsets of servers. Unfortunately, it is not tolerant to the
+from other regions (we call these shadow logs). Each           failure of its participants. In our setting, each ‘server’
+server exposes a low-level API consisting of three prim-       is a replicated partition of chainservers and can be as-
+
+
+
+364    13th USENIX Symposium on Operating Systems Design and Implementation                          USENIX Association
+         skeen-1                         skeen-2                       second phase: this max is the timestamp assigned to
+                       Max = 2.2                                       the multi-append and is sufficient to serialize the multi-
+ C1                                                                    appends in a region. For example, in Figure 5, client
+                2.1                                    2.2
+                             2.2                 2.2                   C1 sends back a max timestamp of 2.2 to servers S1 and
+ S1                                                                    S2. When a chainserver receives this message, it moves
+                                                                       the multi-append from the pending queue to a delivery
+ S2
+                                   3.1                                 queue; it then waits until there is no other multi-append
+                          3.1
+            1.2                           3.1                          in the pending queue with a lower returned timestamp,
+ C2
+                                                                       or in the delivery queue with a lower max timestamp
+                      Max = 3.1
+                                                                       (i.e., no other multi-append that could conceivably be
+      skeen-1
+                                         skeen-2                       assigned a lower max timestamp). Once this condition
+                                                                       is true, the multi-append is removed from the delivery
+Figure 5: Distributed ordering for multi-appends:                      queue and processed. In Figure 5, server S1 receives a
+servers return timestamps X.Y in phase 1 where X is a                  phase 2 message with a max timestamp of 3.1 from client
+local logical clock and Y is a server-specific nonce.                  C2, but does not respond immediately since it previously
+                                                                       responded to a phase 1 message from client C1 with a
+                                                                       timestamp of 2.1. Once C1 sends a phase 2 message
+sumed to not fail. However, the clients in our system are              with a max timestamp of 2.2, S1 knows the ordering for
+unreplicated application servers that can crash. We as-                both outstanding multi-appends and can respond to both
+sume that such client failures are infrequent; this pushes             C1 and C2.
+us towards a protocol that is fast in the absence of client               The protocol described above completes in two
+failures and slower but safe when such failures do occur.              phases. A third step off the critical path involves the
+Accordingly, we add three fault-tolerance mechanisms                   client sending a clean-up message to delete the per-
+– leases, fencing, and write-ahead logging – to produce                append state (the WAL, plus a status bit indicating the
+a variant of Skeen’s that completes in two phases in a                 last executed phase) at the chainservers; this is lazily ex-
+failure-free ‘fast’ path, but can safely recover if the ori-           ecuted after a multiple of the lease time-out, and can be
+gin client crashes.                                                    piggybacked on other messages. If a lease expires be-
+   Each chainserver maintains a local logical Lamport                  fore the two phases are executed at the corresponding
+clock [28]. All client operations are predicated on rela-              server, or the origin client crashes, it leaves one or more
+tively coarse-grain leases [20] (e.g., 100 ms), which they             servers in a wedged state, with the multi-append stuck
+obtain from each server (or the head of the replica chain              in the pending queue and blocking new appends to the
+for each partition); if the lease expires, or the head of the          colors involved. After a time-out, the chainserver begins
+replica chain changes, the operation is rejected.                      responding to new append requests with a stuck-err error
+   We now describe failure-free operation. The fast path               message, along with the WAL entry of the stuck multi-
+consists of two phases, and has to execute from start to               append. A client that receives such an error message can
+completion within the context of a single set of leases,               initiate the recovery protocol for the multi-append.
+one per involved partition. For ease of exposition, we                    A client recovering a stuck multi-append (i.e., a re-
+assume each partition has one chainserver replica.                     covery client) proceeds in three phases: it fences activity
+   In the first phase, an origin client (i.e., a client originat-      by the origin client or other recovery clients; determines
+ing a multi-append) contacts the involved chainservers,                the wedged state of the system; and completes the multi-
+each of which responds with a timestamp consisting of                  append. The fencing phase involves accessing the lease
+the value of its clock augmented with a server-specific                set of the original client (which is stored in the WAL),
+unique nonce to break ties. Each chainserver inserts the               invalidating it at the servers, and writing a new recov-
+multi-append operation into a pending queue along with                 ery lease set at a designated test-and-set location on one
+the returned timestamp. For example, in Figure 5, origin               of the chainservers. If some other recovery client already
+client C1 contacts S1, which responds with 2.1, where                  stored a lease set at this location, we wait for that client to
+the local clock value is 2 and the unique nonce is 1. In               recover the append, fencing it after a time-out. Fencing
+addition, the origin client provides a WAL (write-ahead                ensures that at any given point, only one client is active;
+log) entry that each chainserver stores; this includes the             the WAL allows clients to deterministically roll forward
+payload, the colors involved, and the set of leases used               the multi-append.
+by the multi-append.                                                      Correctness: Skeen’s protocol has been proven to
+   Once the client hears back from all the involved chain-             generate a total order by others [22, 45]. To prove our
+servers, it computes the max across all received times-                recovery protocol correct, we wrote conventional proofs
+tamps, and transmits that back to the chainservers in a                as well as a machine-checked proof in Coq. We omit the
+
+
+
+USENIX Association                              13th USENIX Symposium on Operating Systems Design and Implementation             365
+full proof for lack of space. Informally, we prove that the
+                                                                                                                                              1 replica
+test-and-set mechanism ensures that only one client is ac-                              75                 Single-Color Appends
+                                                                                                                                             2 replicas
+                                                                                        50
+tively mutating the state of the system at any given point                              25
+                                                                                                                                             3 replicas
+
+in time. Further, we show that each append can be mod-                                   0
+eled as a four-stage state machine (some servers in phase                               75                 Two-Color Appends
+1, some uninitiated; some in phase 1, some in phase 2;
+
+
+
+
+                                                                % of operations
+                                                                                        50
+some in phase 2, some completed; all completed). Any                                    25
+                                                                                         0
+recovery client finds the system in a particular state and
+advances it in a manner identical to the non-failing case.                              75
+                                                                                        50
+                                                                                                           Two-Color Recovery
+
+   Performance and availability: The append protocol                                    25
+takes two phases in the fast path and three in the recov-                                0
+                                                                                             0       200       400   600      800     1000    1200        1400
+ery path. The protocol can block if the logs being ap-                                                               Latency (microsecs)
+pended to reside on different sides of a network parti-
+tion; however, the semantics of colors in FuzzyLog en-         Figure 6: Dapple executes single-color appends in one
+sure that we only append to logs within a single region.       phase; multi-color appends in two phases; and recovers
+Single-color appends follow the same protocol as multi-        from crashed clients in three phases.
+appends, but complete in a single phase that compresses
+the two phases of the fast path.                                                        12
+   A subtle point is that a missed fast path deadline will                                       Dapple 0%             Dapple 100%
+
+
+                                                                Millions of Appends/s
+                                                                                        10       Dapple 0.1%         Emulated Tango
+block other multi-appends from completing, but will not                                  8       Dapple 1%
+cause them to miss their own deadlines; they are free to                                 6
+                                                                                                 Dapple 10%
+
+complete the fast path and receive a timestamp, and only                                 4
+block in the delivery queue. As a result, a crashed client                               2
+will cause a latency spike but not a cascading series of re-                             0
+                                                                                             2             4           6                 8      10               12
+coveries. In addition, this protocol is subject to FLP [18]                                                                Num Clients
+and susceptible to livelock, since recovery clients can        Figure 7: Dapple scales with workload parallelism, but
+fence each other perpetually. Our implementation mit-          a centralized sequencer bottlenecks emulated Tango.
+igates this by having clients back-off for a small, ran-
+domized time-out if they encounter an ongoing recovery,
+before fencing it and taking over recovery.                    while two-color appends execute in two phases and two-
+                                                               color recoveries execute in three phases.
+6     Evaluation                                                 The remainder of our evaluation is structured as fol-
+We run all our experiments on Amazon EC2 using                 lows: First, we evaluate the differences between Dapple
+c4.2xlarge instances (8 virtual cores, 15 GiB RAM, Intel       and prior shared log designs (§6.1). Second, we use the
+Xeon E5-2666 v3 processors). Most of the experiments           Map variants from §4 to show that Dapple provides linear
+run within a single EC2 region; for geo-distributed ex-        scaling with atomicity (§6.2), weaker consistency guar-
+periments, we ran across the us-east-2 (Ohio) and the ap-      antees (§6.3), and network partition tolerance (§6.4). Fi-
+northeast-1 (Tokyo) regions, which are separated by an         nally, we describe a ZooKeeper clone over Dapple (§6.5).
+average ping latency of 168ms. In all experiments, we
+run Dapple with two replicas per partition unless other-
+                                                               6.1                           Comparison with shared log systems
+wise specified. All throughput numbers are without any         In this experiment, we show that centralized sequencers
+application-level batching.                                    in existing shared log systems fundamentally limit scal-
+   We first report latency micro-benchmarks for Dapple         ability. Shared log systems such as Tango [8] and
+on a lightly loaded deployment. Figure 6 shows the             vCorfu [57] use a centralized sequencer to determine
+distribution of latencies for 16-byte appends involving        a unique monotonic sequence number for each append.
+one color (top) and two colors on different chainservers       Based on its sequence number, each append is deter-
+(middle), as well as the latency to recover stuck multi-       ministically replicated on a different set of servers. The
+appends due to crashed clients (bottom). In all cases,         sequencer therefore becomes a centralized point of co-
+latency increases with increasing replication factor due       ordination, even when requests execute against differ-
+to chain replication. At every replication factor, single-     ent application-level data-structures or shards. In con-
+color appends are executed with lower latency than two-        trast, Dapple allows applications to naturally express
+color appends, which in turn require lower latency than        their sharding requirements via colors, and can execute
+two-color recovery. This difference in latency arises be-      appends to disjoint sets of colors independently.
+cause single-color appends execute in a single phase,             We emulate Tango’s append protocol in Dapple by us-
+
+
+
+366    13th USENIX Symposium on Operating Systems Design and Implementation                                                          USENIX Association
+                  7                                                            remote partition.
+                             # of AtomicMap / Dapple servers = 1 / 8              Figure 8 shows the results of the AtomicMap ex-
+                  6                                            2/8
+                                                               4/8             periment. For different percentages of multi-puts in
+                  5                                            8/8             the workload (on the x-axis), we vary system size and
+ Ms of puts/sec
+
+
+
+
+                                                            16 / 16
+                  4                                         32 / 16            plot throughput on the y-axis. We use between 8 and
+                                                                               16 chainservers in Dapple (deployed without replication
+                  3                                                            since we ran into EC2 instance limits). We use 8-byte
+                  2                                                            keys and 8-byte values to emulate a workload where the
+                                                                               AtomicMap acts as an index storing pointers to an ex-
+                  1
+                                                                               ternal blob store. Keys for put operations are selected
+                  0                                                            uniformly at random from a key space of 1M keys.
+                      0%       0.1%       1%           10%             100
+                                                                           %      Figure 8 shows that under 0% multi-shard puts,
+                               Workload (% of multi-shard puts)
+                                                                               throughput scales linearly from 1 to 16 AtomicMap
+Figure 8: AtomicMap scales throughput while support-                           servers. The throughput jump from 16 to 32 servers is
+ing multi-shard transactions. Each bar labelled N / K                          slightly less than 2x because we pack two Dapple clients
+shows throughput with N AtomicMap servers running                              per AtomicMap server at the 32 client data point (due
+against a K-server Dapple deployment.                                          to the EC2 instance limit). As the percentage of multi-
+                                                                               shard puts increases from 0.1% to 100%, scalability and
+                                                                               absolute throughput degrade gracefully. This is expected
+ing five chainserver partitions to store data, and a sin-                      due to the extra cost of executing multi-shard puts (each
+gle unreplicated server to disperse sequence numbers;                          requires a two-phase multi-color append).
+given a sequence number, appends are deterministically
+written (via a Dapple-append) to one of the five chain-                        6.3    Weaker consistency guarantees
+server partitions in a round-robin fashion. We com-                            Dapple allows geo-distributed applications to perform
+pare this to a FuzzyLog deployment that uses five chain-                       updates to the same color with low latency. By compos-
+server partitions. The number of partitions and replica-                       ing a single color out of multiple totally ordered chains,
+tion factor in emulated Tango and Dapple are identical,                        one per geographical region, a client in a particular re-
+while emulated Tango uses an extra server for sequenc-                         gion can append updates to a color without performing
+ing. We run a workload where each client appends to                            any coordination across regions in the critical path. This
+a particular color, mixing single-color appends with a                         section demonstrates this capability via a CRDTMap.
+fixed percentage of appends that include a second, ran-                           In Figure 9, we host a single, unpartitioned CRDTMap
+domly picked color. Figure 7 shows average throughput                          on five application servers (i.e., Dapple clients); we lo-
+over a 10-second run for workloads with different per-                         cate each in a virtual region with its own Dapple copy,
+centages of two-color appends. Emulated Tango cannot                           all running in the same EC2 region. Four of these servers
+scale beyond four clients due to its use of a centralized                      are writers issuing put operations at a controlled aggre-
+sequencer. Dapple scales near-linearly when the work-                          gate rate (left y-axis), while the fifth is a reader issuing
+load is fully partitionable (0% multi-color appends), is                       get operations on the CRDTMap. Each writing server
+2X faster at 1% multi-color appends, and matches Tango                         uses four writer processes. The gets observe some fron-
+at 10% multi-color appends. At 100% multi-color ap-                            tier of the underlying DAG, and can therefore lag behind
+pends, Dapple performs worse because the required par-                         by a certain number of puts (right y-axis), but are fast,
+tial order is nearly a total order, which Tango provides                       local operations. Midway through the experiment, we
+more efficiently.                                                              spike the put load on the system; this does not slow down
+                                                                               get operations at the reader (not shown in the graph), but
+6.2                   Scalable multi-shard atomicity                           instead manifests as staleness.
+The FuzzyLog allows applications to scale within a re-
+gion by sharding across colors, and supports multi-shard
+                                                                               6.4    Network partition tolerance
+transactions via multi-color appends. We now demon-                            Dapple allows applications to provide strong consistency
+strate the scalability of an AtomicMap (Section 4.1),                          during normal operation and weak consistency under
+which partitions its state across multiple colors. Each                        network partitions. In this experiment, we demonstrate
+AtomicMap server is a Dapple client, and is affinitized                        this capability by running CAPMap across a primary and
+with a unique color (corresponding to a logical parti-                         a secondary region (us-east-2 and ap-northeast-1, respec-
+tion of the AtomicMap’s state). Each client performs a                         tively). The experiment lasts for 14 seconds. From 0-
+combination of single puts against its local partition and                     6 seconds, the primary and secondary regions are con-
+multi-puts against its partition and a randomly selected                       nected. Between 6-8 seconds, we simulate a network
+
+
+
+USENIX Association                                13th USENIX Symposium on Operating Systems Design and Implementation                367
+                               1.5                                                      4
+
+
+
+
+                                                                                            Staleness (Ms of missing puts)
+                                                Staleness (right y-axis)
+ Throughput (Ms of puts/sec)
+
+                                           CRDTMap puts/sec (left y-axis)
+                                                                                        3
+                                1
+
+                                                                                        2
+
+                               0.5
+                                                                                        1
+
+
+                                0                                                       0
+                                 0
+
+                                     10
+
+                                          20
+
+                                               30
+
+                                                    40
+
+                                                         50
+
+                                                              60
+
+                                                                   70
+
+                                                                        80
+
+                                                                             90
+
+                                                                                  100
+                                                Time Elapsed (secs)
+Figure 9: CRDTMap provides a trade-off between
+throughput and staleness.
+
+
+partition between the primary and secondary. Finally,
+from 8-14 seconds, connectivity between the primary
+and secondary is restored. Each region runs two servers,
+one issuing puts and one issuing gets. We measure the                                                                        Figure 10: CAPMap switches between linearizability
+latency of gets and puts (y-axis), against the wall-clock                                                                    and causal+ consistency during network partitions.
+time they are issued at (x-axis).
+   Figure 10 shows the results of the experiment. In nor-
+mal operation (0 to 6 seconds), all updates are stored in                                                                    ZooKeeper. Each DappleZK server is responsible for
+a single primary chain, and both regions get strong con-                                                                     an independent shard of the ZooKeeper namespace, and
+sistency; the secondary has high latencies for puts and                                                                      atomically creates and renames files. Create operations
+gets due to the 168 ms inter-region roundtrip it incurs                                                                      are restricted to a single DappleZK shard. Each rename
+to access the primary chain. At 6 seconds, the network                                                                       atomically moves a file from one DappleZK shard to an-
+between the regions partitions; the primary continues to                                                                     other via the distributed transaction protocol described in
+obtain strong consistency and low latency, but the sec-                                                                      Section 4.1.
+ondary switches to weaker consistency, storing its up-                                                                          We partition the ZooKeeper namespace across 12
+dates on a local secondary chain (and obtaining much                                                                         DappleZK shards, and run one DappleZK server per
+lower latency for puts/gets in exchange for the weaker                                                                       shard. We deploy Dapple with either one or two parti-
+consistency). At 8 seconds, the network heals; the sec-                                                                      tions. Each partition is configured with three replicas.
+ondary appends a joining node to the primary chain via                                                                       DappleZK uses two coloring schemes; a color per parti-
+a proxy in the primary region. As part of this joining
+request, the secondary provides a snapshot ID reflect-
+ing the last node it appended to its local chain. The
+                                                                                                                                                               4000
+proxy at the primary waits until the nodes in the snap-                                                                                                                    DappleZK, color per ZK shard (2 partitions)
+                                                                                                                              Throughput (Ks of creates/sec)
+
+
+
+
+                                                                                                                                                                                                          (1 partition)
+shot are replicated to the primary region and seen by it                                                                                                       3500
+                                                                                                                                                                           DappleZK, color per partition (2 partitions)
+before completing the joining append. The joining ap-                                                                                                          3000                                       (1 partition)
+                                                                                                                                                                                             ZooKeeper (2 partitions)
+pend causes a high latency put by the secondary just after                                                                                                     2500                                       (1 partition)
+the partition heals, and a spike in get latency on the pri-
+                                                                                                                                                               2000
+mary as it plays nodes appended to the secondary chain
+                                                                                                                                                               1500
+during the partition.
+                                                                                                                                                               1000
+6.5                             End-to-end applications                                                                                                         500
+We implemented a ZooKeeper clone, DappleZK in 1881                                                                                                                0
+                                                                                                                                                                      0%          0.1%      1%         10%           100
+LOC of Rust. DappleZK partitions a namespace across                                                                                                                                                                       %
+a set of servers, each of which acts as a Dapple client,                                                                                                                           Workload (% atomic renames)
+storing a partition of the namespace in in-memory data-
+structures backed by a FuzzyLog color.                                                                                       Figure 11: DappleZK exploits Dapple’s partial ordering
+   This section compares DappleZK’s performance with                                                                         to implement a scalable version of the ZooKeeper API.
+
+
+
+368                             13th USENIX Symposium on Operating Systems Design and Implementation                                                                                                 USENIX Association
+tion and a color per DappleZK shard. In the color per par-   partial orders relating to both causality and data sharding
+tition deployment, each color holds updates correspond-      within a single ordering abstraction.
+ing to multiple DappleZK server shards.                         FuzzyLog designs for providing weaker consistency
+    We run conventional ZooKeeper with three replicas,       are informed by a number of systems: COPS [35] and
+and also include a partitioned ZooKeeper deployment          Eiger [36] provide causal consistency in a partitioned
+with two partitions. Our ZooKeeper deployments keep          store, while Bayou allows for disconnected updates and
+their state in DRAM to enable a fair comparison. Note        eventual reconciliation [44, 49]. TARDiS [15] exposes
+that ZooKeeper does not support atomic renames; we           branch-on-conflict as an abstraction in a fully replicated,
+emulated renames on it by executing a delete and cre-        multi-master store. In contrast to the TARDiS DAG, the
+ate operation in succession. We include the ZooKeeper        FuzzyLog allows applications to construct a wider range
+comparison for completeness; we expect the FuzzyLog          of partial orders (e.g., CAPMap branches on network
+single-partition case to outperform ZooKeeper largely        partitions rather than conflicts), and enables distributed
+due to the different languages used (Rust vs. Java) and      transactions via color-based partitioning.
+the difference between prototype and production-quality
+                                                                A number of systems provide distributed transactions
+code.
+                                                             over addresses or objects [4, 34]. Recent systems lever-
+    Figure 11 shows the results of the experiment. We
+                                                             age modern networks such as RDMA and Infiniband to
+vary the percentage of renames in the workload on the
+                                                             enable high-speed transactions [17, 31]. FuzzyLog pro-
+x-axis, and plot throughput on the y-axis. Each x-axis
+                                                             vides a lower layer of abstraction, which in turn sup-
+point shows a cluster of bars corresponding to the four
+                                                             ports general-purpose transactions using shared log tech-
+DappleZK configurations and two ZooKeeper configura-
+                                                             niques [8, 10]. There has also been recent interest in
+tions. With a single color and a single partition, every
+                                                             improving distributed transaction throughput and latency
+DappleZK server stores its state on the same color. Dap-
+                                                             via techniques such as transaction chopping [39, 58, 59,
+pleZK servers perform their appends and reads against
+                                                             61]. These mechanisms could be employed by transac-
+the same color, which limits their throughput. With two
+                                                             tional FuzzyLog applications.
+partitions, the number of DappleZK servers per color is
+halved, which increases throughput. When we switch             Finally, the FuzzyLog is heavily inspired by shared log
+to a color per DappleZK server, throughput increases         designs from research [7, 8, 10] and industry [1, 2, 55].
+dramatically because requests from different DappleZK
+servers do not need to be serialized against the same        8   Conclusion
+color. The addition of another partition further increases
+                                                             The shared log approach simplifies the construction of
+throughput because the colors can be spread across two
+                                                             control plane services, but tightly bounds the scalability
+partitions. When deployed with a single partition, Dap-
+                                                             and consistency of the resulting systems. The FuzzyLog
+ple servers were overloaded, which led to extra schedul-
+                                                             abstraction – and its implementation in Dapple – extends
+ing overhead and caused the two partition case to out-
+                                                             the shared log approach to partial orders, allowing appli-
+perform a single partition by over 2X (in both color per
+                                                             cations to scale linearly without sacrificing transactional
+ZK shard and color per partition cases). With an increas-
+                                                             guarantees, obtain a range of consistency guarantees, and
+ing fraction of atomic renames, throughput decreases be-
+                                                             switch seamlessly between these guarantees when the
+cause DappleZK must perform a distributed transaction
+                                                             network partitions and heals. Crucially, applications can
+across the involved DappleZK servers. In comparison to
+                                                             achieve these capabilities in hundreds of lines of code via
+DappleZK, ZooKeeper provided 36K and 66K ops/s with
+                                                             simple, data-centric operations on the FuzzyLog, retain-
+one and two partitions respectively.
+                                                             ing the core simplicity of the shared log approach.
+7   Related Work
+                                                             Acknowledgments
+Abstractions for ordering updates in a distributed sys-
+tem have a long history. Examples include Virtual Syn-       This work was funded primarily by an NSF AitF grant
+chrony [13, 53], State Machine Replication [46], View-       (CCF-1637385), and partly by NSF grants CCF-1650596
+stamp Replication [42], Multi-Paxos [52], and newer          and IIS-1718581. We thank Zhong Shao for his signif-
+approaches such as Raft [43]. Most of these impose           icant input from the beginning of the project. We also
+a total order on updates; the exceptions track particu-      thank Luis Rodrigues and Yair Amir for feedback on
+lar partial orders imposed by operation commutativity        the ideas behind the FuzzyLog. Vijayan Prabhakaran
+(pessimistically [30, 37] and optimistically [26]), causal   and Hakim Weatherspoon provided valuable comments
+consistency (as in Virtual Synchrony and Lazy Replica-       on early drafts of this paper. Finally, we would like to
+tion [27]), or network partitions (as in Extended Virtual    thank Kang Chen for shepherding the paper, as well as
+Synchrony [38]). In contrast, the FuzzyLog expresses the     the anonymous reviewers for their insightful reviews.
+
+
+
+USENIX Association                 13th USENIX Symposium on Operating Systems Design and Implementation             369
+References                                                 [13] B IRMAN , K. P., AND J OSEPH , T. A. Reliable
+                                                                communication in the presence of failures. ACM
+ [1] Facebook logdevice. https://code.facebook.
+                                                                Transactions on Computer Systems (TOCS) 5, 1
+     com/posts/357056558062811/logdevice-a-
+                                                                (1987), 47–76.
+     distributed-data-store-for-logs/.
+                                                           [14] B REWER , E. A. Towards robust distributed sys-
+ [2] VMware CorfuDB.           https://github.com/
+                                                                tems. In PODC 2000.
+     CorfuDB/CorfuDB.
+                                                           [15] C ROOKS , N., P U , Y., E STRADA , N., G UPTA , T.,
+ [3] Zlog transactional key-value store. http:                  A LVISI , L., AND C LEMENT, A. Tardis: A branch-
+     //noahdesu.github.io/2016/08/02/zlog-                      and-merge approach to weak consistency. In ACM
+     kvstore-intro.html.                                        SIGMOD 2016.
+ [4] AGUILERA , M. K., M ERCHANT, A., S HAH , M.,          [16] D ÉFAGO , X., S CHIPER , A., AND U RB ÁN , P. Total
+     V EITCH , A., AND K ARAMANOLIS , C. Sinfonia: a            order broadcast and multicast algorithms: Taxon-
+     new paradigm for building scalable distributed sys-        omy and survey. ACM Computing Surveys (CSUR)
+     tems. In ACM SOSP 2007.                                    36, 4 (2004), 372–421.
+ [5] A HAMAD , M., N EIGER , G., B URNS , J. E.,           [17] D RAGOJEVI Ć , A., NARAYANAN , D., N IGHTIN -
+     KOHLI , P., AND H UTTO , P. W. Causal mem-                 GALE , E. B., R ENZELMANN , M., S HAMIS , A.,
+     ory: Definitions, implementation, and program-             BADAM , A., AND C ASTRO , M. No compromises:
+     ming. Distributed Computing 9, 1 (1995), 37–49.            distributed transactions with consistency, availabil-
+                                                                ity, and performance. In ACM SOSP 2015.
+ [6] A KKOORATH , D. D., T OMSIC , A. Z., B RAVO ,
+     M., L I , Z., C RAIN , T., B IENIUSA , A.,            [18] F ISCHER , M. J., LYNCH , N. A., AND PATERSON ,
+     P REGUIÇA , N., AND S HAPIRO , M. Cure: Strong            M. S. Impossibility of distributed consensus with
+     semantics meets high availability and low latency.         one faulty process. Journal of the ACM (JACM) 32,
+     In IEEE ICDCS 2016.                                        2 (1985), 374–382.
+
+ [7] BALAKRISHNAN , M., M ALKHI , D., P RAB -              [19] G OEL , A. K., P OUND , J., AUCH , N., B UM -
+     HAKARAN , V., W OBBER , T., W EI , M., AND                 BULIS , P., M AC L EAN , S., F ÄRBER , F.,
+     DAVIS , J. D. Corfu: A shared log design for flash         G ROPENGIESSER , F., M ATHIS , C., B OD -
+     clusters. In USENIX NSDI 2012.                             NER , T., AND L EHNER , W. Towards scalable
+                                                                real-time analytics: an architecture for scale-out of
+ [8] BALAKRISHNAN , M., M ALKHI , D., W OBBER ,                 OLxP workloads. In VLDB 2015.
+     T., W U , M., P RABHAKARAN , V., W EI , M.,
+     DAVIS , J. D., R AO , S., Z OU , T., AND Z UCK , A.   [20] G RAY, C., AND C HERITON , D. Leases: An ef-
+     Tango: Distributed Data Structures over a Shared           ficient fault-tolerant mechanism for distributed file
+     Log. In ACM SOSP 2013.                                     cache consistency. In ACM SOSP 1989.
+
+ [9] B ERNSTEIN , P. A., AND DAS , S. Scaling Opti-        [21] G RAY, J. N. Notes on data base operating systems.
+     mistic Concurrency Control by Approximately Par-           In Operating Systems. Springer, 1978, pp. 393–481.
+     titioning the Certifier and Log. IEEE Data Eng.       [22] G UERRAOUI , R., AND S CHIPER , A. Total order
+     Bull. 38, 1 (2015), 32–49.                                 multicast to multiple groups. In IEEE ICDCS 1997.
+[10] B ERNSTEIN , P. A., DAS , S., D ING , B., AND         [23] H ERLIHY, M. P., AND W ING , J. M. Linearizabil-
+     P ILMAN , M.     Optimizing Optimistic Concur-             ity: A Correctness Condition for Concurrent Ob-
+     rency Control for Tree-Structured, Log-Structured          jects. ACM Trans. Program. Lang. Syst. 12, 3 (July
+     Databases. In ACM SIGMOD 2015.                             1990), 463–492.
+[11] B ERNSTEIN , P. A., R EID , C. W., AND DAS , S.       [24] K ALIA , A., K AMINSKY, M., AND A NDERSEN ,
+     Hyder-A Transactional Record Manager for Shared            D. G. FaSST: fast, scalable and simple dis-
+     Flash. In CIDR 2011.                                       tributed transactions with two-sided (RDMA) data-
+                                                                gram RPCs. In USENIX OSDI 2016.
+[12] B EVILACQUA -L INN , M., B YRON , M., C LINE , P.,
+     M OORE , J., AND M UIR , S. Sirius: Distributing      [25] K AMINSKY, A. K. M., AND A NDERSEN , D. G.
+     and Coordinating Application Reference Data. In            Design guidelines for high performance RDMA
+     USENIX ATC 2014.                                           systems. In USENIX ATC 2016.
+
+
+
+370   13th USENIX Symposium on Operating Systems Design and Implementation                     USENIX Association
+[26] K APRITSOS , M., WANG , Y., Q UEMA , V.,                 [39] M U , S., C UI , Y., Z HANG , Y., L LOYD , W., AND
+     C LEMENT, A., A LVISI , L., DAHLIN , M., ET AL .              L I , J. Extracting More Concurrency from Dis-
+     All about Eve: Execute-Verify Replication for                 tributed Transactions. In USENIX OSDI 2014.
+     Multi-Core Servers. In USENIX OSDI 2012.
+                                                              [40] M U , S., N ELSON , L., L LOYD , W., AND L I , J.
+[27] L ADIN , R., L ISKOV, B., S HRIRA , L., AND G HE -            Consolidating Concurrency Control and Consensus
+     MAWAT, S. Providing high availability using lazy              for Commits under Conflicts. In USENIX OSDI
+     replication. ACM Transactions on Computer Sys-                2016.
+     tems (TOCS) 10, 4 (1992), 360–391.
+                                                              [41] NAWAB , F., A RORA , V., AGRAWAL , D., AND
+[28] L AMPORT, L. Time, clocks, and the ordering of                E L A BBADI , A. Chariots: A Scalable Shared Log
+     events in a distributed system. Communications of             for Data Management in Multi-Datacenter Cloud
+     the ACM 21, 7 (1978), 558–565.                                Environments. In EDBT (2015), pp. 13–24.
+[29] L AMPORT, L. The part-time parliament. ACM
+                                                              [42] O KI , B. M., AND L ISKOV, B. H. Viewstamped
+     Transactions on Computer Systems (TOCS) 16, 2
+                                                                   replication: A new primary copy method to sup-
+     (1998), 133–169.
+                                                                   port highly-available distributed systems. In ACM
+[30] L AMPORT, L. Generalized consensus and paxos.                 PODC 1988.
+     Tech. rep., Technical Report MSR-TR-2005-33,
+     Microsoft Research, 2005.                                [43] O NGARO , D., AND O USTERHOUT, J. K. In
+                                                                   search of an understandable consensus algorithm.
+[31] L EE , C., PARK , S. J., K EJRIWAL , A., M AT-                In USENIX ATC 2014.
+     SUSHITA , S., AND O USTERHOUT, J. Implement-
+     ing linearizability at large scale and low latency. In   [44] P ETERSEN , K., S PREITZER , M. J., T ERRY, D. B.,
+     ACM SOSP 2015.                                                T HEIMER , M. M., AND D EMERS , A. J. Flexible
+                                                                   update propagation for weakly consistent replica-
+[32] L I , C., P ORTO , D., C LEMENT, A., G EHRKE , J.,            tion. In ACM SOSP 1997.
+     P REGUIÇA , N. M., AND RODRIGUES , R. Making
+     Geo-Replicated Systems Fast as Possible, Consis-         [45] RODRIGUES , L., G UERRAOUI , R., AND
+     tent when Necessary. In USENIX OSDI 2012.                     S CHIPER , A. Scalable atomic multicast. In
+                                                                   IEEE ICCCN 1998.
+[33] L I , J., M ICHAEL , E., S HARMA , N. K., S ZEK -
+     ERES , A., AND P ORTS , D. R. Just say NO to Paxos       [46] S CHNEIDER , F. B. The state machine approach:
+     overhead: Replacing consensus with network or-                A tutorial. In Fault-tolerant distributed computing
+     dering. In USENIX OSDI 2016.                                  (1990), Springer, pp. 18–41.
+[34] L ISKOV, B., C ASTRO , M., S HRIRA , L., AND             [47] S HAPIRO , M., P REGUIÇA , N., BAQUERO , C.,
+     A DYA , A. Providing persistent objects in dis-               AND Z AWIRSKI , M. A comprehensive study of
+     tributed systems. In ECOOP 1999.                              convergent and commutative replicated data types.
+                                                                   PhD thesis, Inria–Centre Paris-Rocquencourt; IN-
+[35] L LOYD , W., F REEDMAN , M. J., K AMINSKY, M.,
+                                                                   RIA, 2011.
+     AND A NDERSEN , D. G. Stronger Semantics for
+     Low-Latency Geo-Replicated Storage. In USENIX            [48] S OVRAN , Y., P OWER , R., AGUILERA , M. K.,
+     NSDI 2013.                                                    AND L I , J. Transactional storage for geo-replicated
+[36] L LOYD , W., F REEDMAN , M. J., K AMINSKY, M.,                systems. In ACM SOSP 2011.
+     AND A NDERSEN , D. G. Stronger semantics for
+                                                              [49] T ERRY, D. B., T HEIMER , M. M., P ETERSEN ,
+     low-latency geo-replicated storage. In USENIX
+                                                                   K., D EMERS , A. J., S PREITZER , M. J., AND
+     NSDI 2013.
+                                                                   H AUSER , C. H. Managing update conflicts in
+[37] M ORARU , I., A NDERSEN , D. G., AND K AMIN -                 Bayou, a weakly connected replicated storage sys-
+     SKY, M. There is more consensus in egalitarian                tem. In ACM SOSP 1995.
+     parliaments. In ACM SOSP 2013.
+                                                              [50] T HOMSON , A., AND A BADI , D. J. CalvinFS:
+[38] M OSER , L. E., A MIR , Y., M ELLIAR -S MITH ,                Consistent WAN Replication and Scalable Meta-
+     P. M., AND AGARWAL , D. A. Extended virtual                   data Management for Distributed File Systems. In
+     synchrony. In IEEE ICDCS 1994.                                USENIX FAST 2015.
+
+
+
+USENIX Association                 13th USENIX Symposium on Operating Systems Design and Implementation             371
+[51] T HOMSON , A., D IAMOND , T., W ENG , S.-
+     C., R EN , K., S HAO , P., AND A BADI , D. J.
+     Calvin: Fast Distributed Transactions for Parti-
+     tioned Database Systems. In ACM SIGMOD 2012.
+[52] VAN R ENESSE , R., AND A LTINBUKEN , D. Paxos
+     made moderately complex. ACM Computing Sur-
+     veys (CSUR) 47, 3 (2015), 42.
+[53] VAN R ENESSE , R., B IRMAN , K. P., AND M AF -
+     FEIS , S. Horus: A flexible group communication
+     system. Communications of the ACM 39, 4 (1996),
+     76–83.
+[54] VAN R ENESSE , R., AND S CHNEIDER , F. B. Chain
+     Replication for Supporting High Throughput and
+     Availability. In USENIX OSDI 2004.
+[55] V ERBITSKI , A., G UPTA , A., S AHA , D., B RAH -
+     MADESAM , M., G UPTA , K., M ITTAL , R., K RISH -
+     NAMURTHY, S., M AURICE , S., K HARATISHVILI ,
+     T., AND BAO , X. Amazon aurora: Design consid-
+     erations for high throughput cloud-native relational
+     databases. In ACM SIGMOD 2017.
+
+[56] W EI , M., ROSSBACH , C., A BRAHAM , I.,
+     W IEDER , U., S WANSON , S., M ALKHI , D., AND
+     TAI , A. Silver: a scalable, distributed, multi-
+     versioning, always growing (Ag) file system. In
+     USENIX HotStorage 2016.
+
+[57] W EI , M., TAI , A., ROSSBACH , C. J., A BRAHAM ,
+     I., M UNSHED , M., D HAWAN , M., W IEDER , U.,
+     F RITCHIE , S., S WANSON , S., F REEDMAN , M. J.,
+     ET AL . vCorfu: A Cloud-Scale Object Store on a
+     Shared Log. In In USENIX NSDI 2017.
+
+[58] X IE , C., S U , C., K APRITSOS , M., WANG , Y.,
+     YAGHMAZADEH , N., A LVISI , L., AND M AHA -
+     JAN , P. Salt: Combining ACID and BASE in a
+     Distributed Database. In USENIX OSDI 2014.
+[59] X IE , C., S U , C., L ITTLEY, C., A LVISI , L.,
+     K APRITSOS , M., AND WANG , Y.            High-
+     performance ACID via modular concurrency con-
+     trol. In ACM SOSP 2015.
+[60] Z HANG , I., S HARMA , N. K., S ZEKERES , A., K R -
+     ISHNAMURTHY, A., AND P ORTS , D. R. Build-
+     ing consistent transactions with inconsistent repli-
+     cation. In ACM SOSP 2015.
+[61] Z HANG , Y., P OWER , R., Z HOU , S., S OVRAN , Y.,
+     AGUILERA , M. K., AND L I , J. Transaction chains:
+     achieving serializability with low latency in geo-
+     distributed storage systems. In ACM SOSP 2013.
+
+
+
+
+372   13th USENIX Symposium on Operating Systems Design and Implementation   USENIX Association
+

@@ -1,0 +1,1284 @@
+            Building Bridges: Safe Interactions
+        with Foreign Languages through Omniglot
+     Leon Schuermann and Jack Toubes, Princeton University; Tyler Potyondy
+  and Pat Pannuto, University of California San Diego; Mae Milano and Amit Levy,
+                               Princeton University
+           https://www.usenix.org/conference/osdi25/presentation/schuermann
+
+
+
+
+This paper is included in the Proceedings of the 19th USENIX Symposium
+          on Operating Systems Design and Implementation.
+                         July 7–9, 2025 • Boston, MA, USA
+                                ISBN 978-1-939133-47-2
+
+             Open access to the Proceedings of the 19th USENIX Symposium
+            on Operating Systems Design and Implementation is sponsored by
+    Building Bridges: Safe Interactions with Foreign Languages through Omniglot
+
+       Leon Schuermann† , Jack Toubes† , Tyler Potyondy‡ , Pat Pannuto‡ , Mae Milano† , Amit Levy†
+                                     †Princeton University, ‡University of California, San Diego
+
+
+
+
+                         Abstract                                    engineers. Pragmatic development does not immediately dis-
+   Memory- and type-safe languages promise to eliminate              card such thoroughly tested code but incrementally replaces
+entire classes of systems vulnerabilities by construction. In        it with safe languages when new features or complex fixes
+practice, though, even clean-slate systems often need to incor-      would otherwise be required.
+porate libraries written in other languages with fewer safety           Unfortunately, integrating foreign libraries into type-safe
+guarantees. Because these interactions threaten the soundness        programs can re-introduce the exact vulnerabilities safe lan-
+of safe languages, they can reintroduce the exact vulnerabili-       guages eliminate. When foreign code is invoked, it runs in the
+ties that safe languages prevent in the first place.                 same address space and with the same privileges as the host
+   This paper presents Omniglot: the first framework to effi-        language. A bug in a foreign library, such as the infamous
+ciently uphold safety and soundness of Rust in the presence          OpenSSL Heartbleed vulnerability [39], can arbitrarily vio-
+of unmodified and untrusted foreign libraries. Omniglot fa-          late the safety of the host language by, for example, accessing
+cilitates interactions with foreign code by integrating with a       memory that the host language assumed was private.
+memory isolation primitive and validation infrastructure, and           Recent contributions propose isolating foreign code in sep-
+avoids expensive operations such as copying or serialization.        arate protection domains [4, 16, 29, 35]. Unfortunately, mem-
+   We implement Omniglot for two systems: we use it to inte-         ory isolation alone is insufficient to maintain safety. Differ-
+grate kernel components in a highly-constrained embedded             ences in semantics across languages mean that even inter-
+operating system kernel, as well as to interface with conven-        actions with internally correct foreign libraries—ones that
+tional Linux userspace libraries. Omniglot performs com-             operate only on sandboxed memory—may violate safety in
+parably to approaches that deliver weaker guarantees and             subtle ways. For example, two languages may differ in their
+significantly better than those with similar safety guarantees.      restrictions on pointer aliasing and corresponding types may
+                                                                     have subtly different memory layouts or permissible values.
+1    Introduction                                                    Manually enforcing these invariants and translating types
+                                                                     between different languages is error prone and endangers se-
+Systems built using type-safe and memory-safe program-               curity and reliability [25]. Instead, we need a safe Foreign
+ming languages are safer, more reliable, and more secure             Function Interface (FFI) that maintains memory safety as well
+than their unsafe counterparts. Languages like Swift, Go, and        as all other language invariants.
+Rust promise to eliminate entire classes of bugs by construc-           We present Omniglot, the first framework to efficiently
+tion. While the advantages of memory and type safety have            maintain all of Rust’s safety-critical language invariants in
+been understood for decades [5, 15], recent advances in mak-         the presence of foreign code. Rather than expose foreign func-
+ing safe languages more practical, along with encouragement          tions directly to the host program, Omniglot invokes foreign
+from government agencies [48], have fostered their adoption          functions through a memory sandbox and wraps returned val-
+in real, practical systems by both researchers [6, 21, 30, 31]       ues and shared memory in special types that ensure host code
+and practitioners [7, 9, 47].                                        only uses foreign objects once they are validated to adhere to
+   At the same time, real-world systems often require incorpo-       the host language’s requirements. By designing a safe FFI us-
+rating components written in several languages. As legacy and        ing these types, in contrast to prior work, Omniglot maintains
+new systems evolve to use newer, safer languages [7, 9], both        both memory and type safety of the host program. Impor-
+old and new languages must co-exist, potentially for years.          tantly, Omniglot does so while avoiding expensive operations
+Components such as filesystems, networking stacks, and de-           such as copying or (de)serialization across the FFI, which
+vice drivers have been fine-tuned over decades by scores of          retains the efficiency of raw, unchecked FFI transitions.
+
+
+
+USENIX Association                           19th USENIX Symposium on Operating Systems Design and Implementation              595
+                                                                    crypt.h:
+   Our implementation of Omniglot for the Rust programming
+                                                                     1 bool aes_encrypt(
+language works with arbitrary foreign libraries and with any         2   const uint8_t *key, uint8_t *src,
+memory isolation mechanism that meets certain common cri-            3   uint8_t **const dst, size_t len, bool in_place);
+teria (Section 4.2). We implement Omniglot for use in a Rust
+operating system kernel using RISC-V’s Physical Memory              crypt.rs:
+Protection (PMP) and in Linux userspace applications using           1 extern "C" {
+x86 Memory Protection Keys (MPK).                                    2   // Implicitly marked as `unsafe`:
+                                                                     3   pub fn aes_encrypt(
+   Finally, we modify the widely used FFI binding generator          4     key: *const u8, src: *mut u8,
+for Rust, rust-bindgen, to generate foreign library bindings         5     dst: *mut *const u8, len: usize,
+for Omniglot. Our evaluation shows that this allows develop-         6     in_place: bool) -> bool;
+                                                                     7 }
+ers to effectively use Omniglot in both kernels and userspace
+programs for a variety of practical libraries, such as cryptog-
+raphy, compression, image decoding, filesystem and TCP/IP           Listing 1: Simplified Rust bindings for a C header file
+networking. Omniglot has negligible overhead compared to            crypt.h as generated by rust-bindgen. The Rust binding
+memory isolation alone, practical overhead compared to an           is wrapped in an extern "C" block and uses raw pointers
+unchecked FFI, and performs significantly better than related       instead of Rust references.
+work that copies and (de)serializes shared data.
+
+                                                                    between high-level languages. As we will see throughout this
+2     Background & Motivation                                       section, the C ABI encodes virtually no assumptions about
+                                                                    a language’s properties such as its memory model, which
+Many of the safety advances in modern systems program-
+                                                                    values are valid for a given type, and synchronization behavior.
+ming languages are rooted in their strict enforcement of
+                                                                    While this flexibility makes the C ABI useful to connect
+memory and type safety. This enforcement allows these lan-
+                                                                    languages that differ in these properties, it also places a heavy
+guages to leave out runtime-checks otherwise required in
+                                                                    burden on developers to maintain correctness across FFIs.
+unsafe languages. For example, whereas a C string (const
+                                                                       Rust developers can use the rust-bindgen1 tool to auto-
+char *) may contain arbitrary 8 bit values, Rust strings (str)
+                                                                    matically generate a set of Rust bindings from a C header file.
+are guaranteed at compile-time to include only UTF-8 code-
+                                                                    Listing 1 shows a C function signature and its correspond-
+points [40]. However, safe languages’ reliance on such prop-
+                                                                    ing Rust binding function as generated by rust-bindgen.
+erties makes their enforcement critical. A single, subtle vio-
+                                                                    The extern "C" tells the Rust compiler to invoke symbols
+lation of memory safety, type safety, or other important in-
+                                                                    using the C ABI. External function definitions are automat-
+variants can lead to arbitrary undefined behavior and have
+                                                                    ically tagged as unsafe—this attribute indicates that the
+significant implications for security and reliability.
+                                                                    Rust compiler cannot reason about the safety of this func-
+   Unfortunately, current tools used to facilitate interactions
+                                                                    tion and instead shifts the burden of proof to the developer.
+between languages do not capture many of these invariants.
+                                                                    Consequently, developers must surround the call-sites of such
+This deficiency means that all interactions with foreign code
+                                                                    functions with an unsafe block promising to the compiler
+must be presumed unsafe. Instead, these tools place the proof
+                                                                    that they verified the safety implications of the function call.
+burden of safety onto the developer who has to verify not
+                                                                    For instance, Listing 2 shows an attempt at writing a safe
+only that foreign code is correct, but also that any interactions
+                                                                    wrapper around the foreign function of Listing 1.
+with this code maintain both the host and guest (foreign)
+                                                                       Throughout this section we use the function aes_encrypt
+language’s invariants.
+                                                                    in Listing 1 as a running example. This function takes an
+   In this section, we show how current cross-language bind-
+                                                                    encryption key and a src buffer with unencrypted data. De-
+ings insufficiently capture language invariants and illustrate
+                                                                    pending on the value of in_place, it can either encrypt data
+how this can violate Rust’s safety properties.
+                                                                    in-place, overwriting the contents of src, or by allocating a
+                                                                    new buffer. For both modes, dst will be set to a pointer to the
+2.1    Cross-Language Interactions                                  encrypted buffer.
+Code written in different programming languages can interact
+through a Foreign Function Interface (FFI). This interface          2.2      Memory Safety
+allows one language to invoke foreign language functions by
+                                                                    Guest (foreign) code has unrestricted access to the host code’s
+emulating the Application Binary Interface (ABI) and calling
+                                                                    memory, even when not explicitly provided to a foreign func-
+conventions of the foreign language. As it is infeasible to
+                                                                    tion. This is a problem. In Listing 2, if Vec src’s internal
+support the calling conventions of every other language, many
+                                                                    length attribute were stored one memory word before the
+programming languages feature support for the C ABI as
+a universal, intermediate interface to facilitate interactions           1 https://github.com/rust-lang/rust-bindgen
+
+
+
+
+596    19th USENIX Symposium on Operating Systems Design and Implementation                                   USENIX Association
+                                                                    enum Message:
+ 1 pub enum Message<'a> {                                                       0                  4                   8
+                                                                              (
+ 2   Encrypted(bool, &'a [u8]),                                                   Encrypted
+ 3   Unencrypted(CString),                                           1 Write:                          Slice Pointer       Length
+                                                                                  bool (0 or 1)
+ 4 }
+                                                                              (
+ 5                                                                              Unencrypted
+ 6 pub fn enc(src: &mut Vec<u8>) -> Message<'_> {                    2 Read:                       CString Pointer
+                                                                                       2
+ 7   let mut dst: *const u8 = ptr::null();
+ 8   unsafe {
+ 9     // Calling aes_encrypt from Listing 1                        Figure 1: Memory layout of the enum Message type. Rust
+10     let res = aes_encrypt(KEY, src.as_mut_ptr(),                 encodes the bool value of the Message::Encrypted variant
+11       &mut dst, src.len(), IN_PLACE);                            into the same memory location as the enumeration’s active
+12     Message::Encrypted(res,
+13       slice::from_raw_parts(dst, src.len()))
+                                                                    variant (called niche filling). When 1 writing an Encrypted
+14   }                                                              value with a slice and an invalid bool value (e.g., 2), the
+15 }                                                                value may be 2 misinterpreted as a different variant, such as
+                                                                    Unencrypted and a CString.
+Listing 2: A Rust wrapper around the C library function
+aes_encrypt from Listing 1, which returns a bool value
+to indicate whether the encrypt-operation succeeded. The            are Rust’s rules around aliasing and mutability. McCormack
+Rust program exposes a function enc that takes a byte-array         et al. explain these rules in great detail [25]; for brevity we
+and uses the C library function to encrypt its contents. It re-     illustrate them through the example of Listing 1.
+turns the Encrypted variant of the enum Message type, a                Such an idiomatic C function interface can easily cause
+tagged union. This variant includes a buffer constructed from       issues when paired with Rust’s restriction on aliasing XOR
+the pointer written to dst and the encryption-operation’s re-       mutability. This rule governs that at any time a value may
+sult. Can you spot the safety violations?                           either have multiple immutable shared references, or a single
+                                                                    mutable unique reference, and never both. The enc wrapper
+                                                                    of Listing 2 violates this rule: it invokes aes_encrypt with
+buffer’s contents, then a simple off-by-one error in the C func-    a src pointer obtained from a mutable reference to the data
+tion could overwrite this value (at address src - 1). This          contained in the src vector (line 10). To pass on the encrypted
+can then cause Rust code to believe that this array is larger       data as part of the Message enum, it creates an immutable ref-
+than its actual underlying allocation.                              erence to this buffer (a slice) from the *dst pointer (line 13).
+   In Rust, Vec is an instance of a safe abstraction. It provides   However, when aes_encrypt is set to perform an in-place
+an API through which the programmer is unable to violate            operation, *dst will be pointed to the exact same memory as
+Rust’s safety invariants. When changing the internal length         src. Thus, creating an immutable reference from *dst is un-
+parameter, the C function prevents this API from living up to       sound while the original mutable reference for src still exists.
+its promise, as the Vec may overflow its allocation.                Therefore, developers must reason about the provenance of
+   Rust prevents such unsoundness by only providing func-           pointers as they flow through both host and guest (foreign)
+tions with references to valid Vec instances. Unlike the raw        code—a task that is difficult in practice, infeasible without
+pointers required by the unchecked C ABI, references do not         source code, and where getting it wrong is commonplace [25]
+allow a developer to perform arbitrary reads and writes to their    and leads to critical security vulnerabilities [1].
+memory. Instead, references are well-typed, and all accesses
+to their memory must be made through the type’s API.
+   To maintain memory safety and thus soundness—crucial             2.4    Type Safety and Valid Values
+to security and integrity—interactions with foreign code must
+uphold an equivalent set of restrictions. In practice, for the      Finally, safe languages rely on type safety to maintain safety-
+example in Listings 1 and 2 this means that the aes_encrypt         invariants at runtime. In Rust, examples of this are the UTF-8
+function, being passed a pointer to the src vector, must only       validity requirement for strings mentioned previously or the
+read and modify the user-accessible part of the Vec data struc-     Vec abstraction shown in Section 2.2. In addition to these
+ture. The caller must, in turn, ensure that the vector outlives     high-level invariants, Rust places restrictions onto the valid
+this function call.                                                 values of primitives and algebraic data types. For example,
+                                                                    the bool primitive is a type occupying one byte of mem-
+                                                                    ory, whose only valid values are 0 or 1. Treating memory
+2.3    Aliasing and Mutability
+                                                                    containing any other value as a bool is thus unsound.
+Apart from basic memory safety, programming languages                  The implications of this are not solely of theoretical inter-
+often have additional, high-level invariants they require for       est, though, as is apparent by surprising runtime behavior of
+correctness and optimizations. A prominent example of this          Listing 2 when this invariant is violated: it may crash with
+
+
+
+USENIX Association                            19th USENIX Symposium on Operating Systems Design and Implementation                  597
+a segmentation fault!2 This is because Rust performs an                             Rust             extern "C" fn f() -> bool Foreign Library
+optimization known as niche filling. Since Rust trusts that                         unsafe f();                                          bool f(){
+the bool type will only ever contain 0 or 1, it encodes the                                                                                return
+                                                                                     f ();            Omniglot Wrapper                       rand_u8();
+value of this type directly into the discriminant of the enum                                                                            }
+Message type, and represents the Unencrypted variant with                                             fn f () -> Result<bool> {
+a discriminant3 of value 2. Figure 1 illustrates the memory                                             let b: ?bool = f′();
+                                                                                                        if is_valid_bool(b) {    extern "C"
+layout of this type. However, if we were to violate the afore-                                                                     fn f′()
+                                                                                                          return Ok(b.unwrap());
+mentioned validity restriction of bool we can construct a                                               } else {                   -> ?bool
+Message::Encrypted instance that, when read back, will                                                    return Err; }
+be misinterpreted as an Unencrypted variant instead. This
+is not farfetched. For example, in many C implementations,
+a bool is typedefed as an int, and hence may contain                               Figure 2: Omniglot interposes on interactions between Rust
+values outside of 0 or 1. Because Rust assumes the returned                        and foreign code. In this example, Omniglot models a foreign
+bool is valid (0 or 1), it simply copies its memory into the                       function through a weaker function binding fn f'(), and
+enum Message’s discriminant and performs no further val-                           restores the original function’s return type through a runtime
+idations. As such, the memory occupied by the slice (&'a                           check in the wrapper fn f ().
+[u8]) member in Figure 1 will erroneously be interpreted as
+an element of type CString, leading to undefined behavior
+and a soundness violation in theory, and a use-after-free or                          Omniglot does not model the entire program, and instead
+out-of-bounds access in practice.                                                  takes a different approach. We argue that it is sufficient to
+                                                                                   reason about an execution of the foreign library, as opposed
+                                                                                   to proving the soundness of the composition of host and for-
+3     The Omniglot Approach                                                        eign code for all such executions. Figure 2 demonstrates this
+                                                                                   approach: f() is a foreign function that would violate Rust’s
+Interactions with foreign languages through Rust’s existing
+                                                                                   soundness through a naïve FFI binding. When a Rust program
+unsafe FFI can trivially reintroduce the exact security and
+                                                                                   calls this function, the compiler assumes certain invariants
+reliability vulnerabilities that safe Rust eliminates. Through
+                                                                                   hold across the foreign function’s execution (we enumerate
+this FFI, foreign code has unrestricted access to host memory.
+                                                                                   this set of invariants below). In this example, f() violates one
+Moreover, even with coarse grained memory access restric-
+                                                                                   such invariant by returning a potentially invalid value for the
+tions, a foreign library could still introduce vulnerabilities due
+                                                                                   Rust bool type (e.g., the number 2).
+to subtle differences in language semantics.
+   Omniglot provides a safe interface for Rust programs to                            Nonetheless, Omniglot can provide a safe encapsulation of
+interact with foreign libraries. This is a high bar. Safety in                     this foreign function, f . Recall that Rust’s invariants for a
+Rust relies on soundness, i.e., interactions with a foreign li-                    given value depend on its ascribed type. The problem with
+brary must not introduce any undefined behavior [44]. This                         the example of Figure 2 arises from the fact that f() is said
+includes4 an absence of data races, dangling or misaligned                         to return a value of the Rust type bool. Omniglot instead
+accesses, aliasing violations, producing invalid values, etc.                      produces a foreign function binding f′. This binding returns
+                                                                                   a different type, ?bool, which is not subject to those same
+   Unfortunately, reasoning about whether a foreign library
+                                                                                   restrictions. As such, calling f′ does not endanger soundness.
+violates any of Rust’s soundness conditions is hard. One con-
+ventionally achieves this by modeling the entire program and                          While the foreign function binding f′ is sound, it is not very
+ensuring that the host code, foreign code, and their composi-                      useful. Because ?bool is not subject to the same invariants as
+tion is sound. While the Rust compiler validates soundness of                      Rust’s regular bool type, we also give up on the guarantees
+safe Rust code, it cannot do so for interactions with foreign                      that follow from these invariants. Omniglot re-establishes
+code. Despite this difficulty, maintaining soundness is vital5                     these invariants through a set of runtime checks. In the above
+to leverage the safety guarantees of type-safe languages.                          example, Omniglot tests whether the returned value is indeed
+                                                                                   a valid bool and, if so, casts it to this more useful type. This
+    2 In practice, compiler optimizations happen to often avoid faults in simple   allows Omniglot to safely expose an encapsulated function
+cases like bool and other enum types with a 1 bit discriminant. For brevity,        f with the same interface as its unsound counterpart, f.
+we elide an example that faults with a recent Rust compiler toolchain.
+    3 The actual value chosen by the Rust compiler is not specified; at the time      This example shows how we reason about type safety in-
+of writing it happens to use 2 for 32 bit platforms.                               variants to develop Omniglot’s safe foreign function interface.
+    4 Rust defines undefined behavior through its Rust Reference [41], Unsafe
+                                                                                   In addition to type safety, there are also memory safety, alias-
+Code Guidelines Reference [44], and Rustonomicon [42]. In the absence of           ing and mutability, and concurrency-related invariants. Over
+a formal model of Rust’s semantics there is no exhaustive list of defined or
+undefined behavior; as such we design Omniglot against the currently known
+invariants.                                                                        the presence of undefined behavior, “the program produced by the compiler
+    5 The Rust Unsafe Code Guidelines Reference states more bluntly that in        is essentially garbage.” [44]
+
+
+
+
+598     19th USENIX Symposium on Operating Systems Design and Implementation                                                       USENIX Association
+the remainder of section, we describe these remaining invari-      niglot can downcast such objects to a more useful type only
+ants, and show how we can uphold them in a similar way.            after validating them. Specifically, an object is considered
+Memory Safety. We adopt Dhurjati et al.’s definition of mem-       valid if its underlying size, alignment, bit-pattern, and other
+ory safety: a software entity is memory-safe if it only refer-     high-level invariants match those of an object of the same type
+ences memory allocated by or for that entity [10]. As this is      created in safe Rust. For example, a well-aligned 32 bit object
+ultimately a language-specific property, strictly enforcing it     is a valid char, so long as it contains a valid, non-surrogate
+across an FFI is difficult. For instance, moving an object—a       Unicode code point [43].
+common operation in Rust—has no equivalent counterpart in             Certain Rust types carry higher-level invariants that cannot
+a language like C with no defined ownership model.                 be validated solely by observing their size, alignment, and
+   However, Omniglot only needs to retain the host language’s      underlying bit-pattern. Examples of this are Rust references,
+memory safety invariants, a more tractable problem. By di-         which impose additional restrictions on their provenance and
+viding each language’s allocations into a distinct set of mem-     lifetimes, or typestates [2, 37]. Omniglot can never safely
+ory regions, where each side is restricted from accessing the      validate these types once written into foreign memory. De-
+other’s allocations, we ensure that any memory safety issues       velopers can instead pass symbolic representations of these
+within foreign code cannot impact the surrounding Rust pro-        objects to foreign code, referring back to a copy in memory
+gram. Memory isolation techniques, including memory pro-           owned by Rust.
+tection, virtual memory, or software fault isolation, are well     Concurrency. Many of Rust’s invariants pertain to the under-
+suited to this purpose.                                            lying memory state of its objects. However, when this state
+   Unfortunately, such strict isolation also prevents memory       changes after being validated, such as through concurrent
+sharing with foreign libraries. To enable sharing, Omniglot        modifications by foreign code, these invariants may no longer
+allows Rust to dereference pointers into foreign memory if         hold, introducing unsoundness.
+and only if the object they reference is wholly contained inside      Thus, Omniglot requires that foreign code not modify cer-
+the foreign library’s valid memory regions.                        tain values without explicit coordination with Rust. This can
+Aliasing and Mutability. Rust uses strict aliasing rules to        be accomplished through synchronization and memory iso-
+statically reason about which references can be used to safely     lation primitives, or by ensuring that foreign code does not
+mutate or read memory. While unique, mutable references            execute concurrently with Rust.
+can never be aliased, shared (aliased) references must never
+be modified (a rule known as aliasing XOR mutability).
+                                                                   4   Design
+   This is problematic in the presence of foreign code: for
+instance, a foreign function may return references to the same     In this section we present the design of Omniglot, a frame-
+memory multiple times. Since we cannot track pointer prove-        work to provide a safe interface to interact with foreign code.
+nance through foreign memory or code, we must conserva-            Omniglot’s workflow is similar to that of Rust’s conventional
+tively assume that all references derived from such pointers       unsafe FFI with rust-bindgen, as described in Section 2.1:
+are mutably aliased with each other. The only way to safely        for a set of C header files, Omniglot generates a set of safe
+support mutable aliasing in Rust is through mutual exclusion.      FFI bindings that developers can use to manipulate foreign
+Section 4.4 show how Omniglot introduces a zero-cost and           data types and call into foreign functions.
+deadlock-free mutual exclusion mechanism for references
+                                                                      To safely interact with an untrusted foreign library, Om-
+into foreign memory.
+                                                                   niglot combines a set of inter-operating mechanisms. It fea-
+Type Safety. Saraswat defines a language as type-safe if “the      tures a pluggable runtime component (described in Sec-
+only operations that can be performed on data in the language      tion 4.2) responsible for loading libraries into a sandbox and
+are those sanctioned by the type of the data.” [36] Violating      isolating their memory. Omniglot further features a set of
+this property can break safe abstractions (Section 2.2), and       reference and validation types (Section 4.3) that capture and
+introduce arbitrary undefined behavior.                            progressively validate the aliasing and type safety invariants
+   Even if a foreign library is itself written using a type-safe   described in Section 3.
+language, its types are likely not identical in either semantics      However, simply applying the approach described in the
+or representation to their counterparts in Rust. Indeed, trans-    previous section is not sufficient: interactions between the
+lating objects between the type systems of two languages is        Omniglot runtime and its types can violate invariants that
+an active area of research [32, 33, 34]. Omniglot must there-      Omniglot’s reference and validation types rely on. Thus, in
+fore assume that objects passed to or obtained from a foreign      Section 4.4 we introduce a mechanism called scopes that
+function do not preserve Rust’s notion of type safety.             captures and enforces an additional set of temporal invariants
+   As illustrated by the example in Figure 2, Omniglot con-        to uphold the required invariants. Scopes are zero-cost, are
+siders objects returned from a foreign library or in foreign       enforced at compile-time, and statically reject code that would
+memory tainted and ascribes them a special “any”-type. Om-         violate these invariants.
+
+
+
+USENIX Association                           19th USENIX Symposium on Operating Systems Design and Implementation            599
+4.1    Threat Model                                                 4.2    Sandboxing Foreign Libraries
+Omniglot maintains Rust’s soundness across interactions with        Omniglot divides memory into regions owned exclusively by
+arbitrary, untrusted, and adverserial foreign code.                 Rust, and regions delegated to foreign library instances. It uses
+   To achieve this goal, we assume that there is an available       a memory isolation primitive to uphold the host’s memory
+hardware, OS-provided, or software-based memory isolation           safety when executing foreign libraries by restricting them to
+primitive that provides strong memory protection—i.e. it can        only be able to access their own, sandboxed memory regions.
+prevent a foreign library from accessing all but explicitly            As these memory isolation primitives vary between differ-
+permitted memory regions.                                           ent architectures and platforms, Omniglot features a set of
+   Furthermore, we assume that there are OS or hardware             platform-specific runtimes. A runtime offers an interface to
+primitives that allow restricting when foreign code can run. In     integrate with the core Omniglot framework. For instance, a
+particular, these primitives must be able to limit the ability of   runtime allows Omniglot and developers to to interact with
+a foreign library to execute concurrently with host code, such      a system’s memory isolation primitive. It also imposes other
+as by preventing it from spawning and running threads that          restrictions on foreign code like limiting its access to con-
+continue to run in the background, or executing in response         currency primitives, to prevent untrusted foreign code from
+to asynchronous signals.                                            invalidating Rust’s invariants after they have been validated
+   We also assume that the Omniglot library, runtime imple-         by Omniglot. Omniglot’s runtimes expose the following (sim-
+mentation, Omniglot’s bindings generation tool, as well as          plified) API which host code uses to interact with foreign
+the Rust type-checker and compiler are correct. Omniglot            code:
+provides a set of interfaces and types that safe Rust cannot         OGRt::new(library) Constructs a new runtime instance
+use incorrectly. Thus, safe Rust code of the host application          and loads library into the sandbox.
+does not need to be trusted. However, any code that uses             rt.stack_alloc(size, closure) Allocates size bytes
+Rust’s unsafe feature to circumvent restrictions imposed               on the foreign library’s stack, and invokes a closure dur-
+by Omniglot through the type system is considered trusted.             ing which this allocation is valid. It restores the previous
+   Omniglot can maintain Rust’s soundness across interac-              foreign stack pointer when the closure returns.
+tions with adverserial libraries when using a strong Omniglot        rt.setup_callback(callback, closure) Prepares a
+runtime—a runtime enforcing the above assumptions using                callback that foreign code can trigger, and invokes a closure
+strong primitives for memory isolation and restricting concur-         during which this callback is valid. This function creates
+rency. We present an implementation of a strong runtime in             an address for which, whenever foreign code jumps to it,
+Section 5.1. However, when these assumptions are violated,             the Omniglot runtime will execute callback.
+Omniglot’s threat model changes. For example, a weak run-            rt.invoke Invokes a foreign function within the memory
+time may not be able to entirely prevent a foreign library from        isolation sandbox. After invoke returns, the runtime guar-
+circumventing memory protection (e.g., through system calls),          antees that no foreign threads are running. This symbol
+or restrict its access to concurrency primitives. In this case,        is not called directly, and instead used by a trampolining
+Omniglot cannot safely run fully untrusted and adverserial for-        mechanism described in Section 5.3.
+eign libraries. Instead, developers must trust that Omniglot’s      The Omniglot FFI bindings for a foreign library are portable
+requirements concerning memory isolation and concurrency            across multiple runtime implementations. These bindings
+are upheld by the foreign library. Section 5.2 describes such a     resemble Rust’s unsafe FFI interface, but call out to the
+weak Omniglot runtime and further discusses its threat model        Omniglot runtime instead of directly invoking foreign code.
+implications.                                                       Nonetheless, Omniglot requires developers using a foreign
+                                                                    library (or those writing Rust wrappers) to transform their
+   Omniglot does not guarantee application-level correctness
+                                                                    code, for instance by using the above methods for allocating
+properties. For example, while it guarantees that a bool re-
+                                                                    memory or callbacks that will be used by foreign code. When
+turned from a foreign function is either true or false,
+                                                                    a foreign library attempts to access an allocation outside of
+it does not guarantee that the foreign library computed this
+                                                                    its sandbox, or invokes a host callback not prepared though
+value correctly. Furthermore, Omniglot does not protect for-
+                                                                    setup_callback, it triggers a fault in the memory isolation
+eign code from operations issued by host code: for example,
+                                                                    mechanism, which the Omniglot runtime catches and exposes
+the host program may write to arbitary locations in foreign
+                                                                    as an Err value returned to Rust by invoke.
+code’s memory, including in ways that can cause foreign
+code to misbehave. However, assuming a strong Omniglot
+runtime, such misbehavior cannot compromise the host pro-           4.3 Communication between Rust and Foreign
+gram’s soundness.
+                                                                        Code
+   Finally, Omniglot does not address timing and other side-
+channel attacks that might allow foreign code to infer the          Omniglot divides memory into mutually-exclusive regions
+contents of host program memory it cannot access directly.          for the host program and foreign code: it uses a memory iso-
+
+
+
+600   19th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+             upgrade()             validate()                        a valid allocation of foreign memory, writing to it does not
+                                                                     violate memory safety.
+    *mut T            OGMutRef<T>           OGVal<T>        &T          However, Rust’s limitations around mutable aliasing com-
+                                                                     plicate this: in general, an aliased Rust reference must not be
+Figure 3: Omniglot captures arbitrary addresses in foreign           modified. As shown in Section 3, given that an OGMutRef<T>
+memory as raw pointers (*mut T). The upgrade and validate            can be constructed from an arbitrary raw pointer supplied by
+methods transform a potentially invalid reference into write-        foreign code, we cannot track its provenance and must instead
+able (OGMutRef<T>) and readable (OGVal<T>) wrappers.                 assume that it is (partially) aliased by other references. To
+                                                                     avoid violating Rust’s aliasing constraints while still allowing
+                                                                     OGMutRef<T> references to be modified, Omniglot opts out
+lation mechanism to prevent foreign code from changing host          of Rust’s strict aliasing model for this reference type, by rep-
+memory. Furthermore, safe Rust is incapable of constructing          resenting it as the composition of two of Rust’s standard
+arbitary references into foreign memory. While this strict divi-     library types: &UnsafeCell<MaybeUninit<T>>. Whereas
+sion trivially upholds memory safety, it also prevents efficient     MaybeUninit prevents the Rust compiler from making as-
+transfer of data between guest (foreign) and host code.              sumptions about the validity of values stored behind this refer-
+   Omniglot cannot allow foreign libraries to access mem-            ence, UnsafeCell allows values to be mutably aliased. How-
+ory belonging to the host program (Rust), as unrestricted,           ever, an UnsafeCell annotation can only be used as long
+arbitrary access of foreign code to Rust’s memory can break          as every other reference to this value also carries this same
+its invariants (see Section 3). Instead, Omniglot provides a         annotation. As a result, Omniglot must ensure that no regular
+mechanism that allows host code to allocate and access values        Rust references (ones not wrapped in such an UnsafeCell)
+in foreign memory. This is sufficient to allow host code to          point into foreign memory. This holds by construction, as
+communicate with foreign libraries, while at the same time           foreign allocations are disjoint from any of Rust’s allocations.
+making it feasible to maintain Rust’s soundness.                        A final type, OGVal<T> captures pointers that refer to mem-
+   Using the runtime interface, host code can allocate ob-           ory which contains an actual, dereferenceable instance of
+jects in memory accessible to a foreign library (e.g. using          type T. This memory may be safely read and interpreted as
+rt.stack_alloc). Depending on the runtime, these alloca-             its ascribed type without any risk to the soundness of the host
+tions can happen on the foreign library’s stack, a separate          program. Host code can attempt to validate an OGMutRef<T>
+stack dedicated for such host-language allocations, or using         into an OGVal<T> by inspecting its underlying bit-pattern, as
+heap memory dedicated to foreign code. These operations              described in Section 3. Omniglot performs this validation
+alone have no impact on the safety of the host program—their         using a Rust trait, and provides implementations for many of
+effects are limited to the foreign library’s memory regions.         Rust’s primitive types. For any types that cannot be validated
+   However, for Rust to safely dereference or modify memory          solely by inspecting their size, alignment, and bit-pattern, this
+belonging to a foreign library, we must ensure that it is con-       trait is not implemented.
+tained within a valid foreign allocation, and that it represents a      Omniglot’s restrictions on concurrency also follow from
+valid instance of its ascribed type. In this section we introduce    the above types and reflect a fundamental constraint: so long
+a set of types following the typestate paradigm [2, 37] that         as any validated Rust references to foreign memory exist, they
+capture validation operations and offer a safe API to access         must retain the invariants described in Section 3. However, if
+data shared with foreign code.                                       foreign code were to execute concurrently with host code, it
+   Figure 3 illustrates these reference and validation types.        could break these invariants at any time, such as by arbitrarily
+The first type, a raw pointer, forms the base of Omniglot’s type     modifying any memory it can access. If the host program
+infrastructure. It can capture arbitrary addresses in foreign        would access a foreign library instance’s memory concur-
+memory. This pointer does not have to maintain any invari-           rently with that instance’s execution, then the above valida-
+ants; it may be dangling, misaligned, or alias host memory.          tions could be subject to a time-of-check to time-of-use (TOC-
+Thus, safe Rust is not able to dereference it.                       TOU) bug: after performing an upgrade or validate operation
+   The second type, OGMutRef<T>, expresses pointers that             in Rust, foreign code may change its available memory alloca-
+refer to an active, well-aligned foreign memory allocation           tions or write invalid values to previously validated memory
+of sufficient size for a type T. It can be obtained through          locations. This would then invalidate the invariants gained
+upgrading a raw pointer and checking the aforementioned              in the upgrade and validate typestate transitions. Therefore,
+invariants at runtime, by checking against the runtime-tracked       Omniglot requires that host code does not hold references
+set of memory regions dedicated to the foreign library. An           into a foreign library instance’s memory concurrently with
+OGMutRef<T> represents a useful intermediate type: when              that instance’s execution. Omniglot’s architecture can support
+considering our model of memory safety in the presence of            running multiple Rust threads, as well as running multiple
+foreign code from Section 3, because this type must point into       instances of foreign libraries concurrently.
+
+
+
+USENIX Association                              19th USENIX Symposium on Operating Systems Design and Implementation             601
+   OGRt::new() yields a unique allocation and access scope per library:   of this memory—doing so will result in a deadlock.
+     OGRt::new(library) -> (Rt, AllocScope, AccessScope)
+   Allocation scopes prevent dangling references:                            Similarly, a read-write lock for each foreign allocation can
+     ptr::upgrade(&AllocScope<'l>) -> OGMutRef<'l>                        protect upgraded references (both OGMutRef and OGVal) from
+     OGRt::stack_alloc(&'a mut AllocScope<'l>,                            memory allocation and revocation operations invalidating
+                            Fn(&'b mut AllocScope<'m>))                   them. In this model, operations which may revoke memory
+   Access scopes prevent invalidating references through writes:
+     OGMutRef::write(val: T, &mut AccessScope)                            (ptr::stack_alloc and OGRt::invoke) take a write-lock
+     OGMutRef::validate(&'a AccessScope) -> OGVal<'a>                     on the relevant memory allocations. Conversely, upgrading
+   invoke may write to memory and modify allocations in callbacks:        a pointer to create an OGMutRef requires a read-lock, released
+     OGRt::invoke(&mut AllocScope, &mut AccessScope)                      only when it goes out of scope. This would ensure that, if there
+                                                                          are any outstanding references to an allocation, an attempt to
+Table 1: Interactions between Omniglot’s runtime, reference               revoke the allocation would result in a deadlock.
+and validation type APIs, and its allocation- and access-                    Unfortunately, dynamic locks do not reject incorrect code
+scopes: by binding OGMutRef references to their originating               at compile time and thus place an undue burden on devel-
+allocation scope, we eliminate dangling references. Validated             opers to ensure their code is deadlock-free. Such dynamic
+OGVal references are further bound to an access scope, which              locks are also unnecessary. Given Omniglot’s restrictions on
+expires upon foreign function execution or when foreign mem-              concurrency—namely that Rust code does not hold references
+ory is modified.                                                          into a foreign library instance’s memory concurrently with
+                                                                          that instance’s execution—we can statically enforce mutual
+                                                                          exclusion by reasoning about data-flow patterns in programs.
+4.4    Temporal Constraints                                               We design a zero-cost, compile-time enforced, static, and
+                                                                          single-threaded locking mechanism based on lexical scopes.
+Omniglot’s reference and validation types allow a developer               Omniglot uses these scopes in tandem with Rust’s restriction
+to safely read and write foreign memory, as long as their                 on aliasing XOR mutability to implement a form of read-
+underlying invariants hold (Section 3). However, even with-               write mutual exclusion, and enforces it through Rust’s borrow
+out concurrency, seemingly unrelated operations can affect                checker.
+these invariants: for example, writing to an OGMutRef may                    Table 1 describes Omniglot’s API using scope-based exclu-
+modify foreign memory previously validated into an OGVal.                 sion. Creating a new, unique, instance of a foreign library us-
+Revoking foreign allocations may cause reference or valida-               ing OGRt::new yields an AllocScope and an AccessScope—
+tion types to be dangling. And invoking a foreign function                two branded types [19, 50] that are uniquely bound to a partic-
+can both modify memory, and trigger a callback which may                  ular call to the constructor. Unique (&mut) borrows of these
+do any of the above.                                                      values correspond to obtaining a write-lock, and a shared (&)
+   In other words, the invariants of Omniglot’s reference and             borrow corresponds to obtaining a read-lock. Rust prevents
+validation types must be temporally constrained. These con-               concurrent unique and shared borrows of the same scope.
+straints may be quite subtle, as we can see in the following              Omniglot’s reference types carry a lifetime derived from the
+example: a foreign library yields two pointers, referencing               lifetime of these borrows, ensuring that they cannot outlive
+overlapping memory that the caller interprets as an integer and           the AccessScopes and AllocScopes in which they have been
+a boolean respectively. The caller upgrades these pointers to             created.
+OGMutRefs and validates one into an OGVal<bool>. Then, if                    Omniglot uses these scopes to enforce its temporal con-
+both pointers alias each other, writing a non-boolean value to            straints on OGMutRef and OGVal types. When an OGMutRef
+the integer reference would invalidate the invariants checked             is validated, it captures a shared borrow of an AccessScope
+when creating the OGVal<bool>. As such, the boolean ref-                  for an anonymous lifetime 'a. It produces an OGVal<'a>
+erence must not exist beyond the write to its aliasing integer            that captures this lifetime. As long as this new value ex-
+reference. Similarly, any of these references may become                  ists, Omniglot statically prevents calling any functions that
+invalid when Omniglot revokes foreign memory.                             could invalidate its invariants, such as OGMutRef::write, by
+   We could enforce these temporal constraints through mu-                requiring these functions to take a unique reference to the
+tual exclusion by using a read-write lock. Assume that we                 AccessScope.
+have a single lock for reading and writing a given library’s                 We use a similar approach to maintain the constraints for
+memory. Then, calling OGMutRef::validate to produce an                    OGMutRef. Upgrading a pointer captures a shared reference
+OGVal<T> could acquire a read-lock internally. This lock                  to an AllocScope, while any operations that may revoke
+would be released when the resulting OGVal<T> goes out                    memory, and thus endanger the invariants of this type, take a
+of scope. Additionally, both operations that can modify for-              unique AllocScope reference.
+eign memory, OGMutRef::write and OGRt::invoke, will                          In practice, Omniglot can be slightly more permissive about
+acquire a corresponding write lock. Under this model, it will             letting OGMutRefs outlive certain revocations of memory. By
+be impossible to retain an OGVal<T> across any modification               combining an allocation with its corresponding revocation
+
+
+
+602    19th USENIX Symposium on Operating Systems Design and Implementation                                        USENIX Association
+into a single function—stack_alloc—Omniglot allows ref-             1          // Load a library into a runtime, creating
+erences that were created before this allocation to also outlive    2          // allocation and access scope markers:
+its revocation. In other words, while Omniglot must prevent         3          let (rt, lib, mut oalloc, mut access) =
+any reference created in a call to stack_alloc from escap-          4            Rt::new("libcompress.so");
+                                                                    5
+ing its inner closure, those created in outer scopes can re-        6          // Allocate a [u8; 4] on the foreign stack
+main live. Omniglot does so by separating the lifetime that         7          rt.stack_alloc_t::<[u8; 4]>(
+an AllocScope is active for ('a), from the lifetime of its          8            &mut oalloc, |array, ialloc| {
+underlying memory allocation ('l), as shown in Table 1.             9              // array: OGMutRef<'_, [u8; 4]>
+                                                                    10             array.write([0, 1, 2, 3], &mut access);
+   Finally, invoking a foreign function can both modify mem-        11
+ory, and trigger a callback that can revoke allocations, and        12              let validated = array.validate(&access);
+thus captures unique references to both allocation and access       13              println!("{:?}", validated);
+                                                                    14
+scopes.                                                             15              let compressed_len = lib.compress(
+                                                                    16                buf: array.as_ptr(),
+                                                                    17                length: 4,
+4.5    Omniglot API Walkthrough                                     18                &mut ialloc, &mut access).validate();
+                                                                    19
+   Listing 3 illustrates how all of Omniglot’s mechanisms           20              // Would not compile, as `validated` is
+interact to provide a safe interface to an arbitrary, untrusted     21              // bound to the previous access scope:
+foreign library. On line 3, this example loads a fictional com-     22              println!("{:?}", validated);
+                                                                    23
+pression library (libcompress.so) into an Omniglot run-             24              let upgraded = array.as_ptr()
+time. Constructing a runtime and loading a library yields four      25                .upgrade_slice(compressed_len, &ialloc);
+return values: a runtime object rt exposing the API shown in        26              let revalidated = upgraded.validate(&access);
+Section 4.2, a library shim lib featuring wrapper methods for       27              println!("{:?}", revalidated);
+                                                                    28
+all foreign library functions, and allocation and access scope      29              // `array` and `upgraded` cannot escape
+marker values as described in Section 4.4.                          30              // closure, capture the `ialloc` scope.
+   In this example, we use the foreign library to compress an       31            }
+                                                                    32          )
+array of 4 bytes. On line 7 we use the runtime’s stack_alloc        33       Active Access Scope
+function to place a new allocation of type [u8; 4] on the for-      34   Active Allocation Scope
+eign library’s stack. Because allocating memory can change
+the set of allocations accessible to foreign code, it interacts
+with Omniglot’s allocation scopes: stack_alloc_t (to al-
+                                                                    Listing 3: A basic Omniglot wrapper around a compression
+locate space for a generic type T) obtains a unique refer-
+                                                                    library, with its allocation and access scopes visualized. We
+ence to the outer allocation scope marker oalloc on line 8
+                                                                    create an Omniglot runtime, allocate memory, invoke a for-
+and holds onto it through line 31. This unique borrow pre-
+                                                                    eign function, and validate its returned result. Dashed and
+vents new upgrade operations (potentially on the new, stacked
+                                                                    dotted lines represent the active and open allocation and ac-
+and ephemeral allocation) from using this outer allocation
+                                                                    cess scopes, respectively. Each mutable borrow of a scope
+scope. In turn, stack_alloc_t provides a new inner alloca-
+                                                                    marker closes the current and re-opens a new scope, causing
+tion scope ialloc which is valid for the duration of this new
+                                                                    all references bound to the previous scope to be inaccessible.
+allocation. Any upgrade operations will thus use this new
+allocation scope instead; we say the active allocation scope
+changes (switching from a solid to a dashed line in Listing 3).     However, this reference is bound to the access scope closed
+   We write uncompressed data to this newly allocated buffer        on line 15. Thus, any attempts to access it (as on line 22) will
+on line 10. As illustrated in Section 4.4, writing any foreign      result in a compile-time error. Instead, correct bindings create
+memory may invalidate other references. Thus, this opera-           a new OGMutRef<[u8]> reference over the compressed data
+tion obtains a unique reference to the access scope marker: it      length (line 25), and then re-validate it against the currently
+closes the previous scope, and immediately re-opens a fresh         open access scope (line 26).
+access scope (dotted line in Listing 3). Finally, we invoke
+the foreign library’s compress function on line 15, which
+executes it in the Omniglot runtime’s sandbox. Invoking a for-      5     Implementation
+eign function may both change foreign memory and change
+the set of foreign allocations (in a callback), and thus requires   We implement Omniglot and its two runtimes in a set
+a unique reference to both allocation and access scopes.            of Rust crates of approx. 7000 LoC. We further extend
+   Listing 3 demonstrates scope-based enforcement of Om-            rust-bindgen by 860 LoC to automatically generate
+niglot’s temporal constraints: for instance, line 12 validates      Omniglot-compatible bindings from C header files. Our im-
+the allocated buffer into an OGVal<[u8; 4]> reference.              plementation is available on GitHub: https://github.com/
+
+
+
+USENIX Association                            19th USENIX Symposium on Operating Systems Design and Implementation             603
+omniglot-rs/omniglot.                                                isolation, and does not expose any concurrency primitives to
+   In this Section, we first present our two prototype Omniglot      the foreign library, it is considered a strong Omniglot runtime.
+runtime implementations for the Tock operating system (us-           It can run arbitrary, untrusted and adverserial foreign libraries,
+ing RISC-V PMP) and Linux userspace (using x86 Memory                while maintaining the soundness of the Tock kernel.
+Protection Keys) respectively. As these runtimes use different
+isolation primitives and run in different environments, we
+classify them into strong and weak runtimes as per our threat
+model (Section 4.1), and discuss which—if any—assumptions
+                                                                     5.2    Omniglot for Linux Userspace
+the Omniglot runtimes make on the behavior of foreign li-
+                                                                     On the other end of the spectrum, OGMPK brings Omniglot to
+braries.
+                                                                     Linux userspace applications on desktop- and server-class sys-
+   Finally, in Section 5.3 we present Omniglot’s invoke tram-
+                                                                     tems. OGMPK utilizes x86 Memory Protection Keys (MPK), a
+poline. While Omniglot is implemented in the type-system of
+                                                                     recent isolation mechanism built around the idea of assigning
+an unmodified Rust compiler, Rust normally does not allow
+                                                                     virtual memory pages one of 16 protection keys. A core-local
+libraries to interpose on calls to foreign functions. Omniglot’s
+                                                                     and userspace-writeable register controls which protection
+invoke trampoline makes Omniglot practical by allowing it
+                                                                     keys are accessible at any given time. Notably, MPK does not
+to switch to a foreign protection domain on calls to foreign
+                                                                     require a system call to switch protection domains, making
+functions. In contrast to existing approaches like libffi6 , we
+                                                                     domain transitions fast.
+do so with minimal overhead, by using the Rust compiler’s
+knowledge of the foreign function’s ABI to statically generate          OGMPK uses link-map lists to load conventional shared
+code for loading function arguments into registers and on the        libraries into an isolated namespace. It then uses MPK to
+stack.                                                               assign all pages associated with a foreign library—and its
+                                                                     transitive dependencies—a protection key. When running
+                                                                     functions of the foreign library, OGMPK disables access to all
+5.1    Omniglot for the Tock Operating System                        memory pages not assigned this protection key—making the
+OGPMP is an implementation of Omniglot for the Tock embed-           memory of host code and other foreign libraries inaccessible.
+ded operating system kernel [21], utilizing the RISC-V Physi-           While MPK is a popular tool for intra-process memory
+cal Memory Protection (PMP) unit as its memory isolation             isolation [4, 16, 20, 23, 38, 46], in particular due to its low
+primitive. The Tock kernel is itself written in Rust and used        overheads, it presents some challenges for security: for in-
+for security critical applications, such as in the firmware of the   stance, Connor et al. show that MPK-based isolation can be
+OpenTitan silicon root-of-trust or Microsoft’s Pluton security       circumvented through system calls, memory mappings, sig-
+controller embedded in modern x86 CPUs [49]. Because Tock            nal delivery, and race conditions [8]. As Omniglot’s focus is
+heavily relies on Rust’s safety for enforcing isolation between      on maintaining Rust’s soundness assuming a strong memory
+mutually distrustful applications and must, for instance, in-        isolation primitive, we do not address the inherent security
+tegrate existing and certified cryptography libraries, it is an      properties of MPK in this work. Therefore, OGMPK is a weak
+ideal target for Omniglot.                                           Omniglot runtime.
+   The RISC-V PMP is a secure memory isolation primi-                   Our implementation of OGMPK does override some sym-
+tive and thus enables OGPMP to provide strong soundness              bols such as alloc and free to use a custom, memory-
+guarantees. In particular, OGPMP loads foreign libraries into        isolation aware allocator. However, actively malicious li-
+protection domains similar to Tock processes, running at a           braries can circumvent OGMPK ’s memory isolation by using
+lower privilege level, and without any memory of the Tock            system calls like mmap. Developers will need to validate that
+kernel accessible to them. It executes library functions by          foreign libraries do not perform such operations, or employ
+loading their arguments into registers and onto a dedicated          seccomp-bpf-based mitigations as presented in ERIM [46].
+stack in foreign memory, and context-switching to a lower-           Similarly, OGMPK does not prevent foreign libraries from ac-
+privilege mode. Libraries can transition back into the Tock          cessing concurrency primitives. Developers must ensure that
+kernel (which corresponds to Omniglot’s host program) by             libraries do not register signal handlers and run background
+one of three mechanisms: returning from the function invoked         threads concurrently with host code execution, such as by
+by the kernel, invoking a registered callback, or producing a        manually inspecting the foreign libraries, disallowing them
+fault—in which case Omniglot returns an error to host code.          from using certain system calls, or inspecting the state of the
+Notably, there is no standard system call interface accessible       program at runtime.
+to foreign code, and OGPMP does not expose any concurrency
+                                                                        Despite these weaker guarantees, OGMPK is still useful to
+primitives.
+                                                                     isolate libraries that are not assumed to be actively malicious.
+   Because OGPMP fully isolates memory belonging to a for-
+                                                                     Its reference and validation types can prevent many cases of
+eign library, does not provide any means to circumvent this
+                                                                     improper mutable aliasing and can ensure that values used by
+  6 https://sourceware.org/libffi/                                   Rust conform to its strict validity requirements.
+
+
+
+604   19th USENIX Symposium on Operating Systems Design and Implementation                                      USENIX Association
+                                                        invoke::<stack spill,
+int randombytes_buf(void *, size_t);                      &rt argument location>                 common_invoke                    encode_return
+               pub fn randombytes_buf(                      Copy arguments and             1. Save callee-saved registers.       Read return value
+ generates
+
+
+
+
+                   &self, *mut c_void, usize,               generic params to              2. Copy t3 (stack spill) bytes        registers and status
+               ) -> OGResult<c_int> {    }                  well-known caller-                from the Rust stack to the         flags to determine
+                                                            saved regs:                       foreign stack.                     and encode return
+
+
+
+
+                                       calls
+                                                            t0 = &rt                       3. Enable memory protection.          value or error.
+                                                            t1 = *const fn()                 4. Call foreign function (t1).      ret = Val(a0,a1);
+               extern "C" fn randombytes_buf_int(                                                                                   or
+                                                            t2 = &mut RetVal               5. Disable memory protection.         ret = Err(SIGSEGV);
+                   *mut c_void, usize,
+                                                            t3 = stack spill               6. Restore saved registers.
+                   &RT, *const fn(), &mut RetVal);                                                                                 return to caller
+                      = RT::invoke::<0, AReg2>                     tail call                          tail call                   (randombytes_buf)
+
+
+
+
+Figure 4: Omniglot wraps foreign functions by creating an internal, unsafe FFI binding and aliasing it to the Omniglot runtime’s
+generic invoke symbol. The runtime preserves the Rust compiler’s argument registers and stack.
+
+
+5.3          The invoke Trampoline                                      setup to proceed. This technique effectively allows us to insert
+                                                                        custom protection instructions directly into a function pro-
+An Omniglot runtime is responsible for ensuring that any                logue, without modifying the foreign library or Rust compiler,
+foreign code runs within its sandbox and, in turn, all callbacks        and without requiring Omniglot users to write any boilerplate
+execute in Rust’s context, with access to both Rust and foreign         code. It does however introduce its own challenge: within the
+memory. Implemented naïvely, however, this could prevent                body of the invoke function, we do not automatically know
+a foreign function from accessing its parameters or writing             which function should be invoked!
+its return value, as they might be spilled on the host’s stack.            To solve this, we pass a combination of runtime and generic
+Omniglot solves this issue by copying this memory to and                arguments to the invoke function (which causes the compiler
+from the foreign stack. This poses a challenge: how can the             to monomorphize it into concrete instantiations bound to its
+Omniglot runtime know which memory to copy? Importantly,                generic parameters). Taken together, these arguments allow
+this depends not only on the platform’s calling convention,             the monomorphized invoke routine to find the function to
+but also on each individual function’s signature.                       be invoked, locate the arguments for that function, find the
+   To solve this problem, we introduce a generic invoke tram-           current foreign stack pointer, and finally store the function’s
+poline mechanism, illustrated in Figure 4. Rather than manu-            returned value. These arguments can be seen in the example in
+ally placing function arguments into their appropriate regis-           Figure 4. The first two arguments to randombytes_buf_int
+ters and stack offsets, Omniglot relies on the Rust compiler’s          are the arguments for the target C function. Of the remain-
+knowledge of the C calling convention (as opposed to using a            ing invoke-specific arguments, the &rt parameter is used to
+dynamic approach like libffi). In particular, our modified              lookup library-specific information (like the location of the
+rust-bindgen generates a new extern "C" Rust function                   foreign stack pointer), the *const fn() function pointer
+for each C function binding, which expects the same argu-               stores the location of the original foreign function (int
+ments as the original C function. When calling this generated           randombytes_buf()), and the RetVal parameter is a con-
+symbol, the compiler will therefore correctly lay out argu-             tainer for the eventual return value. The generic argument
+ments according to the C calling convention. This process is            AReg2 tells invoke where to find these extra arguments7 .
+captured on the left column of Figure 4, for an example C
+function randombytes_buf.
+                                                                        6      Evaluation
+   We must now switch protection domains before executing
+the function. This switch is implemented by a single, generic           This section evaluates Omniglot using multiple libraries
+invoke function, implemented once per runtime. The invoke               across different application domains and two memory iso-
+function executes some argument-specific setup code, some               lation primitives. With our evaluation we show the following:
+common protection setup code, and then dispatches to the
+target C FFI function. We must ensure that invoke is called             Omniglot is general. It is able to safely encapsulate libraries
+whenever a C FFI function is invoked. To do this, we alias               with different interface paradigms, across a wide range of
+the C-ABI function symbol for the FFI call directly to the               application domains. Omniglot further supports a wide
+generic invoke symbol. This has the effect of translating calls          range of systems, from high performance desktop and
+to our generated FFI binding (fn randombytes_buf_int in                     7 Its accompanying integer is used to indicate arguments’ offset into the
+
+Figure 4) to calls to invoke, allowing the protection domain            stack, whenever arguments need to stack-spill.
+
+
+
+
+USENIX Association                             19th USENIX Symposium on Operating Systems Design and Implementation                             605
+                         #u ck
+
+                         #v de
+
+                                     e
+                                   e
+
+
+
+
+                                  at
+                         #c e
+                                im
+
+
+
+
+                                 a
+                                ra
+                               ok
+
+
+
+
+                               id
+                               lb
+                            pg
+                             nt
+
+
+                            nv
+
+
+
+
+                            al
+                            al
+                         Ru
+         Library                                             unsafe              isolation only             Omniglot
+
+
+
+
+                         #i
+         CryptoLib       PMP       14     0    10      2      9105 µs           9145 µs (+0.44%)         9145 µs (+0%)
+         LittleFS        PMP        7     0     0      7    3115.3 µs         3742.8 µs (+20.1%)         3764 µs (+0.5%)
+         LwIP            PMP        3     1     2      5     51.74 µs          78.71 µs (+52.1%)         81.4 µs (+3.4%)
+         Brotli          MPK        2     0     0      4     3.12 ms           3.14 ms (+0.6%)          3.14 ms (+0%)
+         libsodium       MPK        1     0     0      2     51.61 µs          53.41 µs (+3.4%)         53.41 µs (+0%)
+         libpng          MPK        5    15    16      3    352.98 µs         397.93 µs (+12.7%)       401.25 µs (+0.8%)
+
+
+Table 2: Omniglot overheads for a diverse set of libraries, across two runtimes. We show the number of Omniglot operations per
+benchmark iteration, and compare its overheads to an unsafe baseline, and memory isolation without Omniglot’s runtime checks.
+
+
+  server systems to highly resource-constrained microcon-               6.1     Case Study: Tock Kernel
+  trollers, as well as userspace and kernel environments.
+                                                                        Tock is an operating system commonly used in security-
+Omniglot is fast. Omniglot’s ability to perform zero-copy               critical resource-constrained systems. Its kernel is written
+ accesses into foreign memory allows it to efficiently convey           in Rust and its design goes to significant lengths to minimize
+ data between host and foreign code. As we will show in                 the use of unsafe Rust. Nonetheless, practical deployments
+ Section 6.2, this allows Omniglot to outperform related                of Tock often rely on foreign libraries to implement critical
+ work that delivers similar safety guarantees.                          operations. We evaluate OGPMP on three such libraries, across
+   We lift the enforcement of Omniglot’s mutual exclusion               a range of application domains and interface paradigms.
+ requirement into Rust’s type-system, turning it into a zero-              We evaluate the OpenTitan CryptoLib library by encapsu-
+ cost abstraction. In this evaluation, we further show that the         lating its HMAC-SHA256 algorithm. The results in Table 2
+ Rust compiler is able to optimize out validation in many               show the execution time, as well as the number of Omniglot
+ cases and, where it cannot, those overheads are small.                 operations performed in a single HMAC operation over 4 kB
+   Because Omniglot’s overheads are primarily governed                  of data, carried out in batches of 512 B. Because this bench-
+ by its underlying memory isolation mechanism, it delivers              mark requires Omniglot to copy data into the CryptoLib’s
+ competitive performance to existing systems that do not                memory, enabling PMP-based memory isolation increases
+ maintain other safety-critical invariants such as aliasing or          execution time by 0.44%. Omniglot’s runtime checks (during
+ type safety.                                                           upgrade and validate) introduce no measureable overhead in
+                                                                        this case. In this benchmark, Omniglot tracks only a single
+We consider two case studies: Section 6.1 shows how Om-
+                                                                        allocation in the foreign library, its HMAC context, making up-
+niglot can be used to efficiently integrate existing, unsafe
+                                                                        grade operations fast. Furthermore, Omniglot requires devel-
+foreign libraries into an operating system kernel. Section 6.2
+                                                                        opers to validate the returned HMAC tag. However, because
+evaluates Omniglot’s support for loading and interacting with
+                                                                        this tag is a simple byte-array, and a u8 integer is an uncondi-
+widely-used userspace libraries. Table 2 summarizes the re-
+                                                                        tionally valid type, the Rust compiler is able to optimize such
+sults of our measurements across both case studies. Finally,
+                                                                        validation away entirely.
+Section 6.3 provides a breakdown of Omniglot’s overheads
+through a series of microbenchmarks.                                       Additionally, Omniglot supports libraries that maintain
+                                                                        state between calls. We evaluate OGPMP on LittleFS, a filesys-
+Experiment Setup. We evaluate two different Omniglot run-               tem library. We repeatedly format the filesystem, mount it,
+times on different systems. User-space Linux evaluations run            create and open a file, write 1 kB UTF-8 code points to it,
+on a CloudLab Wisconsin c220g5 node with two Intel Xeon                 read the data back, and then close the file. In this benchmark,
+Silver 4114 CPUs at 2.2 GHz, and frequency scaling and hy-              we compare the contents of the file with the original string. To
+perthreading disabled, using rustc 1.84.0-nightly and Linux             do this, Omniglot forces us to validate that the returned buffer
+5.15.0. The benchmark process is pinned to a single CPU core.           is a valid Rust string (i.e., valid UTF-8). This operation is
+Kernel evaluations run using a port of the Tock operating sys-          linear in the amount of data to validate, and explains OGPMP ’s
+tem8 , on a ChipWhisperer CW310 FPGA with the OpenTitan                 overhead of 0.5% compared to memory isolation.
+EarlGrey silicon root-of-trust design9 and a RISC-V rv32imc                Finally, we demonstrate Omniglot’s ability to handle call-
+CPU at 24 MHz.                                                          backs. We do so by evaluating OGPMP with the LwIP em-
+                                                                        bedded network stack. Our benchmark sends an ICMP echo
+  8 Based on https://github.com/tock/tock, git revision 1967fa7.        request by allocating a new buffer, copying the packet, and in-
+  9 https://github.com/lowrisc/opentitan, git revision bbbd9b0.         jecting it into the network stack. In response, LwIP invokes a
+
+
+
+606   19th USENIX Symposium on Operating Systems Design and Implementation                                       USENIX Association
+                                                                             (a)                     Setup                   Invoke
+                                                                                               PMP         MPK         PMP          MPK
+   Decode Time (ms)
+
+                                 Unsafe FFI                                  Unsafe            0.17 µs     1.49 ms     0.17 µs      13.74 ns
+                                 OGMPK                                       Omniglot         73.88 µs     4.08 ms     6.57 µs      98.90 ns
+                      40                                                     Sandcrust                     1.79 ms                  10.87 µs
+                                 Sandcrust
+                                                                             Tock Upcall                              56.20 µs
+                      20
+                                                                             (b)                   Upgrade                 Callback
+                                                                             allocs / CBs     PMP          MPK         PMP         MPK
+                       0                                                     1                 0.6 µs     32.30 ns     8.66 µs    230.1 ns
+                                                                             8                 1.7 µs     164.1 ns     9.82 µs    364.3 ns
+                           0.0     0.5     1.0      1.5      2.0             64                9.4 µs      1.10 µs    18.22 µs      1.32 µs
+                                   Decoded Image Size (MB)
+                                                                             (c) Validate    64 B u8     8 kB u8     64 B str     8 kB str
+                                                                             PMP               0.22 µs     0.23 µs      2.74 µs     161.5 µs
+Figure 5: Execution time of decoding a PNG image, as func-                   MPK               1.67 ns     1.70 ns    359.6 ns      70.94 µs
+tion of the decoded image size. We compare OGMPK against
+an unsafe FFI baseline and Sandcrust. Omniglot’s ability to                 Table 3: Omniglot’s overheads broken down by operation.
+perform zero-copy accesses to foreign memory allows it to
+outperform Sandcrust, which requires serialization and copy-
+ing.                                                                       shows the runtime for a 23 kB image (Omniglot’s relative
+                                                                           overheads decrease in the image size). libpng uses a call-
+                                                                           back to progressively read image data from the host program’s
+callback previously registered with OGPMP , passing a pointer              memory. It also expects callers into the library to use setjmp
+to the ICMP echo response packet. OGPMP needs to upgrade                   for handling errors internal to the library. Omniglot does not
+this pointer to a reference to read it, adding an overhead of              support this directly, as it expects every function to return nor-
+3.4% over memory isolation. Using this reference, it is able to            mally. We thus create a wrapper in C around these functions,
+directly access and read this response in foreign memory with-             converting a longjmp into an error return value.
+out copies. Nonetheless, the small packet size of ICMP echo                   Figure 5 shows that OGMPK ’s performance is close to that
+requests result in a pronounced memory isolation switching                 of the native, unsafe FFI bindings, while Sandcrust incurs
+overhead for invocations and callbacks of 52.1%.                           additional overheads increasing with the decoded image size.
+                                                                           This is because Sandcrust uses IPC and serialization to shut-
+                                                                           tle data between host and foreign memory. While this gives
+6.2                   Case Study: Linux Userspace                          Sandcrust strong soundness properties, similar to those of
+Our OGMPK implementation makes Omniglot usable for iso-                    Omniglot, it imposes significant overheads.
+lating conventional userspace libraries. To demonstrate this,
+we evaluate OGMPK on three libraries performing data com-                  6.3     Microbenchmarks
+pression, cryptographic algorithms, and image encoding. We
+also compare the performance and overheads of Omniglot to                  We quantify Omniglot’s runtime overheads through a com-
+Sandcrust [18], an IPC and serialization-based approach to                 prehensive set of microbenchmarks. Subtable 3 (a) illustrates
+isolate untrusted code within a Rust program.                              the time required to instantiate an Omniglot runtime (Setup,
+   Brotli, a data compression library, and Sodium, a cryptog-              measured as time it takes to start the process and run a sin-
+raphy library, feature similar interface paradigms. Specifi-               gle foreign function until it returns), and to invoke a single
+cally, they perform “one-shot” computations on some input                  foreign function which returns immediately (Invoke). The
+buffer, producing a corresponding output buffer. For Brotli,               table shows OGPMP ’s hot invoke path, where the RISC-V
+we benchmark compressing and decompressing 1 kB of UTF-                    PMP is already configured. When this is not the case, for
+8 encoded English text. Following decompression, we check                  instance by switching to a different library or process, OGPMP
+that the decompressed text equals our input. Similar to Lit-               instead incurs an overhead of 10.49 µs (adding 3.92 µs for
+tleFS, Omniglot forces us to perform Rust’s string validation              PMP re-configuration to the 6.57 µs for the hot invoke path).
+for this operation. The overhead of this validation is masked              We compare Omniglot’s overheads across its two runtimes
+by the long compression routine. For Sodium, we hash 32 kB                 with Rust’s unsafe FFI as a baseline. We further compare
+of random inputs. As the output is a simple byte-array, valida-            OGMPK to Sandcrust’s IPC-based approach [18], and OGPMP
+tion is optimized out by the compiler.                                     to conventional Tock process isolation.
+   Lastly, we use an encapsulated libpng to decode refer-                     Omniglot must keep track of the set of allocations and
+ence images with varying dimensions. Figure 5 shows the                    callbacks registered at runtime. Subtable 3 (b) shows that
+runtime of these operations compared to both an unsafe FFI                 Omniglot’s overheads for upgrade operations and callbacks
+and Sandcrust for a range of output sizes, whereas Table 2                 are linear in the number of such elements tracked. OGPMP has
+
+
+
+USENIX Association                                     19th USENIX Symposium on Operating Systems Design and Implementation               607
+higher base-overhead for callbacks compared to OGMPK , as             might be able to reduce Omniglot’s overheads even further.
+they are implemented similar to a context switch.                     Additionally, while Omniglot as presented does not prevent
+   Finally, Subtable 3 (c) shows that Omniglot’s validate is          a host program from violating soundness in foreign libraries,
+linear in the amount of data validated. However, when types           relying on specific properties of the language in which foreign
+are unconitionally valid, such as fixed-width integer types,          code was written may allow Omniglot to enforce safety and
+the Rust compiler is able to optimize out validation entirely.        soundness in foreign code as well.
+We can see this in the difference between validating 64 B and
+                                                                      Other host languages. In this paper, we focus on implement-
+8 kB for u8 integers.
+                                                                      ing Omniglot specifically for Rust, a popular choice for safe
+                                                                      systems programming today. However, other safe languages
+7     Related Work                                                    have a similar need for sound interactions with foreign code.
+                                                                      Future work should explore how Omniglot’s concepts can be
+Omniglot builds upon a significant body of work in the pro-           mapped to other safe languages.
+gramming languages, systems, and security communities. The
+security implications of foreign function interfaces have only        Better host language bindings. Finally, Omniglot is not API-
+recently been recognized as their own class of vulnerabili-           compatible with Rust’s existing, unsafe C FFI. While our
+ties. For instance, Mergendahl et al. establishes the concept         experience shows that most libraries can be integrated with
+of Cross-Language Attacks, an entirely new set of attack vec-         the Omniglot bindings in a highly mechanical way, Omniglot
+tors [26]. One way to reduce these vulnerabilities is through         does not support automatically transforming existing, unsafe
+static analysis techniques, such as proposed by Li et al. [22].       usages of foreign libraries to Omniglot’s safe APIs. We do
+   Omniglot employs intra-process isolation mechanisms sim-           argue that Omniglot’s API does not place undue burdens on
+ilar to a range of contributions [3, 4, 14, 16, 17, 18, 23, 29, 35,   developers though—in fact, even for correct bindings with
+38, 46, 52]. However, each of these require expensive opera-          Rust’s unchecked FFI, developers would still need to perform
+tions such as copying and serialization to maintain soundness,        the validations that Omniglot enforces.
+or do not consider it at all. Omniglot is the first system that
+maintains soundness across interactions with foreign code
+while supporting zero-copy accesses into foreign memory.              9   Conclusion
+   We design a type infrastructure to model and mediate safe
+interactions with foreign code. This closely relates to work          Software written in type-safe and memory-safe programming
+on Linking Types, which seek to extend the type system of a           languages has to interact with components written in foreign,
+host language to encode the behaviors and semantics native            unsafe languages. A single violation of the language’s safety
+to guest (foreign) code [13, 32, 33, 34, 45]. Existing work           invariants can infringe upon the application’s overall safety.
+on linking types is focused primarly on the core semantic                This paper presents Omniglot, a system that preserves
+questions or type system development, attempting to express           soundness of host code in the presence of untrusted foreign
+foreign semantic guarantees within a host’s type system. How-         code. We demonstrate Omniglot’s generality and low over-
+ever, these contributions assume that foreign code is internally      heads by evaluating it on two systems and a diverse set of
+correct. Omniglot can safely interact with libraries without          libraries. We show that Omniglot can safely encapsulate for-
+reasoning about whether they are correct.                             eign libraries with minimal overheads.
+   Finally, verification based approaches like eBPF [24, 28],
+promise safe interactions with untrusted code, with only few
+or no runtime checks. While these tools are growing increas-
+ingly capable and are used in complex settings such as stor-          Acknowledgments
+age functions [51] and network functions [27], they cannot
+encapsulate arbitrary, untrusted and unmodified libraries. Re-        We thank our shepherd, Andrea Lattuada, for his in depth feed-
+cent work proposes augmenting the static nature of such               back as well as our anonymous reviewers for their invaluable
+verification-based approaches with runtime checks to regain           feedback. We also thank Nicolas Koh, Natalie Popescu, Shai
+more expressiveness [12].                                             Caspin, and Gongqi Huang for suggestions on early versions
+                                                                      of the work as well as drafts of the paper. This work was
+                                                                      supported by the National Science Foundation under Grants
+8     Discussion & Future Work                                        No. CNS-2443589, CNS-2321723, and TIP-2303639. Leon
+                                                                      Schuermann was supported through a Francis Robbins Upton
+Deeper integration with foreign languages. Omniglot can               Fellowship in Engineering. The opinions, findings, conclu-
+isolate untrusted foreign libraries without making any assump-        sions, or recommendations expressed in this material are those
+tions about their behavior. While this is generally desirable,        of the authors and do not necessarily reflect the views of the
+by exploring deeper integrations with foreign languages we            National Science Foundation or the authors institutions.
+
+
+
+608    19th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+References                                                           USENIX Association, 8 2020. ISBN 978-1-939133-
+                                                                     17-5. URL https://www.usenix.org/conference/
+ [1] CVE-2023-30624 in the Rust Wasmtime crate: Wasm-                usenixsecurity20/presentation/connor.
+     time has undefined behavior in Rust runtime func-
+     tions. URL https://nvd.nist.gov/vuln/detail/                [9] Jonathan Corbet. A first look at Rust in the 6.1 ker-
+     CVE-2023-30624. Accessed 11/01/2024.                            nel. URL https://lwn.net/Articles/910762/. Ac-
+                                                                     cessed 04/19/2024.
+ [2] Jonathan Aldrich, Joshua Sunshine, Darpan Saini, and
+     Zachary Sparks. Typestate-oriented programming.            [10] Dinakar Dhurjati, Sumant Kowshik, Vikram Adve,
+     In Proceedings of the 24th ACM SIGPLAN Confer-                  and Chris Lattner. Memory safety without runtime
+     ence Companion on Object Oriented Programming                   checks or garbage collection. In Proceedings of
+     Systems Languages and Applications, OOPSLA ’09,                 the 2003 ACM SIGPLAN Conference on Language,
+     pages 1015–1022, New York, NY, USA, 2009. Associa-              Compiler, and Tool for Embedded Systems, LCTES
+     tion for Computing Machinery. ISBN 9781605587684.               ’03, page 69–80, New York, NY, USA, 2003. Associ-
+     doi:10.1145/1639950.1640073.                                    ation for Computing Machinery. ISBN 1581136471.
+                                                                     doi:10.1145/780732.780743.
+ [3] Hussain M. J. Almohri and David Evans. Fidelius
+     Charm: Isolating unsafe Rust code. In Proceedings          [11] Dmitry Duplyakin, Robert Ricci, Aleksander Mar-
+     of the Eighth ACM Conference on Data and Appli-                 icq, Gary Wong, Jonathon Duerig, Eric Eide, Leigh
+     cation Security and Privacy, CODASPY ’18, page                  Stoller, Mike Hibler, David Johnson, Kirk Webb, Aditya
+     248–255, New York, NY, USA, 2018. Association                   Akella, Kuangching Wang, Glenn Ricart, Larry Landwe-
+     for Computing Machinery. ISBN 9781450356329.                    ber, Chip Elliott, Michael Zink, Emmanuel Cecchet,
+     doi:10.1145/3176258.3176330.                                    Snigdhaswin Kar, and Prabodh Mishra. The design
+                                                                     and operation of CloudLab. In 2019 USENIX Annual
+ [4] Inyoung Bang, Martin Kayondo, HyunGon Moon, and
+                                                                     Technical Conference (USENIX ATC 19), pages 1–14,
+     Yunheung Paek. TRust: A compilation framework for
+                                                                     Renton, WA, 07 2019. USENIX Association. ISBN
+     in-process isolation to protect safe Rust against un-
+                                                                     978-1-939133-03-8. URL https://www.usenix.org/
+     trusted code. In 32nd USENIX Security Symposium
+                                                                     conference/atc19/presentation/duplyakin.
+     (USENIX Security 23), pages 6947–6964, Anaheim, CA,
+     08 2023. USENIX Association. ISBN 978-1-939133-            [12] Kumar Kartikeya Dwivedi, Rishabh Iyer, and Sanid-
+     37-3. URL https://www.usenix.org/conference/                    hya Kashyap. Fast, flexible, and practical kernel ex-
+     usenixsecurity23/presentation/bang.                             tensions. In Proceedings of the ACM SIGOPS 30th
+ [5] B. N. Bershad, S. Savage, P. Pardyak, E. G. Sirer, M. E.        Symposium on Operating Systems Principles, SOSP ’24,
+     Fiuczynski, D. Becker, C. Chambers, and S. Eggers. Ex-          page 249–264, New York, NY, USA, 2024. Associa-
+     tensibility safety and performance in the SPIN operating        tion for Computing Machinery. ISBN 9798400712517.
+     system. SIGOPS Oper. Syst. Rev., 29(5):267–283, dec             doi:10.1145/3694715.3695950.
+     1995. ISSN 0163-5980. doi:10.1145/224057.224077.           [13] Michael Furr and Jeffrey S. Foster. Checking type
+ [6] Kevin Boos, Namitha Liyanage, Ramla Ijaz, and                   safety of foreign function calls. In Proceedings of
+     Lin Zhong.     Theseus: an experiment in operat-                the 2005 ACM SIGPLAN Conference on Program-
+     ing system structure and state management.   In                 ming Language Design and Implementation, PLDI
+     14th USENIX Symposium on Operating Systems De-                  ’05, page 62–72, New York, NY, USA, 2005. Associ-
+     sign and Implementation (OSDI 20), pages 1–19.                  ation for Computing Machinery. ISBN 1595930566.
+     USENIX Association, 11 2020. ISBN 978-1-939133-                 doi:10.1145/1065010.1065019.
+     19-9. URL https://www.usenix.org/conference/
+                                                                [14] Merve Gülmez, Thomas Nyman, Christoph Baumann,
+     osdi20/presentation/boos.
+                                                                     and Jan Tobias Mühlberg. Friend or foe inside?
+ [7] Thomas Claburn.      Microsoft is busy rewriting                Exploring in-process isolation to maintain memory
+     core Windows code in memory-safe Rust, 04 2023.                 safety for unsafe Rust. In 2023 IEEE Secure De-
+     URL https://www.theregister.com/2023/04/27/                     velopment Conference (SecDev), pages 54–66, 2023.
+     microsoftw indowsr ust/. Accessed 10/07/2023.                   doi:10.1109/SecDev56634.2023.00020.
+
+ [8] R. Joseph Connor, Tyler McDaniel, Jared M. Smith, and      [15] Galen C. Hunt and James R. Larus. Singularity:
+     Max Schuchard. PKU pitfalls: Attacks on PKU-based               rethinking the software stack. SIGOPS Oper. Syst.
+     memory isolation systems. In 29th USENIX Security               Rev., 41(2):37–49, April 2007.   ISSN 0163-5980.
+     Symposium (USENIX Security 20), pages 1409–1426.                doi:10.1145/1243418.1243424.
+
+
+
+USENIX Association                         19th USENIX Symposium on Operating Systems Design and Implementation       609
+[16] Paul Kirth, Mitchel Dickerson, Stephen Crane, Per         [23] Peiming Liu, Gang Zhao, and Jeff Huang. Securing
+     Larsen, Adrian Dabrowski, David Gens, Yeoul Na, Stijn          unsafe Rust programs with XRust. In Proceedings of
+     Volckaert, and Michael Franz. PKRU-Safe: Automat-              the ACM/IEEE 42nd International Conference on Soft-
+     ically locking down the heap between safe and unsafe           ware Engineering, ICSE ’20, pages 234–245, New York,
+     languages. In Proceedings of the Seventeenth Euro-             NY, USA, 2020. Association for Computing Machinery.
+     pean Conference on Computer Systems, EuroSys ’22,              ISBN 9781450371216. doi:10.1145/3377811.3380325.
+     pages 132–148, New York, NY, USA, 2022. Associa-
+     tion for Computing Machinery. ISBN 9781450391627.         [24] Steven McCanne and Van Jacobson. The BSD packet
+     doi:10.1145/3492321.3519582.                                   filter: a new architecture for user-level packet capture.
+                                                                    In Proceedings of the USENIX Winter 1993 Conference
+[17] Matthew Kolosick, Shravan Narayan, Evan Johnson,               Proceedings on USENIX Winter 1993 Conference Pro-
+     Conrad Watt, Michael LeMay, Deepak Garg, Ranjit                ceedings, USENIX’93, page 2, USA, 1993. USENIX
+     Jhala, and Deian Stefan.       Isolation without taxa-         Association.
+     tion: Near-zero-cost transitions for WebAssembly and
+     SFI. Proc. ACM Program. Lang., 6(POPL), jan 2022.         [25] Ian McCormack, Joshua Sunshine, and Jonathan
+     doi:10.1145/3498688.                                           Aldrich. A study of undefined behavior across for-
+[18] Benjamin Lamowski, Carsten Weinhold, Adam Lack-                eign function boundaries in Rust libraries, 2024. URL
+     orzynski, and Hermann Härtig. Sandcrust: Auto-                 https://arxiv.org/abs/2404.11671.
+     matic sandboxing of unsafe components in Rust.
+     In Proceedings of the 9th Workshop on Program-            [26] Samuel Mergendahl, Nathan Burow, and Hamed
+     ming Languages and Operating Systems, PLOS’17,                 Okhravi. Cross-language attacks. In 29th Annual Net-
+     pages 51–57, New York, NY, USA, 2017. Association              work and Distributed System Security Symposium, NDSS
+     for Computing Machinery. ISBN 9781450351539.                   2022, San Diego, California, USA, April 24-28, 2022.
+     doi:10.1145/3144555.3144562.                                   The Internet Society, 2022. URL https://www.ndss-
+                                                                    symposium.org/ndss-paper/auto-draft-259/.
+[19] John Launchbury and Simon L Peyton Jones. State in
+     Haskell. LISP and Symbolic Computation, 8:293–341,        [27] Sebastiano Miano, Fulvio Risso, Mauricio Vásquez
+     1995. doi:10.1007/BF01018827.                                  Bernal, Matteo Bertrone, and Yunsong Lu.       A
+                                                                    framework for eBPF-based network functions in an
+[20] Hanwen Lei, Ziqi Zhang, Shaokun Zhang, Peng Jiang,             era of microservices. IEEE Transactions on Net-
+     Zhineng Zhong, Ningyu He, Ding Li, Yao Guo, and Xi-            work and Service Management, 18(1):133–151, 2021.
+     angqun Chen. Put your memory in order: Efficient               doi:10.1109/TNSM.2021.3055676.
+     domain-based memory isolation for WASM applica-
+     tions. In Proceedings of the 2023 ACM SIGSAC Confer-      [28] Jeffrey C. Mogul, Richard F. Rashid, and Michael J.
+     ence on Computer and Communications Security, CCS              Accetta. The packer filter: an efficient mechanism
+     ’23, page 904–918, New York, NY, USA, 2023. Associ-            for user-level network code. SIGOPS Oper. Syst.
+     ation for Computing Machinery. ISBN 9798400700507.             Rev., 21(5):39–51, November 1987. ISSN 0163-5980.
+     doi:10.1145/3576915.3623205.                                   doi:10.1145/37499.37505.
+[21] Amit Levy, Bradford Campbell, Branden Ghena,
+     Daniel B. Giffin, Pat Pannuto, Prabal Dutta, and Philip   [29] Shravan Narayan, Craig Disselkoen, Tal Garfinkel,
+     Levis. Multiprogramming a 64kb computer safely                 Nathan Froyd, Eric Rahm, Sorin Lerner, Ho-
+     and efficiently. In Proceedings of the 26th Sym-               vav Shacham, and Deian Stefan.         Retrofitting
+     posium on Operating Systems Principles, SOSP ’17,              fine grain isolation in the Firefox renderer.    In
+     pages 234–251, New York, NY, USA, 2017. Associa-               29th USENIX Security Symposium (USENIX
+     tion for Computing Machinery. ISBN 9781450350853.              Security 20), pages 699–716. USENIX Associ-
+     doi:10.1145/3132747.3132786.                                   ation, August 2020.      ISBN 978-1-939133-17-5.
+                                                                    URL         https://www.usenix.org/conference/
+[22] Zhuohua Li, Jincheng Wang, Mingshen Sun, and John              usenixsecurity20/presentation/narayan.
+     C. S. Lui. Detecting cross-language memory manage-
+     ment issues in Rust. In Computer Security – ESORICS       [30] Vikram Narayanan, Tianjiao Huang, David Detweiler,
+     2022: 27th European Symposium on Research in Com-              Dan Appel, Zhaofeng Li, Gerd Zellweger, and An-
+     puter Security, Copenhagen, Denmark, September 26–             ton Burtsev. RedLeaf: Isolation and communica-
+     30, 2022, Proceedings, Part III, pages 680–700, Berlin,        tion in a safe operating system. In 14th USENIX
+     Heidelberg, 2022. Springer-Verlag. ISBN 978-3-031-             Symposium on Operating Systems Design and Im-
+     17142-0. doi:10.1007/978-3-031-17143-7_33.                     plementation (OSDI 20), pages 21–39. USENIX
+
+
+
+610   19th USENIX Symposium on Operating Systems Design and Implementation                             USENIX Association
+     Association, 11 2020.  ISBN 978-1-939133-19-              [38] Mincheol Sung, Pierre Olivier, Stefan Lankes, and Bi-
+     9.   URL https://www.usenix.org/conference/                    noy Ravindran. Intra-unikernel isolation with In-
+     osdi20/presentation/narayanan-vikram.                          tel memory protection keys. In Proceedings of the
+                                                                    16th ACM SIGPLAN/SIGOPS International Confer-
+[31] Aurojit Panda, Sangjin Han, Keon Jang, Melvin Walls,           ence on Virtual Execution Environments, VEE ’20,
+     Sylvia Ratnasamy, and Scott Shenker. NetBricks:                pages 143–156, New York, NY, USA, 2020. Associa-
+     Taking the V out of NFV. In 12th USENIX Symposium              tion for Computing Machinery. ISBN 9781450375542.
+     on Operating Systems Design and Implementation                 doi:10.1145/3381052.3381326.
+     (OSDI 16), pages 203–216, Savannah, GA, 11 2016.
+     USENIX Association. ISBN 978-1-931971-33-1. URL           [39] Synopsys, Inc. The heartbleed bug, 2020. URL https:
+     https://www.usenix.org/conference/osdi16/                      //heartbleed.com/. Accessed 10/07/2023.
+     technical-sessions/presentation/panda.
+                                                               [40] The Rust Contributors.   The Rust reference –
+[32] Daniel Patterson and Amal Ahmed. Linking types for             textual types, 2023.   URL https://doc.rust-
+     multi-language software: Have your cake and eat it too.        lang.org/reference/types/textual.html.    Ac-
+     In Benjamin S. Lerner, Rastislav Bodík, and Shriram            cessed 10/07/2023.
+     Krishnamurthi, editors, 2nd Summit on Advances in Pro-
+                                                               [41] The Rust Contributors.    The Rust reference –
+     gramming Languages, SNAPL 2017, May 7-10, 2017,
+                                                                    behavior considered undefined, 2023.      URL
+     Asilomar, CA, USA, volume 71 of LIPIcs, pages 12:1–
+                                                                    https://doc.rust-lang.org/reference/
+     12:15. Schloss Dagstuhl - Leibniz-Zentrum für Infor-
+                                                                    behavior-considered-undefined.html. Accessed
+     matik, 2017. doi:10.4230/LIPICS.SNAPL.2017.12.
+                                                                    10/07/2023.
+[33] Daniel Patterson, Noble Mushtak, Andrew Wagner,           [42] The Rust Contributors. The Rustonomicon, 2023. URL
+     and Amal Ahmed. Semantic soundness for language                https://doc.rust-lang.org/nomicon/. Accessed
+     interoperability. In Proceedings of the 43rd ACM               10/07/2023.
+     SIGPLAN International Conference on Programming
+     Language Design and Implementation, PLDI 2022,            [43] The Rust Contributors. The Rust core library – primitive
+     pages 609–624, New York, NY, USA, 2022. Associa-               type char, 2024. URL https://doc.rust-lang.org/
+     tion for Computing Machinery. ISBN 9781450392655.              std/primitive.char.html. Accessed 04/10/2024.
+     doi:10.1145/3519939.3523703.
+                                                               [44] The Rust Contributors.    Unsafe code guide-
+[34] Daniel Patterson, Andrew Wagner, and Amal Ahmed.               lines reference – glossary, 2024.         URL
+     Semantic encapsulation using linking types. In Pro-            https://rust-lang.github.io/unsafe-code-
+     ceedings of the 8th ACM SIGPLAN International                  guidelines/glossary.html. Accessed 12/02/2024.
+     Workshop on Type-Driven Development, TyDe 2023,
+     pages 14–28, New York, NY, USA, 2023. Association         [45] Alexi Turcotte, Ellen Arteca, and Gregor Richards. Rea-
+     for Computing Machinery. ISBN 9798400702990.                   soning about foreign function interfaces without mod-
+     doi:10.1145/3609027.3609405.                                   elling the foreign language. In Alastair F. Donaldson,
+                                                                    editor, 33rd European Conference on Object-Oriented
+[35] Elijah Rivera, Samuel Mergendahl, Howard Shrobe,               Programming (ECOOP 2019), volume 134 of Leibniz
+     Hamed Okhravi, and Nathan Burow. Keeping safe                  International Proceedings in Informatics (LIPIcs),
+     Rust safe with Galeed. In Annual Computer Se-                  pages 16:1–16:32, Dagstuhl, Germany, 2019. Schloss
+     curity Applications Conference, ACSAC ’21, pages               Dagstuhl – Leibniz-Zentrum für Informatik. ISBN 978-
+     824–836, New York, NY, USA, 2021. Association                  3-95977-111-5. doi:10.4230/LIPIcs.ECOOP.2019.16.
+     for Computing Machinery. ISBN 9781450385794.                   URL         https://drops.dagstuhl.de/entities/
+     doi:10.1145/3485832.3485903.                                   document/10.4230/LIPIcs.ECOOP.2019.16.
+
+[36] Vijay Saraswat. Java is not type-safe, 08 1997. URL       [46] Anjo Vahldiek-Oberwagner, Eslam Elnikety, Nuno O.
+     https://www.cis.upenn.edu/~bcpierce/courses/                   Duarte, Michael Sammler, Peter Druschel, and Deepak
+     629/papers/Saraswat-javabug.html.           Accessed           Garg. ERIM: Secure, efficient in-process isolation
+     11/29/2024.                                                    with protection keys (MPK). In 28th USENIX Security
+                                                                    Symposium (USENIX Security 19), pages 1221–1238,
+[37] Robert E. Strom and Shaula Yemini. Typestate: A pro-           Santa Clara, CA, 8 2019. USENIX Association. ISBN
+     gramming language concept for enhancing software reli-         978-1-939133-06-9. URL https://www.usenix.org/
+     ability. IEEE Transactions on Software Engineering, SE-        conference/usenixsecurity19/presentation/
+     12(1):157–171, 1986. doi:10.1109/TSE.1986.6312929.             vahldiek-oberwagner.
+
+
+
+USENIX Association                        19th USENIX Symposium on Operating Systems Design and Implementation         611
+[47] Jeffrey Vander Stoep.      Memory safe lan-
+     guages in Android 13, 12 2022.           URL
+     https://security.googleblog.com/2022/12/
+     memory-safe-languages-in-android-13.html.
+     Accessed 10/07/2023.
+
+[48] White House Office of the National Cyber Di-
+     rector (ONCD).     Press release: Future soft-
+     ware should be memory safe, 02 2024.     URL
+     https://bidenwhitehouse.archives.gov/oncd/
+     briefing-room/2024/02/26/press-release-
+     technical-report/. Accessed 06/05/2025.
+
+[49] Christof Windeck.     Microsoft security controller
+     Pluton is also coming to Intel Core. Heise. URL
+     https://www.heise.de/en/news/Microsoft-
+     security-controller-Pluton-is-also-coming-
+     to-Intel-Core-9833954.html.              Accessed
+     12/10/2024.
+[50] Joshua Yanovski, Hoang-Hai Dang, Ralf Jung, and
+     Derek Dreyer. GhostCell: separating permissions from
+     data in Rust. Proc. ACM Program. Lang., 5(ICFP), 08
+     2021. doi:10.1145/3473597.
+
+[51] Yuhong Zhong, Haoyu Li, Yu Jian Wu, Ioannis Zarkadas,
+     Jeffrey Tao, Evan Mesterhazy, Michael Makris, Junfeng
+     Yang, Amy Tai, Ryan Stutsman, and Asaf Cidon. XRP:
+     In-kernel storage functions with eBPF. In 16th USENIX
+     Symposium on Operating Systems Design and Imple-
+     mentation (OSDI 22), pages 375–393, Carlsbad, CA,
+     07 2022. USENIX Association. ISBN 978-1-939133-
+     28-1. URL https://www.usenix.org/conference/
+     osdi22/presentation/zhong.
+[52] Tianyang Zhou.      Fine-grained library sandbox-
+     ing for Rust ecosystem, 2023.     URL https://
+     escholarship.org/uc/item/5kq7s1jj.
+
+
+
+
+612   19th USENIX Symposium on Operating Systems Design and Implementation   USENIX Association
+A     Artifact Appendix                                            rust-bindgen: This repository holds our fork of the
+                                                                      rust-bindgen utility for generating Omniglot FFI bind-
+Abstract                                                              ings from a C header file.
+
+Omniglot is a framework to safely interact with libraries writ-
+ten in foreign languages from within Rust. This artifact con-      Hosting
+tains our research prototype implementation of the Omniglot        The       Omniglot framework is            maintained un-
+framework for Linux userspace (x86 MPK) and the Tock em-           der     the      omniglot-rs         GitHub     organization:
+bedded operating system kernel (RISC-V PMP). We also in-           https://github.com/omniglot-rs.
+clude scripts to install any required dependencies for building       We provide instructions for reproducing the artifact eval-
+and running Omniglot, and scripts to generate the evaluation       uation through a Zenodo record under the following identi-
+results as presented in the paper. More details are available in   fier: doi:10.5281/zenodo.15602886. This record also contains
+the artifact’s README.md file.                                     scripts and archived versions of the Omniglot components and
+                                                                   dependencies required for reproducing the evaluation results
+Scope                                                              of the paper.
+
+This artifact demonstrates Omniglot’s ability to work across
+multiple platforms, such as in Linux userspace or resource-
+                                                                   Requirements
+constrained embedded systems, and its support for a range          Each Omniglot runtime is designed to be evaluated on a spe-
+of libraries. It allows readers to evaluate the performance        cific platform:
+and overheads of Omniglot, and validate the claims made
+in the paper. Specifically, it can reproduce the results of the    OGMPK : The OGMPK evaluations must be run on a system
+following experiments:                                                with x86 MPK support. We design our evaluation scripts
+                                                                      to run on a CloudLab [11] cc220g5 node. The included
+    • Omniglot’s overheads for a set of libraries (for both           instructions demonstrate how to set up a CloudLab ex-
+      OGMPK and OGPMP , Table 2).                                     periment for evaluating OGMPK .
+
+    • Omniglot’s ability to perform zero-copy accesses into             We caution against executing the evaluation scripts on a
+      foreign memory (Figure 5).                                        developer’s personal machine, as it installs system-wide
+                                                                        dependencies and attempts to make persistent changes
+    • Omniglot’s overheads broken down by operation (for                to the machine’s bootloader configuration.
+      both OGMPK and OGPMP , Table 3).
+                                                                   OGPMP : The OGPMP evaluations expect to be run on a Chip-
+                                                                      Whisperer CW310 FPGA running the OpenTitan Earl-
+Contents                                                              Grey SoC design, built from the OpenTitan repository at
+                                                                      revision bbbd9b0.
+The artifact contains the implementation of Omniglot,
+its two runtime implementations, and other dependen-
+cies. The Omniglot framework is implemented as a                   Installation and Experiment Workflow
+set of Rust crates, split across multiple repositories             The artifact’s README.md file contain detailed instructions on
+available on GitHub in the omniglot-rs organization                how to prepare the OGMPK and OGPMP evaluation platforms
+(https://github.com/omniglot-rs):                                  and reproducing the evaluation results.
+omniglot: Contains shared infrastructure and implemen-
+   tations of the reference and validation types (see Sec-
+   tion 4).
+
+omniglot-mpk: Contains the implementation of the
+   OGMPK runtime for Linux userspace, as well as bindings
+   and benchmarks for the libraries evaluated using this
+   runtime (see Section 6).
+
+omniglot-tock: Contains the implementation of the Om-
+   niglot runtime for the Tock operating system kernel on
+   RISC-V platforms (OGPMP ). It also contains bindings
+   and benchmarks for the libraries which we evaluate using
+   this runtime (see Section 6).
+
+
+
+USENIX Association                           19th USENIX Symposium on Operating Systems Design and Implementation            613
+

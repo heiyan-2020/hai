@@ -1,0 +1,1266 @@
+  Noria: dynamic, partially-stateful data-flow
+   for high-performance web applications
+  Jon Gjengset, Malte Schwarzkopf, Jonathan Behrens, and Lara Timbó Araújo,
+      MIT CSAIL; Martin Ek, Norwegian University of Science and Technology;
+Eddie Kohler, Harvard University; M. Frans Kaashoek and Robert Morris, MIT CSAIL
+             https://www.usenix.org/conference/osdi18/presentation/gjengset
+
+
+
+
+        This paper is included in the Proceedings of the
+     13th USENIX Symposium on Operating Systems Design
+                and Implementation (OSDI ’18).
+                     October 8–10, 2018 • Carlsbad, CA, USA
+                                ISBN 978-1-939133-08-3
+
+
+
+                                            Open access to the Proceedings of the
+                                        13th USENIX Symposium on Operating Systems
+                                                Design and Implementation
+                                                  is sponsored by USENIX.
+                           Noria: dynamic, partially-stateful data-flow
+                             for high-performance web applications
+
+         Jon Gjengset ∗ Malte Schwarzkopf ∗ Jonathan Behrens Lara Timbó Araújo
+               Martin Ek† Eddie Kohler‡ M. Frans Kaashoek Robert Morris
+      MIT CSAIL † Norwegian University of Science and Technology ‡ Harvard University
+Abstract                                                     table columns to avoid re-computing them on every page
+We introduce partially-stateful data-flow, a new stream-     load [42]. As each vote is reflected in several places, ap-
+ing data-flow model that supports eviction and recon-        plication logic must explicitly update computed columns
+struction of data-flow state on demand. By avoiding state    every time a value changes. Hence, pre-computation
+explosion and supporting live changes to the data-flow       complicates both application reads and writes. In gen-
+graph, this model makes data-flow viable for building        eral, developers must choose between convenient, but
+long-lived, low-latency applications, such as web appli-     slow, “natural” relational queries (e.g., with inline aggre-
+cations. Our implementation, Noria, simplifies the back-     gations), and increased performance at the cost of appli-
+end infrastructure for read-heavy web applications while     cation and deployment complexity (e.g., due to caching).
+improving their performance.                                    Noria applications do not need to choose. Noria ex-
+   A Noria application supplies a relational schema and a    poses a high-level query interface (SQL), but unlike
+set of parameterized queries, which Noria compiles into      in conventional systems, Noria accelerates the execu-
+a data-flow program that pre-computes results for reads      tion of even complex natural queries by answering with
+and incrementally applies writes. Noria makes it easy        pre-computed results where possible. At its core, No-
+to write high-performance applications without manual        ria runs a continuous, but dynamically changing, data-
+performance tuning or complex-to-maintain caching lay-       flow computation that combines the persistent store, the
+ers. Partial statefulness helps Noria limit its in-memory    cache, and elements of application logic. Each write to
+state without prior data-flow systems’ restriction to win-   Noria streams through a joint data-flow graph for the
+dowed state, and helps Noria adapt its data-flow to          current queries and incrementally updates the cached,
+schema and query changes while on-line. Unlike prior         eventually-consistent internal state and query results.
+data-flow systems, Noria also shares state and computa-
+tion across related queries, eliminating duplicate work.       Making this approach work for web applications is
+   On a real web application’s queries, our prototype        challenging. A naı̈ve implementation might maintain un-
+scales to 5× higher load than a hand-optimized MySQL         bounded pre-computed state, causing unacceptable space
+baseline. Noria also outperforms a typical MySQL/mem-        and time overhead, so Noria must limit its state size.
+cached stack and the materialized views of a commercial      Writes can update many pre-computed results, so Noria
+database. It scales to tens of millions of reads and mil-    must ensure that writes are fast and avoid unnecessary
+lions of writes per second over multiple servers, outper-    work. Finally, since many web applications frequently
+forming a state-of-the-art streaming data-flow system.       change their queries [20, 61], Noria must accommodate
+                                                             changes without iterating over all data.
+1    Introduction
+                                                                Existing data-flow systems either cannot perform fine-
+Web applications must serve many users at low latency.
+                                                             grained incremental updates to state [36, 52, 75], or limit
+They respond to each user request using data queried
+                                                             the growth of operator state using “windowed” state (e.g.,
+from backend stores, usually relational databases. The
+                                                             this week’s stories). This bounds their memory footprint
+vast majority of such store accesses are reads, and
+                                                             but prohibits reading older data [11, 39, 46, 51]. No-
+evaluating them as repeated queries over the normal-
+                                                             ria’s data-flow operator state is partial instead of win-
+ized schema of a relational database is inefficient [54,
+                                                             dowed, retaining only the subset of records that the ap-
+57]. Hence, many applications explicitly include pre-
+                                                             plication has queried. This is possible thanks to a new,
+computed query results in their database schemas, or
+                                                             partially-stateful data-flow model: when in need of miss-
+cache such results in separate key-value stores [8, 54].
+                                                             ing state, operators request an upquery that derives the
+For example, the Lobsters news aggregator [43] stores
+                                                             missing records from upstream state. Ensuring correct-
+stories’ computed vote counts and “hotness” in separate
+                                                             ness with this model requires careful attention to invari-
+    ∗ equal contribution                                     ants, as ordinary updates and upqueries can race. With-
+
+
+
+USENIX Association                 13th USENIX Symposium on Operating Systems Design and Implementation             213
+                             Write                                1 Write                                     1 Write
+ Read-side work Write work
+                             stories           votes     users        stories         votes      users          stories       votes       users
+                                                                                                                                                      Add new query
+                                                                                                                                  2 Stream
+                                                                                          ∑                                           through
+                                           ∑                                                                                  ∑
+                                                                     Invalidate                                                       data-flow
+                                                                                  ⋈
+                                                                     2 cache
+                                       ⋈                                                  Query on               ⋈        3 Update view
+                                                                                                                                                        ∑
+                                                                                                                                                                    ⋈
+                                                                                      3
+                                                                                          read miss
+                                                                        cache                                       StoryWithVC                             Karma
+                                                       Read                                   Read                                            Read
+
+(a) Classic database operation                                   (b) Two-tier stack with                     (c) Noria: stateful data-flow operators pre-compute data for
+with compute on reads.                                           demand-filled cache [54, §2].               reads incrementally; data-flow change supports new queries.
+
+                                Figure 1: Overview of how current website backends and Noria process frontend reads and writes.
+
+out care, such races could produce permanently incorrect                                                 crease for Noria-optimized applications. When serving
+state, and therefore incorrect cached query results.                                                     the Lobsters web application on a single Amazon EC2
+   The state that Noria keeps is similar to a material-                                                  VM, our prototype outperforms the default MySQL-
+ized view, and its data-flow processing is akin to view                                                  based backend by 5× while simultaneously simplifying
+maintenance [2, 37]. Noria demonstrates that, contrary                                                   the application (§8.1). For a representative query, our
+to conventional wisdom, maintaining materialized views                                                   prototype outperforms the widely-used MySQL/mem-
+for all application queries is feasible. This is possible                                                cached stack and the materialized views of a commer-
+because partially-stateful operators can evict rarely-used                                               cial database by 2–10× (§8.2). It also scales the query
+state, and discard writes for that state, which reduces                                                  to millions of writes and tens of millions of reads per
+state size and write load. Noria further avoids redundant                                                second on a cluster of EC2 VMs, outperforming a state-
+computation and state by jointly optimizing its queries to                                               of-the-art data-flow system, differential dataflow [46, 51]
+merge overlapping data-flow subgraphs.                                                                   (§8.3). Finally, our prototype adapts the data-flow with-
+   Few existing streaming data-flow systems can change                                                   out any perceptible downtime for reads or writes when
+their queries and input schemas without downtime. For                                                    transitioning the same query to a modified version (§8.5).
+example, Naiad must re-start to accommodate changes,                                                         Nevertheless, our current prototype has some limita-
+and Spark’s Structured Streaming must restart from a                                                     tions. It only guarantees eventual consistency; its evic-
+checkpoint [18]. Noria, by contrast, adapts its data-flow                                                tion from partial state is randomized; it is inefficient for
+to new queries without interrupting existing clients. It ap-                                             sharded queries that require shuffles in the data-flow; and
+plies changes while retaining existing state and while re-                                               it lacks support for some SQL keywords. We plan to ad-
+maining live for reads throughout. Writes from current                                                   dress these limitations in future work.
+clients see sub-second interruptions in the common case.
+   Noria’s techniques remain compatible with traditional                                                 2     Background
+parallel and distributed data-flow, and allow Noria to
+parallelize and scale fine-grained, partially materialized                                               We now explain how current website backends and Noria
+view maintenance over multiple cores and machines.                                                       process data. Figure 1 shows an overview.
+   In summary, Noria makes four principal contributions:                                                    Many web applications use a relational database to
+  1. the partially-stateful data-flow model, its correct-                                                store and query data (Figure 1a). Page views generate
+      ness invariants, and a conforming system design;                                                   database queries that frequently require complex compu-
+  2. automatic merge-and-reuse techniques for data-                                                      tation, and the query load tends to be read-heavy. Across
+      flow subgraphs in joint data-flows over many                                                       one month of traffic data from a HotCRP site and the
+      queries, which reduce processing cost and state size;                                              production deployment of Lobsters [32], 88% to 97%
+  3. near-instantaneous, dynamic transitions for data-                                                   of queries are reads (SELECT queries), and these reads
+      flow graphs in response to changes to queries or                                                   consume 88% of total query execution time in HotCRP.
+      schema without loss of existing state; and                                                         Since read performance is important, application devel-
+  4. a prototype implementation and an evaluation that                                                   opers often manually optimize it. For example, Lob-
+      demonstrates that practical web applications benefit                                               sters stores individual votes for stories in a votes ta-
+      from Noria’s approach.                                                                             ble, but also stores per-story vote counts as a column in
+   Our Noria prototype exposes a backwards-compatible                                                    the stories table. This speeds up read queries of vote
+MySQL protocol interface and can serve real web appli-                                                   counts, but “de-normalizes” the schema and complicates
+cations with minimal changes, although its benefits in-                                                  vote writes, which must update the derived counts.
+
+
+
+214                          13th USENIX Symposium on Operating Systems Design and Implementation                                                    USENIX Association
+   Websites often deploy an in-memory key-value                1  /* base tables */
+cache (like Redis, memcached, or TAO [8]) to speed             2  CREATE TABLE stories
+up common-case read queries (Figure 1b). Such a                 3   (id int, author int, title text, url text);
+                                                                4 CREATE TABLE votes (user int, story_id int);
+cache avoids re-evaluating the query when the under-
+                                                                5 CREATE TABLE users (id int, username text);
+lying records are unchanged. However, the application           6 /* internal view: vote count per story */
+must invalidate or replace cache entries as the records         7 CREATE INTERNAL VIEW VoteCount AS
+
+change. This process is error-prone and requires complex        8   SELECT story_id, COUNT(*) AS vcount
+                                                                      FROM votes GROUP BY story_id;
+application-side logic [37, 48, 57, 64]. For example, de-       9
+                                                               10 /* external view: story details */
+velopers must carefully avoid performance collapse due         11 CREATE VIEW StoriesWithVC AS
+to “thundering herds” (viz., many database queries issued      12   SELECT id, author, title, url, vcount
+just after an invalidation) [54, 57]. Since the cache can      13     FROM stories
+                                                               14     JOIN VoteCount ON VoteCount.story_id = stories.id
+return stale records, reads are eventually-consistent.         15    WHERE stories.id = ?;
+   Some sites use stream-processing systems [13, 39] to
+maintain results for queries whose re-execution over all           Figure 2: Noria program for a key subset of the Lobsters
+past data is infeasible. One major problem for these sys-          news aggregator [43] that counts users’ votes for stories.
+tems is that they must maintain state at some operators,
+such as aggregations. To avoid unbounded growth, exist-
+                                                                   compute and store in base tables for performance. Views,
+ing systems “window” this state by limiting it to the most
+                                                                   by contrast, will likely be larger than a typical cache foot-
+recent records. This makes it difficult for a stream pro-
+                                                                   print, because Noria derives more data, including some
+cessor to serve the general queries needed for websites,
+                                                                   intermediate results. Noria stores base tables persistently
+which need to access older as well as recent state. More-
+                                                                   on disk, either on one server or sharded across multiple
+over, stream processors are less flexible than a database
+                                                                   servers, but stores views in server memory. The applica-
+that can execute any relational query on its schema: in-
+                                                                   tion’s working set in these views should fit in memory
+troducing a new query often requires a restart.
+                                                                   for good performance, but Noria reduces memory use by
+   Noria, as shown in Figure 1c, combines the best of
+                                                                   only materializing records that are actually read, and by
+these worlds. It supports the fast reads of key-value
+                                                                   evicting infrequently-accessed data.
+caches, the efficient updates and parallelism of streaming
+data-flow, and, like a classic database, supports changing         3.2   Programming interface
+queries and base table schemas without downtime.                   Applications interact with Noria via an interface that
+                                                                   resembles parameterized SQL queries. The application
+3     Noria design
+                                                                   supplies a Noria program, which registers base tables
+Noria is a stateful, dynamic, parallel, and distributed            and views with parameters supplied by the application
+data-flow system designed for the storage, query process-          when it retrieves data. Figure 2 shows an example Noria
+ing, and caching needs of typical web applications.                program for a Lobsters-like news aggregator application
+                                                                   (? is a parameter). The Noria program includes base ta-
+3.1   Target applications and deployment
+                                                                   ble definitions, internal views used as shorthands in other
+Noria targets read-heavy applications that tolerate even-          expressions, and external views that the application later
+tual consistency. Many web applications fit this model:            queries. Internally, Noria instantiates a data-flow to con-
+they accept the eventual consistency imposed by caches             tinuously process the application’s writes through this
+that make common-case reads fast [15, 19, 54, 72]. No-             program, which in turn maintains the external views.
+ria’s current design primarily targets relational operators,          To retrieve data, the application supplies Noria with an
+rather than the iterative or graph computations that are           external view identifier (e.g., StoriesWithVC) and one
+the focus of other data-flow systems [46, 51], and pro-            or more sets of parameter values. Noria then responds
+cesses structured records in tabular form [12, 16]. Large          with the records in the view that match those values.
+blobs (e.g., videos, PDF files) are best stored in external        To modify records in base tables, the application per-
+blob stores [7, 24, 50] and referenced by Noria’s records.         forms insertions, updates, and deletions, similar to a SQL
+   Noria runs on one or more multicore servers that com-           database. Noria applies these changes to the appropriate
+municate with clients and with one another using RPCs.             base tables and updates dependent views.
+A Noria deployment stores both base tables and derived                The application may change its Noria program to add
+views. Roughly, base tables contain the data typically             new views, to modify or remove existing views, and to
+stored persistently, and derived views hold data an appli-         adapt base table schemas. Noria expects such changes
+cation might choose to cache. Compared to conventional             to be common and aims to complete them quickly. This
+database use, Noria base tables might be smaller, as No-           contrasts with most previous data-flow systems, which
+ria derives data that an application may otherwise pre-            lack support for efficient changes without downtime.
+
+
+
+USENIX Association                  13th USENIX Symposium on Operating Systems Design and Implementation                   215
+                 ...                              ...
+ I                               upstream   II                   upstream     for example, an operator that aggregates votes by user ID
+             ∑ SUM               state       ∑ SUM               state        requires a user ID index to process new votes efficiently.
+                               2 upquery
+                                            ...
+                                                                                 In most stream processors, join operators keep a win-
+ 1 incoming            σ FILTER into
+                                upstream                σ FILTER 3 upquery    dowed cache of their inputs [3, 76], allowing an up-
+                                                                   response
+      record                    state                                         date arriving at one input to join with all relevant state
+      at join
+      triggers   ⨝ JOIN                           ⨝ JOIN                      from the other. In Noria, joins instead perform upqueries,
+      upquery                                                                 which are requests for matching records from stateful an-
+                 ...                              ...                         cestors (Figure 3): when an update arrives at one join
+Figure 3: Noria’s data-flow operators can query into up-                      input, the join looks up the relevant state by querying
+stream state: a join issues an upquery (I) to retrieve a                      its other inputs. This reduces Noria’s space overhead,
+   ...
+record from upstream state to produce a join result (II).                     since joins often need not store duplicate state, but re-
+                                                                              quires care in the presence of concurrent updates, an is-
+                                                                              sue further discussed in §4. Upqueries also impose in-
+   In addition to its native SQL-based query interface,                       dexing obligations that Noria detects and satisfies.
+Noria provides an implementation of the MySQL bi-
+nary protocol, which allows existing applications that use                    3.4   Consistency semantics
+prepared statements against a MySQL database to in-                           To achieve high parallel processing performance, Noria’s
+teract with Noria without further changes. The adapter                        data-flow avoids global progress tracking or coordina-
+turns ad-hoc queries and prepared SQL statements into                         tion. An update injected by a base table takes time to
+writes to base tables, reads from external views, and in-                     propagate through the data-flow, and the update may ap-
+crementally effects Noria program changes. Noria sup-                         pear in different views at different times. Noria opera-
+ports much, but not all, SQL syntax. We discuss the ex-                       tors and the contents of its external views are eventually-
+perience of building and porting applications in §7.                          consistent. Eventual consistency is attractive for perfor-
+3.3      Data-flow execution                                                  mance and scalability, and is sufficient for many web ap-
+                                                                              plications [15, 54, 72].
+Noria’s data-flow is a directed acyclic graph of relational                      Noria does ensure that if writes quiesce, all external
+operators such as aggregations, joins, and filters. Base                      views eventually hold results that are the same as if the
+tables are the roots of this graph, and external views form                   queries had been executed directly against the base ta-
+the leaves. Noria extends the graph with new base tables,                     ble data. Making this work correctly requires some care.
+operators, and views as the application adds new queries.                     Like most data-flow systems, Noria requires that opera-
+   When an application write arrives, Noria applies it to                     tors are deterministic functions over their own state and
+a durable base table and injects it into the data-flow as                     the inputs from their ancestors. In addition, Noria must
+an update. Operators process the update and emit de-                          avoid races between updates and upqueries; avoid re-
+rived updates to their children; eventually updates reach                     ordering updates on the same data-flow path; and resolve
+and modify the external views. Updates are deltas [46,                        races between related updates that arrive independently
+60] that can add to, modify, and remove from down-                            at multi-ancestor operators via different data-flow paths.
+stream state. For example, a count operator emits deltas                      Consider an OR that combines filters using a union oper-
+that indicate how the count for a key has changed; a                          ator, or a join between data-flow paths connected to the
+join may emit an update that installs new rows in down-                       same base table: such operators’ final output (and state)
+stream state; and a deletion from a base table generates                      must be commutative over the order in which updates
+a “negative” update that revokes derived records. Neg-                        arrive at their inputs. The standard relational operators
+ative updates remove entries when Noria applies them                          Noria supports have this property.
+to state, and retain their negative “sign” when combined                         Web applications sometimes rely on database trans-
+with other records (e.g., through joins). Negative updates                    actions, e.g., to atomically update pre-computed val-
+hold exactly the same values as the positives they revoke                     ues. Noria approach’s is compatible with basic,
+and thus follow the same data-flow paths.                                     optimistically-concurrent multi-statement transactions,
+   Noria supports stateless and stateful operators. State-                    but Noria also often obviates the need for them. For ex-
+less operators, such as filters and projections, need no                      ample, Lobsters uses transactions only to avoid write-
+context to process updates; stateful operators, such as                       write conflicts on vote counts and stories’ “hotness”
+count, min/max, and top-k, maintain state to avoid inef-                      scores. A multi-statement transaction is required only be-
+ficient re-computation of aggregate values from scratch.                      cause baseline Lobsters pre-computes hotness for perfor-
+Stateful operators, like external views, keep one or more                     mance. Noria instead computes hotness in the data-flow,
+indexes to speed up operation. Noria adds indexes based                       which avoids write-write conflicts without a transaction,
+on indexing obligations imposed by operator semantics;                        albeit at the cost of eventual consistency for reads. We
+
+
+
+216      13th USENIX Symposium on Operating Systems Design and Implementation                                      USENIX Association
+                 ...                        ...                                           stories                       votes
+    I                                  II              3 recursive upquery hits
+                                                                                        id author text              user story_id
+                       ∑ SUM   k x 7              ∑ SUM         k x 7
+                                                                                         0 u3       a                u7      0      Te = { u1 1 , u3 1 }
+                               k y 2                            k y 2                    1 u1       b                u1      1
+    2 recursive                                                                                                      u3      1        VoteCount
+        upquery                                                                                                    u3 1             story_id vcount
+        misses,
+        recurses
+                 ∑ SUM
+                               k
+                                                  ∑ SUM
+                                                                 k   9
+                                                                                                         ⨝     JOIN     ∑ COUNT
+                                                                                                                                       0
+                                                                                                                                       1       1    e
+                                                                                                         id:story_id
+                                                       k   9                                StoriesWithVC
+    1 read
+                                                                                                                                     Se = { u1 1 }
+                                                                                            story_id author text vcount
+        misses                                             4 upquery response                  0
+                 k                          k      9                                           1      u1       b     2
+                                                                                                                                    De = { 1 u1         b   2   }
+                                                               fills missing record
+
+Figure 4: A partially-stateful view sends a recursive up-                             Figure 5: Definitions for partial state entry e (yellow)
+query to derive evicted state (⊥) for key k from upstream                             in VoteCount: an in-flight update from votes (blue) is
+state (I); the response fills the missing state (II).                                 in Te , but not yet in Se ; the entry in StoriesWithVC is
+                                                                                      key-descendant from e via story id (green).
+omit further discussion of transactions with Noria in this
+paper; we plan to describe them in future work.                                       ing operator—while (possibly slow) upqueries are in
+3.5       Challenges                                                                  flight. These requirements complicate the design.
+An efficient Noria design faces two key challenges: first,                            4.1     Data-flow model and invariants
+it must limit the size of its state and views (§4); and sec-
+ond, changes to the Noria program must adapt the data-                                We first describe high-level correctness invariants of No-
+flow without downtime in serving clients (§5).                                        ria’s partially-stateful data-flow. These invariants ensure
+                                                                                      that Noria remains eventually-consistent and never re-
+4       Partially-stateful data-flow                                                  turns results contaminated by duplicate, missing, or spu-
+Noria must limit the size of its views, as the state for                              rious updates. Since Noria allows operators to execute in
+an application with many queries could exceed available                               parallel to take advantage of multicore processors, these
+memory and become too expensive to maintain.                                          invariants must hold in the presence of concurrent up-
+   The partially-stateful data-flow model lets operators                              dates and eviction notices. The invariants concern state
+maintain only a subset of their state. This concept of par-                           entries, where a state entry models one record in one op-
+tial materialization is well-known for materialized views                             erator or view. Data-flow implementations derive state
+in databases [79, 80], but novel to data-flow systems. Par-                           entry values from input records, possibly after multi-
+tial state reduces memory use, allows eviction of rarely-                             ple steps. For ease of expression, we model a state en-
+used state, and relieves operators from maintaining state                             try as the multiset of input records that produced that
+that is never read. Partially-stateful data-flow generalizes                          entry’s value. Noria’s eventual consistency requires that
+beyond Noria, but we highlight specific design choices                                each state entry’s contents approach the ideal set of input
+that help Noria achieve its goals.                                                    records that would produce the most up-to-date value.
+   Partial state introduces new data-flow messages to No-                             Given some state entry e, we define:
+ria. Eviction notices flow forward along the update data-                                • Te is the set of all input records received so far that, in
+flow path; they indicate that some state entries will no                              a correct implementation of the data-flow graph, would
+longer be updated. Operators drop updates that would                                  be used to compute e.
+affect these evicted state entries without further pro-
+                                                                                         • Se is either the multiset of input records actually used
+cessing or forwarding. When Noria needs to read from
+                                                                                      to compute in e, or ⊥, which represents an evicted entry.
+evicted state—for instance, when the application reads
+                                                                                      We use a multiset so the model can represent potential
+state evicted from an external view—Noria re-computes
+                                                                                      bugs such as duplicate updates.
+that state. This process sends recursive upqueries to the
+relevant ancestors in the graph (Figure 4). An ancestor                                  • De is the set of key-descendant entries of e. These
+that handles such an upquery computes the desired value                               are entries of operators downstream of e in the data-flow
+(possibly after sending its own upqueries), then forwards                             that depend on e through key lookup.
+a response that follows the data-flow path to the query-                              Te and Se are time-dependent, whereas the dependencies
+ing operator. When the upquery response eventually ar-                                represented in De can be determined from the data-flow
+rives, Noria uses it to populate the evicted entry. After the                         graph. If e is the VoteCount entry for some story in
+evicted entry has been filled, subsequent updates through                             Figure 5, then Te contains all input votes ever received
+the data-flow keep it up-to-date until it is evicted again.                           for that story; Se contains the updates represented in its
+   For correctness, upqueries must produce eventually-                                vcount; and De includes its StoriesWithVC entry.
+consistent results. For performance, Noria should con-                                   Correctness of partially-stateful data-flow relies on en-
+tinue to process updates—including updates to the wait-                               suring these invariants:
+
+
+
+USENIX Association                                  13th USENIX Symposium on Operating Systems Design and Implementation                                        217
+  1. Update completeness: if Se 6= ⊥, then either all up-        use recursive upqueries to fill it in. Moreover, operators
+      dates in Te − Se are in flight toward e, or an eviction    now encounter evicted state when they handle updates.
+      notice for e is in flight toward e.                        These factors influence the Noria design in several ways.
+  2. No spurious or duplicate updates: Se ⊆ Te .                    First and simplest, Noria operators drop updates that
+  3. Descendant eviction: if Se = ⊥, then for all d ∈ De ,       encounter evicted entries. This reduces the time spent
+      either Sd = ⊥, or an eviction notice for d is in flight    processing updates downstream, but necessitates the de-
+      toward d’s operator.                                       scendant eviction invariant: operators downstream of an
+  4. Eventual consistency: if Te stops growing, then             evicted entry never see updates for that entry, so they
+      eventually either Se = Te or Se = ⊥.                       must evict their own dependent entries lest they remain
+We now explain the mechanisms that Noria uses to real-           permanently out of date.
+ize this data-flow model and maintain the invariants.               Second, recursive upqueries now occasionally cascade
+4.2   Update ordering                                            up in the data-flow until they encounter the necessary
+                                                                 state—in the worst case, up to base tables. Responses
+Noria uses update ordering to ensure eventual consis-            then flow forward to the querying operator. Upquery re-
+tency without global data-flow coordination. Each oper-          sults are snapshots of operator state, and do not com-
+ator totally orders all updates and upquery requests it re-      mute with updates. For unbranched chains, update order-
+ceives for an entry; and, critically, the downstream data-       ing (§4.2) and the fact that updates to evicted state are
+flow ensures that all updates and upquery responses from         dropped ensure that the requested upquery response is
+that entry are processed by all consumers in that order.         processed before any update for the evicted state.
+Thus, if the operator orders update u1 before u2 , then             Recursive upqueries of branching subgraphs, such as
+every downstream consumer likewise processes updates             joins, are more complex. A join operator must emit a sin-
+derived from u1 before those derived from u2 . Noria data-       gle correct response for each upquery it receives, even if
+flows can split and merge (e.g., at joins), but update or-       it must make one or more recursive upqueries of its own
+dering and operator commutativity ensure that the even-          to produce the needed state. Combining the upqueries’
+tual result is correct independent of processing order.          results directly would be incorrect: those upqueries exe-
+4.3   Join upqueries                                             cute independently, and updates can arrive between their
+                                                                 responses. Joins thus issue recursive upqueries, but com-
+Join operators use upqueries (§3.3): when an update ar-
+                                                                 pute the final result exclusively with join upqueries once
+rives at one input, the join upqueries its other input for the
+                                                                 the recursive upqueries complete (multiple rounds of re-
+corresponding records, and combines them with the up-
+                                                                 cursive upqueries may be required). These join upqueries
+date. Join upqueries reach the next upstream stateful op-
+                                                                 execute within a single operator chain and exclude con-
+erator, which computes a snapshot of the requested state
+                                                                 current updates. Noria supports other branching opera-
+entry and forwards it along the data-flow to the querying
+                                                                 tors, such as unions, which obey the same rules as joins.
+join. Intermediate operators process the response as ap-
+                                                                    Finally, a join upquery performed during update pro-
+propriate. Unlike normal updates, upquery responses fol-
+                                                                 cessing may encounter evicted state. In this case, No-
+low the single path back to the querying operator without
+                                                                 ria chooses to drop the update and evict dependent en-
+forking. Upquery responses also commute neither with
+                                                                 tries downstream; Noria statically analyzes the graph to
+each other nor with previous updates. This introduces a
+                                                                 compute the required eviction notices. There is a trade-
+problem for join update processing, since every such up-
+                                                                 off here: computing the missing entry could avoid future
+date requires an upquery that produces non-commutative
+                                                                 upqueries. Noria chooses to evict to avoid blocking the
+results, yet must produce an update that does commute.
+                                                                 write path while filling in the missing state.
+   Noria achieves this by ensuring that no updates are
+in flight between the upstream stateful operator and the            Such evictions are rare, but they can occur.
+join when a join upquery occurs. To do so, Noria lim-            For example, imagine a version of Figure 2 that
+its the scope of each join upquery to an operator chain          adds AuthorVotes, which aggregates VoteCount by
+processed by a single thread. Noria executes updates on          stories.author, and the following system state:
+other operator chains in parallel with join upqueries.              • stories[id=1] has author=Elena.
+   This introduces a trade-off between parallelism and              • VoteCount[story id=1] has vcount=8.
+state duplication: join processing must stay within a sin-          • AuthorVotes[author=Elena] has vcount=8.
+gle operator chain, so copies of upstream state may be              • stories[id=2] has author=Bob.
+required in each operator chain that contains a join.               • VoteCount[story id=2] is evicted.
+                                                                 Now imagine that an update changes story 2’s au-
+4.4   Eviction and recursive upqueries                           thor to Elena. When this update arrives at the join
+Evicted state introduces new challenges for Noria’s data-        for AuthorVotes, that join operator upqueries for
+flow. If the application requests evicted state, Noria must      VoteCount[story id=2], which is evicted. As a result,
+
+
+
+218   13th USENIX Symposium on Operating Systems Design and Implementation                           USENIX Association
+Noria sends an eviction notice for Elena—whose number          new expression. The sharing candidates are existing ex-
+of votes has changed—to AuthorVotes.                           pressions that likely overlap with the new expression.
+                                                               Next, Noria generates a verbose intermediate represen-
+4.5   Partial and full state
+                                                               tation (IR), which splits the new expression into more
+Noria makes state partial whenever it can service up-          fine-grained operators. This simplifies common subex-
+queries using efficient index lookups. If Noria would          pression detection, and allows Noria to efficiently merge
+have to scan the full state of an upstream operator to sat-    the new IR with the cached IR of the sharing candidates.
+isfy upqueries, Noria disables partial state for that oper-       For each sharing candidate, Noria reorders joins in the
+ator. This may happen because every downstream record          new IR to match the candidate when possible to max-
+depends on all upstream ones—consider e.g., the top 20         imize re-use opportunities. It then traverses the candi-
+stories by vote count. In addition, the descendant evic-       date’s IR in topological order from the base tables. For
+tion invariant implies that partial-state operators cannot     each operator, Noria searches for a matching operator (or
+have full-state descendants.                                   clique of operators) in the new IR. A match represents a
+   Partial-state operators in Noria start out fully evicted    reusable subexpression, and Noria splices the two IRs to-
+and are gradually and lazily populated by upqueries. As        gether at the deepest matches.
+we show next, this choice has important consequences              This process continues until Noria has considered all
+for Noria’s ability to transition the data-flow efficiently.   identified reuse candidates, producing a final, merged IR.
+5     Dynamic data-flow                                        5.2   Data-flow transition
+Application queries evolve over time, so Noria’s dy-           The combined final IRs of all current expressions rep-
+namic data-flow represents a continuously-changing set         resent the transition’s target data-flow. Noria must add
+of SQL expressions. Existing data-flow systems run sep-        any operator in the final IR that does not already exist in
+arate data-flows for each expression, initialize new op-       the data-flow. To do so, Noria first informs existing op-
+erators with empty state and reflect only new writes, or       erators of index obligations (§3.3) incurred by new op-
+require restarting from a checkpoint. Changes to the No-       erators that they must construct indexes for. Noria then
+ria program instead adapt the data-flow dynamically.           walks the target data-flow in topological order and inserts
+   Given new or removed expressions, Noria transitions         each new operator into the running data-flow and boot-
+the data-flow to reflect the changes. Noria first plans the    straps its state. Finally, after installing new operators and
+transition, reusing operators and state of existing expres-    deleting removed queries’ external views, Noria removes
+sions where possible (§5.1). It then incrementally applies     obsolete operators and state from the data-flow.
+these changes to the data-flow, taking care to maintain its       Bootstrapping operator state. When Noria adds a
+correctness invariants (§5.2). Once both steps complete,       new stateful operator, it must ensure that the operator
+the application can use new tables and queries.                starts with the correct state. Partially-stateful operators
+   The key challenges for transitions are to avoid unnec-      and views start processing immediately. They are ini-
+essary state duplication and to continue processing reads      tially empty and bootstrap via upqueries in response to
+and writes throughout. Operator reuse and partial state        application reads during normal operation, amortizing
+help Noria address these challenges.                           the bootstrapping work over time. Fully-stateful opera-
+                                                               tors are initially marked as “inactive”, which causes them
+5.1   Determining data-flow changes
+                                                               to ignore all incoming updates. Noria then executes a
+To initiate a transition, the application provides Noria       special, large upquery for all keys on behalf of the fully-
+with sets of added and removed expressions. Noria then         stateful operator. Once the last upquery response has ar-
+computes required changes to the currently-running data-       rived, Noria activates the operator for update processing
+flow. This process resembles traditional database query        and moves on to the next new operator.
+planning, but produces a long-term joint data-flow across         Base table changes. As applications evolve, develop-
+all expressions in the Noria program. This allows Noria        ers often add or remove base table columns [17]. This
+to reuse existing operators for efficiency: if two queries     affects existing operators in the data-flow: new updates
+include the same join, the data-flow contains it only once.    from the base table may now lack values that existing op-
+   To plan a transition, Noria first translates each new ex-   erators expect. Noria could rebuild the data-flow or trans-
+pression into an extended query graph [21]. The query          form the existing base table state to effect such a change,
+graph contains a node for each table or view in the ex-        but this would be inefficient for large base tables. Instead,
+pression, and an edge for every join or group-by clause.       Noria base tables internally track all columns that have
+Noria uses query graphs to inexpensively reject many ex-       existed in the table’s schema, including those that have
+pressions from consideration [21, §3.4, 78, §3] and to         been deleted. When a base table processes an application
+quickly establish a set of sharing candidates for each         write, it automatically injects default values for missing
+
+
+
+USENIX Association                  13th USENIX Symposium on Operating Systems Design and Implementation               219
+columns (but does not store them). This permits queries       There are typically fewer data-flow workers than oper-
+for different base table schemas to coexist in the data-      ators in the data-flow graph, so Noria multiplexes opera-
+flow graph, and makes most base table changes cheap.          tor work across the worker threads. Within one instance,
+                                                              Noria schedules chains of operators with the same key as
+6     Implementation                                          a unit. This reduces queueing and inter-core data move-
+Our Noria prototype implementation consists of 45k            ment at operator boundaries. It also allows Noria to op-
+lines of Rust and can operate both on a single server and     timize some upqueries: an upquery within a chain can
+across a cluster of servers. Applications interface with      simply access the ancestor’s data synchronously, without
+Noria either through native Rust bindings, using JSON         worry of contamination from in-flight updates (§4.3).
+over HTTP, or through a MySQL protocol adapter.                  Read handlers process clients’ RPCs to read from ex-
+                                                              ternal views. They must access the view with low latency
+6.1   Persistent data storage                                 and high concurrency, even while a data-flow worker is
+Noria persists base tables in RocksDB [66], a high-           applying updates to the view. To minimize synchroniza-
+performance key-value store based on log-structured           tion, Noria uses double-buffered hash tables for external
+merge (LSM) trees. Batches of application updates are         views [27]: the data-flow worker updates one table while
+synchronously flushed into RocksDB’s log before No-           read handlers read the other, and an atomic pointer swap
+ria acknowledges them and admits them into the data-          exposes new writes. This trades space and timeliness for
+flow; a background thread asynchronously merges log           performance: with skewed key popularity distributions,
+entries into the LSM trees. Each base table index forms       it can improve read throughput by 10× over a single-
+a RocksDB “column family”. For base tables with non-          buffered hash table with bucket-level locks.
+unique indexes, Noria uses RocksDB’s ordered iterators        6.3   Distributed operation
+to efficiently retrieve all rows for an index key [14, 67].
+   Persistence reduces Noria’s write throughput by about      A Noria controller process manages distributed in-
+5% over in-memory base tables. Reads are not greatly          stances on a cluster of servers, and informs them of
+impacted when an application’s working set fits in mem-       changes to the data-flow graph and of shard assign-
+ory: only occasional upqueries access RocksDB, and            ments. Noria elects the controller and persists its state
+these add < 1ms of additional latency on a fast SSD.          via ZooKeeper [34]. Clients discover the controller via
+                                                              ZooKeeper, and obtain long-lived read and write handles
+6.2   Parallel processing                                     to send requests directly to instances.
+Noria shards the data-flow and allows concurrent reads           Noria handles failures by rebuilding the data-flow. If
+and writes with minimal synchronization for parallelism.      the controller fails, Noria elects a new controller that re-
+                                                              stores the data-flow graph. It then streams the persistent
+   Sharding. Noria processes updates in parallel on a
+                                                              base table data from RocksDB to rebuild fully-stateful
+cluster by hash-partitioning each operator on a key and
+                                                              operators and views. Partial operators are instead pop-
+assigning shards to different servers. Each machine runs
+                                                              ulated through on-demand upqueries. If individual in-
+a Noria instance, a process that contains a complete copy
+                                                              stances fail, Noria rebuilds only the affected operators.
+of the data-flow graph, but holds state only for its shards
+of each operator. When an operator with one hash parti-       6.4   MySQL adapter
+tioning links to an operator with a different partitioning,   Our prototype includes an implementation of the
+Noria inserts “shuffle” operators that perform inter-shard    MySQL binary protocol in a dedicated stateless adapter
+transfers over TCP connections. Upqueries across shuf-        that appears as a standard MySQL server to the applica-
+fle operators are expensive since they must contact all       tion. This adapter allows developers to easily run existing
+ancestor shards. This limits scalability, but allows opera-   applications on Noria. The adapter transparently trans-
+tors below a shuffle to maintain partial state.               lates prepared statements and ad-hoc queries into transi-
+   Multicore parallelism. Noria achieves multicore par-       tions on Noria’s data-flow, and applies reads and writes
+allelism within each server in two ways: a server can         using Noria’s API behind the scenes. Its SQL support is
+handle multiple shards by running multiple Noria in-          sufficiently complete to run some unmodified web appli-
+stances, and each instance runs multiple threads to pro-      cations (e.g., JConf [74] written in Django [22]), and to
+cess its shard. Each instance has two thread pools: data-     run Lobsters with minimal syntax adaptation.
+flow workers process updates within the data-flow graph,
+and read handlers handle reads from external views.           6.5   Limitations
+   At most one data-flow worker executes updates for          Our current prototype has some limitations that we plan
+each data-flow operator at a time. This arrangement           to address in future work; none of them are fundamental.
+yields CPU parallelism among different operators, and         First, it only shards by hash partitioning on a single col-
+also allows lock-free processing within each operator.        umn, and resharding requires sending updates through
+
+
+
+220    13th USENIX Symposium on Operating Systems Design and Implementation                         USENIX Association
+a single instance, which limits scalability. Second, it         long commit history). Most application updates reduced
+re-computes data-flow state on failure; recovering from         to single-table inserts, deletes, or updates.
+snapshots or data-flow replicas would be more efficient            Limitations. Though applications traditionally use
+(e.g., using selective rollback [35]). And third, it does not   parameterized queries to avoid SQL injection attacks
+currently support range indices or multi-column joins.          and cache query plans, Noria parameterized queries also
+                                                                build materialized views. An application with many dis-
+7   Applications                                                tinct parameterized queries can thus end up with more
+This section discusses our experiences with developing          views than necessary. The developer can correct this by
+Noria applications. Noria aims to simplify the develop-         adding shared views. Our prototype does not yet support
+ment of high-performance web applications; several as-          update and delete operations conditioned on non-primary
+pects of our implementation help it achieve that goal.          key columns, and lacks support for parameterized range
+   First, applications written for a MySQL database can         queries (e.g., age > ?), which some applications need.
+use Noria directly via its MySQL adapter, provided              Planned support for range indexes and an extended base
+they generate parameterized SQL queries (for instance,          table implementation will address these limitations.
+via libraries like PHP Data Objects [69] or Python’s
+MySQL connector [55, §10.6.8]). Porting typically pro-          8     Evaluation
+ceeds in three steps. First, the developer points the appli-    We evaluated our Noria prototype using backend work-
+cation at the Noria MySQL adapter instead of a MySQL            loads generated from the production Lobsters web appli-
+server and imports existing data into Noria from database       cation, as well as using individual queries. Our experi-
+dumps. The application will immediately see perfor-             ments seek to answer the following questions:
+mance improvements for read queries that formerly ran
+                                                                  1. What performance gains does Noria deliver for a
+substantial in-line compute. Though the MySQL adapter
+                                                                      typical database-backed web application? (§8.1)
+even supports ad-hoc read queries (it transitions the
+                                                                  2. How does Noria perform compared to a
+data-flow as required to support each query), the most
+                                                                      MySQL/memcached stack, the materialized
+benefit will be seen for frequently-reused queries. Sec-
+                                                                      views of a commercial database, and an idealized
+ond, the developer creates views for computations that
+                                                                      cache-only deployment? (§8.2)
+the MySQL application manually materialized, such as
+                                                                  3. Given a scalable workload, how does our prototype
+the per-story vote count in Lobsters. These views co-
+                                                                      utilize multiple servers, and how does it compare to
+exist with the manual materializations, and allow exist-
+                                                                      a state-of-the-art data-flow system? (§8.3)
+ing queries to continue to work as the developer updates
+                                                                  4. What space overhead does Noria’s data-flow state
+the write path so that it no longer manually updates de-
+                                                                      impose, and how does Noria perform with limited
+rived views and caches. Third, the developer incremen-
+                                                                      memory and partial state? (§8.4)
+tally rewrites their application to rely on natural views
+                                                                  5. Can Noria data-flows adapt to new queries and input
+and remove manual write optimizations. These changes
+                                                                      schema changes without downtime? (§8.5)
+gradually increase application performance as the devel-
+oper removes now-unnecessary complexity from the ap-               Setup. In all experiments, Noria and other storage
+plication’s read and write paths.                               backends run on an Amazon EC2 c5.4xlarge instance
+   The porting process is not burdensome. We ported             with 16 vCPUs; clients run on separate c5.4xlarge in-
+a PHP web application for college room ballots—                 stances unless stated otherwise. Our setup is “partially
+developed by one of the authors and used production             open-loop”: clients generate load according to a Poisson
+for a decade—to Noria; the process took two evenings,           distribution of interarrival-times and have a limited num-
+and required changes to four queries. We also used              ber of backend requests outstanding, queueing additional
+the MySQL adapter to port the Lobsters application’s            requests. This ensures that clients maintain the measure-
+queries to Noria; the result is a focus of our evaluation.      ment frequency even during periods of high latency [45].
+                                                                Our test harness measures offered request throughput and
+   Developing native Noria applications can be even eas-
+                                                                “sojourn time” [62], which is the delay from request gen-
+ier. We developed a simple web application to show the
+                                                                eration until a response returns from the backend.
+results of our continuous integration (CI) tests for No-
+ria. The CI system stores its results in Noria, and the         8.1   Application performance: Lobsters
+web application displays performance results and aggre-
+gate statistics. Since we developed directly for Noria, we      We first evaluate Noria’s performance on a realistic web
+were not tempted to cache intermediate results or ap-           application workload to answer two questions:
+ply other manual optimizations, and could use aggrega-            1. Do Noria’s fast reads help it outperform a conven-
+tions and joins in queries without fear that performance             tional database on a real application workload, even
+would suffer as a result (e.g., due to aggregations over the         on a hand-optimized application?
+
+
+
+USENIX Association                  13th USENIX Symposium on Operating Systems Design and Implementation              221
+                  MariaDB, baseline qu.   Noria, baseline qu.   Noria, natural qu.
+                                                                                        The baseline queries manually pre-compute aggre-
+                                                                                     gates. MariaDB requires this for performance: without
+                100                                                                  the pre-computation, it supports just 20 pages/sec. Noria
+                80                                                                   instead maintains pre-computed aggregates in its data-
+ Latency [ms]
+
+
+
+
+                60                                                                   flow. This allows us to include the aggregations directly
+                40                                                                   in the queries, which normalizes the base table schema,
+                                                                                     reduces write load, and avoids bugs due to missed up-
+                20
+                                                                                     dates to pre-computed values. With all aggregate compu-
+                 0                                                                   tation moved into Noria’s data-flow (“natural queries”),
+                      0        1K       2K        3K       4K             5K
+                                                                                     throughput scales higher still, to 5,000 pages/second (5×
+                                 Offered load [page views/sec]
+                                                                                     MariaDB). Eliminating application pre-computation re-
+Figure 6: Noria scales Lobsters to a 5× higher load                                  duces overall write load and compacts the data-flow,
+than MariaDB (2.3× with baseline queries) at sub-100ms                               which lets Noria parallelize it more effectively.
+95%ile latency (dashed: median). MariaDB is limited by                                 The result is that Noria achieves both good perfor-
+read computation, while Noria becomes write-bound.                                   mance and natural, robust queries. We observed similar
+                                                                                     benefits with other applications (e.g., a synthetic TPC-
+   2. Can Noria preserve good performance for an appli-                              W-like workload), which we omit for space.
+      cation without hand optimization?
+Our workload models production Lobsters traffic. The                                 8.2   In-depth performance comparison
+benchmark emulates authenticated Lobsters users vis-
+iting different pages according to the access frequen-                               We compare to alternative systems using a subset of
+cies and popularity distributions in the production work-                            Lobsters. This restriction gives us better control over
+load [32]. Lobsters is a Ruby-on-Rails application, but                              workload properties, while capturing the aspects of web
+our benchmark generates database operations directly in                              workloads that motivated the Noria design. We use one
+order to eliminate Rails overhead. We seed the database                              kind of write, inserting a vote, and one read query,
+with 9.2k users, 40k stories and 120k comments—the                                   StoriesWithVC from Figure 2. This read query fetches
+size of the real Lobsters deployment—and run increasing                              stories and their vote counts; 85% of page views in pro-
+request loads to push the different setups to their limits.                          duction Lobsters are for pages that execute this query.
+    The baseline queries include the Lobsters developers’                               We compare five single-server deployments that all
+optimizations, which manually materialize and maintain                               have access to the same resources, but differ in how they
+aggregate values like vote counts to reduce read-side                                store and calculate the per-story vote count. MariaDB
+work. We also developed “natural” queries that produce                               uses the baseline Lobsters approach of pre-computing
+the same results using Noria data-flow to compute ag-                                and storing vote counts in a column of the Lob-
+gregations rather than manual optimizations. We com-                                 sters stories table. System Z, a commercial database
+pare MariaDB (a community-developed MySQL fork;                                      with materialized view support, uses an incrementally-
+v10.1.34) with Noria using baseline queries, and then                                maintained materialized view defined similarly to
+to Noria using natural queries (both via Noria’s MySQL                               StoriesWithVC; we use System Z to compare database
+adapter). We configured MariaDB to use a thread pool,                                view maintenance with Noria’s data-flow-based ap-
+to avoid flushing to disk after transactions, and to store                           proach. MariaDB and System Z run at the fastest transac-
+the database on a ramdisk to remove overheads unrelated                              tional isolation level (“read uncommitted”) and are con-
+to query execution. With the baseline queries, the median                            figured to keep data in memory. MariaDB+memcached
+page view executes 11 queries; this reduces to eight with                            adds a demand-filled memcached (v1.5.6) cache [54]
+natural queries. This experiment uses an m5.24xlarge                                 to MariaDB that caches StoryWithVC entries. This re-
+EC2 instance for the CPU-intensive clients.                                          duces read load on MariaDB, but complicates applica-
+    Figure 6 shows the results as throughput-latency                                 tion code even beyond pre-computation: writes must in-
+curves. An ideal system would show as a horizontal line                              validate the cache and reads must sometimes populate it.
+with low latency; in reality, each setup hits a “hockey                              We also measure memcached-only without a relational
+stick” once it fails to keep up with the offered load.                               backend. This setup offers good performance, but is un-
+MariaDB scales to 1,000 pages/second, after which it                                 realistic: it does not store individual votes or stories, is
+saturates all 16 CPU cores with read-side computation                                not persistent, and cannot prevent double-voting. It helps
+(e.g., for per-page notification counts [33]). Noria run-                            us estimate how a backend that serves all reads from
+ning the same baseline queries scales to a 2.3× higher                               memory and does minimal work for writes might per-
+offered load, since its incremental write-side processing                            form. Finally, we measure Noria sharded four ways on
+avoids redundant re-computation on reads.                                            stories.id, with the remaining 12 cores serving reads.
+
+
+
+222              13th USENIX Symposium on Operating Systems Design and Implementation                                      USENIX Association
+ 95%-ile latency [ms]
+
+
+
+
+                                                                                95%-ile latency [ms]
+                        100        MariaDB (hand-opt.)                                                 100                        MariaDB (hand-opt.)
+                                   System Z                                                                                       System Z
+                                   MariaDB+memcached                                                                              MariaDB+memcached
+                        50         memcached-only                                                      50                         memcached-only
+                                   Noria (4 shards)                                                                               Noria (4 shards)
+
+
+                         0                                                                              0
+                              0   2M   4M 6M 8M 10M 12M 14M                                                  0   2M   4M 6M 8M 10M 12M 14M
+                                       Offered load [requests/sec]                                                    Offered load [requests/sec]
+
+(a) Read-heavy workload (95%/5%): Noria outperforms all                        (b) Mixed read-write workload (50%/50%): Noria outperforms
+other systems (all but memcached at 100–200k requests/sec).                    all systems but memcached (others are at 20k requests/sec).
+Figure 7: A Lobsters subset (Figure 2) benchmarked on Noria hand-optimized MariaDB, System Z’s materialized
+views, a MariaDB/memcached setup, and on memcached only, all with Zipf-distributed (s = 1.08) reads and votes.
+
+                                                                               s/second with four shards. Noria also handles a write-
+ 95%-ile latency [ms]
+
+
+
+
+                        100                              MariaDB (hand-opt.)   heavy workload (50% writes) well (Figure 7b): although
+                                                         System Z              absolute performance has dropped, Noria still outper-
+                                                         MariaDB+memcached     forms all other systems apart from the cache-only setup.
+                        50                               memcached-only        This is because sharding allows data-parallel write pro-
+                                                         Noria (4 shards)
+                                                                               cessing, which helps Noria scale to 2M requests/second.
+
+                         0                                                        With a (less-realistic) uniform workload, other
+                              0   2M   4M 6M 8M 10M 12M 14M                    systems come closer to Noria’s 5M requests/second
+                                       Offered load [requests/sec]             (Figure 8). System Z does better than before, but
+                                                                               suffers from slow writes to the materialized view.
+Figure 8: For a uniformly-distributed, read-heavy                              MariaDB+memcached, perhaps surprisingly, performs
+(95%/5%) workload on Figure 2, Noria performs simi-                            worse than MariaDB, which scales to 3M requests/sec-
+larly to the (unrealistic) memcached-only setup.                               ond: the reason lies in the extra work (and RPCs) the ap-
+                                                                               plication must perform for invalidations. This illustrates
+Noria uses natural queries; other systems except System                        that a look-aside cache only helps if it avoid expensive
+Z manually pre-compute vote counts.                                            queries; a write-through cache avoids invalidation over-
+   Clients read and insert votes for randomly-chosen sto-                      heads, but would still perform worse than the idealized
+ries; we measure the 95th-percentile latency for each of-                      memcached-only setup (and thus, than Noria).
+fered load. Before measurement begins, we populate the                            Separately, we evaluated Noria’s view maintenance
+stories table with 500k records and perform 40 sec-                            against DBToaster [2, 53], a state-of-the-art material-
+onds of warmup using the same workload as the bench-                           ized view maintenance system that compiles view def-
+mark itself. Absolute throughput is higher in these ex-                        initions to native code. DBToaster (v2.2.3387) lacks
+periments because the data-flow only contains a single                         support for persistent base tables, concurrent reads, or
+query and clients batch reads and writes for up to 1ms.                        multicore parallelism—its only read operation snap-
+   Figure 7 shows results for a skewed workload simi-                          shots entire views—but it does provide fast updates
+lar to Lobsters’, with story popularity following a Zip-                       to materialized views. When we constrain Noria to
+fian distribution (s = 1.08). With 95% reads, Noria                            only one shard and data-flow worker thread, we expect
+outperforms all other systems, including the unrealis-                         DBToaster to outperform it, since DBToaster’s generated
+tic cache-only deployment (Figure 7a). Most updates                            C++ code does close-to-minimal work to incrementally
+write votes for popular stories, which creates write                           maintain the vote count. We measure the write through-
+contention problems in MariaDB and System Z. The                               put of 50M uniformly-distributed votes that update
+MariaDB+memcached setup performs equally poorly:                               StoriesWithVC for 500k stories. Noria achieves 240k
+on memcached invalidations for popular keys, multiple                          single-record writes/second for fully-populated state, and
+clients miss and a “thundering herd” of clients simulta-                       1M writes/second for fully-evicted state. DBToaster only
+neously issues database queries [54, §3.2.1]. memcached                        supports fully-populated state, and achieves 520k single-
+on its own scales, but Noria outperforms it (despite do-                       record writes/second. At the same time, Noria is more
+ing more work) since Noria’s lockless views avoid con-                         memory-efficient, using 6.2 GB of memory for base ta-
+tention for popular keys. Noria scales to 14M request-                         bles and all derived state, 36% of DBToaster’s 17 GB.
+
+
+
+USENIX Association                                   13th USENIX Symposium on Operating Systems Design and Implementation                         223
+                                                                              overhead as the number of machines grows. DD amor-
+ Throughput [req/sec]   30M
+                                      Differential Dataflow                   tizes this coordination by increasing its batch size, and
+                                      Noria                                   consequently sees increased latency as throughput in-
+                        20M                                                   creases. Noria avoids such coordination and scales well,
+                                                                              but offers only eventually-consistent reads.
+                        10M
+                                                                              8.4   State size
+                          0                                                   Noria relies on partial state to keep its memory footprint
+                              1   2       3    4   5    6    7   8   9   10
+                                                                              low. How much of Noria’s state for Lobsters can be par-
+                                              Number of machines
+                                                                              tial, and how does Noria perform when it evicts from par-
+Figure 9: For a uniform 95%/5% workload, Noria scales                         tial state to meet a memory limit? We investigate these
+to ten machines with sub-100ms 95th %tile latency by                          questions using the full Lobsters application, first at Lob-
+sharding the data-flow. Differential dataflow [44] scales                     sters production scale, and then at 10× scale.
+less well due to its inter-worker coordination.                                  The Noria data-flow for the natural Lobsters queries
+                                                                              has 235 operators, of which 60 of are stateful. With par-
+Additionally, Noria can process shards in parallel and use                    tial state disabled, i.e., forcing all data-flow operators
+more machines to increase throughput.                                         to keep full state, Noria needs 789 MB of in-memory
+                                                                              state (8× the base table size of 137 MB). With partial
+8.3                     Distribution over multiple servers                    state enabled, 35 of the stateful operators can use partial
+We next evaluate Noria’s support for distributed opera-                       state; the remaining 25 are part of unparameterized views
+tion. Can Noria effectively use multiple machines’ re-                        (e.g., all stories on the front page) whose state Noria can-
+sources given a scalable workload?                                            not make partial as they lack suitable keys. Together,
+   We evaluate the 95%-read Lobsters subset from §8.2                         the non-partial state occupies 73 MB: Noria’s essential
+with two million stories. We shard the data-flow on                           memory requirement for Lobsters therefore amounts to
+stories.id and vary the number of machines from one                           9% of total state (adding an overhead of 53% of base ta-
+to ten, with each machine hosting four shards. For a de-                      ble size). Noria can evict and re-compute the remaining
+ployment with n Noria machines, we scale client load to                       91% of state should it exceed a memory limit.
+n×3M requests/second in a partially open-loop test har-                          As for any cache, this memory limit should exceed
+ness. This arrangement achieves close to Noria’s maxi-                        the application’s working set size to achieve low read
+mum load at sub-100ms 95th-percentile latency for two                         latency and avoid thrashing of evictions and upqueries.
+million stories on one machine. Load generators select                        For Lobsters, the working set size depends on the of-
+stories uniformly at random, so the workload is perfectly                     fered load, as higher load means a wider range of sto-
+shardable. The ideal result is a straight diagonal, with n                    ries are read. We determine it by varying Noria’s state
+machines achieving n times the throughput of a single                         size limit (and hence, eviction frequency) and measur-
+one. Figure 9 shows that Noria achieves this and serves                       ing 95th-percentile read latency. With production-scale
+the full per-machine load at all points.                                      Lobsters data, Noria’s working set contains 525 MB of
+   We also implemented this benchmark for a state-                            state (60% of total, 3.8× base tables) at an offered load of
+of-the-art Differential Dataflow (DD) implementation                          2,300 pages/second. However, with a few thousand users,
+(v0.7) in Rust [44] based on Naiad and its earlier version                    the production Lobsters deployment is small. Our bench-
+of DD [46, 51]. Since DD lacks a client-facing RPC in-                        mark further understates its size as we use synthetic story
+terface, we co-locate DD clients with workers; this does                      and comment texts of a few bytes. Hence, we repeated
+not disadvantage DD since load generation is cheap com-                       this experiment with the Lobsters data scaled up by 10×.
+pared to RPC processing. DD uses 12 worker threads and                        Noria meets sub-100ms 95th percentile latency at 2,300
+four network threads per machine.                                             pages/second if the memory limit exceeds the 2.6 GB
+   Figure 9 shows that Noria is competitive with DD on                        working set (38% of 7 GB total state; 3× base tables).
+this benchmark. On one and two machines, DD supports                             These results suggest that Noria imposes a reasonable
+a slightly higher per-machine load (3.5M requests/sec-                        space overhead (around 3× base table size) for Lobsters,
+ond vs. Noria’s 3M) within our 95th-percentile latency                        and that partial state is key to reducing the overhead.
+budget of 100ms. Beyond four machines, however, DD
+                                                                              8.5   Live data-flow adaptation
+fails to meet Noria’s maximum per-machine load. Its
+supported throughput tails off to around 20M requests/-                       In a traditional database, query changes are easy and
+sec at ten machines. This tail-off is due to DD’s progress-                   instantaneous. Can Noria’s data-flow adaptation seam-
+tracking protocol, which coordinates between workers to                       lessly transition to include new SQL expressions? The
+expose writes atomically, and which imposes increasing                        goal is for the transition to complete quickly, for write
+
+
+
+224                      13th USENIX Symposium on Operating Systems Design and Implementation                       USENIX Association
+                                                                                  ria to serve the majority of rating reads without recur-
+                     Total write throughput   % fast reads from new view
+                                                                                  sive upqueries. Reuse is also crucial: without reusing
+ Throughput
+              300K
+              200K                                                                VoteCount, Noria must upquery rating reads by re-
+              100K                                                                computing from the base tables. This leads to slow up-
+                 0                                                         100%
+                                                                           0%     queries for popular stories, as the data-flow must re-
+              (a) With partial materialization and reuse (Zipfian).               count their votes. With reuse enabled, pre-computed vote
+                                                                                  counts satisfy the upqueries. The results also follow this
+ Throughput
+
+
+
+
+              300K                                                                pattern for a uniform workload (Figure 10b). Initially,
+              200K                                                                most rating reads are slow, but fast reads increase as the
+              100K
+                 0                                                         100%   partial state populates; write throughput is reduced be-
+                                                                           0%     cause data-flow updates contend with upquery responses.
+              (b) With partial materialization and reuse (uniform).               Contention increases as more entries populate, since
+                                                                                  fewer updates hit evicted state.
+ Throughput
+
+
+
+
+              300K                                                                   Figure 10c shows the same transition (with a Zip-
+              200K
+              100K                                                                fian workload), but with partial materialization and
+                 0                                                         100%
+                                                                                  operator reuse disabled. Noria fully populates the
+                                                                           0%
+                     −15     0           30            60            90           StoriesWithRatings view and all internal stateful
+                             Time after transition start [sec]                    operators during the transition. It copies votes and
+                                                                                  stories to bootstrap the rating aggregation state, and
+                (c) No reuse or partial materialization (Zipfian).
+                                                                                  then copies the resulting state again to initialize the
+Figure 10: Reuse and partial state allow Noria to adapt                           new external view. Each copy stops write processing
+the live data-flow. Gray lines delimit start and end of the                       for several seconds, and Noria’s state transfer to the
+transition (in (a) and (b), the transitions are almost in-                        new operators via the data-flow slows down concurrent
+stantaneous); the green shaded area shows the fraction of                         writes. When transition completes after 25 seconds, the
+new view reads that require no upqueries. Reads from the                          StoriesWithRatings view is fully materialized and all
+old view (not shown) proceed at full speed throughout.                            rating reads are fast. This illustrates that partial state and
+                                                                                  reuse are crucial for downtime-free data-flow transitions.
+                                                                                     How often can Noria achieve a live transition in
+performance to remain stable, for reads from existing
+                                                                                  practice? In a separate analysis of query and schema
+views to be unaffected, and for reads from newly-added
+                                                                                  changes in HotCRP and TPC-W, we found that Noria
+views to quickly achieve low latency.
+                                                                                  live-transitioned for over 95% of program changes. Ex-
+   We test this by adding a modified version of the                               isting approaches are less flexible: System Z must rebuild
+StoriesWithVC view to the Lobsters subset. This                                   its materialized views on change; a memcached clus-
+new view, StoriesWithRatings, uses numeric rat-                                   ter must be carefully transitioned [54, §4.3]; DBToaster
+ings stored in a ratings base table instead of votes.                             lacks support for query changes; and even relational
+It also reflects old votes scaled to a rating. We first                           databases pause writes during some schema updates.
+load an unsharded Noria with 2M stories and 30M
+votes, then transition to the new program. Once the                               8.6   Discussion
+transition finishes, clients perform “rating reads” from
+StoriesWithRatings and start writing to the new                                   We evaluated Lobsters both at production scale and at
+ratings table. Throughout the experiment, clients                                 10× scale, but many web applications are much larger
+also read the StoriesWithVC view, and write to the                                still. We believe that Noria can also support such appli-
+votes table. We expect post-transition throughput to                              cations. For applications with many queries, and conse-
+be reduced—the new data-flow graph is larger, with                                quently a large data-flow, Noria can assign shards of only
+more tables and deeper paths—although removing the                                some operators to each machine, sending cross-operator
+old view would increase throughput again. However, we                             traffic over the network. Similarly, Noria can shard large
+hope that throughput and latency do not suffer greatly                            base tables and operators with large state across ma-
+during the transition.                                                            chines. Efficient resharding and partitioning the data-
+   Figure 10a shows the transition with reuse and par-                            flow to minimize network transfers are important future
+tial materialization enabled. The transition completes im-                        work for Noria to achieve truly large scale.
+mediately: Noria creates the new operators and view as                               We also believe Noria is well suited for applications
+empty, and populates them on demand in response to                                whose working sets change over time. Many large, real-
+reads. Due to the skewed read and write distributions,                            world applications see such changing workloads; for in-
+upqueries for only a few popular keys suffice for No-                             stance, an old story may suddenly become popular. As
+
+
+
+USENIX Association                              13th USENIX Symposium on Operating Systems Design and Implementation                       225
+clients request such items, Noria’s upqueries bring them         quod is limited to static queries, and unlike Noria, neither
+into the working set, making subsequent reads fast.              shares state nor processing across queries.
+                                                                    The problem of detecting shared subexpressions
+9     Related work                                               (§5.1) is a multi-query optimization (MQO) prob-
+Noria builds on considerable related work.                       lem [21, 59, 78]. MQO tries to maximize sharing across
+   Data-flow systems excel at data-parallel comput-              a batch of expressions, with the freedom to rewrite any
+ing [36, 51], including on streams, but cannot serve web         expression to suit the others. Like joint query process-
+applications directly. They only achieve low-latency in-         ing systems [10, 25, 31], Noria faces the more restricted
+cremental updates at the expense of windowed state (and          problem of mutating new expressions to increase their
+incomplete results) or by keeping full state in memory.          opportunity to share existing expressions in the data-flow.
+Noria’s partially-stateful data-flow lifts this restriction. A      A wide array of tools deal with websites’ query and
+few data-flow systems can reuse operators automatically:         schema transitions [9, 23, 26, 56, 65]. Like Noria,
+for example, Nectar [28] detects similar subexpressions          they aim to transition backend stores without interrup-
+in DryadLINQ programs, similar to Noria’s automated              tion in client service, but they require developers to
+operator reuse, using DryadLINQ-specific merge and               manually configure complex “ghost tables” or binlog-
+rewrite rules. Support for dynamic changes to a running          following triggers. Base table schema changes increase
+data-flow is more common: C IEL [52] dynamically ex-             complexity further [73]. Noria handles query changes
+tends batch-processing data-flows, as does Ray [58] for          transparently, and efficiently applies common base table
+stateful “actor” operators’ state transitions in reinforce-      schema changes by supporting many concurrent base ta-
+ment learning applications. Noria dynamically changes            ble schemas. Most of its data-flow transitions are live for
+long-running, low-latency streaming computations by              reads and writes without added complexity.
+modifying the data-flow; unlike existing streaming data-            Finally, some open-source systems have experi-
+flow systems like Naiad [51] or Spark Streaming [76], it         mented with flexible query and schema changes. Apache
+has no need for a restart or recovery from a checkpoint.         Kafka [5] achieves some flexibility in query and schema
+   Stream processing systems [3, 11, 39, 71, 76] often           changes as used by the New York Times [68], and sim-
+use data-flow, but usually have windowed state and static        ilar ideas were proposed as an extension proposal for
+queries that process only new records. STREAM [6]                Samza [38]. To our knowledge, however, no prior sys-
+identifies opportunities for operator reuse among static         tem achieves the performance and flexibility of Noria.
+queries; Noria achieves similar reuse for dynamic                10    Conclusions
+queries. S-Store [47] lacks Noria’s partial materialization
+                                                                 Noria is a web application backend that delivers high
+and state reuse, but combines a classic database with a
+                                                                 performance while allowing for simplified application
+stream processing system using trigger-based view main-
+                                                                 logic. Partially-stateful data-flow is essential to achiev-
+tenance. S-Store enables transactional processing, a fu-
+                                                                 ing this goal: it allows fast reads, restricts Noria’s mem-
+ture goal for Noria.
+                                                                 ory footprint to state that is actually used, and enables
+   Database materialized views [29, 41] were devised
+                                                                 live changes to the data-flow. In future work, we plan
+to cache expensive analytical query results. Commercial
+                                                                 to add more flexible sharding, range indexes, and better
+databases’ materialized view support [1] is limited [49,
+                                                                 eviction strategies.
+63] and views must usually be rebuilt on change. How-
+                                                                    Noria is open-source software and available at:
+ever, there is considerable research on incremental view
+maintenance in databases [30, 40, 41, 70, 77, 81]. No-                  https://pdos.csail.mit.edu/noria
+ria builds upon ideas from this work, but applies them
+in the context of a concurrent, stateful data-flow system        Acknowledgements
+for web applications. This requires efficient fine-grained       We thank Joana da Trindade and Nikhil Benesch for
+access to views, solutions to new coordination problems          contributions to our implementation, as well as Frank
+and concurrency races, as well as inexpensive long-term          McSherry for assisting with implementation and tuning
+adaptation as view definitions change. DBToaster [2, 53]         of the differential dataflow benchmark. Jon Howell pro-
+supports incremental view maintenance under high write           vided helpful feedback that much improved the paper,
+loads with generated recursive delta query implemen-             as did Ionel Gog, Frank McSherry, David DeWitt, Sam
+tations. Noria sees lower single-threaded performance,           Madden, Amy Ousterhout, Tej Chajed, Anish Athalye,
+but supports parallel processing and changing queries;           and the PDOS and Database groups at MIT. We are also
+adding native-code generation to Noria might further im-         grateful to the helpful comments we received from our
+prove its performance, but would complicate operator             anonymous reviewers, as well as from Wyatt Lloyd, our
+reuse. Pequod [37] and DBProxy [4] support partial ma-           shepherd. This work was funded through NSF awards
+terialization in response to client demand, although Pe-         CSR-1301934, CSR-1704172, and CSR-1704376.
+
+
+
+226    13th USENIX Symposium on Operating Systems Design and Implementation                            USENIX Association
+References                                                       Yee Jiun Song, and Venkat Venkataramani. “TAO:
+ [1]   Sanjay Agrawal, Surajit Chaudhuri, and Vivek R.           Facebook’s Distributed Data Store for the Social
+       Narasayya. “Automated Selection of Materialized           Graph”. In: Proceedings of the USENIX Annual
+       Views and Indexes in SQL Databases”. In: Pro-             Technical Conference. San Jose, California, USA,
+       ceedings of the 26th International Conference on          June 2013, pages 49–60.
+       Very Large Data Bases (VLDB). Cairo, Egypt,         [9]   Mark Callaghan. Online Schema Change for
+       Sept. 2000, pages 496–505.                                MySQL. URL: https://www.facebook.com/
+                                                                 note.php?note_id=430801045932 (visited on
+ [2]   Yanif Ahmad, Oliver Kennedy, Christoph Koch,
+                                                                 02/01/2017).
+       and Milos Nikolic. “DBToaster: Higher-order
+       Delta Processing for Dynamic, Frequently Fresh     [10]   George Candea, Neoklis Polyzotis, and Radek
+       Views”. In: Proceedings of the VLDB Endowment             Vingralek. “A Scalable, Predictable Join Opera-
+       5.10 (June 2012), pages 968–979.                          tor for Highly Concurrent Data Warehouses”. In:
+                                                                 Proceedings of the VLDB Endowment 2.1 (Aug.
+ [3]   Tyler Akidau, Alex Balikov, Kaya Bekiroğlu,
+                                                                 2009), pages 277–288.
+       Slava Chernyak, Josh Haberman, Reuven Lax,
+       Sam McVeety, Daniel Mills, Paul Nordstrom, and     [11]   Paris Carbone, Stephan Ewen, Seif Haridi, As-
+       Sam Whittle. “MillWheel: Fault-tolerant Stream            terios Katsifodimos, Volker Markl, and Kostas
+       Processing at Internet Scale”. In: Proceedings            Tzoumas. “Apache Flink: Stream and batch pro-
+       of the VLDB Endowment 6.11 (Aug. 2013),                   cessing in a single engine”. In: IEEE Data Engi-
+       pages 1033–1044.                                          neering 38.4 (Dec. 2015).
+ [4]   Khalil Amiri, Sanghyun Park, Renu Tewari, and      [12]   Fay Chang, Jeffrey Dean, Sanjay Ghemawat, Wil-
+       Sriram Padmanabhan. “DBProxy: a dynamic data              son C. Hsieh, Deborah A. Wallach, Mike Bur-
+       cache for web applications”. In: Proceedings of           rows, Tushar Chandra, Andrew Fikes, and Robert
+       the 19th International Conference on Data Engi-           E. Gruber. “Bigtable: A Distributed Storage Sys-
+       neering (ICDE). Mar. 2003, pages 821–831.                 tem for Structured Data”. In: Proceedings of the
+ [5]   Apache Software Foundation. Apache Kafka: a               7th USENIX Symposium on Operating System De-
+       distributed streaming platform. URL: http : / /           sign and Implementation (OSDI). Seattle, Wash-
+       kafka.apache.org/ (visited on 09/14/2017).                ington, USA, Nov. 2006.
+ [6]   Arvind Arasu, Brian Babcock, Shivnath Babu,        [13]   Guoqiang Jerry Chen, Janet L. Wiener, Shrid-
+       John Cieslewicz, Mayur Datar, Keith Ito, Ra-              har Iyer, Anshul Jaiswal, Ran Lei, Nikhil Simha,
+       jeev Motwani, Utkarsh Srivastava, and Jennifer            Wei Wang, Kevin Wilfong, Tim Williamson, and
+       Widom. “STREAM: The Stanford Data Stream                  Serhat Yilmaz. “Realtime Data Processing at
+       Management System”. In: Data Stream Man-                  Facebook”. In: Proceedings of the 2016 SIG-
+       agement: Processing High-Speed Data Streams.              MOD International Conference on Management
+       Edited by Minos Garofalakis, Johannes Gehrke,             of Data. San Francisco, California, USA, 2016,
+       and Rajeev Rastogi. Berlin/Heidelberg, Germany:           pages 1087–1098.
+       Springer, 2016, pages 317–336.                     [14]   CockroachDB. Structured data encoding in Cock-
+ [7]   Doug Beaver, Sanjeev Kumar, Harry C. Li, Ja-              roachDB SQL. Jan. 2018. URL: https : / /
+       son Sobel, and Peter Vajgel. “Finding a Nee-              github . com / cockroachdb / cockroach /
+       dle in Haystack: Facebook’s Photo Storage”. In:           blob/master/docs/tech-notes/encoding.
+       Proceedings of the 9th USENIX Conference on               md (visited on 04/20/2018).
+       Operating Systems Design and Implementation        [15]   Brian F. Cooper, Raghu Ramakrishnan, Utkarsh
+       (OSDI). Vancouver, British Columbia, Canada,              Srivastava, Adam Silberstein, Philip Bohannon,
+       Oct. 2010, pages 1–8.                                     Hans-Arno Jacobsen, Nick Puz, Daniel Weaver,
+ [8]   Nathan Bronson, Zach Amsden, George Cabrera,              and Ramana Yerneni. “PNUTS: Yahoo!’s Hosted
+       Prasad Chakka, Peter Dimov, Hui Ding, Jack Fer-           Data Serving Platform”. In: Proceedings of the
+       ris, Anthony Giardullo, Sachin Kulkarni, Harry            VLDB Endowment 1.2 (Aug. 2008), pages 1277–
+       Li, Mark Marchukov, Dmitri Petrov, Lovro Puzar,           1288.
+
+
+
+
+USENIX Association               13th USENIX Symposium on Operating Systems Design and Implementation        227
+[16]   James C. Corbett, Jeffrey Dean, Michael Epstein,     [24]   Sanjay Ghemawat, Howard Gobioff, and Shun-
+       Andrew Fikes, Christopher Frost, J. J. Furman,              Tak Leung. “The Google File System”. In: Pro-
+       Sanjay Ghemawat, Andrey Gubarev, Christopher                ceedings of the 19th ACM Symposium on Operat-
+       Heiser, Peter Hochschild, Wilson Hsieh, Sebas-              ing Systems Principles (SOSP). Bolton Landing,
+       tian Kanthak, Eugene Kogan, Hongyi Li, Alexan-              NY, USA, Oct. 2003, pages 29–43.
+       der Lloyd, Sergey Melnik, David Mwaura, David        [25]   Georgios Giannikis, Gustavo Alonso, and Donald
+       Nagle, Sean Quinlan, Rajesh Rao, Lindsay Rolig,             Kossmann. “SharedDB: Killing One Thousand
+       Yasushi Saito, Michal Szymaniak, Christopher                Queries with One Stone”. In: Proceedings of the
+       Taylor, Ruth Wang, and Dale Woodford. “Span-                VLDB Endowment 5.6 (Feb. 2012), pages 526–
+       ner: Google’s Globally Distributed Database”. In:           537.
+       ACM Transactions on Computer Systems 31.3
+       (Aug. 2013), 8:1–8:22.                               [26]   GitHub, Inc. gh-ost: GitHub’s online schema mi-
+                                                                   gration for MySQL. URL: https : / / github .
+[17]   Carlo A. Curino, Letizia Tanca, Hyun J. Moon,               com/github/gh-ost (visited on 02/01/2017).
+       and Carlo Zaniolo. “Schema Evolution in
+       Wikipedia: toward a Web Information System           [27]   Jon Gjengset. evmap: A lock-free, eventually con-
+       Benchmark”. In: Proceedings of the International            sistent, concurrent multi-value map. URL: https:
+       Conference on Enterprise Information Systems                //github.com/jonhoo/rust- evmap (visited
+       (ICEIS). June 2008.                                         on 09/13/2018).
+[18]   Databricks, Inc. Structured Streaming in Produc-     [28]   Pradeep Kumar Gunda, Lenin Ravindranath,
+       tion – Recover after changes in a streaming query.          Chandramohan A. Thekkath, Yuan Yu, and Li
+       URL: https : / / docs . databricks . com /                  Zhuang. “Nectar: Automatic Management of Data
+       spark / latest / structured - streaming /                   and Computation in Datacenters”. In: Proceedings
+       production . html # recover - after -                       of the 9th USENIX Conference on Operating Sys-
+       changes- in- a- streaming- query (visited on                tems Design and Implementation (OSDI). Vancou-
+       09/06/2018).                                                ver, British Columbia, Canada, 2010, pages 75–
+                                                                   88.
+[19]   Giuseppe DeCandia, Deniz Hastorun, Madan
+       Jampani, Gunavardhan Kakulapati, Avinash Lak-        [29]   Himanshu Gupta and Inderpal Singh Mumick.
+       shman, Alex Pilchin, Swaminathan Sivasubrama-               “Selection of views to materialize in a data ware-
+       nian, Peter Vosshall, and Werner Vogels. “Dy-               house”. In: IEEE Transactions on Knowledge and
+       namo: Amazon’s Highly Available Key-value                   Data Engineering 17.1 (Jan. 2005), pages 24–43.
+       Store”. In: Proceedings of 21st ACM SIGOPS           [30]   Himanshu Gupta and Inderpal Singh Mumick.
+       Symposium on Operating Systems Principles                   “Incremental Maintenance of Aggregate and Out-
+       (SOSP). Stevenson, Washington, USA, Oct. 2007,              erjoin Expressions”. In: Information Systems 31.6
+       pages 205–220.                                              (Sept. 2006), pages 435–464.
+[20]   Dror G. Feitelson, Eitan Frachtenberg, and Kent      [31]   Stavros Harizopoulos, Vladislav Shkapenyuk, and
+       L. Beck. “Development and Deployment at Face-               Anastassia Ailamaki. “QPipe: A Simultaneously
+       book”. In: IEEE Internet Computing 17.4 (July               Pipelined Relational Query Engine”. In: Proceed-
+       2013), pages 8–17.                                          ings of the 2005 ACM SIGMOD International
+[21]   Sheldon Finkelstein. “Common Expression Anal-               Conference on Management of Data. Baltimore,
+       ysis in Database Applications”. In: Proceedings             Maryland, USA, June 2005, pages 383–394.
+       of the 1982 ACM SIGMOD International Confer-         [32]   Peter Bhat Harkins. Lobste.rs access pattern
+       ence on Management of Data. Orlando, Florida,               statistics for research purposes. Mar. 2018. URL:
+       USA, June 1982, pages 235–245.                              https : / / lobste . rs / s / cqnzl5 / lobste _
+[22]   Django Software Foundation. Django: The Web                 rs _ access _ pattern _ statistics _ for # c _
+       framework for perfectionists with deadlines. Mar.           hj0r1b (visited on 03/12/2018).
+       2018. URL: https : / / www . djangoproject .         [33]   Peter Bhat Harkins. replying comments
+       com/ (visited on 03/20/2018).                               view in Lobsters. Feb. 2018. URL: https :
+[23]   Matt Freels. TableMigrator. URL: https : / /                //github.com/lobsters/lobsters/blob/
+       github . com / freels / table _ migrator (vis-              640f2cdca10cc737aa627dbdf0bbe398b81b497f/
+       ited on 02/01/2017).                                        db / views / replying _ comments _ v06 . sql
+                                                                   (visited on 04/20/2018).
+
+
+
+
+228    13th USENIX Symposium on Operating Systems Design and Implementation                     USENIX Association
+[34]   Patrick Hunt, Mahadev Konar, Flavio Paiva Jun-            db / schema . rb # L145 - L148 (visited on
+       queira, and Benjamin Reed. “ZooKeeper: Wait-              04/23/2018).
+       free Coordination for Internet-scale Systems”. In:   [43] Lobsters Developers. Lobsters News Aggregator.
+       Proceedings of the USENIX Annual Technical                Mar. 2018. URL: https://lobste.rs (visited
+       Conference. Boston, Massachusetts, USA, June              on 03/02/2018).
+       2010, pages 149–158.
+                                                            [44]   Frank McSherry. Differential Dataflow in Rust.
+[35]   Michael Isard and Martı́n Abadi. “Falkirk Wheel:            URL: https : / / crates . io / crates /
+       Rollback Recovery for Dataflow Systems”. In:                differential - dataflow (visited on
+       CoRR abs/1503.08877 (2015).                                 01/15/2017).
+[36]   Michael Isard, Mihai Budiu, Yuan Yu, Andrew          [45]   Frank McSherry. Throughput and Latency in
+       Birrell, and Dennis Fetterly. “Dryad: Distributed           Differential Dataflow: open-loop measurements.
+       Data-parallel Programs from Sequential Building             Aug. 2017. URL: https : / / github . com /
+       Blocks”. In: Proceedings of the 2nd ACM SIGOPS              frankmcsherry/blog/blob/master/posts/
+       European Conference on Computer Systems (Eu-                2017 - 07 - 24 . md # addendum - open - loop -
+       roSys). Lisbon, Portugal, Mar. 2007, pages 59–72.           measurements - 2017 - 08 - 14 (visited on
+[37]   Bryan Kate, Eddie Kohler, Michael S. Kester,                04/13/2018).
+       Neha Narula, Yandong Mao, and Robert Morris.         [46]   Frank McSherry, Derek G. Murray, Rebecca
+       “Easy Freshness with Pequod Cache Joins”. In:               Isaacs, and Michael Isard. “Differential dataflow”.
+       Proceedings of the 11th USENIX Symposium on                 In: Proceedings of the 6th Biennial Conference on
+       Networked Systems Design and Implementation                 Innovative Data Systems Research (CIDR). Asilo-
+       (NSDI). Seattle, Washington, USA, Apr. 2014,                mar, California, USA, Jan. 2013.
+       pages 415–428.
+                                                            [47]   John Meehan, Nesime Tatbul, Stan Zdonik, Cansu
+[38]   Martin Kleppmann. Turning the database inside-              Aslantas, Ugur Cetintemel, Jiang Du, Tim Kraska,
+       out with Apache Samza. Mar. 2015. URL: https:               Samuel Madden, David Maier, Andrew Pavlo,
+       / / martin . kleppmann . com / 2015 / 03 / 04 /             Michael Stonebraker, Kristin Tufte, and Hao
+       turning- the- database- inside- out.html                    Wang. “S-Store: Streaming Meets Transaction
+       (visited on 05/09/2016).                                    Processing”. In: Proceedings of the VLDB Endow-
+[39]   Sanjeev Kulkarni, Nikunj Bhagat, Maosong Fu,                ment 8.13 (Sept. 2015), pages 2134–2145.
+       Vikas Kedigehalli, Christopher Kellogg, Sailesh      [48]   Jhonny Mertz and Ingrid Nunes. “Understand-
+       Mittal, Jignesh M. Patel, Karthik Ramasamy, and             ing Application-Level Caching in Web Applica-
+       Siddarth Taneja. “Twitter Heron: Stream Process-            tions: A Comprehensive Introduction and Survey
+       ing at Scale”. In: Proceedings of the 2015 ACM              of State-of-the-Art Approaches”. In: ACM Com-
+       SIGMOD International Conference on Manage-                  puting Surveys 50.6 (Nov. 2017), 98:1–98:34.
+       ment of Data. Melbourne, Victoria, Australia,
+                                                            [49]   Microsoft, Inc. Create Indexed Views – Additional
+       May 2015, pages 239–250.
+                                                                   Requirements. SQL Server Documentation. URL:
+[40]   Per-Åke Larson and Jingren Zhou. “Efficient                https://docs.microsoft.com/en-us/sql/
+       Maintenance of Materialized Outer-Join Views”.              relational - databases / views / create -
+       In: Proceedings of the 23rd International Con-              indexed- views#additional- requirements
+       ference on Data Engineering (ICDE). Apr. 2007,              (visited on 04/16/2017).
+       pages 56–65.
+                                                            [50]   Subramanian     Muralidhar,    Wyatt    Lloyd,
+[41]   Ki Yong Lee and Myoung Ho Kim. “Optimiz-                    Sabyasachi Roy, Cory Hill, Ernest Lin, Wei-
+       ing the Incremental Maintenance of Multiple Join            wen Liu, Satadru Pan, Shiva Shankar, Viswanath
+       Views”. In: Proceedings of the 8th ACM Inter-               Sivakumar, Linpeng Tang, and Sanjeev Kumar.
+       national Workshop on Data Warehousing and                   “f4: Facebook’s Warm BLOB Storage System”.
+       OLAP (DOLAP). Bremen, Germany, Nov. 2005,                   In: Proceedings of the 11th USENIX Conference
+       pages 107–113.                                              on Operating Systems Design and Implementation
+[42]   Lobsters Developers. Lobsters Database Schema               (OSDI). Broomfield, Colorado, USA, Oct. 2014,
+       (schema.rb). Apr. 2018. URL: https : / /                    pages 383–398.
+       github . com / lobsters / lobsters / blob /
+       93fe0fdd74028cf678134d6d112ae084d8fdd928/
+
+
+
+
+USENIX Association                13th USENIX Symposium on Operating Systems Design and Implementation            229
+[51]   Derek G. Murray, Frank McSherry, Rebecca            [59]   Prasan Roy, S. Seshadri, S. Sudarshan, and Sid-
+       Isaacs, Michael Isard, Paul Barham, and Martı́n            dhesh Bhobe. “Efficient and Extensible Algo-
+       Abadi. In: Proceedings of the 24th ACM Sympo-              rithms for Multi Query Optimization”. In: Pro-
+       sium on Operating Systems Principles (SOSP).               ceedings of the 2000 ACM SIGMOD Interna-
+       Farmington, Pennsylvania, USA, Nov. 2013,                  tional Conference on Management of Data. Dal-
+       pages 439–455.                                             las, Texas, USA, May 2000, pages 249–260.
+[52]   Derek G. Murray, Malte Schwarzkopf, Christo-        [60]   Kenneth Salem, Kevin Beyer, Bruce Lindsay, and
+       pher Smowton, Steven Smith, Anil Mad-                      Roberta Cochrane. “How to Roll a Join: Asyn-
+       havapeddy, and Steven Hand. “C IEL: a universal            chronous Incremental View Maintenance”. In:
+       execution engine for distributed data-flow com-            Proceedings of the 2000 ACM SIGMOD Interna-
+       puting”. In: Proceedings of the 8th USENIX                 tional Conference on Management of Data. Dal-
+       Symposium on Networked System Design and                   las, Texas, USA, 2000, pages 129–140.
+       Implementation (NSDI). Boston, Massachusetts,       [61]   Tony Savor, Mitchell Douglas, Michael Gen-
+       USA, Mar. 2011, pages 113–126.                             tili, Laurie Williams, Kent Beck, and Michael
+[53]   Milos Nikolic, Mohammad Dashti, and Christoph              Stumm. “Continuous Deployment at Facebook
+       Koch. “How to Win a Hot Dog Eating Contest:                and OANDA”. In: Proceedings of the 38th In-
+       Distributed Incremental View Maintenance with              ternational Conference on Software Engineering
+       Batch Updates”. In: Proceedings of the 2016 ACM            (ICSE). Austin, Texas, USA, 2016, pages 21–30.
+       SIGMOD International Conference on Manage-          [62]   Bianca Schroeder, Adam Wierman, and Mor
+       ment of Data (SIGMOD). San Francisco, Califor-             Harchol-Balter. “Open Versus Closed: A Caution-
+       nia, USA, 2016, pages 511–526.                             ary Tale”. In: Proceedings of the 3rd USENIX Con-
+[54]   Rajesh Nishtala, Hans Fugal, Steven Grimm,                 ference on Networked Systems Design and Im-
+       Marc Kwiatkowski, Herman Lee, Harry C. Li,                 plementation (NSDI). San Jose, California, USA,
+       Ryan McElroy, Mike Paleczny, Daniel Peek, Paul             2006, pages 239–252.
+       Saab, David Stafford, Tony Tung, and Venkatesh-     [63]   Jes Schultz Borland. What You Can (and Can’t)
+       waran Venkataramani. “Scaling Memcache at                  Do With Indexed Views. Brent Ozar Unlimited
+       Facebook”. In: Proceedings of the 10th USENIX              Blog. URL: https : / / www . brentozar . com /
+       Conference on Networked Systems Design and                 archive / 2013 / 11 / what - you - can - and -
+       Implementation (NSDI). Lombard, Illinois, USA,             cant - do - with - indexed - views/ (visited on
+       Apr. 2013, pages 385–398.                                  04/16/2017).
+[55]   Oracle Corp. MySQL Connector/Python Devel-          [64]   Ziv Scully and Adam Chlipala. “A Program
+       oper Guide. URL: https://dev.mysql.com/                    Optimization for Automatic Database Result
+       doc / connector - python / en / connector -                Caching”. In: Proceedings of the 44th ACM SIG-
+       python - api - mysqlcursorprepared . html                  PLAN Symposium on Principles of Program-
+       (visited on 09/05/2018).                                   ming Languages (POPL). Paris, France, 2017,
+[56]   Percona LLC. pt-online-schema-change. URL:                 pages 271–284.
+       https://www.percona.com/doc/percona-                [65]   SoundCloud Ltd. Large Hadron Migrator. URL:
+       toolkit/2.2/pt- online- schema- change.                    https://github.com/soundcloud/lhm (vis-
+       html (visited on 02/01/2017).                              ited on 02/01/2017).
+[57]   Dan R. K. Ports, Austin T. Clements, Irene Zhang,   [66]   Facebook Open Source. A persistent key-value
+       Samuel Madden, and Barbara Liskov. “Transac-               store for fast storage environments. Apr. 2018.
+       tional Consistency and Automatic Management in             URL: http : / / rocksdb . org/ (visited on
+       an Application Data Cache”. In: Proceedings of             04/20/2018).
+       the 9th USENIX Conference on Operating Systems
+       Design and Implementation (OSDI). Vancouver,        [67]   Facebook Open Source. MyRocks data dictionary
+       British Columbia, Canada, 2010, pages 279–292.             format. Apr. 2018. URL: https://github.com/
+                                                                  facebook/mysql-5.6/wiki/MyRocks-data-
+[58]   “Ray: A Distributed Framework for Emerging                 dictionary-format (visited on 04/20/2018).
+       AI Applications”. In: Proceedings of the 13th
+       USENIX Symposium on Operating Systems De-           [68]   Boerge Svingen. Publishing with Apache Kafka at
+       sign and Implementation (OSDI). Carlsbad, Cal-             The New York Times. Confluent, Inc. blog. Sept.
+       ifornia, USA, Oct. 2018.                                   2017. URL: https : / / www . confluent . io /
+                                                                  blog / publishing - apache - kafka - new -
+                                                                  york-times/ (visited on 09/14/2017).
+
+
+230    13th USENIX Symposium on Operating Systems Design and Implementation                   USENIX Association
+[69]   The PHP Group. PHP Data Objects. URL: http:                plementation (NSDI). San Jose, California, USA,
+       //php.net/manual/en/book.pdo.php (vis-                     Apr. 2012, pages 15–28.
+       ited on 09/05/2018).                                [76]   Matei Zaharia, Tathagata Das, Haoyuan Li, Tim-
+[70]   Frank W. Tompa and Joseph A. Blakeley. “Main-              othy Hunter, Scott Shenker, and Ion Stoica. “Dis-
+       taining Materialized Views Without Accessing               cretized Streams: Fault-tolerant Streaming Com-
+       Base Data”. In: Information Systems 13.4 (Oct.             putation at Scale”. In: Proceedings of the 24th
+       1988), pages 393–406.                                      ACM Symposium on Operating Systems Prin-
+[71]   Ankit Toshniwal, Siddarth Taneja, Amit Shukla,             ciples (SOSP). Farmington, Pennsylvania, USA,
+       Karthik Ramasamy, Jignesh M. Patel, Sanjeev                Nov. 2013, pages 423–438.
+       Kulkarni, Jason Jackson, Krishna Gade, Maosong      [77] Jingren Zhou, Per-Åke Larson, and Hicham G.
+       Fu, Jake Donham, Nikunj Bhagat, Sailesh Mittal,          Elmongui. “Lazy Maintenance of Materialized
+       and Dmitriy Ryaboy. “Storm@Twitter”. In: Pro-            Views”. In: Proceedings of the 33rd International
+       ceedings of the 2014 ACM SIGMOD International            Conference on Very Large Data Bases. Vienna,
+       Conference on Management of Data. Snowbird,              Austria, Sept. 2007, pages 231–242.
+       Utah, USA, June 2014, pages 147–156.                [78] Jingren Zhou, Per-Ake Larson, Johann-Christoph
+[72]   Werner Vogels. “Eventually Consistent”. In: Com-         Freytag, and Wolfgang Lehner. “Efficient Ex-
+       munications of the ACM 52.1 (Jan. 2009),                 ploitation of Similar Subexpressions for Query
+       pages 40–44.                                             Processing”. In: Proceedings of the 2007 ACM
+[73]   Jacqueline Xu. Online migrations at scale. Stripe        SIGMOD International Conference on Manage-
+       engineering blog. URL: https : / / stripe .              ment of Data (SIGMOD). Beijing, China, 2007,
+       com / blog / online - migrations (visited on             pages 533–544.
+       02/01/2017).                                        [79]   Jingren Zhou, Per-Åke Larson, and Jonathan
+[74]   Jean Yang, Travis Hance, Thomas H. Austin,                 Goldstein. Partially Materialized Views. Techni-
+       Armando Solar-Lezama, Cormac Flanagan, and                 cal report MSR-TR-2005-77. Microsoft Research,
+       Stephen Chong. “Precise, Dynamic Information               June 2005.
+       Flow for Database-backed Applications”. In: Pro-    [80]   Jingren Zhou, Per-Åke Larson, Jonathan Gold-
+       ceedings of the 37th ACM SIGPLAN Confer-                   stein, and Luping Ding. “Dynamic Materialized
+       ence on Programming Language Design and Im-                Views”. In: Proceedings of the 23rd International
+       plementation (PLDI). Santa Barbara, California,            Conference on Data Engineering (ICDE). Istan-
+       USA, June 2016, pages 631–647.                             bul, Turkey, Apr. 2007, pages 526–535.
+[75]   Matei Zaharia, Mosharaf Chowdhury, Tathagata        [81]   Yue Zhuge, Héctor Garcı́a-Molina, Joachim Ham-
+       Das, Ankur Dave, Justin Ma, Murphy McCauley,               mer, and Jennifer Widom. “View Maintenance in
+       Michael J. Franklin, Scott Shenker, and Ion Sto-           a Warehousing Environment”. In: Proceedings of
+       ica. “Resilient Distributed Datasets: A Fault-             the 1995 ACM SIGMOD International Confer-
+       tolerant Abstraction for In-memory Cluster Com-            ence on Management of Data. San Jose, Califor-
+       puting”. In: Proceedings of the 9th USENIX Con-            nia, USA, May 1995, pages 316–327.
+       ference on Networked Systems Design and Im-
+
+
+
+
+USENIX Association                13th USENIX Symposium on Operating Systems Design and Implementation         231
+

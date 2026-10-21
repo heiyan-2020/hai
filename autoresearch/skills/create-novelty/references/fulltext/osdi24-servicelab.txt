@@ -1,0 +1,1108 @@
+ServiceLab: Preventing Tiny Performance Regressions
+    at Hyperscale through Pre-Production Testing
+         Mike Chow, Meta Platforms; Yang Wang, Meta Platforms and
+  The Ohio State University; William Wang, Ayichew Hailu, Rohan Bopardikar,
+   Bin Zhang, Jialiang Qu, David Meisner, Santosh Sonawane, Yunqi Zhang,
+     Rodrigo Paim, Mack Ward, Ivor Huang, Matt McNally, Daniel Hodges,
+Zoltan Farkas, Caner Gocmen, Elvis Huang, and Chunqiang Tang, Meta Platforms
+            https://www.usenix.org/conference/osdi24/presentation/chow
+
+
+
+        This paper is included in the Proceedings of the
+        18th USENIX Symposium on Operating Systems
+                 Design and Implementation.
+                   July 10–12, 2024 • Santa Clara, CA, USA
+                                978-1-939133-40-3
+
+
+                                        Open access to the Proceedings of the
+                                        18th USENIX Symposium on Operating
+                                         Systems Design and Implementation
+                                                  is sponsored by
+            ServiceLab: Preventing Tiny Performance Regressions at Hyperscale
+                             through Pre-Production Testing
+
+                Mike Chow1 , Yang Wang1 ² , William Wang1 , Ayichew Hailu1 , Rohan Bopardikar1 ,
+                 Bin Zhang1 , Jialiang Qu1 , David Meisner1 , Santosh Sonawane1 , Yunqi Zhang1 ,
+                  Rodrigo Paim1 , Mack Ward1 , Ivor Huang1 , Matt McNally1 , Daniel Hodges1 ,
+                     Zoltan Farkas1 , Caner Gocmen1 , Elvis Huang1 , and Chunqiang Tang1
+                                                                1 Meta Platforms
+                                                        ² The Ohio State University
+
+                             Abstract                                       three hours. If a code change causes even just a 0.01% regres-
+   This paper presents ServiceLab, a large-scale performance                sion in the platform’s overall CPU usage, an alarm is raised.
+testing platform developed at Meta. Currently, the diverse set              To our knowledge, strict thresholds of this level have not been
+of applications and ML models it tests consumes millions                    studied before. We use this strict threshold because Front-
+of machines in production, and each year it detects perfor-                 FaaS consumes more than half a million machines and 0.01%
+mance regressions that could otherwise lead to the wastage                  would mean more than 50 machines. Moreover, if left unde-
+of millions of machines. A major challenge for ServiceLab                   tected, many small regressions would accumulate over time.
+is to detect small performance regressions, sometimes as tiny               Each year, we catch regressions in FrontFaaS that amount to
+as 0.01%. These minor regressions matter due to our large                   the capacity of more than one million machines.
+fleet size and their potential to accumulate over time. For in-                This paper presents our performance testing platform called
+stance, the median regression detected by ServiceLab for our                ServiceLab. It currently tests about one thousand diverse ser-
+large serverless platform, running on more than half a mil-                 vices and ML models, which, in aggregate, consume millions
+lion machines, is only 0.14%. Another challenge is running                  of machines in production. Although performance testing is
+performance tests in our private cloud, which, like the public              widely used, there is no detailed report of its usage at hyper-
+cloud, is a noisy environment that exhibits inherent perfor-                scale. Specifically, we have encountered several challenges
+mance variances even for machines of the same instance type.                that have not been studied before:
+To address these challenges, we conduct a large-scale study                 1. How to run tests on heterogeneous machines provided by
+with millions of performance experiments to identify machine                   the cloud while still ensuring comparable results?
+factors, such as the kernel, CPU, and datacenter location, that
+introduce variance to test results. Moreover, we present statis-            2. How to detect regressions as small as 0.01%?
+tical analysis methods to robustly identify small regressions.              3. How to support hundreds of diverse services with one
+Finally, we share our seven years of operational experience in                 uniform testing platform?
+dealing with a diverse set of applications.
+                                                                            We elaborate on each of these challenges below.
+1    Introduction                                                           Use heterogeneous cloud machines. To detect small regres-
+In our hyperscale private cloud, tens of thousands of services              sions, we must conduct numerous trials for an experiment
+run on millions of machines to serve billions of users, and                 and then apply statistical analysis. Since running these trials
+engineers make thousands of code changes to these services                  sequentially on one machine can take a long time (a trial takes
+daily. Performance or resource usage regressions caused by                  over one hour on average), a natural solution is to run them
+these changes may impact user experiences or even cause a                   in parallel on many machines. Ideally, these machines should
+site outage. Therefore, engineers critically rely on automated              be identical to reduce performance variance.
+performance testing to catch regressions early.                                However, when a test workload is launched on a cloud,
+   Consider, for example, the frontend serverless platform                  the cloud chooses machines to run the workload and even
+called FrontFaaS. More than ten thousand engineers write                    machines of the same instance type exhibit varying perfor-
+code on this platform, with thousands of code changes com-                  mance [47], due to differences in SSD wearing, memory chips
+mitted daily and a new version released into production every               from different vendors, and varying frequencies of CPU’s
+Contributions: Yang wrote the majority of the paper, followed by Mike and
+                                                                            uncore components like memory controller, etc. This phe-
+Chunqiang. Mike led the development of ServiceLab for multiple years, and   nomenon not only exists in public clouds but also in our
+other authors also made major contributions to its development.             private cloud that we use to run testing workloads. Note that
+
+
+
+USENIX Association                                  18th USENIX Symposium on Operating Systems Design and Implementation              545
+our private cloud runs workloads on Linux containers instead         of the total code changes, surpassing the combined coverage
+of virtual machines (VMs) so there are no performance vari-          of other specialized testing platforms.
+ances caused by VMs.                                                    ServiceLab takes the record-and-replay approach for test-
+   Although it is theoretically possible to reduce performance       ing, with three key distinctions. First, unlike past solutions
+variance by maintaining our own dedicated pool of identical          that emphasize deterministic replay [8,20,24,62], ServiceLab
+physical machines for testing, it is impractical for two main        replays requests captured from a production system (PS) to a
+reasons: (1) testing workloads are spiky, and running them           system under test (SUT) without expecting the SUT to exhibit
+as on-demand workloads in the cloud is more cost-effective,          the same behavior as the PS. In fact, due to testing changed
+and (2) maintaining a dedicated pool of tens of thousands            code, it is anticipated that the SUT may make outgoing calls
+of machines for testing requires an operations team that we          to downstream services that differ from those made by the
+cannot afford, which is exactly the problem that clouds aim          PS. Therefore, ServiceLab does not replay the responses from
+to solve anyway.                                                     downstream services to the SUT.
+   Like in a public cloud, we can provision a batch of ma-              Second, ServiceLab allows the SUT to call downstream
+chines, keep a subset of ªnearly identical machinesº to run          services running in production, provided there are no adverse
+test workloads, and return the rest. The key question is how         side effects. Although users can set up a group of interdepen-
+to select ªnearly identical machines.º Specifically, among           dent services in ServiceLab to create a self-contained testing
+the factors affecting a machine’s performance, which are cru-        environment without relying on the production environment,
+cial for machine selection, and which can be ignored and             this approach is not consistently implemented due to practical
+addressed through statistical analysis?                              reasons. For instance, making a per-test replica of certain mas-
+   To answer this question, we conducted a large-scale study         sive datasets accessed by the SUT, such as the social graph
+with millions of performance experiments on various ma-              for billions of users, is economically impractical.
+chines, using both microbenchmarks and real-world applica-              In ServiceLab, the SUT can call downstream production
+tions. We find that the performance variance on two machines         services, and most of those calls do not incur side effects, as
+is comparable to that on a single machine if the two machines        they are read-only or idempotent. If a SUT’s call to a down-
+share the same instance type, CPU architecture (e.g., Intel          stream service does cause side effects, ServiceLab provides
+Cooper Lake), and kernel version, are located in the same            a mock framework to assist the SUT in mitigating it. For ex-
+datacenter region, and have CPU turbo disabled. An interest-         ample, instead of writing to a production database, the writes
+ing observation is that the datacenter location matters, while       can be redirected to a test database.
+other factors such as RAM vendor and RAM speed are less                 Third, due to the complexity of hyperscale services, Ser-
+important. We will delve into this in §4.                            viceLab does not attempt to provide a simple but inflexible
+                                                                     solution that requires no involvement from service owners,
+Detect small regressions. For large services that consume            because such a solution would only work for a small fraction
+tens of thousands of machines, we need to detect regressions         of services. Instead, ServiceLab allows and encourages the
+as small as 0.01% while maintaining a low false positive rate.       service owner’s participation. For example, when testing a
+A high false positive rate not only wastes engineers’ time in        sharded stateful service, it is the service owner’s responsibility
+unnecessary debugging but also leads to engineers distrust-          to populate the necessary states before the test starts.
+ing and ignoring the warnings even when they are correct.               With the three key distinctions above, while ServiceLab’s
+Our experience indicates that there is no one-size-fits-all sta-     record-and-replay approach may necessitate occasional in-
+tistical model that can accurately detect regressions for all        volvement from the service owner and does not extend to
+services, due to the different outlier patterns of these services.   certain complex services, it effectively covers the majority of
+To address this issue, we leverage multiple statistical models       code changes submitted by engineers.
+simultaneously and evaluate their false negatives and false
+                                                                     Contributions. We make the following contributions:
+positives on historical data to select the best model for each
+service. Although this ensemble approach may seem concep-            • We address the performance variance issue arising from
+tually simple, we will discuss the intricacies of applying it at       running tests in the cloud. Specifically, we conducted mil-
+scale in highly noisy production environments.                         lions of experiments to identify the factors that contribute
+                                                                       most significantly to performance variance across machines.
+Support diverse services. Our private cloud runs numerous              Such a large-scale study has not been reported before.
+services with intricate interdependencies, a complexity shared
+with other hyperscalers [30, 38, 48]. A single testing solution      • We develop statistical analysis methods to robustly identify
+capable of covering all these services likely does not exist.          performance regression as small as 0.01%, even when tests
+Can we achieve the next best thing, i.e., having a single so-          do not use identical machines. This represents a significant
+lution to cover the majority of code changes submitted by              refinement of existing methods, as no prior research has
+engineers? ServiceLab indeed accomplishes this. Currently,             achieved this level of a low threshold.
+as a general-purpose testing platform, it covers more than half      • This is the first holistic report of a hyperscale testing plat-
+
+
+
+546   18th USENIX Symposium on Operating Systems Design and Implementation                                      USENIX Association
+    form, including its design and our seven years of operational   • A container manifest that specifies the executable to test
+    experience in dealing with a diverse set of applications.         and how to set up Linux containers to run the executable;
+                                                                    • The metrics to be aggregated at the end of a test run, and
+2     ServiceLab from a User’s Perspective                            the condition to fail the test;
+Before presenting the internals of ServiceLab, we first de-
+                                                                    • A traffic-recording configuration that instructs the RPC
+scribe its usage from a user’s perspective. ServiceLab can be
+                                                                      system how to sample production traffic for later replay;
+used in different testing modes. The efficiency mode tests a
+code or configuration change’s impact on key metrics such           • The rate at which the recorded traffic will be replayed during
+as latency or CPU/memory usage. The capacity mode tests               a test run.
+a code or configuration change’s impact on the maximum              ServiceLab supports both synthetic and record-and-replay
+throughput that can be achieved, which affects the amount           traffic for testing, but primarily relies on the latter because
+of capacity needed to run the service. The hardware mode            it more accurately represents the production system. This
+compares the performance of different hardware running the          approach records live production traffic and then replays it
+same code. Below, we focus on the efficiency mode.                  on a separate application instance in the testing environment,
+                                                                    which may run modified code. It is the application owner’s re-
+2.1     ServiceLab in the Development Workflow                      sponsibility to ensure that a replay in the testing environment
+Figure 1 depicts our development workflow, where Service-           does not cause undesirable side effects on the production sys-
+Lab is involved in the review-time test, commit test, deploy-       tem. Moreover, a stateful application needs to set up its state
+ment test, and config test. We elaborate on them below.             properly so that it can handle the replayed traffic.
+   Meta uses the monorepo approach [12] to store code for              Once a SUT is registered at ServiceLab, it undergoes tests
+all projects in one repository. When developing a new feature       in four phases. The build phase compiles all required code into
+for an application, the developer clones the repository and         a package. The allocation phase acquires necessary machines
+makes local changes without affecting others. Once the code         from the cloud. The running phase initiates the target appli-
+is ready, they submit the change, referred to as a diff, for peer   cation on the allocated machines and replays the recorded
+review. Both functional and performance tests are automati-         workload. The analysis phase conducts statistical analysis on
+cally executed for the diff. The peer reviewer examines the         the results to draw a conclusion.
+code and test results, requesting changes as needed before
+approving the diff. Upon approval, the developer commits the        3     Applications Tested by ServiceLab
+diff, triggering post-commit tests.                                 Currently, ServiceLab tests about one thousand diverse ser-
+   On a set schedule, the continuous-deployment tool com-           vices and ML models, and their collective capacity consump-
+piles a new executable for the application and creates a re-        tion in production amounts to millions of machines. We de-
+lease candidate (RC). It conducts tests to compare the RC           scribe several representative and large workloads below.
+with the executable running in production. The RC is aban-
+doned if a regression is identified. Otherwise, it is deployed      3.1    FrontFaaS Serverless Platform
+into production in stages, and the application’s health metrics,    FrontFaaS is one of the most complex software ecosys-
+including performance metrics, are monitored continuously.          tems in our private cloud. It is a serverless function-as-a-
+If any health issue is detected, the deployment is reverted.        service (FaaS) platform that runs on more than half a million
+   A common practice is to use a configuration parameter            machines and has tens of thousands of developers making
+known as a gate to control access to the new code path. Ini-        changes to its code base, with thousands of code commits
+tially, the gate is disabled so that the application continues      every workday. ServiceLab tests FrontFaaS to detect CPU us-
+to execute the old code path even after the new release is          age regression as small as 0.01%. It holistically tests different
+deployed. Then, the developer makes a remote configuration          aspects of FrontFaaS: its PHP runtime called HHVM [27],
+change to toggle the gate, enabling the application to execute      the FaaS code written by tens of thousands of developers, and
+the new code path. If any issues arise, the gate can be instantly   that code’s impact on downstream services like databases.
+disabled to revert back to the old code path without requiring
+                                                                    Testing the language runtime. HHVM performs just-in-time
+a new code release.
+                                                                    (JIT) compilation for efficient execution. The HHVM team
+2.2     Setting Up Tests with ServiceLab                            relies on ServiceLab to collect performance signals on com-
+                                                                    piler optimizations, monitoring metrics such as instructions
+To register a system-under-test (SUT) with ServiceLab, the
+                                                                    per cycle, execution time, and cache misses. In addition to
+application owner provides the following information:
+                                                                    the core code written by the HHVM team, HHVM links with
+• The selection criteria for code or configuration changes to       many libraries developed by other teams, any of which may
+  trigger a test (note that it may not be necessary to run tests    cause regressions. HHVM tests compare the code running
+  on every change);                                                 in production with the code in the trunk (i.e., the latest code
+
+
+
+USENIX Association                             18th USENIX Symposium on Operating Systems Design and Implementation             547
+                                                     Merge with       Cut Release                               Launch
+            Write code           Code review                                               Deployment
+                                                       trunk           Candidate                                (config)
+
+
+
+                                                                      Deployment
+                                 Run perf tests      Commit test                          Health checks        Config test
+                                                                         test
+
+
+                    Feedback on code
+
+
+
+Figure 1: Code change workflow. In this figure, tests refer to both functional and performance tests, but this paper focuses on
+performance tests.
+
+
+in the monorepo shared by all developers), enabling devel-          to call downstream services running in production and care-
+opers to catch regressions before a new release candidate is        fully manages any adverse side effects. The non-functional
+created. If a regression is detected, ServiceLab uses bisection     side effects, such as test-induced load on downstream pro-
+to identify the root cause.                                         duction systems, is not a concern because that test load is
+                                                                    negligible compared to the production traffic from billions of
+Selecting diffs to test. In addition to testing HHVM, Ser-
+                                                                    users. The functional side effects, such as writing to a produc-
+viceLab also tests FrontFaaS’ application-level FaaS code.
+                                                                    tion database, is the main concern and is managed carefully.
+FrontFaaS is the primary entry point for user-facing traffic for
+our products and runs thousands of unique application end-
+points. With thousands of FaaS code changes (diffs) occurring          By default, FrontFaaS’ writes to databases, caches, and
+every workday, it is not cost-effective to test every change.       data warehouses are automatically dropped via a shim layer
+Moreover, since a change is unlikely to affect all thousands        in the client libraries, while reads to these production systems
+of application endpoints, it is unnecessary to replay the traffic   are allowed. Unlike data stores where differences between
+for all those endpoints during a test.                              read and write can be easily identified, for generic RPC calls,
+   A ServiceLab component called DiffSuggester selects              ServiceLab and the RPC system cannot easily infer whether
+which diffs to test based on a calculated impact score and also     an RPC method has undesirable side effects or not. Therefore,
+determines the traffic for which endpoints to replay during         the RPC system drops calls to downstream production sys-
+a test. DiffSuggester traverses the compiler’s abstract syntax      tems by default to ensure safety, while users can provide a
+tree to identify functions modified by the diff. It calculates      list of specific RPC calls that are allowed to proceed. How-
+an impact score for each modified function by leveraging a          ever, this method may prevent certain code paths from being
+profiling dataset of FrontFaaS’ execution in production to          executed and result in ServiceLab missing the opportunity
+estimate the global cost of the function, considering both its      to detect regressions on those code paths. If the owners of
+execution frequency and resource consumption per invoca-            certain FrontFaaS endpoints really want to cover those code
+tion. The diff’s impact score is simply the sum of the impact       paths, it is their responsibility to modify the code’s behavior
+scores for all impacted functions. If a diff’s impact score is      so that it can run in ServiceLab to exercise those code paths
+above a threshold, ServiceLab will run experiments for it.          without causing adverse side effects to production systems.
+The threshold is statically chosen based on the number of           We will delve into this in §5.3.
+machines available to run experiments and the distribution of
+diffs’ impact scores. Moreover, DiffSuggester also uses the
+production profiling data to infer which application endpoints      Testing performance impact on downstream services. A
+are impacted by the diff and selectively replay traffic for those   FrontFaaS diff may not cause regressions in the resource
+endpoints with the right proportion.                                usage of FrontFaas itself but may regress in the load it im-
+                                                                    poses on downstream services. Specifically, the social graph
+Dealing with side effects. Because of the complexity of             database (TAO [11]) is one of the most important downstream
+FrontFaaS, it is too costly to set up an entirely isolated test-    services for FrontFaaS, and ServiceLab also detects increased
+ing environment for it. It invokes hundreds of downstream           reads to TAO. During a test, ServiceLab monitors the number
+services, which recursively have their own dependencies. All        of read requests that FrontFaaS issues to TAO when process-
+these are hard to replicate in a testing environment and keep       ing a replayed end-user request. Statistics are gathered at the
+them faithful to the production environment. Moreover, given        granularity of each type of end-user request because the num-
+numerous concurrent tests, it is economically impractical to        ber of reads to TAO may vary widely depending on the type
+make a per-test copy of certain massive datasets accessed by        of the end-user request. Similar to reporting regressions on
+FrontFaaS, such as the social graph for billions of users.          FrontFaaS’ own metrics, ServiceLab also reports regressions
+   Therefore, ServiceLab allows a test instance of FrontFaaS        in reads to TAO.
+
+
+
+548   18th USENIX Symposium on Operating Systems Design and Implementation                                   USENIX Association
+3.2    Sharded and Stateful Services                                  user request, and its role is to collect all relevant information
+L ASER is a low-latency key-value store that is frequently            about posts and analyze all the features (e.g., how many peo-
+accessed by FrontFaaS on the critical path of serving user            ple have liked this post previously) to predict the posts’ values
+requests. L ASER primarily serves as an indexing service for          to the user. New releases of DataAggregator are deployed to
+data in the data warehouse. Its index can be updated either           production multiple times throughout the day, and it primarily
+by real-time stream processing that extracts data from data           uses ServiceLab for release-time testing.
+streams or by running daily MapReduce computation to build               Instead of using record-and-replay, it uses a forker service
+the index and then performing a bulk load into the key-value          to duplicate live production traffic and send it to the testing
+store. L ASER is sharded and managed by a shared, central             environment in ServiceLab. The forker sends the production
+control plane similar to ShardManager [36] and Slicer [4],            system’s responses back to users but drops the test instance’s
+which dynamically assigns shards to different L ASER servers.         responses so that they will not affect users. DataAggrega-
+   Testing L ASER faces several challenges. First, to bring           tor prefers testing with shadow production traffic instead of
+up a L ASER instance in the isolated test environment, we             recorded traffic because the setup is straightforward for them,
+have to disconnect it from the central shard control plane and        and the existence of the forker even predates ServiceLab.
+specifically instruct it to load certain shards, instead of relying      DataAggregator uses 68 key metrics for regression detec-
+on the control plane’s dynamic shard assignment. Second,              tion. Examples of the key metrics and their regression thresh-
+we allow L ASER to perform read-only accesses to the data             olds include container-level CPU usage (1.25%), process-
+warehouse to set up its stateful index for testing. Finally, in       level CPU usage (0.6%), and p99 memory usage (3%). Some
+production, requests routed to a specific L ASER shard have           metrics are related to the application logic, e.g., log error or
+an RPC header with the shard ID that matches with the shard;          warning counts (5%), no stories returned (2%), and latency to
+otherwise, the requests would be rejected. L ASER uses record-        process all stories in the ranking service (30%).
+and-replay for testing, which broadly samples requests for
+different shards. When requests are replayed, ServiceLab
+                                                                      3.5    XFinder
+dynamically adds an RPC request header that matches with              XFinder is a large service performing ads aggregation and
+the shard ID of the L ASER server under test.                         ranking. Upon receiving a user request, it fans out requests to
+   L ASER uses three major metrics for regression detection.          many leaf services, aggregates, and ranks the results before
+These metrics and their regression thresholds are CPU usage           returning them to the user. XFinder uses record-and-replay,
+(2%), anonymous memory usage (5%), and SSD storage usage              but to obtain accurate results, it requires near real-time traffic
+(5%).                                                                 recorded from production within the past hour. Each week,
+                                                                      it conducts over 3,000 and 1,000 experiments on code and
+3.3    ML Prediction                                                  configuration changes, respectively. To understand the impact
+MLPredictor is a shared ML deployment platform used by                of a change more precisely, instead of A/B tests, it runs 3-sided
+ML engineers to effortlessly deploy and manage thousands              experiments: (1) the version currently running in production;
+of ML models without the need for an understanding of the             (2) the latest version before this change; and (3) the new
+underlying infrastructure. This ªserverlessº approach con-            version with the change to be tested.
+ceals the operational complexities of large-scale distributed            XFinder uses 65 key metrics for regression detection. These
+systems, which are often unfamiliar to ML engineers.                  key metrics all use a regression threshold of 0.5%. The key
+   MLPredictor uses record-and-replay, along with Service-            metrics include total CPU time, log error or warning counts,
+Lab’s capacity mode, to test performance under varying load           count of ads returned, number of calls to downstream services,
+levels. ServiceLab incrementally increases the load level of          and failure rates of these calls.
+the replayed traffic until MLPredictor breaches its service
+level objective (SLO), helping identify both the maximum              3.6    Ranker
+throughput and potential capacity regressions. Initially, we          Ranker executes a graph of rules for ranking. A diverse set of
+recorded traffic for different models using uniform sampling,         application clients calls Ranker with different rules to provide
+leading to an overwhelming number of samples from high-               ranking for their specific purposes, and these rules impact
+traffic models. Later, we switched to interval-based reservoir        Ranker’s performance. Ranker relies on record-and-replay to
+sampling [5,57], capping the number of samples for a popular          capture these rules. Requests from each application client are
+model at a constant per time interval.                                sampled on the client side and stored in the data warehouse.
+   MLPredictor uses the maximum requests rate for regression          Each major client corresponds to a different shard of Ranker
+detection, with a threshold of 5%.                                    deployment, and these different shards run the same Ranker
+                                                                      executable but serve different clients. Previously, Ranker cre-
+3.4    Data Aggregation                                               ated a mix of requests when replaying them for testing in Ser-
+DataAggregator is a CPU-intensive backend service that han-           viceLab. However, maintaining the correct ratio of requests
+dles all news feed rankings. It is invoked by FrontFaaS upon a        in the mix became a burdensome process, and an incorrect
+
+
+
+USENIX Association                             18th USENIX Symposium on Operating Systems Design and Implementation                549
+ratio would lead to missed regressions. As a result, Ranker        test to compare two test runs, one with the change and one
+now runs separate experiments to replay traffic from different     without. A trial is a singular A/B test, and an experiment
+major clients.                                                     comprises multiple such trials. An A/A test compares two
+   Ranker uses 30 key metrics for regression detection. The        runs of the same code.
+key metrics and thresholds include container-level CPU us-            Performance differences may stem from (a) accidental vari-
+age (9%), container-level memory usage (7%), CPU MIPS              ance caused by code’s random factors such as the timing of
+busy (5%), and application metrics such as different types of      lock contention; (b) environment variance, stemming from
+candidates fetched (20%).                                          testing environment differences like CPU generation and ker-
+                                                                   nel version; and (c) true regression in the code change. Our
+3.7    Applications not Using ServiceLab                           goal is to minimize the impact of accidental and environment
+ServiceLab tests now cover more than half of the total code        variance to identify true regression.
+changes at Meta. The remaining applications choose other              To detect true regressions as small as 0.01%, we must ag-
+testing methodologies for various reasons as described below.      gressively reduce both accidental and environmental variance,
+A common theme among them is that setting up a service for         as they could conceal small regressions. To reduce acciden-
+testing in ServiceLab requires effort, and sometimes a simpler     tal variance, we collect a large amount of test data and then
+alternative exists.                                                apply statistical analysis. To reduce environmental variance,
+   First, Meta’s continuous deployment tool, Conveyor [22],        we always acquire entire machines from our private cloud to
+and its in-production detection tool, FBDetect, can catch per-     run tests, avoiding the ªnoisy neighborº problem. However,
+formance regressions either during the staged deployment           sequentially executing all test runs on one machine, while
+process or during steady-state execution in production. De-        minimizing environmental variance, leads to prolonged test
+spite the higher risk of catching issues in production, these      times and a slowdown in the iteration speed of software de-
+tools work sufficiently well for some services, leading those      velopment.
+services to skip pre-production testing in ServiceLab.                One fundamental decision we have made is to run tests con-
+   Second, some services have complex interdependencies,           currently on different machines to expedite testing. Initially,
+and services like Meta’s cluster manager ecosystem [42, 54]        the ServiceLab team operated its own dedicated machine pool
+even depend on the physical data center environment. These         and meticulously configured the machines to be nearly identi-
+complex services have their own sophisticated ways of set-         cal to reduce environment variance across machines. However,
+ting up their testing environments, which are often overly         as the pool size expanded, maintaining it became uneconomi-
+complicated to migrate to ServiceLab.                              cal, leading us to switch to using our private cloud’s shared
+   Third, some stateful services require a massive amount of       machine pool. Moreover, the cloud allows ServiceLab to use
+data for effective testing. It is too slow to populate such data   temporarily reclaimed resources called ªElastic Serversº, akin
+in newly allocated containers during each ServiceLab test run.     to Spot Instances in AWS, for testing. Since Elastic Servers
+Therefore, these services maintain their own dedicated and         can be revoked, our cloud employs predictive models to infer
+persistent test environments with prepopulated data, without       the availability of Elastic Servers and run tests correspond-
+relying on ServiceLab.                                             ingly. When Elastic Servers are revoked unexpectedly, Ser-
+   Fourth, some services do not consume significant capacity       viceLab simply re-runs the interrupted tests.
+and do not have stringent performance requirements. As a              When acquiring machines from the cloud, ServiceLab can
+result, thorough performance testing is not a priority for them.   specify a certain coarse-grained configuration such as CPU
+Their developers often prefer simpler ad-hoc testing methods,      cores and memory, but cannot control other details, such as
+as opposed to the burden of setting up and maintaining their       memory chip or kernel version. Note that the cloud automati-
+service setup in ServiceLab.                                       cally updates kernels at its own schedule to ensure security
+   Finally, in a large organization with tens of thousands of      compliance. ServiceLab can provision a batch of machines,
+developers, our experience indicates that achieving universal      retain a subset of ªnearly identical machinesº to run test work-
+adoption of a technology is challenging unless it becomes a        loads, and return the rest. We do not require machines to be
+company priority, as demonstrated by the Push4Push program         identical in every aspect as finding a sufficient number of such
+driving the universal adoption of the continuous deployment        machines is difficult. Next, we discuss how to select ªnearly
+tool at Meta [22]. So far, ServiceLab has relied entirely on       identical machinesº by using factors that impact a machine’s
+organic, bottom-up adoption without top-down push.                 performance most.
+
+4     Taming Performance Variance                                  4.1    Machine Factors Impacting Performance
+A key challenge in designing any testing platform is managing      We analyze millions of test records to identify key factors im-
+variance in testing data to separate signals from noises. To set   pacting a machine’s performance. Our analysis involves two
+the stage for the discussion, we first define some terminology.    large datasets. The Release to Production (RTP) dataset com-
+Assessing a code change’s performance impact uses an A/B           prises 21.5 million records, each executing a CPU or memory
+
+
+
+550    18th USENIX Symposium on Operating Systems Design and Implementation                                 USENIX Association
+benchmark. The ServiceLab dataset contains 186K records,            releaseÐwe attain an R2 of 0.87 on the CPU benchmark,
+each testing a real production application. Each record in          closely approaching the upper bound. In practice, we observe
+both datasets specifies the test result alongside the used hard-    that the cloud can generally provide matching machines based
+ware and software configuration. Leveraging both datasets is        on these three factors. Note that this subset is not the only vi-
+crucial as they complement each other. The RTP dataset pro-         able option. As hardware factors are correlated, some factors
+vides diverse hardware results, though its benchmarks are less      can be replaced by others. Additionally, we find that certain
+complex. Conversely, the ServiceLab dataset contains real           factors, such as RAM speed and RAM vendor, have minimal
+application results, but the machines used are less diverse.        impact, even in memory benchmarks.
+   We use the ANOVA method [52] to identify factors that               Analyzing the ServiceLab dataset reveals two additional
+best explain the variance in the data. ANOVA is similar to          important factors: CPU turbo and the datacenter region where
+linear regression but operates on categorical data. Its output,     the test was executed. Their impact varies across applications,
+the coefficient of determination (R2 ), represents the proportion   and adding these factors can increase R2 by up to 0.23. In
+of the variance in the dependent variable (performance metrics      comparison, in the RTP dataset, adding these factors only
+in our case) that is predictable from the independent variables     increases R2 by 0.01 for the CPU benchmark. The influence
+(e.g., CPU generation or kernel version). Our goal is to find a     of CPU turbo, previously reported in research [40], manifests
+minimal subset of key machine factors (independent variables)       only in the ServiceLab dataset, not in the RTP dataset. This
+that can explain as much variance as using many factors.            difference arises due to constant CPU activity in the RTP
+This allows us to use these key factors for machine selection.      benchmarks. The datacenter region is significant for real ap-
+Otherwise, a large number of factors would make it hard to          plications tested in the ServiceLab dataset because many of
+find matching machines due to overly aggressive filtering. To       them have external dependencies. For example, if the test
+achieve our goal, we first use many factors to establish an         instance of an application reads from a production database in
+approximate upper bound for R2 , and then explore different         the region, the test result would be affected by the database’s
+subsets of factors to approach the upper limit.                     performance, which tends to vary across regions. In contrast,
+   To set the stage for discussion, we will first describe how      the RTP benchmarks have no external dependencies.
+physical machines are classified with three levels of granu-           While the key factors account for 87% of the variance,
+larity. At the most coarse level, machines are classified into      the remaining 13% is attributed to other smaller factors. For
+tens of ServerTypes. Examples of ServerTypes include single-        example, in machines with CPUs of the same model, the
+CPU general-purpose machine, two-CPU general-purpose                frequency of their uncore components, such as cache and
+machine, GPU training machine, GPU inference machine, etc.          memory controller, can vary, resulting in approximately a 2%
+The median granularity, known as ServerSubType, takes into          performance difference across tests. However, these factors
+account more hardware information, such as RAM size and             cannot be used for selecting machines from the cloud as they
+CPU architecture (e.g., Intel Skylake, Cooper Lake, etc.). The      are not exposed by the cloud.
+finest granularity, referred to as ServerModel, includes the           Our analysis further reveals that certain CPU models and
+model names of all major components, such as CPU, RAM,              kernel versions contribute significantly more variance than
+NIC, disk, etc. Typically, users specify ServerType when re-        others. Like prior works [40], we use Coefficient of Variance
+questing machines from our private cloud. While specifying          (CoV), defined as the ratio of the standard deviation to the
+ServerSubType is allowed, it is discouraged because it limits       mean, to compute the variance of a set of values. Specifically,
+flexibility for the cloud to choose machines. Users are not         regarding CPU models, Intel Xeon E5-2680 v4 @ 2.40GHz
+allowed to specify specific ServerModel. Concretely, our pri-       has the highest CoV at 42%, while AMD EPYC 7D13 36-
+vate cloud uses O(10) ServerTypes, O(100) ServerSubTypes,           Core Processor has the lowest CoV at 5.6%, with an overall
+and more than 10,000 ServerModels. They are equipped with           P50 at 19%. Regarding the kernel, version 5.6.13-0 has the
+O(100) CPU models, O(100) RAM models, O(1000) disk                  highest CoV at 52%, and 5.2.0-240 has the lowest CoV at
+models, and O(100) NIC models.                                      9.5%, with the overall P50 at 36%. While investigating the
+   To approximate the upper bound of R2 , we use ServerModel        root cause of CoV is beyond the scope of this paper, Service-
+as one factor since it includes almost all hardware information     Lab avoids using CPUs or kernel versions with high variance.
+and add non-hardware factors like the kernel release version.          In summary, the strategy we use is to select similar ma-
+We first report our results on the RTP dataset. These factors       chines with matching kernel versions, ServerTypes, CPU ar-
+can achieve an R2 of 0.89 for the CPU benchmark and an R2           chitecture, and datacenter regions, while disabling CPU turbo.
+of 0.97 for the memory benchmark. In the remainder of this          To assess whether performance variance within the similar
+section, we will focus on the CPU benchmark as the memory           machines selected by our criteria is comparable to that for
+benchmark exhibits much less variance.                              a single machine, we compare their CoVs. The comparison
+   We explore various factor subsets to determine if a small        is conducted using the RTP dataset with turbo disabled. The
+combination can achieve an R2 close to the upper limit. Us-         CoVs for same-machine tests are 5.9% at P50 (50 percentile)
+ing three factorsÐServerType, CPU architecture, and kernel          and 28% at P99, while for similar-machine tests, they are
+
+
+
+USENIX Association                            18th USENIX Symposium on Operating Systems Design and Implementation              551
+5.7% at P50 and 38% at P99. The P50 values are nearly iden-          A/A tests from the past two weeks to build the distribution
+tical, with a higher difference at P99. Overall, the difference      of mean(A′ ) − mean(A), and further computes the confi-
+is deemed acceptable, considering the advantage of running           dence interval given the p-value, i.e., the probability of the
+tests in parallel.                                                   observed difference of means being smaller than the confi-
+                                                                     dence interval is larger than 1 − p. Then, for an experiment,
+Applicability to public cloud. To implement our machine
+                                                                     it can test whether the B side follows the same distribution
+selection method in a public cloud, we recommend using
+bare metal instances, which are offered by all major cloud           as the A side by determining whether mean(B) − mean(A)
+providers, rather than the more commonly used virtual ma-            is smaller than the confidence interval.
+chine instances. Although it is reported that lightweight hy-
+pervisors like AWS Nitro System can match the performance          ServiceLab uses the following data preprocessing methods:
+of bare metal machines [34], they may still introduce greater      • Square root transformations. An important preprocessing
+performance variability than bare metal machines. We have            step involves square root transformations. This is motivated
+not validated our method in virtualized environments.                by recognizing significant heterogeneity in the cost of re-
+                                                                     quests, with certain requests disproportionately impacting
+4.2    Statistical Methods                                           mean metric values. Such disparities are exacerbated across
+Despite using matching machines, experiments still exhibit           multiple trials, leading to skewed aggregations. The square
+variance. We conduct experiments multiple times and employ           root transformation mitigates this, ensuring a more uniform
+statistical methods to determine the level of regression with        contribution from each request to the trial’s mean metric
+a confidence interval. In general, we observe that there is no       value. This adjustment has been empirically validated to
+one-size-fits-all model due to the diverse requirements and          enhance detection accuracy, especially for high-demand
+varying performance-data distribution of different services.         services.
+Therefore, ServiceLab incorporates multiple models with a
+mechanism to learn the best model for each service based on        • Outlier detection. We use conventional outlier mitigation
+historical data.                                                     methods, such as winsorization [18], which are particularly
+   Recall that a trial is a singular A/B test, and an experiment     effective in moderating the elevated variance observed when
+comprises multiple trials. An A/A test compares two runs of          services operate under strenuous conditions. Specifically,
+the same code. A test may generate multiple data points. For         we either delete data points that are above a certain per-
+example, a test may measure CPU utilization for an hour and          centile (called outlier-elim) or cap those data points at the
+generate a CPU-utilization data point per minute.                    percentile value (called outlier-cap).
+   A model used by ServiceLab is a combination of a statisti-         Out of all possible combinations of statistical test meth-
+cal test method and a data preprocessing method. ServiceLab        ods and data preprocessing methods, currently ServiceLab
+uses the following statistical test methods:                       uses seven combinations: t-test-none, t-test-sqrt, t-test-outlier-
+• Student’s t-test [17]. If an experiment only contains a          elim, t-test-outlier-cap, permutation-test-none, permutation-
+  single trial, we use the student’s t-test to determine whether   test-sqrt, and confidence-interval-none, as well as some
+  there is a significant difference between the means of the A     service-specific models.
+  side and the B side.                                                ServiceLab uses an adaptive method to determine the best
+                                                                   model for each <service, metric> combination. It conducts
+• Permutation test [6]. If an experiment includes multiple tri-    periodic A/A experiments and artificial A/B experiments (i.e.,
+  als, for each trial, we first compute the difference in means    A/A experiments with injected regression on one side) to gen-
+  between the A side and the B side. This step results in a        erate a ªground truth.º Then, ServiceLab tests each model on
+  vector of m values called M,⃗ where m is the number of trials.
+                                                                   the results of these experiments to obtain the model’s false
+  Then we posit the null hypothesis H0 : µ∆ = 0, where µ∆ is       positive rate (from the A/A experiments), the false negative
+  the mean of M.⃗ We apply a permutation test for this hypoth-
+                                                                   rate (from the artificial A/B experiments), and the detectabil-
+  esis as follows. We generate a large number of permuted          ity [10] (from the A/A experiments). ServiceLab then selects
+  samples from M  ⃗ and calculate the mean for each. Then we
+                                                                   the model with the highest score, which is a linear combi-
+  derive the p-value from the proportion of permuted sam-          nation of the false positive rate, false negative rate, and de-
+  ple means that are as extreme as or more extreme than the        tectability, under the constraint that its false positive rate is
+  observed mean of M.  ⃗
+                                                                   below a threshold. ServiceLab runs this model selection al-
+• Confidence interval test. The above tests infer the distri-      gorithm periodically to adapt to changes in existing services
+  bution of the data from the experimental data. Since we can      and accommodate new services and metrics.
+  only run a limited number of trials within an experiment            In our production, 51% of the services have adopted the
+  and some tests may incur outliers, such inference may not        confidence-interval-none model, 21% have adopted the t-test-
+  be accurate. The confidence interval test builds the data        sqrt model, 21% have adopted the adaptive method, 5% have
+  distribution from historical data. Specifically, it leverages    adopted the t-test-none model, and 1% have adopted the
+
+
+
+552   18th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+permutation-test-none model. Not all services use the adaptive       5     ServiceLab Design
+method, either because they find a fixed model always works          This section presents the design of ServiceLab, utilizing the
+well or because they have not tried the recently introduced          architecture diagram shown in Figure 2 in our discussion.
+adaptive method.
+   The breakdown of the models chosen by the adaptive
+                                                                     5.1    Experiment Lifecycle
+method is as follows: confidence-interval-none (49%), t-             During an experiment’s lifecycle, it transitions through sev-
+test-none (19%), t-test-outlier-cap (10%), t-test-outlier-elim       eral phases: queuedbuildallocationrunninganalysis.
+(9%), permutation-test-none model (5%), t-test-sqrt (4%), and        An experiment begins when a user or an automation tool sub-
+permutation-test-sqrt (3%). Over a 90-day period, for services       mits a request via the Windtunnel API, which enqueues the
+using the adaptive method, more than 50% of them have                request into a DurableQ (durable queue) and creates an entry
+changed models at least once, and more than 10% of them              in the Windtunnel DB to represent the experiment, setting its
+have changed models at least four times. This indicates that         phase as queued. The phase transition of an experiment is
+the best model for a service can change as the service’s code        managed by a processor, and multiple processors can work
+and characteristics evolve.                                          independently to manage different experiments. When a pro-
+                                                                     cessor determines it can take on additional work, it polls the
+   Next, we discuss our journey to arrive at the current set of      DurableQ to claim a queued experiment and locks the corre-
+models. Initially, ServiceLab only supported single-trial exper-     sponding Windtunnel DB entry to prevent other processors
+iments and thus used the student t-test with outliers handled by     from performing duplicate work.
+winsorization. When working with services requiring multiple            After some input validation and preprocessing, the proces-
+trials, we found that the t-test did not work well. Outliers in      sor transitions the experiment to the build phase, where the
+both trials and requests within a trial affected the experiment      experiment’s executables are created. The processor does not
+results, showing up as either false positives or missed regres-      compile the executables directly but instead sends a request
+sions due to excluding outliers. Consequently, for multiple-         to a separate build service, which acts as a caching layer to
+trial experiments, we added the permutation-test-none and            prevent duplicate builds.
+permutation-test-sqrt models. The confidence-interval test              Once all executables are built, the experiment enters the al-
+was added to handle noisy metrics or ones that are not contin-       location phase. Each team is configured with a certain testing-
+uous like CPU or memory. We found that for these metrics,            machine quota that they are allowed to use. The processor
+looking at the historical data to find the regression threshold      tracks the already used portion of the quota and determines
+would work better than dealing with a t-distribution (as the         when to allocate machines for experiments, enforcing priority
+t-test and other variants do). Finally, motivated by the ob-         and fairness. An experiment may need to run multiple jobs,
+servation that different metrics follow different distribution       such as one for the A side of the A/B test and another for
+patterns and such patterns may change over time, we added            the B side. As all jobs of an experiment must be allocated
+the adaptive method to help users find the best model.               from the same datacenter region to minimize variance (§4.1),
+  Finally, we describe two optimizations that improve the            the processor decides from which region to allocate the jobs
+accuracy of the statistical methods.                                 based on the remaining quotas in different regions. Addition-
+                                                                     ally, the processor filters machines based on ServerType, CPU
+Test warm up time. Identifying and excluding initial warm-           architecture, and kernel version to minimize variance across
+up periods in service operations is crucial for isolating steady-    the selected machines (§4.1).
+state performance metrics. We employ an algorithm using                 In addition to allocating the system-under-test (SUT) jobs,
+exponential moving averages to determine the point at which          the processor also allocates a traffic-replay job and a test-
+a time series reaches approximate stationarity. Observations         harness job. The test-harness job drives the experiment and
+before this point are discarded. As the duration of the warm-        monitors the test’s status. Depending on the experiment’s
+up phase depends on the test environment, this determination         purpose, different test-harness jobs can be used. For example,
+is made on an individual trial basis, ensuring that only matured     to measure the maximum throughput that the SUT can sus-
+performance data undergoes further analysis.                         tain, the capacity test harness can gradually increase the test
+                                                                     throughput until the SUT violates its SLOs, such as response
+Periodic A/A experiments. ServiceLab conducts periodic               time, error rate, or CPU utilization exceeding a threshold.
+A/A tests, and aggregates the results into a user dashboard, en-        Once all the necessary jobs are allocated, the experiment
+abling users to monitor the false positive rate and detectability.   enters the running phase. If the experiment is testing a
+This dashboard aids users in modifying workload settings to          configuration change, the corresponding configuration ca-
+enhance the statistical signal of their experiment. For instance,    nary [13,15,53] is set up correctly on the test machines. Subse-
+users can adjust parameters such as increasing the number of         quently, the traffic-replay job loads the previously recorded re-
+trials, extending experiment duration, removing noisy metrics,       quests that will be replayed during the experiment. Finally, the
+or changing the aggregation method.                                  processor instructs the test harness to start the test. Through-
+
+
+
+USENIX Association                             18th USENIX Symposium on Operating Systems Design and Implementation              553
+                            API          Build Service
+                                                            ExperimentStore
+
+                                          Windtunnel
+                         DurableQ                                                      Test harness      SUT
+                                          Processor
+
+
+                                          Windtunnel
+                                             DB                                          Treadmill       SUT
+
+
+                                                                                      Experiment jobs
+                                                               Cluster
+                                                               Manager
+
+      Figure 2: ServiceLab architecture. Windtunnel is the orchestration engine and Treadmill replays traffic and runs tests.
+
+out the experiment, the test harness monitors the health checks          open-control loop to send requests at a fixed rate. We have im-
+of all jobs and fails the experiment if any job fails its health         plemented several modifications to Treadmill, extending it to
+check. Meanwhile, the SUT exports performance metrics to                 load recorded requests from a datastore and replay Thrift RPC
+monitoring databases during the experiment.                              requests. In support of A/B experiments, we further enhanced
+   After the test finishes, the processor deallocates all jobs and       Treadmill to ensure consistent pacing and request rates for
+transitions the experiment to the analysis phase. Aggregation            both sides. A single Treadmill instance loads an identical set
+and statistical analysis of performance metrics are performed            of requests to be dispatched to both SUTs, synchronizing the
+by a service called Experiment Store (ES). The results are               sending of requests to ensure simultaneous receipt on both
+written to the Windtunnel DB, which users can view from                  sides. For the capacity mode, a control loop in the test har-
+a UI. These results can also trigger certain actions, such as            ness monitors the SUT and instructs Treadmill to dynamically
+blocking a service from being released into production.                  adjust the request rate.
+                                                                            Additionally, services may have a warm-up period during
+5.2    Traffic Record-and-Replay                                         which performance measurements should not be taken until
+At Meta, all services use the Thrift [49] RPC protocol, which            the service reaches a steady-state behavior. ServiceLab can
+is leveraged by ServiceLab to record production traffic trans-           be configured to enable a warm-up phase, allowing a lower
+parently. The user specifies the Linux containers where RPC              request rate to be set during this phase to gradually increase
+traffic should be recorded. Upon receiving a request on these            the load on the service. The service exports a counter to
+containers, the Thrift server’s recording module flips a coin to         indicate whether it has reached warm-up. Treadmill waits
+decide whether to sample the request. To minimize the impact             for both sides to be warmed up before synchronizing and
+on RPC latency, the recorded data is written asynchronously.             sending requests once again for steady-state performance
+The user configures the request sampling rate, and by default,           measurement. For example, HHVM employs a JIT compiler,
+requests are sampled uniformly. For a service with a highly              and steady-state performance measurements should start after
+variable request rate, reservoir sampling [5, 57] ensures that           JIT compilation is sufficiently warmed up.
+sampled requests are evenly spread over time, with at most K                Finally, services with high variability in request process-
+samples during each T time interval. In practice, the median             ing time due to diverse request types are harder to handle.
+sampling rate is 0.03%, and above that, 22% of services set              FrontFaaS is one such example. We can reduce variability
+sampling rate to 1%.                                                     by testing only with request types relevant to a specific code
+   By default, ServiceLab assumes that RPC requests are                  change, as opposed to all request types.
+independentÐmeaning the execution of one request does
+not depend on the execution of the previous request. How-                5.3    Handling Service Dependencies
+ever, this assumption may not hold for some services. In these           Meta products are built out of tens of thousands of services
+cases, the service can record all requests, and then during              with intricate interdependencies, akin to those documented in
+replay, all recorded requests are replayed in order. For some            prior research [30, 38, 48]. For example, FrontFaaS invokes
+services, request dependencies are encoded at the RPC layer              hundreds of downstream services. Consequently, testing a ser-
+and can thus be recorded accurately and transparently.                   vice in isolation is challenging due to these interdependencies.
+   For sharded services, since sharding is done at the applica-          ServiceLab tackles this issue through various approaches.
+tion layer and is invisible to the RPC layer, ServiceLab relies             First, users can set up a group of interdependent services
+on the service owner to specify the set of Linux containers to           together in ServiceLab, creating a self-contained testing en-
+capture requests for all shards.                                         vironment. While theoretically possible, this approach is not
+   ServiceLab leverages the open-source load testing plat-               consistently implemented in practice due to various reasons.
+form Treadmill [61] to replay requests. Treadmill employs an             For instance, replicating the massive datasets accessed by
+
+
+
+554    18th USENIX Symposium on Operating Systems Design and Implementation                                       USENIX Association
+services, like the social graph for billions of users, is often     6.1    Testing FrontFaaS
+economically impractical.                                           As FrontFaaS is our largest programming platform and has
+   Second, ServiceLab allows a system under test (SUT) to           more code changes than other services, we report its statistics
+invoke certain services in the production environment, pro-         separately. ServiceLab has been running for FrontFaaS for
+vided there are no adverse side effects. In ServiceLab, most        over 5 years in production. It has a regression threshold as
+calls to downstream production services do not incur side ef-       low as 0.01%, and by default, it runs 25 trials in each experi-
+fects because they are read-only or idempotent. Moreover, the       ment. On average, developers made over 100,000 FrontFaaS
+testing load imposed on these downstream services is often          changes per month. ServiceLab ran at least one experiment
+negligible compared to their ample capacity to serve billions       on 23% of those changes during that period. Leaving out 77%
+of users. However, as these downstream services often exhibit       showcases the importance of ServiceLab’s DiffSuggester in
+performance variance across datacenter regions, meaningful          reducing the machine capacity needed for testing. For the
+comparisons can only be drawn from tests conducted in the           code changes tested by ServiceLab, ServiceLab signaled per-
+same region (§4.1).                                                 formance regressions on 0.3% (5,560) of those changes.
+   Third, for a SUT that potentially can cause side effects            ServiceLab assigns regression tickets to developers, and
+on downstream production services, ServiceLab requires the          we calculate ServiceLab’s accuracy based on the developers’
+service owner to modify the SUT’s behavior to prevent those         actions in these tickets. We classify a signaled regression as
+side effects. For example, the SUT may use a mock interface         a true positive if the developer fixed the issue or marked the
+of a database so that it writes data to a test database instead     issue as ªexpected,º perhaps due to a new product feature re-
+of the production database. Moreover, to prevent a SUT from         quiring more resources. We classify it as a false positive if the
+accidentally accessing a production service, the RPC layer can      developer identified it as such. If the developer did not provide
+be instructed to block all traffic to production services except    a clear answer, we classify the regression as unknown. Among
+those on an allowed list. Mocking or blocking traffic can result    all signaled regressions, 57% (3,173) are true positives, 15%
+in certain code paths not being executed, potentially causing       (823) are false positives, and 28% (1,564) are unknown. As-
+false negatives in testing results. However, § 6.1 shows that       suming the unknowns have the same false positive rate as
+the false negative rate of ServiceLab is acceptable.                others, the overall false positive rate is about 21%.
+   Fourth, the business and performance metrics logged by              Although the false positive rate of 21% may seem high
+the SUT are kept separately from those generated by its coun-       initially, it actually signifies a significant success of Service-
+terpart in production. This ensures that the analytics for these    Lab because FrontFaaS uses a very low regression threshold,
+metrics do not interfere with each other.                           0.01%. Out of all FrontFaaS diffs submitted by developers,
+   In summary, ServiceLab provides tools to assist service          only 0.014% experience a false positive flagged by Service-
+owners in managing service dependencies during test envi-           Lab, calculated as 23% × 0.3% × 21% = 0.014%. Assuming
+ronment setup but does not offer complete isolation out of the      a developer writes one diff per day, they will experience a
+box. As a result, some complex services (e.g., MySQL) are           false positive about once every 20 years! While promoting
+not tested in ServiceLab. They either use a specialized test        the adoption of ServiceLab, we learned that the per-developer
+environment or conduct canary tests directly in production          experience significantly affects whether developers ignore the
+by deploying new code to some instances of the production           regression tickets assigned by ServiceLab. If a developer fre-
+service and comparing those instances with the rest. Despite        quently receives false-positive tickets, they are likely to ignore
+its limitations, ServiceLab is successful as a general-purpose      them after repeated futile investigations. Conversely, if they
+testing platform, covering more than half of the total code         receive a false-positive ticket only once every 20 years, they
+changes by all services and surpassing the combined coverage        will likely always take ServiceLab regression tickets seriously
+of all other specialized testing platforms.                         and investigate them. The good developer experience even at
+                                                                    a very low regression threshold of 0.01% demonstrates the
+6   Production Experience                                           robustness of ServiceLab’s statistical methods.
+During its steady state, ServiceLab constantly leverages tens          Figure 3 shows the distribution of the level of regression of
+of thousands of machines to test hundreds of services and           those true positive cases. The median value (p50) is 0.14%,
+hundreds of ML models. We use production data to answer             p90 is 1.7%, and p99 is 38.7%. Summing them together, they
+the following questions:                                            account for 12284% of regression over five years. Since very
+                                                                    large regressions are often caused by experimental purposes,
+1. What are the statistics for different use cases (e.g., regres-
+                                                                    if we only sum those causing less than 1% regression, they
+   sion thresholds, number of trials, etc.)?
+                                                                    account for 545% of regression, which translates to over 2
+2. What are the false positive and false negative rates of          million machines (i.e., 545% × the number of machines used
+   ServiceLab?                                                      by FrontFaaS). This shows that ignoring small regressions
+                                                                    is not acceptable, as they will accumulate to a large number
+3. How much regression did actually ServiceLab prevent?
+                                                                    over time. That is why FrontFaaS uses a strict threshold.
+
+
+
+USENIX Association                            18th USENIX Symposium on Operating Systems Design and Implementation               555
+Figure 3: Cumulative distribution of regressions detected by        Figure 5: Thresholds and number of trials. The size of the
+ServiceLab for FrontFaaS.                                           circle represents the count of use cases with the same setting.
+
+                                                                    use cases, and their breakdown is shown below. Note that
+                                                                    ServiceLab also tests hundreds of distinct ML models, which
+                                                                    are counted as a single use case.
+                                                                    • 44% (N=211) of the use cases have experiments that auto-
+                                                                      matically run on code diffs.
+                                                                    • 15% (N=74) run automatically on code commits.
+                                                                    • 21% (N=100) run automatically on configuration changes.
+                                                                    • 22% (N=107) run as part of their release process.
+                                                                    The distribution of the number of trials in experiments is as
+   Figure 4: Number of experiments completed each day.              follows: p50=1, p90=10, p99=10, and p100=25. The distribu-
+                                                                    tion of the execution time of trials is as follows: p50= 2,820
+   To approximate the false negative rate, we rely on re-           seconds, p90= 4,200 seconds, p99=p100=259,200 seconds.
+ports from in-production monitoring of performance changes.         Among the 483 use cases, 413 have defined a relative thresh-
+FrontFaaS has a production monitoring system that exam-             old on some metric; 5 have defined an absolute threshold on
+ines the per-function CPU usage of functions and raises a           some metric; the remaining ones do not define any threshold.
+signal if it detects a performance regression. It then attempts     We focus on the 413 cases with a relative threshold in the
+to triage the performance regression to a code change. Out          following discussion.
+of all changes, 0.02% (2038) of changes were found to cause            Each use case may contain multiple metrics with different
+regressions but have been missed by ServiceLab, leading to          thresholds. Since the number of trials and trial duration are
+                                                     2038
+a false negative rate of 32%, calculated as 2038+5560×(1−21%)   .   usually determined by the strictest threshold, we define the
+However, this number should be viewed with caveats because          threshold of a use case as the smallest threshold among all
+1) there are potential performance regressions that cannot be       its metrics. 23% of the use cases have a threshold smaller
+root-caused to their original changes, which are not included       than 1%, while p50=5%, p90=10%, and p99=20%. This, once
+in this number, and 2) there is no guarantee that the production    again, emphasizes the importance of using small thresholds.
+monitoring system is fully accurate.                                   Figure 5 plots the threshold and the number of trials used
+   In summary, despite FrontFaaS’ low threshold of 0.01%,           by different use cases. A circle in this figure represents the
+ServiceLab achieves a reasonable false positive rate and false      count of use cases using a specific setting. This figure shows
+negative rate, and helps us prevent a significant amount of         that a large number of use cases use a relaxed threshold of 5%
+regressions, which could accumulate over years.                     or 10% with only one trial, but a small number of use cases
+                                                                    use a very small threshold with up to 25 trials. This small
+6.2    Testing Other Services                                       subset includes many of the largest services.
+While FrontFaaS is reported in its own category, in this sec-          Services often run preliminary experiments with a large
+tion, we report the aggregate statistics for all non-FrontFaaS      number of trials to determine how many trials are needed to
+services in one category. Figure 4 shows the number of Ser-         achieve a certain confidence interval in regression detection.
+viceLab experiments completed each day for non-FrontFaaS            Specifically, they run multiple trials of A/A tests, compute
+                                                                                                                          ′
+services. The majority of completed experiments are run au-         the difference between each pair of A/A test (i.e., A A−A ), and
+tomatically as part of code changes, configuration configs, or      then determine the confidence interval (i.e., 95% within two
+service releases. ServiceLab supports a total of 483 distinct       standard deviations assuming normal distribution). Figure 6
+
+
+
+556   18th USENIX Symposium on Operating Systems Design and Implementation                                   USENIX Association
+                                                                  additional functionality; however, the amount of increased
+                                                                  memory was not. ServiceLab detected the memory regression
+                                                                  before a release deployment. In this case, the developer who
+                                                                  included the additional ranking library knew that there would
+                                                                  be an added resource cost. However, ServiceLab helped the
+                                                                  developer and service owners understand the resource cost of
+                                                                  the regression before deployment. The developer reverted the
+                                                                  change and found optimizations to minimize the use of the
+                                                                  ranking library by excluding unused ranking configurations.
+                                                                  6.2.2   Example of False Positives
+                                                                  In another incident, a ranking service using ServiceLab occa-
+Figure 6: The number of trials required for detecting small
+                                                                  sionally experienced high rates of false positives due to a pro-
+regressions.
+                                                                  duction issue with a downstream dependency. A production
+                                                                  misconfiguration led to imbalanced load among the machines
+shows, for one service, how the confidence interval decreases     in the downstream service. During experiments, some of the
+with more trials. Users can then decide the number of trials      SUTs would send requests to these overloaded instances of
+according to their required confidence interval.                  the downstream service. The queuing resulting from those
+   We examine how often ServiceLab signals a regression on        overloaded downstream instances affected the performance
+code changes during the 54 day period shown in Figure 4.          measurement in ServiceLab, resulting in false positives. To
+During this time, 15,058 code changes were tested and Ser-        remediate this issue, the production routing configuration that
+viceLab signaled on 2,742 (18.5%) of those code changes           led to the imbalanced load was fixed. This remediated the
+with at least one metric crossing its configured threshold. For   load imbalance issue in production and also eliminated the
+non-FrontFaaS services, ServiceLab reports on a diverse set       false positives in ServiceLab.
+of metrics. Across these code changes, 2,714 different metrics
+were considered as significant. 80% of the signaled metrics       6.2.3   Examples of False Negatives
+had a threshold of less than 2%. Unlike the uniform Front-        False negatives are incidents where ServiceLab does not re-
+FaaS platform used by over ten thousand developers, for these     port a regression but a regression actually occurs. These cases
+413 diverse use cases, there are no uniform tools and hence       are often reported by service owners. In one incident with
+no clear marking about whether a reported regression is a true    XFinder (§3.5), a developer was implementing a new feature
+or false positive. In subsequent sections, we will present some   to read from an online classifier instead of an offline classifier.
+examples with these use cases to understand their impact.         The change introduced a new function call making use of the
+6.2.1   Example of True Positives                                 new classifier to better classify the type of ads to return. The
+                                                                  change resulted in an increase of 0.62% in the total capacity
+ServiceLab helps non-performance experts understand the           used by XFinder. ServiceLab failed to report a regression for
+performance implications of their code. For example, con-         this change since this regression only applied to a subset of
+sider one case where ServiceLab successfully detected and         request types, and those types were not represented in the set
+prevented a CPU performance regression in XFinder (§3.5)          of requests replayed in the experiment. Those request types
+before the change landed in production.                           were newly added after the request trace was captured.
+   In the change, the developer inadvertently copied a large
+data structure when introducing a new function. The Ser-          6.2.4   Summary
+viceLab experiment that ran for this change detected a sig-       In our experience, the top reason for false positives is that
+nificant CPU regression of around 20%. ServiceLab flagged         another event, such as another test or deployment either in the
+this change to both the developer and performance engineers       SUT or in the downstream services, is happening concurrently
+working on XFinder. The developer was working on a product        with a ServiceLab test, which will disrupt the result of the
+feature across multiple services, and was neither familiar with   ServiceLab test. The top reason for false negatives is that a
+the XFinder codebase nor C++. After ServiceLab flagged the        newly introduced feature is not tested since the requests for
+regression, the developer applied a fix by adding const when      replaying were recorded when this feature does not exist.
+passing the parameter to the function, eliminating the memory
+copy of the data structure.                                       6.3     False Positive in A/A Experiments
+   In another incident involving the Ranker service (§3.6), a     As described in § 4.2, periodic A/A experiments provide an
+change increased the service’s memory usage by 50%. The           empirical measurement of whether a metric would be con-
+change involved enabling a new ranking library that increased     sidered significant with the same experiment inputs. Periodic
+memory usage due to loading additional ranking configu-           A/A experiments run every two hours and test for statisti-
+rations. The increase in memory was expected due to the           cally significant differences without considering any signal-
+
+
+
+USENIX Association                          18th USENIX Symposium on Operating Systems Design and Implementation                557
+ing thresholds. Over a two-month period, we examined 6,783           in parallel. Second, the CloudLab study focuses on the num-
+metrics from A/A experiments where signaling was enabled.            ber of experiments needed to achieve a certain confidence
+Among these 6,783 metrics, the p50, p90, and p99 metric              interval, whereas ServiceLab addresses the problem more
+had a false positive rate of 0.6%, 40%, and 64%, respectively.       holistically, using an ensemble of statistical models, A/A tests,
+This signifies the inherent variance in the services and the         and artificial A/B tests. Finally, the CloudLab study only runs
+test environment. It also emphasizes the importance of our           microbenchmarks in a single-machine environment, whereas
+method of using results from A/A experiments to help select          ServiceLab must be robust enough to work in real-world sce-
+the best statistical model for each service (§4.2).                  narios with full services and complex interdependencies.
+
+6.4    Key Takeaways                                                 Performance Testing. Synthetic benchmark [14, 41, 46, 50,
+                                                                     55] and record-and-replay [1±3] are two primary methods
+We have learned several key lessons from our experience of           for performance evaluation. ServiceLab supports both but
+operating ServiceLab over seven years. Initially, the Service-       primarily uses record-and-replay due to its high fidelity in
+Lab team maintained a dedicated pool of identical physical           testing real applications.
+machines for testing to reduce performance variance. How-
+ever, as ServiceLab adoption increased, we had to switch to             Treadmill [61] and TailBench [32] overcome several com-
+using heterogeneous cloud machines. This change was driven           mon pitfalls of performance testing frameworks with synthetic
+by the high maintenance burden of a dedicated machine pool           traffic, allowing them to precisely measure at microsecond-
+and the lower cost of running some tests using the cloud’s           scale. Lancet [33] incorporates online statistical tests to ensure
+elastic capacity.                                                    the obtained measurements are statistically sound. Primorac
+   Testing a wide range of services is a key design goal for         et. al. leverage kernel-bypass networking and advanced NIC
+ServiceLab. To achieve this, unlike traditional systems that         features to further improve the precision of microsecond-scale
+aim for completely isolated and reproducible environments,           tail latency measurements [44].
+ServiceLab allows Systems Under Test to call external depen-            Performance data from Google’s gmail [7] shows that work-
+dent services that handle live production traffic. This approach     loads change constantly, both QPS and response size. Hence
+significantly broadens the scope of services that ServiceLab         we need to do real production traffic record and replay. Re-
+can test, accommodating those with complex interdependen-            cent studies including Kraken [56] and WSMeter [35] directly
+cies that are too intricate or costly to replicate fully in a test   utilize production traffic to carry out the performance tests,
+environment. Moreover, ServiceLab is extensible and allows           to address the limitation of synthetic benchmarking in how
+for developer customizations, recognizing that a one-size-fits-      accurately they can reproduce the complex production envi-
+all approach would fall short in supporting diverse services.        ronment. Similarly, deterministic record and replay are com-
+For example, while traffic record-and-replay simplifies test         monly leveraged to reduce the non-determinism to simplify
+setup, some services face strict time constraints for replay,        multiprocessor software development and testing, which can
+and others choose to use synthetic traffic.                          be done at multiple levels (e.g., virtual machine-level [20],
+                                                                     OS-level [8], and library-level [24]).
+7     Related Work
+Performance Variance. Performance variance is a well-                8   Conclusion
+known issue for performance experiments and reproducibility,         We have presented ServiceLab, which tests a large, diverse set
+especially when the performance of two versions to com-              of applications to catch small performance regressions. It se-
+pare is close. There are multiple lines of work in this direc-       lects similar but non-identical machines for testing and learns
+tion: 1) some works mitigate the problems by re-designing            the best statistical model for each service. During seven years
+systems [9, 16, 21, 25, 45, 51, 60], tuning configuration pa-        of production, ServiceLab has helped us prevent a significant
+rameters [37, 39, 59, 64], or changing hardware [40, 58, 63].        amount of regression, which could accumulate over time if
+2) Some works try to detect machines that are significantly          not detected promptly.
+slower than others [19, 23, 28, 29, 43], so as to exclude such
+outlier machines from performance experiments. We also               Acknowledgments
+run routine performance tests to filter those outlier machines.
+3) Some works propose statistical methods for performance            This paper presents over seven years of work by past and
+comparison [26, 31, 40].                                             current members of several teams at Meta, including Service-
+   The closest work is the study by Maricq et al. on perfor-         Lab, HHVM, Ads, Release Engineering, and Instagram. In
+mance variance in CloudLab [40]. ServiceLab differs from             particular, we would like to thank those who have contributed
+the CloudLab study in several ways. First, the CloudLab study        to ServiceLab and this paper: Matt Meyers, Elena Mironova,
+assumes repeated experiments are run on the same or identi-          Yun Jin, Harish Dattatraya Dixit, and Gautham Vunnam. We
+cal machines, whereas ServiceLab identifies heterogeneous            also thank all reviewers, especially our shepherd, Atul Adya,
+machines with comparable performance to run experiments              for their insightful comments.
+
+
+
+558    18th USENIX Symposium on Operating Systems Design and Implementation                                     USENIX Association
+References                                                          USENIX ATC’13, page 49±60, USA, 2013. USENIX
+ [1] Azure Public Dataset. https://github.com/Azure/                Association.
+     AzurePublicDataset.
+                                                               [12] Nicolas Brousse. The Issue of Monorepo and Polyrepo
+ [2] Google Cluster Workload Traces 2019. https://                  In Large Enterprises. In Companion Proceedings of the
+     research.google/resources/datasets/google-                     3rd International Conference on the Art, Science, and
+     cluster-workload-traces-2019/, 2019.                           Engineering of Programming, pages 1±4, 2019.
+
+ [3] Google Workload Traces 2022. https://research.            [13] Amazon CloudWatch - Creating a canary. https:
+     google/resources/datasets/google-workload-                     //docs.aws.amazon.com/AmazonCloudWatch/
+     traces-2022/, 2022.                                            latest/monitoring/CloudWatch_Synthetics_
+                                                                    Canaries_Create.html.
+ [4] Atul Adya, Daniel Myers, Jon Howell, Jeremy Elson,
+     Colin Meek, Vishesh Khemani, Stefan Fulger, Pan Gu,       [14] Brian F. Cooper, Adam Silberstein, Erwin Tam, Raghu
+     Lakshminath Bhuvanagiri, Jason Hunter, et al. Slicer:          Ramakrishnan, and Russell Sears. Benchmarking Cloud
+     Auto-sharding for Datacenter Applications. In 12th             Serving Systems with YCSB. In Proceedings of the
+     USENIX Symposium on Operating Systems Design and               1st ACM Symposium on Cloud Computing, SoCC ’10,
+     Implementation (OSDI), pages 739±753, 2016.                    pages 143±154, New York, NY, USA, 2010. ACM.
+
+ [5] Charu C Aggarwal. On Biased Reservoir Sampling in         [15] David Daly. Creating a Virtuous Cycle in Performance
+     the presence of Stream Evolution. In Proceedings of the        Testing at MongoDB. In Proceedings of the ACM/SPEC
+     32nd international conference on Very large data bases,        International Conference on Performance Engineering,
+     pages 607±618, 2006.                                           pages 33±41, 2021.
+ [6] Marti J Anderson and John Robinson. Permutation tests     [16] Giuseppe DeCandia, Deniz Hastorun, Madan Jampani,
+     for linear models. Australian & New Zealand Journal            Gunavardhan Kakulapati, Avinash Lakshman, Alex
+     of Statistics, 43(1):75±88, 2001.                              Pilchin, Swaminathan Sivasubramanian, Peter Vosshall,
+ [7] Dan Ardelean, Amer Diwan, and Chandra Erdman. Per-             and Werner Vogels. Dynamo: Amazon’s Highly Avail-
+     formance Analysis of Cloud Applications. In 15th               able Key-value Store. In SOSP, 2007.
+     USENIX Symposium on Networked Systems Design and
+                                                               [17] Wilfrid J Dixon and Frank J Massey Jr. Introduction to
+     Implementation (NSDI 18), pages 405±417, 2018.
+                                                                    Statistical Analysis. 1957.
+ [8] Tom Bergan, Nicholas Hunt, Luis Ceze, and Steven D
+                                                               [18] Wilfrid J Dixon and Kareb K Yuen. Trimming and
+     Gribble. Deterministic Process Groups in dOS. In 9th
+                                                                    winsorization: A review. Statistische Hefte, 15(2-3):157±
+     USENIX Symposium on Operating Systems Design and
+                                                                    170, 1974.
+     Implementation (OSDI 10), 2010.
+
+ [9] Daniel S. Berger, Benjamin Berg, Timothy Zhu, Sid-        [19] Thanh Do, Mingzhe Hao, Tanakorn Leesatapornwongsa,
+     dhartha Sen, and Mor Harchol-Balter. RobinHood: Tail           Tiratat Patana-anake, and Haryadi S. Gunawi. Limplock:
+     Latency Aware Caching ± Dynamic Reallocation from              Understanding the Impact of Limpware on Scale-out
+     Cache-Rich to Cache-Poor. In 13th USENIX Sympo-                Cloud Systems. In Proceedings of the 4th Annual Sym-
+     sium on Operating Systems Design and Implementa-               posium on Cloud Computing, SOCC ’13, New York, NY,
+     tion (OSDI 18), pages 195±212, Carlsbad, CA, 2018.             USA, 2013. Association for Computing Machinery.
+     USENIX Association.
+                                                               [20] George W Dunlap, Samuel T King, Sukru Cinar, Mur-
+[10] Howard S Bloom. Minimum Detectable Effects: A Sim-             taza A Basrai, and Peter M Chen. ReVirt: Enabling
+     ple Way to Report the Statistical Power of Experimental        Intrusion Analysis Through Virtual-Machine Logging
+     Designs. Evaluation review, 19(5):547±556, 1995.               and Replay. ACM SIGOPS Operating Systems Review,
+                                                                    36(SI):211±224, 2002.
+[11] Nathan Bronson, Zach Amsden, George Cabrera, Prasad
+     Chakka, Peter Dimov, Hui Ding, Jack Ferris, Anthony       [21] Joshua Fried, Zhenyuan Ruan, Amy Ousterhout, and
+     Giardullo, Sachin Kulkarni, Harry Li, Mark Marchukov,          Adam Belay. Caladan: Mitigating Interference at Mi-
+     Dmitri Petrov, Lovro Puzar, Yee Jiun Song, and Venkat          crosecond Timescales. In 14th USENIX Symposium on
+     Venkataramani. TAO: Facebook’s Distributed Data                Operating Systems Design and Implementation (OSDI
+     Store for the Social Graph. In Proceedings of the 2013         20), pages 281±297. USENIX Association, November
+     USENIX Conference on Annual Technical Conference,              2020.
+
+
+
+USENIX Association                        18th USENIX Symposium on Operating Systems Design and Implementation          559
+[22] Boris Grubic, Yang Wang, Tyler Petrochko, Ran Yaniv,      [30] Darby Huye, Yuri Shkuro, and Raja R. Sambasivan. Lift-
+     Brad Jones, David Callies, Matt Clarke-Lauer, Dan              ing the veil on Meta’s microservice architecture: Anal-
+     Kelley, Soteris Demetriou, Kenny Yu, and Chunqiang             yses of topology and request workflows. In Proceed-
+     Tang. Conveyor: One-Tool-Fits-All Continuous Soft-             ings of the 2023 USENIX Annual Technical Conference.
+     ware Deployment at Meta. In Roxana Geambasu and                USENIX, 2023.
+     Ed Nightingale, editors, 17th USENIX Symposium on
+     Operating Systems Design and Implementation, OSDI         [31] Raj Jain. The Art Of Computer Systems Performance
+     2023, Boston, MA, USA, July 10-12, 2023, pages 325±            Analysis: Techniques For Experimental Measurement,
+     342. USENIX Association, 2023.                                 Simulation, And Modeling. john wiley & sons, 2008.
+
+[23] Haryadi S. Gunawi, Riza O. Suminto, Russell Sears,        [32] Harshad Kasture and Daniel Sanchez. TailBench:
+     Casey Golliher, Swaminathan Sundararaman, Xing Lin,            A Benchmark Suite and Evaluation Methodology for
+     Tim Emami, Weiguang Sheng, Nematollah Bidokhti,                Latency-Critical Applications. In 2016 IEEE Inter-
+     Caitie McCaffrey, Gary Grider, Parks M. Fields, Kevin          national Symposium on Workload Characterization
+     Harms, Robert B. Ross, Andree Jacobson, Robert Ricci,          (IISWC), pages 1±10, 2016.
+     Kirk Webb, Peter Alvaro, H. Birali Runesha, Mingzhe
+                                                               [33] Marios Kogias, Stephen Mallon, and Edouard Bugnion.
+     Hao, and Huaicheng Li. Fail-Slow at Scale: Evidence
+                                                                    Lancet: A self-correcting Latency Measuring Tool. In
+     of Hardware Performance Faults in Large Production
+                                                                    2019 USENIX Annual Technical Conference (USENIX
+     Systems. In 16th USENIX Conference on File and Stor-
+                                                                    ATC 19), pages 881±896, Renton, WA, July 2019.
+     age Technologies (FAST 18), pages 1±14, Oakland, CA,
+                                                                    USENIX Association.
+     February 2018. USENIX Association.
+                                                               [34] Matt Koop. Bare metal performance with the AWS
+[24] Zhenyu Guo, Xi Wang, Jian Tang, Xuezheng Liu, Zhilei           Nitro System. https://aws.amazon.com/blogs/
+     Xu, Ming Wu, M Frans Kaashoek, and Zheng Zhang.                hpc/bare-metal-performance-with-the-aws-
+     R2: An Application-Level Kernel for Record and Replay.         nitro-system/.
+     In OSDI, volume 8, pages 193±208, 2008.
+                                                               [35] Jaewon Lee, Changkyu Kim, Kun Lin, Liqun Cheng,
+[25] Mingzhe Hao, Huaicheng Li, Michael Hao Tong,                   Rama Govindaraju, and Jangwoo Kim. WSMeter: A
+     Chrisma Pakha, Riza O. Suminto, Cesar A. Stuardo,              Performance Evaluation Methodology for Google’s Pro-
+     Andrew A. Chien, and Haryadi S. Gunawi. MittOS:                duction Warehouse-Scale Computers. SIGPLAN Not.,
+     Supporting Millisecond Tail Tolerance with Fast Reject-        53(2):549±563, mar 2018.
+     ing SLO-Aware OS Interface. In Proceedings of the 26th
+     Symposium on Operating Systems Principles, SOSP ’17,      [36] Sangmin Lee, Zhenhua Guo, Omer Sunercan, Jun Ying,
+     page 168±183, New York, NY, USA, 2017. Association             Thawan Kooburat, Suryadeep Biswal, Jun Chen, Kun
+     for Computing Machinery.                                       Huang, Yatpang Cheung, Yiding Zhou, Kaushik Veer-
+                                                                    araghavan, Biren Damani, Pol Mauri Ruiz, Vikas Mehta,
+[26] Mor Harchol-Balter. Performance Modeling and De-               and Chunqiang Tang. Shard Manager: A Generic Shard
+     sign of Computer Systems: Queueing Theory in Action.           Management Framework for Geo-Distributed Applica-
+     Cambridge University Press, USA, 1st edition, 2013.            tions. In Proceedings of the ACM SIGOPS 28th Sympo-
+                                                                    sium on Operating Systems Principles, SOSP ’21, page
+[27] HHVM. https://hhvm.com.                                        553±569, 2021.
+
+[28] Peng Huang, Chuanxiong Guo, Jacob R. Lorch, Lidong        [37] Jialin Li, Naveen Kr. Sharma, Dan R. K. Ports, and
+     Zhou, and Yingnong Dang. Capturing and Enhancing               Steven D. Gribble. Tales of the Tail: Hardware, OS,
+     In Situ System Observability for Failure Detection. In         and Application-level Sources of Tail Latency. In Pro-
+     13th USENIX Symposium on Operating Systems Design              ceedings of the ACM Symposium on Cloud Computing,
+     and Implementation, OSDI ’18, pages 1±16, Carlsbad,            SOCC ’14, pages 9:1±9:14, New York, NY, USA, 2014.
+     CA, October 2018. USENIX Association.                          ACM.
+
+[29] Peng Huang, Chuanxiong Guo, Lidong Zhou, Jacob R.         [38] Shutian Luo, Huanle Xu, Chengzhi Lu, Kejiang Ye,
+     Lorch, Yingnong Dang, Murali Chintalapati, and Ran-            Guoyao Xu, Liping Zhang, Yu Ding, Jian He, and
+     dolph Yao. Gray Failure: The Achilles’ Heel of Cloud-          Chengzhong Xu. Characterizing Microservice Depen-
+     Scale Systems. In Proceedings of the 16th Workshop             dency and Performance: Alibaba Trace Analysis. In
+     on Hot Topics in Operating Systems, HotOS ’17, pages           Proceedings of the ACM Symposium on Cloud Comput-
+     150±155, New York, NY, USA, May 2017. ACM.                     ing, pages 412±426, 2021.
+
+
+
+560   18th USENIX Symposium on Operating Systems Design and Implementation                            USENIX Association
+[39] Ashraf Mahgoub, Paul Wood, Alexander Medoff, Sub-          [46] Vijay Janapa Reddi, Christine Cheng, David Kanter, Pe-
+     rata Mitra, Folker Meyer, Somali Chaterji, and Saurabh          ter Mattson, Guenther Schmuelling, Carole-Jean Wu,
+     Bagchi. SOPHIA: Online Reconfiguration of Clustered             Brian Anderson, Maximilien Breughe, Mark Charlebois,
+     NoSQL Databases for Time-Varying Workloads. In                  William Chou, Ramesh Chukka, Cody Coleman, Sam
+     2019 USENIX Annual Technical Conference (USENIX                 Davis, Pan Deng, Greg Diamos, Jared Duke, Dave Fick,
+     ATC 19), pages 223±240, Renton, WA, July 2019.                  J. Scott Gardner, Itay Hubara, Sachin Idgunji, Thomas B.
+     USENIX Association.                                             Jablin, Jeff Jiao, Tom St. John, Pankaj Kanwar, David
+                                                                     Lee, Jeffery Liao, Anton Lokhmotov, Francisco Massa,
+[40] Aleksander Maricq, Dmitry Duplyakin, Ivo Jimenez,               Peng Meng, Paulius Micikevicius, Colin Osborne, Gen-
+     Carlos Maltzahn, Ryan Stutsman, and Robert Ricci.               nady Pekhimenko, Arun Tejusve Raghunath Rajan, Dilip
+     Taming Performance Variability. In 13th USENIX Sym-             Sequeira, Ashish Sirasao, Fei Sun, Hanlin Tang, Michael
+     posium on Operating Systems Design and Implementa-              Thomson, Frank Wei, Ephrem Wu, Lingjie Xu, Koichi
+     tion (OSDI 18), pages 409±425, Carlsbad, CA, October            Yamada, Bing Yu, George Yuan, Aaron Zhong, Peizhao
+     2018. USENIX Association.                                       Zhang, and Yuchen Zhou. MLPerf Inference Bench-
+                                                                     mark. In Proceedings of the ACM/IEEE 47th Annual In-
+[41] Peter Mattson, Christine Cheng, Cody Coleman, Greg              ternational Symposium on Computer Architecture, ISCA
+     Diamos, Paulius Micikevicius, David Patterson, Hanlin           ’20, page 446±459. IEEE Press, 2020.
+     Tang, Gu-Yeon Wei, Peter Bailis, Victor Bittorf, David
+     Brooks, Dehao Chen, Debojyoti Dutta, Udit Gupta, Kim       [47] Jörg Schad, Jens Dittrich, and Jorge-Arnulfo Quiané-
+     Hazelwood, Andrew Hock, Xinyuan Huang, Atsushi                  Ruiz. Runtime Measurements in the Cloud: Observing,
+     Ike, Bill Jia, Daniel Kang, David Kanter, Naveen Ku-            Analyzing, and Reducing Variance. Proceedings of the
+     mar, Jeffery Liao, Guokai Ma, Deepak Narayanan, Tayo            VLDB Endowment, 3(1-2):460±471, 2010.
+     Oguntebi, Gennady Pekhimenko, Lillian Pentecost, Vi-
+                                                                [48] Korakit Seemakhupt, Brent E Stephens, Samira Khan,
+     jay Janapa Reddi, Taylor Robie, Tom St. John, Tsug-
+                                                                     Sihang Liu, Hassan Wassel, Soheil Hassas Yeganeh,
+     uchika Tabaru, Carole-Jean Wu, Lingjie Xu, Masafumi
+                                                                     Alex C Snoeren, Arvind Krishnamurthy, David E Culler,
+     Yamazaki, Cliff Young, and Matei Zaharia. MLPerf
+                                                                     and Henry M Levy. A Cloud-Scale Characterization of
+     Training Benchmark, 2020.
+                                                                     Remote Procedure Calls. In Proceedings of the 29th
+[42] Andrew Newell, Dimitrios Skarlatos, Jingyuan Fan, Pa-           Symposium on Operating Systems Principles, pages 498±
+     van Kumar, Maxim Khutornenko, Mayank Pundir, Yirui              514, 2023.
+     Zhang, Mingjun Zhang, Yuanlai Liu, Linh Le, Bren-          [49] Mark Slee, Aditya Agarwal, and Marc Kwiatkowski.
+     don Daugherty, Apurva Samudra, Prashasti Baid, James            Thrift: Scalable Cross-Language Services Implementa-
+     Kneeland, Igor Kabiljo, Dmitry Shchukin, Andre Ro-              tion. Facebook white paper, 5(8):127, 2007.
+     drigues, Scott Michelson, Ben Christensen, Kaushik
+     Veeraraghavan, and Chunqiang Tang. RAS: Contin-            [50] Standard Performance        Evaluation    Corporation.
+     uously Optimized Region-Wide Datacenter Resource                https://www.spec.org/.
+     Allocation. In Proceedings of the 28th ACM Symposium
+     on Operating Systems Principles, 2021.                     [51] Akshitha Sriraman and Thomas F. Wenisch. uTune:
+                                                                     Auto-Tuned Threading for OLDI Microservices. In 13th
+[43] Biswaranjan Panda, Deepthi Srinivasan, Huan Ke, Karan           USENIX Symposium on Operating Systems Design and
+     Gupta, Vinayak Khot, and Haryadi S. Gunawi. IASO:               Implementation (OSDI 18), pages 177±194, Carlsbad,
+     A Fail-Slow Detection and Mitigation Framework for              CA, 2018. USENIX Association.
+     Distributed Storage Services. In 2019 USENIX Annual
+                                                                [52] Lars St and Svante Wold. Analysis of variance
+     Technical Conference (USENIX ATC 19), pages 47±62,
+                                                                     (ANOVA). Chemometrics and intelligent laboratory
+     Renton, WA, July 2019. USENIX Association.
+                                                                     systems, 6(4):259±272, 1989.
+[44] Mia Primorac, Edouard Bugnion, and Katerina Argyraki.      [53] Chunqiang Tang, Thawan Kooburat, Pradeep Venkat-
+     How to Measure the Killer Microsecond. SIGCOMM                  achalam, Akshay Chander, Zhe Wen, Aravind
+     Comput. Commun. Rev., 47(5):61±66, oct 2017.                    Narayanan, Patrick Dowell, and Robert Karl. Holistic
+                                                                     Configuration Management at Facebook. In Proceed-
+[45] Henry Qin, Qian Li, Jacqueline Speiser, Peter Kraft, and        ings of the 25th Symposium on Operating Systems
+     John Ousterhout. Arachne: Core-Aware Thread Man-                Principles, pages 328±343, 2015.
+     agement. In 13th USENIX Symposium on Operating
+     Systems Design and Implementation (OSDI 18), pages         [54] Chunqiang Tang, Kenny Yu, Kaushik Veeraraghavan,
+     145±160, Carlsbad, CA, 2018. USENIX Association.                Jonathan Kaldor, Scott Michelson, Thawan Kooburat,
+
+
+
+USENIX Association                         18th USENIX Symposium on Operating Systems Design and Implementation         561
+      Aravind Anbudurai, Matthew Clark, Kabir Gogia, Long      [63] Fang Zhou, Yifan Gan, Sixiang Ma, and Yang Wang.
+      Cheng, Ben Christensen, Alex Gartrell, Maxim Khutor-          wPerf: Generic Off-CPU Analysis to Identify Bottle-
+      nenko, Sachin Kulkarni, Marcin Pawlowski, Tuomas              neck Waiting Events. In 13th USENIX Symposium on
+      Pelkonen, Andre Rodrigues, Rounak Tibrewal, Vaish-            Operating Systems Design and Implementation (OSDI
+      navi Venkatesan, and Peter Zhang. Twine: A Unified            18), pages 527±543, Carlsbad, CA, 2018. USENIX As-
+      Cluster Management System for Shared Infrastructure.          sociation.
+      In 14th USENIX Symposium on Operating Systems
+      Design and Implementation (OSDI), pages 787±803.         [64] Yuqing Zhu, Jianxun Liu, Mengying Guo, Yungang
+      USENIX Association, 2020.                                     Bao, Wenlong Ma, Zhuoyue Liu, Kunpeng Song, and
+                                                                    Yingchun Yang. BestConfig: Tapping the Performance
+[55] Transaction Processing Performance Council. The TPC            Potential of Systems via Automatic Configuration Tun-
+     home page. http://www.tpc.org.                                 ing. In Proceedings of the 2017 Symposium on Cloud
+                                                                    Computing, SoCC ’17, page 338±350, New York, NY,
+[56] Kaushik Veeraraghavan, Justin Meza, David Chou,                USA, 2017. Association for Computing Machinery.
+     Wonho Kim, Sonia Margulis, Scott Michelson, Ra-
+     jesh Nishtala, Daniel Obenshain, Dmitri Perelman, and
+     Yee Jiun Song. Kraken: Leveraging Live Traffic Tests to
+     Identify and Resolve Resource Utilization Bottlenecks
+     in Large Scale Web Services. In 12th USENIX Sympo-
+     sium on Operating Systems Design and Implementation
+     (OSDI 16), pages 635±651, 2016.
+
+[57] Jeffrey S. Vitter. Random Sampling with a Reservoir.
+     ACM Trans. Math. Softw., 11(1):37±57, mar 1985.
+
+[58] Guosai Wang, Lifei Zhang, and Wei Xu. What Can
+     We Learn from Four Years of Data Center Hardware
+     Failures? In 2017 47th Annual IEEE/IFIP Interna-
+     tional Conference on Dependable Systems and Networks
+     (DSN), pages 25±36. IEEE, 2017.
+
+[59] Shu Wang, Chi Li, Henry Hoffmann, Shan Lu, William
+     Sentosa, and Achmad Imam Kistijantoro. Understand-
+     ing and Auto-Adjusting Performance-Sensitive Config-
+     urations. SIGPLAN Not., 53(2):154±168, March 2018.
+
+[60] Shiqin Yan, Huaicheng Li, Mingzhe Hao, Michael Hao
+     Tong, Swaminathan Sundararaman, Andrew A. Chien,
+     and Haryadi S. Gunawi. Tiny-Tail Flash: Near-Perfect
+     Elimination of Garbage Collection Tail Latencies in
+     NAND SSDs. In 15th USENIX Conference on File and
+     Storage Technologies (FAST 17), pages 15±28, Santa
+     Clara, CA, February 2017. USENIX Association.
+
+[61] Yunqi Zhang, David Meisner, Jason Mars, and Lingjia
+     Tang. Treadmill: Attributing the Source of Tail Latency
+     through Precise Load Testing and Statistical Inference.
+     In Proceedings of the 43rd International Symposium on
+     Computer Architecture, ISCA ’16, page 456±468. IEEE
+     Press, 2016.
+
+[62] Wei Zheng, Ricardo Bianchini, G John Janakiraman,
+     Jose Renato Santos, and Yoshio Turner. JustRunIt:
+     Experiment-Based Management of Virtualized Data
+     Centers. In Proc. USENIX Annual technical conference,
+     volume 96, 2009.
+
+
+
+562   18th USENIX Symposium on Operating Systems Design and Implementation                          USENIX Association
+

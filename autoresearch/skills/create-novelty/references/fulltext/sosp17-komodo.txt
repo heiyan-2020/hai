@@ -1,0 +1,1153 @@
+                 Komodo: Using verification to disentangle
+                  secure-enclave hardware from software
+   Andrew Ferraiuolo Andrew Baumann                                                  Chris Hawblitzel                  Bryan Parno
+        Cornell University                     Microsoft Research                        Microsoft Research        Carnegie Mellon University
+ABSTRACT                                                                             1     INTRODUCTION
+Intel SGX promises powerful security: an arbitrary number                            Software guard extensions (SGX) [43] is a set of new instruc-
+of user-mode enclaves protected against physical attacks and                         tions in recent Intel CPUs for strong isolation of software
+privileged software adversaries. However, to achieve this,                           enclaves. Compared to prior mainstream trusted comput-
+Intel extended the x86 architecture with an isolation mech-                          ing hardware [2, 83], SGX includes strong physical security
+anism approaching the complexity of an OS microkernel,                               (memory encryption) and supports multiple enclaves: any
+implemented by an inscrutable mix of silicon and microcode.                          number of enclaves may run concurrently without trust-
+While hardware-based security can offer performance and                              ing a kernel or hypervisor. Nevertheless, SGX supports a
+features that are difficult or impossible to achieve in pure                         familiar user-mode execution environment for enclave code,
+software, hardware-only solutions are difficult to update,                           and remains compatible with existing OSes and hypervi-
+either to patch security flaws or introduce new features.                            sors. In the short time since the SGX specification was pub-
+   Komodo illustrates an alternative approach to attested,                           lished, a wide range of applications have been devised [e.g.,
+on-demand, user-mode, concurrent isolated execution. We                              5, 8, 9, 14, 21, 42, 65, 68, 75], and competing vendors are
+decouple the core hardware mechanisms such as memory                                 developing similar features [48].
+encryption, address-space isolation and attestation from the                            However, like most new hardware, SGX has been slow to
+management thereof, which Komodo delegates to a priv-                                deploy and evolve. SGX version 2, which enables dynamic
+ileged software monitor that in turn implements enclaves.                            memory management features essential to many enclave
+The monitor’s correctness is ensured by a machine-checkable                          applications [5, 8, 42], was specified in October 2014 [43],
+proof of both functional correctness and high-level security                         but 3 years later there is still no announcement of CPUs
+properties of enclave integrity and confidentiality. We show                         that will implement it. The slow pace of hardware devel-
+that the approach is practical and performant with a concrete                        opment is not new, but SGX is almost unique among CPU
+implementation of a prototype in verified assembly code on                           features in that there is no alternative—other architecture
+ARM TrustZone. Our ultimate goal is to achieve security                              extensions boost performance, but it is usually possible to
+equivalent to or better than SGX while enabling deployment                           achieve equivalent functionality using legacy instructions.
+of new enclave features independently of CPU upgrades.                               Moreover, as we detail in §2, the security of SGX rests on
+   The Komodo specification, prototype implementation, and                           an opaque implementation in microcode and silicon [18],
+proofs are available at https://github.com/Microsoft/Komodo.                         and already has known flaws, including security vulnerabil-
+                                                                                     ities [61] and “controlled-channel” attacks that exploit the
+ACM Reference Format:
+                                                                                     OS’s ability to induce and observe enclave page faults to leak
+Andrew Ferraiuolo, Andrew Baumann, Chris Hawblitzel, and Bryan                       enclave data [78, 88].
+Parno. 2017. Komodo: Using verification to disentangle secure-                          Given the slowing pace of silicon scaling [22, 79], it is
+enclave hardware from software. In Proceedings of SOSP ’17, Shang-                   dangerous to tie critical security features like enclaves to
+hai, China, October 28, 2017, 19 pages.                                              a hardware implementation. Each incremental change, for
+https://doi.org/10.1145/3132747.3132782                                              example to correct security flaws like controlled channels
+                                                                                     or even to add features like dynamic allocation, must wait
+                                                                                     for the deployment of new CPUs, and hence will take many
+                                                                                     years. Software is inherently more malleable than hardware,
+SOSP ’17, October 28, 2017, Shanghai, China                                          and an effective split between the two would allow for new
+© 2017 Copyright held by the owner/author(s). Publication rights licensed            features to be developed and flaws to be fixed independently
+to Association for Computing Machinery.                                              of new hardware. Hardware vendors could simplify the com-
+This is the author’s version of the work. It is posted here for your personal        plexity of their CPUs [7], reducing the validation effort and
+use. Not for redistribution. The definitive Version of Record was published          risk of bugs, and focus on improving the capacity and per-
+in Proceedings of SOSP ’17, October 28, 2017, https://doi.org/10.1145/3132747.
+3132782.
+                                                                                     formance of hardware features such as memory encryption.
+
+                                                                                 1
+SOSP ’17, October 28, 2017, Shanghai, China                                                                       A. Ferraiuolo et al.
+
+   In this paper, we aim to disentangle the management of              2   BACKGROUND AND MOTIVATION
+enclaves from underlying hardware mechanisms like protec-              Prior research efforts have focused on using hardware mech-
+tion, attestation, and memory encryption. Our core obser-              anisms to protect critical software, even if privileged soft-
+vation is that the security properties of SGX do not depend            ware (such as the OS or hypervisor) is malicious or compro-
+on its implementation entirely as a CPU feature. Similar iso-          mised [15, 16, 19, 26, 50, 57, 67, 82]. SGX is the first commer-
+lation mechanisms have existed since the first multi-user              cial attempt at such protection, and its design is partly driven
+systems; what distinguishes SGX is memory encryption, in-              by pragmatic implementation constraints, such as compati-
+dependence from a large untrusted OS, and the folklore in-             bility with existing OS resource-management mechanisms,
+tuition that hardware is more secure than software.                    and avoiding changes to the processor’s fast paths [18]. In
+   Komodo draws on ideas from SGX, but it replaces folk-               this section, we provide a high-level overview of the SGX
+lore with formal verification. Like SGX, it relies on hardware         design to the extent that it informs our own.
+support for memory encryption and address-space isolation.                The SGX implementation consists of three components:
+However, instead of enclave-manipulation instructions, Ko-             (i) encryption and integrity protection for a static region
+modo is implemented as a software reference monitor in                 of physical memory implemented by an encryption engine
+verified assembly code. In fact, the design of Komodo mir-             within the memory controller, (ii) a set of instructions that
+rors an internal separation in SGX between core hardware               allow the creation, manipulation and execution of enclaves,
+and the instruction set. Since the monitor’s only role is to           and (iii) changes to the processor’s TLB miss and exception
+protect enclaves, it is substantially simpler (and thus easier         handling procedures that enforce enclave protections on
+to evolve) than a full verified kernel [35, 49, 89]. It can also       access to the encrypted memory region.
+be readily updated. For example, after developing an initial              The basic approach taken by SGX is to act as a reference
+version of Komodo modelled after SGXv1, we added dynamic               monitor for actions taken by the untrusted OS and/or hy-
+memory management similar to SGXv2. We implemented                     pervisor (we refer to both as the “OS”). Although it has no
+and verified this update in approximately 6 person-months.             direct access to encrypted pages, the OS allocates and maps
+   We describe Komodo in detail in §4. In addition to formal-          them to enclaves, and although it cannot directly manipulate
+ising its specification in §5, we prove in §6 that it protects         an enclave’s register state, the OS chooses when, and on
+the confidentiality and integrity of enclaves from both other          which CPUs, to execute enclave threads. OS management of
+enclaves and the untrusted OS. To our knowledge, no other              enclave pages is performed indirectly via SGX instructions
+secure-enclave implementations provide such formal guaran-             that manipulate the enclave page cache map (EPCM), a data
+tees. This proof holds for any correct implementation of the           structure maintained in encrypted memory and inaccessible
+specification, including the ARM TrustZone-based prototype             to software. The EPCM stores metadata for every encrypted
+we describe in §7 and evaluate in §8.                                  page, including its allocation state, type, owning enclave,
+   Komodo does not support multi-processor execution—                  permissions, and virtual address. Effectively a reverse map
+while the OS may run on multiple cores, the monitor and                of encrypted pages, the EPCM is also consulted on a TLB
+enclaves are restricted to a single core. Verification of low-         miss to enforce enclave protections on memory—every page
+level concurrent code remains challenging, recent progress             table mapping must be consistent with the EPCM.
+notwithstanding [35], to which ARM’s weak memory con-                     Since they update a complex data structure, SGX instruc-
+sistency [54] adds complexity. We leave this as future work.           tions are complex. For example, besides basic argument va-
+   The contributions of our work include:                              lidity, the EADD instruction must check that a page being
+                                                                       added to an enclave is free and the enclave is in the correct
+    • the identification of hardware requirements (§3) and a
+                                                                       state, before updating both the new page’s EPCM entry and
+      design for implementing enclaves in software (§4);
+                                                                       the enclave control structure. In doing this, it must guard
+    • a formal model of a substantial subset of ARMv7, in-
+                                                                       against concurrent allocations of the page or modifications
+      cluding user and privileged modes, TrustZone, page
+                                                                       of the enclave. Other SGX instructions have even greater
+      tables, and exceptions (§5.1);
+                                                                       complexity—the process for validating a TLB shootdown be-
+    • a high-level formal functional specification of Komodo
+                                                                       fore recycling EPC pages involves a series of epoch counters
+      (§5.2), and a proof that it guarantees the confidential-
+                                                                       maintained in enclave control structures. These instructions
+      ity and integrity of enclave programs, formalised as
+                                                                       are also not generally performance critical; indeed, based on
+      noninterference (§6);
+                                                                       Intel’s patents [46, 60], Costan and Devadas [18, §2.14] claim
+    • a verified prototype (§7) and evaluation (§8) showing
+                                                                       they are implemented entirely in microcode.
+      performance competitive with SGX;
+                                                                          Regardless of how the instructions are implemented,
+    • evidence for the hypothesis that verified software can
+                                                                       SGX’s security rests on their correctness. Intel has published
+      evolve faster than hardware (§7.3).
+                                                                   2
+Komodo                                                                                SOSP ’17, October 28, 2017, Shanghai, China
+
+details for the formal verification of a high-level SGX model              As with SGX, general side-channel attacks are out of scope.
+using an SMT solver [31, 44], and has verified the linearisabil-        Hardware isolation technologies such as cache partition-
+ity of a (different) model of concurrent SGX operations [52].           ing [19, 63] are required to defeat these in a practical manner
+However, there does not appear to be any formal connec-                 for general-purpose code, and we anticipate that a future
+tion between these models and the SGX implementation, in                version of Komodo could enable them. Komodo is immune to
+which at least one security vulnerability has already been              controlled-channel attacks [88]; as our confidentiality proof
+patched [61]. We can expect more bugs to be found, as they              (§6) ensures, the OS learns only the type of exception taken,
+were in past CPU security technologies [86, 87].                        and cannot induce an exception.
+   Even assuming a correct implementation, SGX remains
+vulnerable to a variety of attacks. Classic side-channel attacks
+exploit shared hardware resources such as caches, branch                3.2    Hardware requirements
+predictors and TLBs, and are not addressed by SGX [13, 76].             Our basic approach with Komodo is to implement a highly
+Enclaves must instead use (often expensive) mitigations, such           privileged program in verified assembly code; its role mirrors
+as avoiding secret-dependent memory accesses. Schwarz                   that of the enclave-management instructions in SGX: main-
+et al. [76] observed that existing hardware support for cache           taining an EPCM-like “database” of secure pages by acting as
+partitioning (Intel cache allocation technology [63]) could             a reference monitor for enclave manipulation and execution.
+defeat such attacks, if only it were activated on enclave entry,        In order to implement enclaves in software, we rely on four
+but this is not a feature that SGX presently provides. One              hardware primitives: isolated memory for monitor code/data
+of our goals in decoupling higher-level enclave implementa-             and enclave pages, protected execution environments for
+tions from hardware is to permit such fixes to be deployed              both the privileged monitor and unprivileged enclaves, a
+independently of hardware or architecture changes.                      root of trust for attestation, and a source of randomness.
+   In addition to classic side channels, enclaves are vulnerable
+to new “controlled-channel” attacks in which the OS exploits
+                                                                           Isolated memory. Komodo requires a region of physical
+its ability to induce and observe enclave page faults to de-
+                                                                        memory whose confidentiality and integrity is protected
+duce secrets [78, 88]. Mitigations exist, but (at a minimum)
+                                                                        by hardware. Our design is agnostic to the exact memory
+they require recompilation of enclave code, prevent use of
+                                                                        isolation mechanisms, which we expect will vary in different
+dynamic paging, and carry a high performance cost [77, 78].
+                                                                        applications depending on the hardware threat boundary.
+   Overall, we argue that the limitations of SGX are systemic:
+                                                                           If physical attacks on memory are in scope, the hardware
+because its entire specification is part of the x86 architecture,
+                                                                        must include memory encryption and/or on-chip RAM. For
+SGX is simply too slow to add features or respond to threats,
+                                                                        example, SGX performs encryption and integrity protection
+and further, the limitations of hardware implementation also
+                                                                        of RAM. This offers strong protection against physical at-
+hobble its functionality [7]. In the following section, we
+                                                                        tacks, at the cost of limited size and a performance penalty
+describe how to disentangle enclave-supporting hardware
+                                                                        for integrity protection [44]. Unfortunately Intel’s memory
+from software, allowing them to evolve independently.
+                                                                        encryption engine is accessible only by SGX, so Komodo
+                                                                        cannot make use of it. IBM SecureBlue [11] also includes
+3 THREAT MODEL AND HARDWARE                                             memory encryption hardware, but with limited public in-
+3.1 Threat model                                                        formation it is difficult to be sure whether IBM’s design is
+Like SGX, we seek to protect the confidentiality and integrity          suitable. AMD recently published a proposal for hardware
+of user-mode code executing inside an enclave from an at-               memory encryption configurable by privileged software [48].
+tacker who has full control over a platform’s privileged soft-          Since this proposal lacks integrity protection, it would scale
+ware (OS and hypervisor). To preserve generality across                 to large memories, at the cost of weaker security.
+platforms, we consider two variants of this threat model,                  As an alternative to encryption, some “systems on a
+based on whether physical attacks on memory are in scope.               chip” (SoCs) include scratchpad RAM, which is protected
+   We assume a software attacker who controls privileged                against most physical attacks by virtue of its on-chip loca-
+software. We also trust our verification tools (Dafny and Z3,           tion [41, 64]. Although size-limited, this may be effective for
+described later in §5), assembler, linker, and bootloader. On           secure embedded applications, since it avoids the complexity
+the hardware side, we assume a correct CPU. The attacker                and energy/performance overhead of encryption [17].
+may inject external interrupts, and attempt to interfere with              Finally, if physical attacks on memory are out of scope (as
+I/O devices. If physical memory attacks are in scope, the               is common in many pre-SGX applications), all that is needed
+attacker may access any RAM external to the CPU package.                in hardware is an IOMMU-like filter to partition RAM and
+This includes bus snooping and cold-boot [36] attacks.                  prevent access by unprivileged software or devices.
+                                                                    3
+SOSP ’17, October 28, 2017, Shanghai, China                                                                                A. Ferraiuolo et al.
+
+   Privileged environment for monitor. Komodo’s monitor
+must be protected from malicious privileged code on the
+platform, including the OS and hypervisor. This require-
+ment includes a secure control transfer mechanism between
+monitor code and normal execution, protection against un-
+programmed control transfers within monitor code or access
+to its intermediate states (e.g. registers). Note that we do not
+assume another (costly) layer of memory translation—the
+monitor requires access to isolated memory, but this can take                Figure 1: ARM TrustZone modes and worlds
+the form of a direct physical mapping or restricted segment
+which is otherwise inaccessible.
+   A variety of architectures already include such an envi-            attacks are out of scope. Indeed, Sanctum shares much with
+ronment. In SGX, it is effectively provided by the microcode           Komodo, with several key differences: it relies on significant
+engine: the processor guarantees that the execution of mi-             hardware modifications (per-enclave page tables); it calls
+crocode sequences is uninterruptible and protected from                for a far more elaborate attestation mechanism than what
+interference. Other examples of a super-privileged restricted          Komodo employs, and its security guarantees rely on the
+environment include DEC Alpha PALcode [24] and RISC-                   correctness of an unverified monitor implemented in 5k lines
+V machine mode [85]. Our prototype leverages the secure                of C++. In this paper, we formally verify the correctness of
+monitor mode of ARM TrustZone, which we describe below.                such a security monitor implemented on ARM TrustZone.
+                                                                       We discuss Sanctum further in §10.
+   Enclave execution environment. Komodo must be able to
+control the execution of enclaves, protecting itself and other         3.3     ARM TrustZone
+code on the platform against a malicious enclave. A typical            We prototype Komodo on TrustZone [2], a security tech-
+user mode suffices, if it can also be protected from the OS.           nology in many ARM CPUs. TrustZone extends the core
+   One unique feature of SGX enclaves that we do not attempt           architecture and peripherals such as memory controllers.
+to emulate is their virtual memory layout. SGX enclaves                   As shown in Figure 1, a TrustZone processor runs in one
+execute within the context of an untrusted user process—               of two worlds: normal world, where a regular OS and ap-
+memory outside the enclave region transparently reflects the           plications run, and secure world. Each world contains both
+address space of its parent process. Instead, Komodo executes          user mode and five different privileged modes; the latter are
+each enclave in its own virtual address space, and memory              used by different exceptions (e.g., page faults enter a different
+shared with an untrusted process must be established by                mode from system calls) but are all equally privileged.1 Se-
+explicit mappings. In our experience, there are very few               cure world has a sixth privileged monitor mode which is used
+applications that require uncontrolled ad-hoc access from an           to switch worlds: a secure monitor call (SMC) instruction in
+enclave to an untrusted parent process. Not only would such            normal world can cause an exception taken in monitor mode.
+a feature require extra hardware support, it also arguably                Some system control registers are banked, with one copy
+reduces overall enclave security, since most of the enclave’s          for each world. These include the MMU configuration and
+virtual memory space is untrusted, as opposed to our model             page-table base registers, so a world switch may enter a dif-
+where the entire virtual space is trusted except for well-             ferent address space. TLB and cache entries are also tagged
+defined shared mappings.                                               according to world.I/O devices may also participate in Trust-
+   Remote attestation. Komodo requires a hardware-backed               Zone. A secure bit in page-table entries is used to tag memory
+root of trust for remote attestation. Much like a TPM-based            references issued by secure-world code, and devices such as
+trust chain, our expectation is that either hardware or an             a TrustZone-aware memory-controller or IOMMU may use
+early bootloader would attest to a secure hash of the monitor          this to prevent normal-world access to secure-world mem-
+(the monitor in turn implements enclave attestation). Such             ory or devices [1, 4]. The accessibility of memory between
+attestation mechanisms are widely supported [70, 83].                  worlds depends on the specific platform configuration; for
+                                                                       example, on some SoCs the secure world has exclusive access
+   Random number source. Finally, we require a hardware-               to an isolated region of memory [17, 70].
+backed cryptographically secure source of randomness. This                We chose to prototype Komodo on TrustZone, because its
+could be an instruction (like the x86 RDRAND/RDSEED [45]) or           secure world satisfies our requirements for executing both
+a hardware device accessible to the monitor.
+                                                                       1 Some ARM CPUs include virtualisation extensions, which add a hypervisor
+   We note that Sanctum [19] (a modified RISC-V CPU) meets             mode to normal world with an additional level of translation. Komodo offers
+all the above requirements, with the caveat that physical              the same functionality and security, regardless of whether these are present.
+                                                                   4
+Komodo                                                                                    SOSP ’17, October 28, 2017, Shanghai, China
+
+                                       Table 1: OS and enclave APIs to Komodo monitor
+ Secure monitor calls (SMCs, from OS):
+ GetPhysPages()→int npages                                             Return number of secure pages
+ InitAddrspace(PageNr asPg, PageNr l1ptPg)                             Create address space (enclave) given two empty pages
+ InitThread(PageNr asPg, PageNr threadPg, void *entry)                 Create thread
+ InitL2PTable(PageNr asPg, PageNr l2ptPg, int l1index)                 Allocate 2nd -level page table
+ AllocSpare(PageNr asPg, PageNr sparePg)                               Allocate spare page to given address space
+ MapSecure(PageNr asPg, PageNr dataPg, Mapping va, InsecurePg content) Allocate a data page, mapped at address and perms in va
+ MapInsecure(PageNr asPg, Mapping va, InsecurePg target)               Map an insecure (shared) page at address and perms in va
+ Finalise(PageNr asPg)                                                 Mark enclave final, compute measurement and allow execution
+ Enter(PageNr thread, int arg1, int arg2, int arg3)→int retval         Enter enclave on an idle thread, passing parameters
+ Resume(PageNr thread)→int retval                                      Resume execution of a previously suspended thread
+ Stop(PageNr asPg)                                                     Mark enclave stopped, permitting deallocation
+ Remove(PageNr pg)                                                     Deallocate any page in a stopped enclave or a spare page in any enclave
+ Supervisor calls (SVCs, from enclave):
+ GetRandom()→u32 val                                                       Hardware source of secure random numbers
+ Attest(u32 data[8])→u32 mac[8]                                            Construct attestation of enclave’s identity
+ Verify(u32 data[8], u32 measure[8], u32 mac[8])→bool ok                   Check validity of an attestation
+ InitL2PTable(PageNr sparePg, int l1index)                                 Create 2nd -level page table from a spare page
+ MapData(PageNr sparePg, Mapping vaddr)                                    Map spare page as zero-filled data page at address and perms in vaddr
+ UnmapData(PageNr dataPg, Mapping vaddr)                                   Unmap data page, turning it back into a spare page
+ Exit(int retval)                                                          Return control to the OS
+
+
+the monitor and enclave code: enclaves run in secure user                 However, before it can populate the address space, the OS
+world, using a page table established by Komodo running in                must allocate a second-level page table using InitL2PTable.
+secure privileged modes (mostly monitor mode). In addition,               Komodo’s API encodes a two-level hierarchical page table
+the ARM ecosystem presently lacks enclave-like features;                  with a granularity chosen to reflect ARM’s hardware page-
+existing TrustZone applications either assume that all secure-            table format. The OS may allocate as many second-level
+world code is trusted [6, 30, 47] or rely on language-based               tables as it wishes, but for a mapping call to succeed at a
+isolation for “trustlets” [74].                                           given virtual address the relevant page table must exist.
+                                                                             The OS may then populate the address space by mapping
+4   KOMODO DESIGN AND API                                                 one or more secure and insecure data pages. Secure data pages
+The Komodo monitor builds on the hardware described in                    are located within the isolated memory, and they are private
+the previous section to implement enclaves. Like SGX, it                  to an enclave. Their initial contents, virtual address and page
+manages a region of isolated physical memory, making se-                  permissions are included in the attestation measurement de-
+cure pages available for constructing enclaves, and enabling              scribed below. Insecure pages are not protected by hardware
+enclave execution while protecting enclave-internal state.                isolation, and are therefore accessible to the untrusted OS.
+The API calls in Table 1 mirror SGX operations, but rather                These may be mapped to the enclave to facilitate untrusted
+than distinct instructions, they are invoked as monitor calls.            communication channels with the OS or between enclaves.
+                                                                             For the enclave to be executable, the OS must also create a
+   Page types and enclave construction. The monitor must                  thread, specifying its entry-point address. The enclave is then
+ensure consistent use of secure pages, preventing, for exam-              explicitly finalised, preventing the uncontrolled mapping of
+ple, double-mapping between distrusting enclaves. Komodo                  further pages/threads, before execution.
+tracks the state of secure pages using a data structure we
+term the PageDB. This is roughly equivalent to the EPCM
+of SGX; for every secure page, it stores the page’s allocation               Enclave execution. A newly created thread belonging to a
+state, and, if allocated, its type and a reference to the owning          finalised enclave may be executed by invoking Enter, which
+enclave. The monitor does no allocations of its own—the OS                causes the monitor to switch into secure-world user mode
+must choose pages it knows to be free, or API calls fail.                 and begin execution at the thread’s entry-point address with
+   Each allocated page has one of six types: address space,               the given parameters. The enclave thread then executes un-
+thread, first-level page table, second-level page table, data             til an exception occurs: either an interrupt, or an enclave-
+page, and spare page. An enclave consists of an address space             triggered exception such as a page fault, undefined instruc-
+with at least one thread. To begin constructing an enclave, the           tion, or a system call. On an interrupt, the monitor saves
+OS calls InitAddrspace to create a new (empty) address space.
+                                                                      5
+SOSP ’17, October 28, 2017, Shanghai, China                                                                       A. Ferraiuolo et al.
+
+register context in the thread page before reporting the in-           pages. This is in contrast to SGXv2, where the OS remains in
+terrupt to the OS. The thread context is marked as entered,            control of the type, address and permissions of all dynamic
+to prevent a suspended thread from being re-entered.                   allocations. We are not aware of attacks on this side-channel,
+   Enclaves may also invoke the monitor via the supervisor             but nevertheless saw no reason to mirror it.
+call (SVC) instruction. One such call, Exit, serves to explic-
+                                                                         Deallocation. Before an enclave’s pages can be freed, the
+itly pass a result back to the OS. In this case, the enclave’s
+                                                                       OS must call Stop. This prevents further execution, and per-
+registers are not saved, permitting it to be re-entered.
+                                                                       mits the use of Remove to deallocate secure pages. The address
+   If the enclave takes an exception, the thread simply exits
+                                                                       space is reference counted, and must be removed last.
+with an error code (but no other information, to avoid side-
+channel leaks). Unlike SGX [88], the OS cannot induce en-
+clave page faults. Our design is thus secure and also sufficient
+                                                                       5     SPECIFICATION
+for simple enclaves that do not emulate illegal instructions           We specify and verify Komodo using Dafny [51], a
+nor handle page faults; we anticipate adding a mechanism               general-purpose verification language. This section describes
+for enclaves to handle their own faults in future work.                our trusted Dafny specifications of ARM assembly lan-
+                                                                       guage (§5.1) and of Komodo’s overall correctness (§5.2). We
+   Attestation. Komodo adopts a minimalist attestation de-             increase our confidence in the Komodo specification by prov-
+sign, inspired by previous work on local attestations [40, 58].        ing several high-level lemmas: that it maintains consistency
+This important design choice makes it feasible for us to for-          invariants on page state (described in §5.2) and that it guaran-
+mally verify the attestation mechanism, which would be                 tees enclave confidentiality and integrity (§6). Dafny checks
+challenging with more complex schemes [19].                            the validity of these lemmas with the help of the Z3 SMT
+   As the enclave is being constructed, the monitor constructs         solver [23].
+a hash of the sequence of page allocation calls and their pa-
+rameters; specifically: (i) the enclave virtual address, per-          5.1    ARM machine model
+missions and initial contents of each secure page; and (ii)
+                                                                       Our hardware specification, written in Dafny, covers a subset
+the entry point of every thread. Like SGX, the OS is free to
+                                                                       of the ARMv7 architecture [3]. We model execution as a
+construct enclaves arbitrarily, but any change in an enclave’s
+                                                                       series of machine states, where a state includes everything
+layout will be reflected in the hash. When the enclave is
+                                                                       visible about a machine (e.g. registers and memory). Our
+finalised, this hash becomes the enclave’s immutable mea-
+                                                                       model includes core registers R0–R12, stack pointer (SP),
+surement for attestation purposes.
+                                                                       link register (LR), portions of the current and saved program
+   Like SGX, Komodo implements local (same machine) attes-
+                                                                       status registers (CPSR and SPSRs), privilege modes, control
+tation as a monitor primitive, and defers remote attestation to
+                                                                       flow, interrupts, and exceptions. We model the semantics
+a trusted enclave (that we have yet to implement). A Komodo
+                                                                       of 25 instructions, including integer and bitwise arithmetic,
+attestation is a message authentication code (MAC) using a
+                                                                       and access to memory and control registers.
+secret key generated at boot from a cryptographically secure
+                                                                          At present, our model must be fully trusted, but this could
+source of randomness. The MAC is computed over (i) the
+                                                                       be avoided by proving its correctness against another formal
+attesting enclave’s measurement, and (ii) enclave-provided
+                                                                       model for ARM [29, 71, 72]. To help ensure trustworthiness,
+data, which may be used to bind a public key-pair to the
+                                                                       we adopt the methodology termed idiomatic specification
+enclave and hence bootstrap encrypted communication with
+                                                                       by Ironclad [38]: we specify only the features that a Ko-
+code outside the enclave [56]. The monitor provides calls for
+                                                                       modo implementation needs, and write the specifications
+enclaves to create and verify attestations.
+                                                                       such that the implementation cannot trigger other unspec-
+   Dynamic allocation. Komodo includes support for dy-                 ified behaviours. For example, a verified implementation
+namic management of enclave memory, comparable to                      cannot execute unspecified instructions.
+SGXv2 [43]. At any time, the OS may allocate spare pages to               To simplify reasoning about control flow, we do not ex-
+an enclave using the AllocSpare monitor call. These do not             plicitly model the program counter (PC) register. Instead,
+alter the enclave’s measurement, since they do not become              our model encodes a limited form of structured control
+accessible until the enclave issues either a MapData or an             flow: if statements, while loops, and subprocedure calls. This
+InitL2PTable SVC to map them as data pages or page tables.             avoids the verification burden of reasoning about PC updates
+The enclave may also unmap data pages (turning them back               and the effects of control-flow instructions like conditional
+into spare pages), and the OS may reclaim spare pages. As a            branches. However, we do model the side-effects of two
+result, the OS may infer that spare pages have been allocated          control transfers crucial to the correctness of Komodo: the
+(since attempts to remove them will fail), but it cannot tell          branch from privileged code to user-mode (a MOVS PC, LR in-
+whether the enclave has used them as data or page-table                struction, which branches to the link register and updates
+                                                                   6
+Komodo                                                                                SOSP ’17, October 28, 2017, Shanghai, China
+
+the mode and flags), and the switch back into privileged               model the effects of user-mode code by translating writable
+mode when an exception occurs, which preserves the pre-                pages into the memory map using the offset.
+exception PC value in LR. The Komodo specification can                    As another example of idiomatic specification, ARM sup-
+therefore use its value to refer implicitly to the PC at the           ports many page table formats, but we model only one: 4 kB
+time of an exception.                                                  “small” pages in the short descriptor format. If an unrecog-
+   The 32-bit ARM architecture includes a register banking             nised page-table entry is encountered, the model says noth-
+feature that we also model: the SP, LR and SPSR registers are          ing about the results of user execution—this forces the imple-
+banked according to the current mode—user-mode accesses                mentation to prove that its page tables meet the specification
+to SP refer to a concrete register SP_usr, whereas monitor-            in order to reason about states after user-mode execution.
+mode code accesses SP_mon, etc. We model all the banked                   As well as page tables, we also model TLB consistency. Ex-
+registers, with the exception of those banked only in FIQ              ecuting a TLB flush instruction marks the TLB as consistent.
+mode (which is not needed).                                            Loading the page-table base register, or executing a store to
+                                                                       an address in either the first-level or any second-level page
+   Memory. In designing our memory model, we made sev-                 table, marks the TLB as inconsistent. This gives the imple-
+eral design decisions that proved crucial to building a scalable       mentation freedom to either simply flush the TLB whenever
+proof. For example, our machine state models memory as                 consistency is required, or else to prove that its stores did not
+a mapping from word-aligned addresses to 32-bit values;                modify the page table. For simplicity, we model only flushes
+reasoning only about aligned memory accesses simplifies                of the entire TLB (not tag- or region-based flushes).
+proofs, since accesses to distinct addresses are independent.
+   We do not directly model virtual memory translation—load               Exceptions. Our strategy for dealing with exceptions is
+and store instructions directly manipulate the contents of             primarily to avoid them. For example, preconditions on
+the memory map at the address specified by their operands.             the load and store instructions prevent the possibility of
+This allows us to define address validity solely based on              a page or alignment fault in verified code. However, we must
+the effective address value, not on the overall machine state.         model the CPU interrupt-enable flags (we describe why later,
+This expedites verification since the prover readily sees that         in §7.2). Our core specification for instruction evaluation
+validity is not affected by state changes.                             states that if interrupts are enabled, and if an interrupt (non-
+   The Komodo specification (§5.2) ensures valid address re-           deterministically) occurs, then the instruction executes only
+gions for the monitor’s stack, global variables, and secure/in-        after first running the interrupt handler, which is modelled as
+secure enclave pages. §7.2 later describes how these are pro-          an arbitrary implementation-specific predicate. This forces
+vided by the bootloader using a static page table.                     a correct implementation to prove either that interrupts re-
+                                                                       main disabled, or else to implement an interrupt handler
+   User-mode execution. Besides the privilege separation of-           and prove that the pre-conditions of any instruction exe-
+fered by ARM user-mode, Komodo’s design does not con-                  cuted with interrupts enabled are satisfied by the handler’s
+strain the code that can be run in an enclave. To model                postcondition.
+enclave execution, we might therefore need to model ev-
+ery permissible user-mode instruction, along with its effects             Limitations. Our model precludes the implementation
+on the machine state. This would imply specifying a large              from using many features irrelevant to Komodo, including
+number of instructions, along with a more complete model               I/O devices, most co-processor registers, floating point and
+of machine state and virtual memory translation. However,              vector state, and unaligned memory accesses. Since we do
+we do not seek to verify the code that runs in enclaves, and           not support multi-core execution, we do not model caches
+such a model would needlessly bloat our trusted computing              or memory consistency.
+base (TCB) and increase verification times.
+   Instead, we model only the aspects of user-mode execu-              5.2    Komodo specification
+tion necessary to reason about Komodo’s correctness, in-               In addition to the ARM model, we must also trust our high-
+cluding a limited view of virtual memory: when user code               level behavioural specification of the Komodo monitor, also
+executes, it havocs (trashes) all user-mode registers and all          written in Dafny. We increase our confidence in this spec-
+user-writable pages before taking an exception. Writable               ification by proving that it maintains internal consistency
+pages are found by walking page tables starting from the               invariants (described below) and guarantees high-level se-
+page-table base register, and translated into the monitor’s            curity properties (described in §6). At the core of this speci-
+memory map. Essentially, we specify that the monitor ex-               fication is an abstract representation of the PageDB: a map
+ecutes in a 1:1 mapping of physical memory at some fixed               from page numbers to entries, each of which has one of the
+virtual offset (established by the bootloader, per §7.2). We           six types described earlier in §4.
+                                                                   7
+SOSP ’17, October 28, 2017, Shanghai, China                                                                      A. Ferraiuolo et al.
+
+   The PageDB representation abstracts away implementa-                  The specifications of SVCs from an enclave are logically
+tion details irrelevant to most of the specification; for exam-       nested inside the definition of Enter and Resume. After user-
+ple: page tables are represented as entries in an abstract data       mode execution, an exception is taken, and the specification
+type, and the enclave measurement established for attesta-            then determines the results of the call and final PageDB based
+tion is represented by an unbounded sequence of words. The            on the exceptional state. If the exception taken was for a non-
+contents of memory and registers are of course significant            Exit SVC that returns to the enclave, then the specification
+when an enclave executes, so the specification includes a             describes how to compute the results of the call, and return to
+predicate describing the contents of enclave-visible regis-           executing the enclave (using a recursively defined predicate).
+ters, memory, and page tables at the time of execution. The           All other exceptions update the PageDB and return results
+implementation is free to choose its own in-memory repre-             from the SMC handler; for example, the PageDB’s data pages
+sentation of the PageDB, as long as it can prove that when            are updated to reflect any changes made by the enclave, and
+an enclave executes, the contents of registers and virtual            if an interrupt was taken, the user-mode context must be
+memory match the abstract PageDB.                                     saved in the PageDB and the thread marked as entered.
+   The top level of our specification is a predicate describing          A valid PageDB satisfies invariants guaranteeing internal
+the SMC handler. It relates the concrete machine and abstract         consistency: e.g., reference counts are correct, internal ref-
+PageDB states just after taking an SMC exception from the             erences (including page table pointers) are to pages of the
+OS, to the final states (s' and d') just prior to returning:          correct type belonging to the same address space, and all leaf
+                                                                      pages mapped in a page table are either insecure pages or
+predicate smchandler(s: state, d: PageDb,
+                                                                      data pages allocated to the same address space. To increase
+                     s': state, d': PageDb)
+                                                                      our confidence in the specification, we prove that each SMC
+   Of all the monitor calls in Table 1, only two involve en-          and SVC preserves the PageDB invariants. These invariants
+clave execution: Enter and Resume. We specify the body of             then form the basis of our security proofs in the next section.
+the rest as pure functions that, given an input PageDB and
+call parameters, compute an error/success code and result-
+ing PageDB. The top-level smchandler predicate holds if the
+                                                                      6   PROVING SECURITY
+resulting PageDB and error code match the appropriate func-           We formally prove that the Komodo specification described
+tion (based on the call number and argument registers), and           above protects the confidentiality and integrity of enclave
+also that certain invariants hold across every SMC: non-              code and data from other software on the machine. Because
+volatile registers are preserved, other non-return registers          the implementation is verified to satisfy the specification,
+are zeroed (to prevent information leaks), insecure memory            these security proofs extend to the concrete Komodo code
+is invariant, and we return in the correct mode.                      as well. In particular, we prove that an enclave’s contents
+   The specifications for Enter and Resume are also modelled          cannot be modified by any software other than that enclave,
+as predicates relating two states and PageDBs. The specifica-         and that an enclave’s contents do not leak to other enclaves,
+tions for these calls forces the implementation to enter user-        the OS, or other non-enclave code, unless the enclave itself
+mode (which it can only satisfy by executing MOVS PC, LR)             chooses to leak them either directly (e.g., by writing to inse-
+from a highly constrained state. Specifically, the page-table         cure memory) or indirectly (e.g., via the pattern of insecure
+base register must be loaded with the address of the enclave’s        memory addresses to which the enclave chooses to write).
+page table, its representation in memory must match the ab-               More formally, we establish Komodo’s security proper-
+stract page table encoded in the PageDB, and the TLB must             ties by proving that enclaves are noninterfering [32] with
+be consistent. The contents of secure data pages must equal           an adversary who controls the OS and colludes with an en-
+those in the PageDB (either the contents at the time the en-          clave. Modulo a limited set of declassification operations
+clave was created, or as modified by enclave execution). The          (§6.2), we establish two separate results for confidentiality
+user-visible registers must be loaded from the PageDB: for            and integrity which are respectively: (i) enclave state is non-
+entry, the PC is set to the entry-point and other registers           interfering with state observable outside the enclave, and
+are zeroed; for resume, the user-visible registers are restored       (ii) state which can be influenced by software outside the
+from context saved in the thread’s PageDB entry.                      enclave is noninterfering with enclave state. Our model of
+   By constraining the concrete machine state only at the             enclave state is sufficient to show that the confidentiality and
+time of entry to user-mode, we maintain a significant degree          integrity of both enclave data and execution are preserved.
+of implementation freedom. For example, an implementation                 From the confidentiality perspective, noninterference re-
+may maintain its data structures in any format it chooses, as         quires that all adversarially observable outputs during the
+long as it can prove that the user-mode execution environ-            execution of the system are determined purely by the ad-
+ment satisfies the specification.                                     versarially supplied inputs. In other words, public outputs
+                                                                  8
+Komodo                                                                                  SOSP ’17, October 28, 2017, Shanghai, China
+
+are never influenced by secrets. This is a strong end-to-end                We consider states (s, d) which comprise a concrete ma-
+security property: it precludes secrets from affecting public            chine state, s, and an abstract PageDB, d, such that s is an im-
+outputs even indirectly through control flow. Integrity is               plementation of d. Our confidentiality result roughly states
+dual to confidentiality [10], and requires that trusted outputs          that publicly observable outputs depend solely on publicly
+are purely determined by trusted inputs.                                 observable inputs. Our integrity result states that trusted
+   By modelling a strong adversary who controls both the OS              outputs depend solely on trusted inputs.
+and an enclave, our results generalise to simpler attackers                 We formalise both results with a relation, ≈L , that char-
+such as an OS or enclave acting alone. In short, we prove                acterises the observational power of some observer L—two
+formally that enclave secrets do not leak to, and that enclaves          states are related by ≈L if the states appear the same to L.
+cannot be influenced by, any software other than the monitor.            The definition of ≈L depends on the observer under consid-
+   We do not aim to prove that enclaves use Komodo correctly.            eration. For the proof of confidentiality, the observer is an
+An enclave may leak information directly through its return              adversary, adv, who models an OS colluding with an enclave.
+code, writes to insecure memory, or the use of SVCs for                  For the integrity proof, the observer is a trusted enclave, enc.
+dynamic allocation (a side-channel we formally characterise                 Address-space pages in the PageDB are linked to all pages
+in §6.2). It may also leak indirectly through hardware side-             belonging to an enclave. Therefore, enc is an address-space
+channels (e.g., via cache effects). The enclave’s integrity may          page that identifies an enclave, and the definition of ≈enc
+be compromised, for example, if it fails to sanitise values              characterises the observational power of that enclave. To
+passed as parameters or read from insecure memory. Work                  define ≈enc , we rely on an auxiliary relation =enc that relates
+complementary to ours provides security guarantees for SGX               PageDB entries and characterises pages that look the same
+enclaves [33, 80, 81], and could be adapted for Komodo.                  to the enclave when they are outside its address space enc:
+                                                                           Definition 1 (Weak-eqivalence of pages =enc ).
+                                                                         PageDB entries e 1 , e 2 are related by e 1 =enc e 2 iff:
+6.1    Specification                                                      (e 1 .DataPage? ∧ e 2 .DataPage?)
+Komodo executes on a single core, so attackers on that core              ∨(e 1 .SparePage? ∧ e 2 .SparePage?)
+(including potentially malicious enclaves) cannot observe                ∨(e 1 .Thread? ∧ e 2 .Thread? ∧ e 1 .entered = e 2 .entered)
+machine state concurrently with Komodo. However, as de-
+                                                                         ∨((e 1 .L1PTable? ∨ e 1 .L2PTable? ∨ e 1 .Addrspace?) ∧ e 1 = e 2 )
+scribed in §5.1, we do permit concurrent execution of the OS
+on a different core. The OS cannot observe registers or secure           where e 1 .DataPage? denotes that e 1 has the type data page.
+memory, but it may access insecure memory concurrently                   In other words, an enclave cannot observe data page contents
+with Komodo execution. Our hardware model prevents infor-                or thread context unless those pages belong to it.
+mation about Komodo’s execution from leaking to insecure
+                                                                            Definition 2 (Observational eqivalence ≈enc ). Let
+memory by prohibiting the implementation from writing to
+                                                                         d[i] denote page i in PageDB d. Let F (d) denote the set of pages
+insecure memory (it has no reason to do so).
+                                                                         i such that d[i] is not allocated. Let Aenc (d) denote the set of
+    We take advantage of the fact that attackers can only make
+                                                                         pages i such that d[i] belongs to the address space enc in d.
+observations while they are executing to simplify our proofs.
+                                                                         Then two PageDB states, d 1 , d 2 , are observationally equivalent
+It is sufficient for us to reason about the states that transition
+                                                                         from the perspective of an enclave enc, written d 1 ≈enc d 2 iff:
+between different entities in the system (normal world, the
+Komodo monitor, and enclaves), because it is impossible for                          F (d 1 ) = F (d 2 ) ∧ Aenc (d 1 ) = Aenc (d 2 )
+adversaries to observe intermediate states (e.g., while a non-                     ∧∀i < Aenc (d 1 ) . d 1 [i] =enc d 2 [i]
+malicious enclave is executing). Reasoning about states at
+                                                                                   ∧∀j ∈ Aenc (d 1 ) . d 1 [j] = d 2 [j]
+these transition points is simpler than reasoning about entire
+execution traces.                                                           To characterise the observational power of a malicious OS
+    The transition points in our system are at the beginning             colluding with an enclave, we also define ≈adv . Since this
+and end of SMCs and enclave execution. We prove our nonin-               adversary has more observational power than an enclave
+terference theorems for each monitor call, and as we discuss,            alone, for states to be related by ≈adv , they must also be
+this is sufficient for guaranteeing security at the start and            related by ≈enc , where enc represents a malicious enclave.
+end of enclave execution. By carefully structuring the pre-              The additional requirements on ≈adv further restrict the set
+and post-conditions so we make no assumptions about the                  of pages that look equivalent to the adversary, and hence
+initial state that do not also hold of the final state, we ensure        characterise the observational power of the OS. In particular,
+that our result generalises to an infinite sequence of SMCs.             the OS adversary can directly observe the registers to which
+                                                                         it has access and the entire insecure memory. Hence, two
+                                                                     9
+SOSP ’17, October 28, 2017, Shanghai, China                                                                                                     A. Ferraiuolo et al.
+
+states are related by ≈adv if in addition to the requirements                                       predicated on certain SVC calls being invoked. The dynamic
+imposed by ≈enc , all of the following are the same for both                                        memory management calls release information about the
+states: the general-purpose registers, the banked registers                                         pages that are allocated or deallocated by the enclave. The
+(excluding monitor mode), and the insecure memory.                                                  OS can distinguish these by design, because it is permitted
+   We formalise our noninterference properties as:                                                  to Remove deallocated pages.
+    Theorem 6.1 (Noninterference). Let execution of the
+SMC handler beginning in state (s, d) and returning in state                                        6.3    Proofs and non-determinism
+(s ′, d ′) be denoted as smchandler(s, d, s ′, d ′). Then,                                          Our proofs use bisimulation; we reason about two executions
+  ∀(s 1 , d 1 ), (s 2 , d 2 ), (s 1′ , d 1′ ), (s 2′ , d 2′ ) . (s 1 , d 1 ) ≈L (s 2 , d 2 )        beginning from initial states that are related by ≈L and our
+  ∧ smchandler(s 1 , d 1 , s 1′ , d 1′ ) ∧ smchandler(s 2 , d 2 , s 2′ , d 2′ )                     proof goal is to show that the final states are also related by
+                                                                                                    ≈L . Our proof is then structured into smaller bisimulation
+            =⇒ (s 1′ , d 1′ ) ≈L (s 2′ , d 2′ )                                                     proofs about each monitor call and each SVC. One exception
+   We prove a relaxation of this theorem, and we discuss the                                        is that we cannot prove that output states are related by ≈enc
+way in which our result relaxes this theorem in Section 6.2                                         if the call is Remove(enc), as the relation is undefined for an
+   For the proof of integrity, ≈enc is used, and enc denotes a                                      observer whose only page was just removed.
+trusted enclave. For the proof of confidentiality, ≈adv is used,                                        Because ≈enc is used to characterise both the trusted state
+and the enc implicit in the definition of ≈adv is a malicious                                       during the integrity proof and the observational power of
+enclave. Although the definition of ≈enc is concise and does                                        a malicious enclave during the confidentiality proof, many
+not directly constrain the concrete state, both proofs of non-                                      lemmas are re-used between the two proofs.
+interference ensure strong guarantees when combined with                                                The Enter and Resume proofs are the most complex since
+our correctness specification. Proving these noninterference                                        they involve enclave execution. In order to satisfy the
+theorems entails proving that the contents of registers and                                         PageDB refinement relation, handling the case where both
+all memory reachable by the enclave at both the start and                                           executions are of the observer enclave requires that the en-
+end of its execution are determined purely by PageDB entries                                        clave’s secure pages and register context are updated in the
+allocated to the enclave prior to the Enter or Resume call.                                         same way. However, enclave execution is not determinis-
+                                                                                                    tic. We do not know what the enclave code will do; we can
+6.2       Declassification                                                                          merely model what portions of the state it might affect.
+Enclaves release a small amount of information to the OS                                                Our specification models the non-determinism by updat-
+during normal execution: the type of exception or interrupt                                         ing each part of the enclave state with an uninterpreted
+that ends enclave execution, the return value passed to Exit                                        function specific to the updated state. Each function takes at
+and the fact that an exit call was made. Enclaves that use                                          least two inputs: (i) all of the user-visible state including the
+dynamic memory allocation also leak through a side channel,                                         general-purpose registers, the PC on entry to the enclave,
+since the OS can observe which spare pages have been allo-                                          and all of memory accessible with the current page table and
+cated and which data pages have been freed by the enclave                                           (ii) a source of non-determinism modelled as an unknown
+during execution. As is conventional for any practical sys-                                         integer seed. For both noninterference proofs, we require
+tem that enforces noninterference, we rely on declassification                                      that the seeds in the initial states are the same for successful
+to permit the communication described above, that would                                             executions of the observer enclave. This allows us to prove
+otherwise be precluded by the information flow policy. Our                                          that updates happen deterministically. However, in order
+effort to precisely control what information is declassified                                        to do so, we must prove that the user-visible state on entry
+most closely resembles the delimited release model [73].                                            to the enclave and on updates to the seed are equivalent.
+   Declassification is incorporated into our proofs through                                         The registers, insecure memory pages, and secure memory
+four axioms which each have preconditions that precisely                                            pages that Komodo presents to the enclave must be purely
+control the state transitions during which they can be used.                                        determined by that enclave’s pages in the PageDB.
+The axiom for releasing the exception or interrupt taken by                                             The confidentiality proof must show that secret enclave
+the enclave can be invoked to reason about states immedi-                                           state is not leaked to the adversary through the registers
+ately following the execution of enclave code in user-space.                                        which it can observe during monitor calls or through inse-
+For example, the SVC call number is stored in register R0, and                                      cure pages of memory. For calls involving enclave execution,
+the axiom for releasing it can only be invoked to reason about                                      we must show that updates to the registers and insecure mem-
+the state after taking an SVC exception from user-mode—                                             ory at the end of the call are purely determined by public
+this prevents, for example, leaking the enclave’s R0 value                                          state. The enclave is permitted to write to insecure memory.
+when an interrupt occurs. Other declassification axioms are                                         However, correct enclave code should not write anything
+                                                                                               10
+Komodo                                                                               SOSP ’17, October 28, 2017, Shanghai, China
+
+                                                                       procedure MRS_STR(operand src:sreg, operand base:reg,
+                                                                                       operand ofs:word, out operand tmp:reg)
+                                                                         requires
+                                                                           SaneState(this) && ValidMem(base + ofs);
+                                                                           @tmp != OSP && @tmp != @base && @tmp != @ofs;
+                                                                         modifies mem;
+                                                                         ensures
+                                                                           SaneState(this);
+                                                                           MemContents(this.m, base + ofs) == src;
+                                                                           MemPreservingExcept(old(this), this, base + ofs,
+                                                                                                base + ofs + WORDSIZE);
+                                                                       {
+                                                                         MRS(tmp, src);
+                                                                         STR(tmp, base, ofs);
+Figure 2: Verification/implementation tools. Shaded                    }
+boxes indicate trusted components.                                      Listing 1: Vale procedure to store a banked register
+
+
+secret to insecure memory. To model the fact that insecure             This printer, along with Dafny and the trusted specifications,
+memory is public, enclave updates to it are handled differ-            constitute Komodo’s trusted computing base for verification.
+ently from secure memory: they are still non-deterministic,            The Vale tool is not part of the trusted computing base; a
+but do not depend on user state.                                       bug in Vale could create incorrect ASTs or invalid proofs,
+                                                                       and Dafny would reject such ASTs or proofs for failing to
+7 IMPLEMENTATION                                                       correctly fulfil the specifications.
+7.1 Vale language                                                         Each Vale procedure is encoded as an AST that when ex-
+                                                                       ecuted takes an input state, and (if the preconditions are
+Figure 2 shows the tools used to implement and verify Ko-              satisfied) produces an output state. Following earlier work
+modo. Our implementation uses the Vale [12] programming                with Vale [12], we do not model labels and jumps directly,
+language. Vale programs, shown in the “annotated code” box,            but rather define structured control constructs: conditionals,
+consist of assembly language instructions together with an-            loops, and subprocedures. The trusted printer then turns
+notations, such as preconditions, postconditions, and loop             these into labels and jumps. All subprocedure calls are in-
+invariants, that describe the behaviour of the instructions.           lined; for most of Komodo the complexity of stack-based
+   Listing 1 shows a simple Vale procedure used in Komodo.             call/return is unwarranted, but we plan to add this for large
+This two-instruction procedure copies a banked register to             procedures (e.g., hash functions) in future work.
+a general-purpose register and then stores it to memory
+at a given base address and offset. Its preconditions (the             7.2    Implementation details
+requires clause) include a valid memory address and regis-
+                                                                          Hardware platform. Our prototype runs on a Raspberry
+ter allocation—the general-purpose register tmp cannot alias
+                                                                       Pi 2, which is widely available and includes a TrustZone-
+the base address nor stack pointer. Its postconditions (the
+                                                                       capable CPU and hardware random-number generator, but
+ensures clause) guarantee to the caller that only the tmp reg-
+                                                                       lacks support for isolating secure-world memory or perform-
+ister is modified, and that memory is invariant except the
+                                                                       ing hardware-backed attestation. Instead, we simply assume
+single word at base+ofs which equals the banked register.
+                                                                       the existence of a statically configured isolated memory re-
+   The Vale tool generates two intermediate Dafny-language
+                                                                       gion and hardware-derived attestation secret, and rely on
+objects: an abstract-syntax-tree (AST) representation of the
+                                                                       the bootloader to provide them. This means that our pro-
+instructions, and a purported proof about the behaviour of
+                                                                       totype unfortunately offers no practical security; however,
+the instructions (e.g., that the instructions ensure the post-
+                                                                       porting it to an ARM platform that included these features
+conditions in the annotations). If the annotations or code are
+                                                                       would alter neither its performance nor the proof, since both
+wrong, this proof will be invalid.
+                                                                       features affect only boot-time configuration.
+   Since Komodo consists of low-level assembly code, we do
+not rely heavily on Dafny’s features for executable code. In              Exception-handler procedures. One of the biggest chal-
+fact, the only executable Dafny code is a simple pretty-printer        lenges faced by the implementation is a mismatch between
+that turns the instruction ASTs into GNU assembly format.              the linear control-flow modelled by Vale, which automates
+                                                                  11
+SOSP ’17, October 28, 2017, Shanghai, China                                                                       A. Ferraiuolo et al.
+
+                                                                       and disabled automatically when taking either an SMC or in-
+                                                                       terrupt exception. However, it is possible to take an interrupt
+                                                                       after entering the handler for a system call, abort, or unde-
+                                                                       fined instruction. Our exception handlers immediately dis-
+                                                                       able interrupts, but there is an unavoidable single-instruction
+                                                                       window in which a nested exception may occur.
+                                                                           The interrupt handler’s behaviour depends on the prior
+                                                                       state of the system. If the interrupt was taken in user-mode, it
+                                                                       locates the current thread page, and saves the user-mode reg-
+                                                                       ister context before branching to the continuation. However,
+                                                                       if the interrupt was taken in privileged mode, it simply sets
+                                                                       a flag to record that the interrupt occurred, before restoring
+                                                                       execution with registers and memory preserved and inter-
+                                                                       rupts disabled. To keep the code simple, the Vale procedures
+                                                                       for all instructions in our machine model require that inter-
+                                                                       rupts are disabled, with one exception: the instruction used
+                                                                       to disable interrupts which is written such that the inter-
+ Figure 3: State transitions and top-level procedures                  rupt handler may have been executed prior to instruction
+                                                                       completion. Again, we prove in Dafny that these pre- and
+                                                                       post-conditions match between the different procedures, so
+                                                                       the only gaps in our trusted computing base are the jumps
+verification of procedures with a single starting and ending           emitted by the printer at the end of each interrupt handler.
+state, and the exception-driven style of execution inherent
+in kernel code. Komodo lacks a single top-level procedure;                Enclave execution. The implementation of Enter and
+instead it is implemented by handlers invoked from a table of          Resume must execute the enclave an unbounded number of
+hardware exception vectors. These include the SMC and SVC              times, until either an Exit SVC or an exception occurs. The
+handlers invoked for API calls by the OS and enclave respec-           natural way to implement this (as in an early unverified pro-
+tively, handlers for ARM’s two different kinds of interrupt            totype), is to have the SMC handler push its PC on the stack
+(“FIQ” and “IRQ”), and exceptions for undefined instructions           for later return prior to dispatching the enclave. When the
+and data aborts (page faults).                                         SVC handler is invoked, it can handle the SVC and return
+   As Figure 3 illustrates, these handlers form a state machine        directly to the enclave, unless the call is Exit, in which case
+which is nested inside the top-level SMC handler and con-              it branches back to the SMC handler’s return path. This ar-
+strained by its specification. We model the state transitions          rangement, however, is impractical to verify in our model
+explicitly in Dafny, proving that whenever an exception may            of linear control flow. As we mentioned above, we print a
+occur, its preconditions are satisfied and its handler estab-          single branch after the instruction that initiates user-mode
+lishes the conditions required by the next state. We then rely         execution, so that any exception handler can unambiguously
+on trusted wrappers in the assembly printer to link these pro-         return to it. This in turn requires that user-space entry occurs
+cedures together; for example, the “instruction” used to begin         at only one point, leading to a loop of the form:
+enclave execution prints as MOVS PC, LR followed by a label.
+The exception handlers are all printed with a jump to the la-            while (!done) {
+bel at the end. To ensure this control flow is sound, we prove             MOVS_PC_LR(); / / enter user−mode,
+in a Dafny lemma that the state after user execution start-                / / handle exception , branch back
+ing from the above instruction satisfies the preconditions of            }
+any of the exception handlers, and that their postconditions
+satisfy the postconditions of the user execution instruction.          However, because at the point of the done test every user-
+                                                                       visible register is live (and even testing a global variable
+   Interrupts. Whenever possible, the monitor executes with            would require a spare register), we were forced to use the
+interrupts disabled. This allows us to reason about most in-           least-significant-bit of the monitor’s SP register as the done
+structions in isolation, which is a reasonable tradeoff since          flag. Our insight here is that polluting part of the implemen-
+all operations are bounded-time (the longest-running mon-              tation with ugly (but verified) code is preferable to added
+itor call, MapSecure, initialises and hashes a single page of          complexity in our execution model (and thus our TCB).
+memory). Interrupts are enabled when executing an enclave,
+                                                                  12
+Komodo                                                                                SOSP ’17, October 28, 2017, Shanghai, China
+
+                                                                                          Table 2: Line counts
+                                                                          Component               Spec    Impl      Proof   Assembly
+                                                                                                   (source lines of code)   (instructs.)
+
+                                                                          ARM model               1,174     112       985
+      Figure 4: Secure-world virtual memory map                           Dafny libraries           588               806
+                                                                          SHA-256, SHA-HMAC         250     415     3,200          170
+                                                                          Komodo common             775     358     3,078          136
+                                                                          SMC handler               591   1,082     4,493          284
+   Memory map. Figure 4 shows the secure-world virtual
+                                                                          SVC handler               204     612     2,509          233
+memory layout. We make use of an ARM architectural fea-
+                                                                          Other exceptions           39     131       940           52
+ture to decouple the monitor’s page table from the one used               Noninterference           175             2,644
+by enclave address spaces—the enclave’s page table is loaded              Assembly printer          650
+into the TTBR0 control register, which is configured to map
+                                                                          Total                   4,446   2,710    18,655          875
+only the first 1GB of virtual address space (the upper address
+limit for enclaves). The remaining address space is mapped
+by a separate static page table in TTBR1 created by the boot-
+loader. This latter region is restricted to privileged modes,          Proof lines are annotations that help the verifier, such as pre-
+and includes mappings for the monitor’s code and data (stack           and post-conditions, loop invariants, assertions, and lemmas.
+and global variables), and a large direct mapping to physical             The table also reports the number of ARM instructions ap-
+memory. This in turn includes the isolated memory allocated            pearing at the Vale source level. Due to our use of structured
+by the bootloader, and is where enclaves live.                         control flow, this does not include comparisons and branches,
+   The only regions of its virtual address space that the mon-         which are added by the pretty-printer. After printing, which
+itor directly loads and stores are its stack, global variables,        also adds labels and symbol declarations, and performs inline
+and secure pages. Additionally, it reads from the OS insecure          expansion of procedure calls, the verified prototype is emit-
+pages when initialising enclave pages. As described in §5.1,           ted as a 26,800-line assembly file. This could be substantially
+this allows us to reason about the contents of memory while            reduced if Vale supported function call/return.
+largely ignoring address translation.                                     The complete end-to-end verification of Komodo takes
+                                                                       4 core-hours. However, it is highly parallel, and supports
+   Attestation and cryptography. Komodo borrows the core               distributed verification. Furthermore, the typical developer
+ARM SHA-256 implementation from previous work with                     works on one procedure or lemma at a time, and most of
+Vale [12]. As a result, we benefit from good hashing perfor-           these take well under a minute to verify.
+mance, since the code mirrors the optimised SHA routines                  Excluding the core SHA implementation that we inherited
+from OpenSSL, and a proof of freedom from digital (cache               from prior work [12], we spent a total of about 2 person-
+and timing) side channels. We extended the prior implemen-             years specifying and implementing Komodo. We began with
+tation to a complete SHA-256 in ARM assembly, including                the specification of the ARM model, then specified and imple-
+initialisation and finalisation routines which previously re-          mented a simplified version of Komodo using static memory
+lied on a high-level Dafny implementation. We also imple-              management modelled on SGXv1. Building this first version
+mented a SHA-256-based MAC for generating and checking                 took around 1.5 person-years, including a steep learning
+attestations. In our implementation, we leverage a precondi-           curve for the primary developers who were unfamiliar with
+tion that Komodo only invokes SHA on block-aligned data                the verification tools (at the time under active development).
+to significantly simplify reasoning about padding.                        In the process of developing this first version, we iter-
+                                                                       ated through several phases in which we refactored the core
+7.3    Code size and verification effort                               definitions (e.g., the ARM machine model) to make them
+Table 2 shows a breakdown of the number of physical lines              more amenable to automated verification, and to model pro-
+of code, excluding comments and whitespace, in Komodo.                 gressively more complex features such as exceptions and
+Specification lines include all trusted Dafny code: our ma-            interrupts. Each such iteration required revising existing
+chine model and Komodo functional specification (§5) along             proofs to maintain new invariants. As with any engineering
+with the helper Dafny libraries used to define them (common            project, and in line with the experience of the seL4 devel-
+data types, bitwise functions, etc.), cryptographic algorithms,        opers [49, §7.4], the more pervasive the model or invariants
+noninterference properties (§6) and finally the pretty-printer         changed the more work it was to re-establish the proofs.
+for assembly output. Implementation lines are assembly in-                For example, we discovered that reasoning about word
+structions, procedure calls and control-flow we write in Vale.         alignment was excessively costly for Z3, and was indirectly
+                                                                  13
+SOSP ’17, October 28, 2017, Shanghai, China                                                                        A. Ferraiuolo et al.
+
+causing verification timeouts. We therefore changed the core            Table 3: Microbenchmark results on Raspberry Pi
+definition of a word-aligned address, which was originally:              Operation      Notes                                   Cycles
+const WORDSIZE:int := 4;                                                 GetPhysPages   Null SMC                                   123
+predicate WordAligned(x:int) { x % WORDSIZE == 0 }                       Enter + Exit   Full enclave crossing (call & return)      738
+                                                                         Enter only     (no return)                                496
+In the new definition, WordAligned is an opaque function (for            Resume only    (no return)                                625
+which the prover doesn’t see the definition), and we prove               Attest         Construct attestation                   12,411
+selected lemmas about it, for example that addition of two               Verify         Verify attestation                      13,373
+word-aligned values, or the computation of a word-offset (i.e.,          AllocSpare     Dynamic allocation                         217
+x+n×WORDSIZE), always results in a word-aligned value. This              MapData        Dynamic allocation                       5,826
+required changing all our procedures that perform memory
+access or manipulate addresses to use the new declarations
+and lemmas, leading to a week’s worth of semi-mechanical
+refactoring but resulting in much improved proof stability.            setting up its memory map and exception vectors. The boot-
+Given improvements like this, we estimate that repeating               loader was implemented in unverified C and assembly for
+the effort to rebuild the first version now with stable tools          expedience, but we could use the same approach to also
+and specifications would require much less than 1 year.                specify and verify it (it runs to completion without taking
+   We then extended the spec and implementation with dy-               exceptions, so it is much simpler than the monitor). The boot-
+namic memory management; this totalled 6 person-months                 loader also reserves a configurable amount of RAM as secure
+of extra work, including 3 person-weeks for updates to the             memory, before switching to normal world to boot Linux. As
+noninterference proofs. This work included major changes to            mentioned in §7.2, the hardware lacks support for memory
+the specification, such as modelling TLB consistency, weak-            isolation, so our prototype is not secure against a malicious
+ening various PageDB invariants to reason about spare pages,           OS, but it performs equivalently. Once Linux boots, a kernel
+and permitting non-trivial changes to the PageDB in an SVC             driver issues SMCs to create and run enclaves.
+handler. In the process of implementing the new SVCs, we                  We performed the microbenchmarks reported in Table 3.
+also refactored much of the implementation of the core page-           The prototype monitor is entirely unoptimised. It conser-
+table management code to permit its use in either SMC or               vatively saves and restores every non-volatile register—a
+SVC handler contexts. This required reasoning about flexible           needless cost for trivial SMCs like GetPhysPages. On enclave
+register allocations. For example, the procedure to write a            entry, it also saves and restores every banked register, al-
+page-table entry previously used a hard-coded register al-             though some are known to be preserved, and flushes the
+location with each operand passed in a specific machine                TLB, although this could be avoided for repeated invocation
+register; this simplifies the verifier’s job (and thus permits         of the same enclave (even for distinct enclaves with the use of
+verifying longer procedures with fewer annotations) because            TLB tags). These are all optimisations that we aim to add, but
+it can trivially see that modifications of one operand do not          only after proving their correctness; for example, by proving
+affect the others. However, to permit calling the procedure            in Dafny a lemma that the banked registers for FIQ and IRQ
+in different contexts, this procedure and many others like it          modes are unchanged by enclave execution, we can call that
+were changed to take arbitrary register operands in the style          lemma in our implementation rather than needlessly saving
+of Listing 1 (but with more operands, and thus many more               and restoring the registers.
+preconditions for disjointedness).                                        Despite the lack of optimisations, Komodo’s performance
+   Although most of the memory-management code changed,                compares favourably to SGX. Orenbach et al. [66, §2.2] report
+other significant portions of the implementation did not, in-          EENTER and EEXIT latencies of about 3,800 and 3,300 cycles
+cluding most of the enclave entry/resume path and top-level            respectively, or 7,100 cycles for a full enclave crossing. Of
+SMC handler. Thanks to our use of automated verification               course, the x86 runs at a higher clock rate (2GHz vs. 900MHz)
+tools, the proofs for these were largely unaffected, even by           and includes memory encryption, but the Komodo result
+changes in the core specification.                                     represents an order of magnitude improvement. We can only
+                                                                       speculate about the reasons, but there is clearly no inherent
+8 EVALUATION                                                           penalty for implementing enclaves in software.
+8.1 Microbenchmarks
+We tested our prototype on a Raspberry Pi 2 Model B with a             8.2    Notary enclave
+900MHz ARM Cortex-A7 CPU. To do this, we implemented                   To test Komodo with a real enclave, and help convince our-
+a simple bootloader that loads the monitor in secure world,            selves of the completeness of its API, we ported the trusted
+                                                                  14
+Komodo                                                                                 SOSP ’17, October 28, 2017, Shanghai, China
+
+
+              80                                                         whether an insecure physical address passed to the moni-
+              70                                                         tor for MapSecure or MapInsecure is valid, it is not sufficient
+              60
+                                                                         merely to check that it does not refer to secure pages; in-
+                                                                         stead, it must also avoid any of the monitor’s own pages. We
+  Time (ms)
+
+
+
+
+              50
+                                                                         discovered this discrepancy in the process of formalising our
+              40
+                                                                         model of virtual memory—an example of how the process of
+              30
+                                            Komodo enclave               writing a specification forces clarity.
+              20
+                                            Linux process
+              10                                                            Trusted components require extra diligence. In verifying
+               0                                                         any system, one must choose what to trust and what to
+                    4   8   16   32    64    128   256   512
+                                                                         verify, and against what specification. We discovered bugs
+                              Input size (kB)                            in our code when we ran it; unsurprisingly, they were all in
+                                                                         trusted code or under-specified portions of our system [28].
+                   Figure 5: Notary performance                          For example:
+                                                                             • a bug in the assembly printer caused all instructions in-
+notary application from Ironclad [38, §5.1]. The notary as-                    tended to operate on banked SPSR registers to instead
+signs logical timestamps to documents so they can be conclu-                   use the current mode’s SPSR;
+sively ordered. We reimplemented the notary as a standalone                  • we were missing barriers (DSB and ISB instructions)
+3700-line C program compiled for the Komodo enclave API.                       when accessing certain control registers;
+When first entered, it constructs an RSA key pair, initialises a             • inconsistencies in the configuration of caches and page
+monotonic counter, and constructs and returns an attestation                   attributes between the bootloader, monitor and Linux
+of its initial state. On subsequent calls, it hashes the provided              driver resulted in incoherent caches for normal-world
+document with the current value of the counter and signs                       and secure-world views of shared pages.
+it with its RSA key before incrementing the counter and re-                 Our conclusion is that while verification has great value
+turning the signature. The notary’s total memory footprint               in eliminating entire classes of errors, it cannot prevent a
+is 145 kB. Performance measurements (Figure 5) show that,                developer from making any unwarranted assumptions, at
+since its execution is dominated by CPU-intensive hashing                least not without a complete and correct formal specification
+and signing, the notary performs equivalently in an enclave              of CPU behaviour. Besides the obvious issues such as mem-
+to a native Linux process.                                               ory consistency (which we explicitly chose not to model),
+                                                                         modern CPUs include a seemingly endless number of control
+9 DISCUSSION                                                             registers that alter system behaviour and could lead to viola-
+9.1 Lessons learned                                                      tions of our ARM model. In this respect, we are encouraged
+                                                                         by recent progress on connecting a formal specification of
+   A small code base is no substitute for verification. Before           the ARM architecture to its implementation [71, 72].
+embarking on the verification of Komodo, we had previously
+implemented an unverified version in C and assembly, as                     Opportunities remain to improve verification tools. Past
+a way to gain familiarity with the TrustZone design. The                 work on verifying systems software [38, 39] extended Dafny
+unimplemented monitor comprised only about 650 lines of                  with features for information hiding and modular reason-
+C and 300 lines of assembler (it did not support attestation),           ing such as opaque functions. More recent improvements
+and yet it still contained critical security bugs which came to          to Dafny have included support for constants, bitvectors,
+light in the process of specifying and implementing Komodo.              and refinement types (such as 32-bit unsigned integers). We
+   For example, InitAddrspace takes two page numbers. The                benefited from all these improvements, but still found that
+unverified implementation checked that both were free, be-               Dafny struggled with complex systems such as Komodo.
+fore proceeding to allocate them and initialise the address                 The most frustrating recurring problem was proof insta-
+space. Only after writing the specification for this call and            bility. For simple lemmas, Dafny will either report success or
+failing to prove that it maintained PageDB invariants did we             a concrete failure, such as an assertion violation. However,
+discover that we hadn’t considered the case when the two                 as proof complexity increases, solver time may increase ex-
+arguments are the same page.                                             ponentially. This happens easily in Komodo wherever we
+   As a more subtle problem, when checking the validity of               are reasoning about procedures with many instructions (and
+insecure memory pages, we had failed to account for the                  thus many state transitions) or complex specifications. To
+fact that the monitor’s text and data exist in direct-map                avoid an endless search, Dafny implements a time limit be-
+physical as well as virtual memory (see Figure 4). To check              fore reporting failure. Timeouts are challenging to debug,
+                                                                    15
+SOSP ’17, October 28, 2017, Shanghai, China                                                                        A. Ferraiuolo et al.
+
+because the solver generally fails to provide useful feedback.             Sanctum and Komodo also differ in their approach to attes-
+Instead, the developer must simplify the proof and/or add               tation. Sanctum computes measurements in the monitor, but
+assertions to reduce the complexity. However, even once                 delegates attestation to a privileged signing enclave to avoid
+fixed, the proof may easily timeout again due to minor per-             side-channel leaks involving the attestation key. We instead
+turbations. Worse, minor changes can trigger timeouts in                implement local attestation directly in the monitor. Our at-
+seemingly unrelated proofs. Proofs involving bitwise opera-             testation algorithm (HMAC-SHA256) is data-independent in
+tions or the modulo operator proved particularly unstable.              its address trace, and we could prove this using techniques
+The only reliable way to remove timeouts in a given piece of            previously developed for Vale [12]. We feel that this is a good
+code was generally to refactor it into smaller subprocedures            verification-complexity tradeoff compared to specifying and
+with their own explicit pre- and post-conditions, but this              implementing the IPC mechanisms that Sanctum uses to
+leads to inelegant and hard-to-maintain code.                           support attestation in an enclave.
+                                                                           Software. Other systems have sought to use commodity
+9.2    Future work                                                      hardware to provide enclave-like isolated execution environ-
+While we believe Komodo represents a significant step to-               ments in software. However, the majority of these did not
+wards practicality, and many applications (e.g., in embedded            provide formal guarantees [e.g., 57, 58, 69].
+systems) are already in reach, more work remains.                          Our verification methodology builds on the tools and
+                                                                        techniques developed in Verve [89], Ironclad [38] and Iron-
+   Dispatcher interface. Komodo is not vulnerable to
+                                                                        Fleet [39], however the most closely related verified sys-
+controlled-channel attacks [78, 88] merely by virtue of the
+                                                                        tems are the kernels seL4 [49], CertiKOS [34, 35] and
+fact that it does not yet support demand-paging of enclave
+                                                                        überSpark [84]. Komodo might even be viewed as a microker-
+memory. We hope to evolve our current thread-based in-
+                                                                        nel with an unusual API, but this comparison has its limits:
+terface where enclave threads are either started anew, or
+                                                                        Komodo does not handle interrupts nor support device dri-
+saved/restored transparently into a LibOS-style dispatcher
+                                                                        vers, not even for the system clock or interrupt controller; it
+interface [55] with explicit user-mode upcalls to resume a
+                                                                        does not implement a scheduler nor perform resource man-
+thread or report an exception. This will permit the use of
+                                                                        agement; it lacks an IPC mechanism. It does, however, per-
+enclave self-paging to manage memory [37, 66], without
+                                                                        form attestation and run alongside an untrusted OS. Like Ko-
+exposing page faults to the untrusted OS.
+                                                                        modo, seL4 and CertiKOS also benefit from proofs of security
+   Multi-core support. Komodo’s biggest remaining limita-               properties based on noninterference [20, 62]; seL4’s formali-
+tion is undoubtedly multi-core support. There are several               sation is more complex since it includes general-purpose IPC.
+avenues to close this gap, but the simplest is a single shared          Ultimately the advantage that Komodo gains from simplic-
+lock around all monitor activities, which would preserve                ity and automated verification tools is adaptability: we can
+the sequential (Floyd-Hoare) reasoning used in our current              rapidly evolve Komodo while preserving its security guar-
+proofs. Experience with microkernels even suggests that this            antees, whereas complex kernels like seL4 and CertiKOS
+may not unduly harm performance [25].                                   represent substantially more human effort.
+
+10    RELATED WORK                                                      11    CONCLUSION
+   Hardware. A wide range of systems have used hardware to              Komodo is the first formally verified implementation of an
+isolate sensitive code from an untrusted OS [15, 16, 26, 27, 50,        SGX-like enclave isolation mechanism. Its design decouples
+53, 67, 82]. These vary in their resilience to hardware attacks,        enclave hardware primitives from security-critical but for-
+size of the software trusted computing base, and granularity            mally verified software, enabling independent evolution of
+of protection. However, to our knowledge none has a formal              the two. We used noninterference to prove high-level guar-
+specification nor a proof of security. SGX [43, 59] is unique           antees of confidentiality and integrity, we showed that the
+mainly because of its implementation in x86.                            approach is feasible, that Komodo can evolve more quickly
+   The most closely related system to Komodo is Sanc-                   than SGX, and that it can even outperform SGX.
+tum [19]. Like Komodo, Sanctum consists of simple hard-
+ware extensions to support a trusted security monitor that              ACKNOWLEDGEMENTS
+in turn manages and protects enclaves. Unlike Sanctum, the              We thank the anonymous reviewers and our shepherd
+Komodo prototype runs on readily available hardware (ARM                George Candea for valuable feedback, and Rustan Leino and
+TrustZone) and includes machine-checked proofs of both                  Jay Lorch for help with Dafny.
+functional correctness and noninterference properties that                This work was supported in part by the National Science
+guarantee enclave integrity and confidentiality.                        Foundation and VMware under Grant No. CNS-1700521.
+                                                                   16
+Komodo                                                                                                     SOSP ’17, October 28, 2017, Shanghai, China
+
+REFERENCES                                                                                    ISBN 978-1-4503-2835-7. doi: 10.1145/2694344.2694380.
+ [1] PrimeCell Infrastructure AMBA 3 TrustZone Protection Controller (BP147)             [18] V. Costan and S. Devadas. Intel SGX explained. Cryptology ePrint
+     Technical Overview. ARM Limited, Nov. 2004. Ref. DTO 0015A.                              Archive, Report 2016/086, Feb. 2016. http://eprint.iacr.org/2016/086.
+ [2] Building a Secure System using TrustZone Technology. ARM Limited,                   [19] V. Costan, I. Lebedev, and S. Devadas. Sanctum: Minimal hard-
+     Apr. 2009. Ref. PRD29-GENC-009492C.                                                      ware extensions for strong software isolation. In 25th USENIX Se-
+ [3] ARM Architecture Reference Manual, ARMv7-A and ARMv7-R edition.                          curity Symposium, pages 857–874, Aug. 2016. ISBN 978-1-931971-
+     ARM Limited, May 2014. Ref. DDI 0406C.c.                                                 32-4. URL https://www.usenix.org/conference/usenixsecurity16/
+ [4] ARM CoreLink TZC-400 TrustZone Address Space Controller Technical                        technical-sessions/presentation/costan.
+     Reference Manual. ARM Limited, Feb. 2014. Ref. DDI 0504C.                           [20] D. Costanzo, Z. Shao, and R. Gu. End-to-end verification of information-
+ [5] S. Arnautov, B. Trach, F. Gregor, T. Knauth, A. Martin, C. Priebe, J. Lind,              flow security for C and assembly programs. In 37th ACM SIGPLAN Con-
+     D. Muthukumaran, D. O’Keeffe, M. L. Stillwell, D. Goltzsche, D. Eyers,                   ference on Programming Language Design and Implementation, pages
+     R. Kapitza, P. Pietzuch, and C. Fetzer. SCONE: Secure Linux containers                   648–664, 2016. ISBN 978-1-4503-4261-2. doi: 10.1145/2908080.2908100.
+     with Intel SGX. In 12th USENIX Symposium on Operating Systems De-                   [21] S. Crosby.       Using Intel SGX to protect on-line credentials,
+     sign and Implementation, pages 689–703, 2016. ISBN 978-1-931971-33-1.                    Aug. 2016.             URL https://blogs.bromium.com/2016/08/09/
+     URL https://www.usenix.org/conference/osdi16/technical-sessions/                         using-intel-sgx-to-protect-on-line-credentials/.
+     presentation/arnautov.                                                              [22] I. Cutress. Intel’s ‘Tick-Tock’ seemingly dead, becomes ‘Process-
+ [6] A. M. Azab, P. Ning, J. Shah, Q. Chen, R. Bhutkar, G. Ganesh, J. Ma,                     Architecture-Optimization’. AnandTech, Mar. 2016. URL http://www.
+     and W. Shen. Hypervision across worlds: Real-time kernel protection                      anandtech.com/show/10183.
+     from the ARM TrustZone secure world. In 21st ACM Conference on                      [23] L. de Moura and N. Bjørner. Z3: An efficient SMT solver. In 14th
+     Computer and Communications Security, pages 90–102, 2014. ISBN                           International Conference on Tools and Algorithms for the Construction
+     978-1-4503-2957-6. doi: 10.1145/2660267.2660350.                                         and Analysis of Systems (TACAS), pages 337–340, Mar. 2008. ISBN
+ [7] A. Baumann. Hardware is the new software. In 16th Workshop on Hot                        978-3-540-78800-3. doi: 10.1007/978-3-540-78800-3_24.
+     Topics in Operating Systems, HotOS ’17, pages 132–137, 2017. ISBN                   [24] PALcode for Alpha Microprocessors System Design Guide. Digital Equip-
+     978-1-4503-5068-6. doi: 10.1145/3102980.3103002.                                         ment Corp., May 1996. Order No. EC-QFGLC-TE.
+ [8] A. Baumann, M. Peinado, and G. Hunt. Shielding applications from an                 [25] K. Elphinstone, A. Zarrabi, A. Danis, Y. Shen, and G. Heiser. An
+     untrusted cloud with Haven. In 11th USENIX Symposium on Operating                        evaluation of coarse-grained locking for multicore microkernels. CoRR,
+     Systems Design and Implementation, pages 267–283, Oct. 2014. ISBN                        abs/1609.08372, Oct. 2016. URL http://arxiv.org/abs/1609.08372.
+     978-1-931971-16-4. URL https://www.usenix.org/conference/osdi14/                    [26] D. Evtyushkin, J. Elwell, M. Ozsoy, D. Ponomarev, N. A. Ghazaleh,
+     technical-sessions/presentation/baumann.                                                 and R. Riley. Iso-X: A flexible architecture for hardware-managed
+ [9] J. Behl, T. Distler, and R. Kapitza. Hybrids on steroids: SGX-based high                 isolated execution. In 47th Annual IEEE/ACM International Symposium
+     performance BFT. In EuroSys Conference, pages 222–237, 2017. ISBN                        on Microarchitecture, MICRO-47, pages 190–202, 2014. ISBN 978-1-
+     978-1-4503-4938-3. doi: 10.1145/3064176.3064213.                                         4799-6998-2. doi: 10.1109/MICRO.2014.25.
+[10] K. J. Biba. Integrity considerations for secure computer systems. Tech-             [27] C. W. Fletcher, M. v. Dijk, and S. Devadas. A secure processor archi-
+     nical Report ESD-TR-76-372, USAF Electronic Systems Division, 1977.                      tecture for encrypted computation on untrusted programs. In 7th
+[11] R. Boivie. SecureBlue++: CPU support for secure execution. Technical                     ACM Workshop on Scalable Trusted Computing, pages 3–8, 2012. ISBN
+     Report RC25287, IBM Research, May 2012. URL http://researcher.                           978-1-4503-1662-0. doi: 10.1145/2382536.2382540.
+     watson.ibm.com/researcher/view_group.php?id=7253.                                   [28] P. Fonseca, K. Zhang, X. Wang, and A. Krishnamurthy. An empirical
+[12] B. Bond, C. Hawblitzel, M. Kapritsos, K. R. M. Leino, J. R. Lorch,                       study on the correctness of formally verified distributed systems. In
+     B. Parno, A. Rane, S. Setty, and L. Thompson. Vale: Verifying high-                      EuroSys Conference, Apr. 2017. doi: 10.1145/3064176.3064183.
+     performance cryptographic assembly code. In 26th USENIX Secu-                       [29] A. Fox and M. O. Myreen. A trustworthy monadic formalization of
+     rity Symposium, Aug. 2017. URL https://www.usenix.org/conference/                        the ARMv7 instruction set architecture. In 1st International Conference
+     usenixsecurity17/technical-sessions/presentation/bond.                                   on Interactive Theorem Proving, pages 243–258, July 2010. ISBN 978-3-
+[13] F. Brasser, U. Müller, A. Dmitrienko, K. Kostiainen, S. Capkun, and A.-R.                642-14052-5. doi: 10.1007/978-3-642-14052-5_18.
+     Sadeghi. Software grand exposure: SGX cache attacks are practical. In               [30] GlobalPlatform Device Technology TEE System Architecture v1.1. Glob-
+     11th USENIX Workshop on Offensive Technologies (WOOT 17), Aug. 2017.                     alPlatform, Jan. 2017. Ref. GPD_SPE_009.
+     URL https://www.usenix.org/conference/woot17/workshop-program/                      [31] A. Goel, S. Krstić, R. Leslie, and M. R. Tuttle. SMT-based system
+     presentation/brasser.                                                                    verification with DVF. In 10th International Workshop on Satisfiability
+[14] S. Brenner, C. Wulf, D. Goltzsche, N. Weichbrodt, M. Lorenz, C. Fetzer,                  Modulo Theories, pages 32–43, 2012. URL http://smt2012.loria.fr/paper2.
+     P. Pietzuch, and R. Kapitza. SecureKeeper: Confidential ZooKeeper us-                    pdf.
+     ing Intel SGX. In 17th International Middleware Conference, pages 14:1–             [32] J. A. Goguen and J. Meseguer. Security policies and security
+     14:13, 2016. ISBN 978-1-4503-4300-8. doi: 10.1145/2988336.2988350.                       models. In IEEE Symposium on Security and Privacy, 1982. doi:
+[15] D. Champagne and R. B. Lee. Scalable architectural support for trusted                   10.1109/SP.1982.10014.
+     software. In 16th IEEE International Symposium on High-Performance                  [33] A. Gollamudi and S. Chong. Automatic enforcement of expressive
+     Computer Architecture, Jan. 2010. doi: 10.1109/HPCA.2010.5416657.                        security policies using enclaves. In 2016 ACM SIGPLAN Conference
+[16] S. Chhabra, B. Rogers, Y. Solihin, and M. Prvulovic. SecureME: a                         on Object-Oriented Programming Systems, Languages, and Applications,
+     hardware-software approach to full system security. In International                     OOPSLA 2016, pages 494–513, 2016. ISBN 978-1-4503-4444-9. doi:
+     Conference on Supercomputing, pages 108–119, 2011. ISBN 978-1-4503-                      10.1145/2983990.2984002.
+     0102-2. doi: 10.1145/1995896.1995914.                                               [34] R. Gu, J. Koenig, T. Ramananandro, Z. Shao, X. N. Wu, S.-C. Weng,
+[17] P. Colp, J. Zhang, J. Gleeson, S. Suneja, E. de Lara, H. Raj, S. Saroiu, and             H. Zhang, and Y. Guo. Deep specifications and certified abstraction
+     A. Wolman. Protecting data on smartphones and tablets from memory                        layers. In 42nd ACM SIGPLAN-SIGACT Symposium on Principles of
+     attacks. In 20th International Conference on Architectural Support for                   Programming Languages, pages 595–608, 2015. ISBN 978-1-4503-3300-9.
+     Programming Languages and Operating Systems, pages 177–189, 2015.                        doi: 10.1145/2676726.2676975.
+                                                                                    17
+SOSP ’17, October 28, 2017, Shanghai, China                                                                                                 A. Ferraiuolo et al.
+
+[35] R. Gu, Z. Shao, H. Chen, X. N. Wo, J. Kim, V. Sjöberg, and D. Costanzo.                ISBN 0-7695-2270-X. doi: 10.1109/ISCA.2005.14.
+     CertiKOS: An extensible architecture for building certified concurrent            [51] K. R. M. Leino. Dafny: An automatic program verifier for functional
+     OS kernels. In 12th USENIX Symposium on Operating Systems Design                       correctness. In 16th International Conference on Logic for Programming,
+     and Implementation, Nov. 2016.                                                         Artificial Intelligence, and Reasoning (LPAR-16), pages 348–370, Apr.
+[36] J. A. Halderman, S. D. Schoen, N. Heninger, W. Clarkson, W. Paul, J. A.                2010. ISBN 978-3-642-17511-4. doi: 10.1007/978-3-642-17511-4_20.
+     Calandrino, A. J. Feldman, J. Appelbaum, and E. W. Felten. Lest we                [52] R. Leslie-Hurd, D. Caspi, and M. Fernandez. Verifying linearizability
+     remember: Cold boot attacks on encryption keys. In 17th USENIX                         of Intel software guard extensions. In 27th International Conference
+     Security Symposium, pages 45–60, July 2008. URL https://www.usenix.                    on Computer Aided Verification, pages 144–160, July 2015. ISBN 978-3-
+     org/legacy/event/sec08/tech/full_papers/halderman/halderman.pdf.                       319-21668-3. doi: 10.1007/978-3-319-21668-3_9.
+[37] S. M. Hand. Self-paging in the Nemesis operating system. In 3rd                   [53] D. Lie, C. Thekkath, M. Mitchell, P. Lincoln, D. Boneh, J. Mitchell, and
+     USENIX Symposium on Operating Systems Design and Implementation,                       M. Horowitz. Architectural support for copy and tamper resistant
+     pages 73–86, New Orleans, Louisiana, USA, 1999. ISBN 1-880446-39-1.                    software. In 9th International Conference on Architectural Support
+     URL https://www.usenix.org/events/osdi99/hand.html.                                    for Programming Languages and Operating Systems, Nov. 2000. doi:
+[38] C. Hawblitzel, J. Howell, J. R. Lorch, A. Narayan, B. Parno, D. Zhang,                 10.1145/356989.357005.
+     and B. Zill. Ironclad apps: End-to-end security via automated full-               [54] L. Maranget, S. Sarkar, and P. Sewell. A tutorial introduction to the
+     system verification. In 11th USENIX Symposium on Operating Sys-                        ARM and POWER relaxed memory models. Draft revision 120, Oct.
+     tems Design and Implementation, pages 165–181, Oct. 2014. ISBN                         2012. URL http://www.cl.cam.ac.uk/~pes20/weakmemory/.
+     978-1-931971-16-4. URL https://www.usenix.org/conference/osdi14/                  [55] B. D. Marsh, M. L. Scott, T. J. LeBlanc, and E. P. Markatos. First-
+     technical-sessions/presentation/hawblitzel.                                            class user-level threads. In 13th ACM Symposium on Operating
+[39] C. Hawblitzel, J. Howell, M. Kapritsos, J. R. Lorch, B. Parno, M. L.                   Systems Principles, pages 110–121, 1991. ISBN 0-89791-447-3. doi:
+     Roberts, S. Setty, and B. Zill. IronFleet: Proving practical dis-                      10.1145/121132.344329.
+     tributed systems correct. In 25th ACM Symposium on Operating                      [56] J. M. McCune, B. Parno, A. Perrig, M. K. Reiter, and A. Seshadri. Min-
+     Systems Principles, pages 1–17, 2015. ISBN 978-1-4503-3834-9. doi:                     imal TCB code execution (extended abstract). In Proceedings of the
+     10.1145/2815400.2815428.                                                               IEEE Symposium on Security and Privacy, May 2007.
+[40] J. Howell, B. Parno, and J. R. Douceur. Embassies: Radically refactoring          [57] J. M. McCune, B. J. Parno, A. Perrig, M. K. Reiter, and H. Isozaki.
+     the web. In 10th USENIX Symposium on Networked Systems Design                          Flicker: an execution infrastructure for TCB minimization. In Eu-
+     and Implementation, pages 529–545, 2013. ISBN 978-1-931971-00-3.                       roSys Conference, pages 315–328, 2008. ISBN 978-1-60558-013-5. doi:
+     URL https://www.usenix.org/conference/nsdi13/technical-sessions/                       10.1145/1352592.1352625.
+     presentation/howell.                                                              [58] J. M. McCune, Y. Li, N. Qu, Z. Zhou, A. Datta, V. Gligor, and A. Per-
+[41] G. Hunt, G. Letey, and E. Nightingale. The seven properties of highly                  rig. TrustVisor: Efficient TCB reduction and attestation. In IEEE
+     secure devices. Technical Report MSR-TR-2017-16, Microsoft Re-                         Symposium on Security and Privacy, pages 143–158, May 2010. doi:
+     search, Mar. 2017. URL https://www.microsoft.com/en-us/research/                       10.1109/SP.2010.17.
+     publication/seven-properties-highly-secure-devices/.                              [59] F. McKeen, I. Alexandrovich, A. Berenzon, C. V. Rozas, H. Shafi,
+[42] T. Hunt, Z. Zhu, Y. Xu, S. Peter, and E. Witchel. Ryoan: A distributed                 V. Shanbhogue, and U. R. Savagaonkar. Innovative instructions and
+     sandbox for untrusted computation on secret data. In 12th USENIX                       software model for isolated execution. In 2nd International Workshop
+     Symposium on Operating Systems Design and Implementation, pages                        on Hardware and Architectural Support for Security and Privacy, 2013.
+     533–549, 2016. ISBN 978-1-931971-33-1. URL https://www.usenix.org/                     ISBN 978-1-4503-2118-1. doi: 10.1145/2487726.2488368.
+     conference/osdi16/technical-sessions/presentation/hunt.                           [60] F. X. McKeen, C. V. Rozas, U. R. Savagaonkar, S. P. Johnson, V. Scarlata,
+[43] Software Guard Extensions Programming Reference. Intel Corp., Oct.                     M. A. Goldsmith, E. Brickell, et al. Method and apparatus to provide
+     2014. Ref. #329298-002 https://software.intel.com/sites/default/files/                 secure application execution, Dec. 2009. US Patent 9,087,200.
+     managed/48/88/329298-002.pdf.                                                     [61] MITRE. CVE-2017-5691, July 2017. URL https://nvd.nist.gov/vuln/
+[44] SGX Tutorial at ISCA 2015. Intel Corp., June 2015. Ref. #332680-002                    detail/CVE-2017-5691.
+     https://software.intel.com/sites/default/files/332680-002.pdf.                    [62] T. Murray, D. Matichuk, M. Brassil, P. Gammie, T. Bourke, S. Seefried,
+[45] Intel 64 and IA-32 Architectures Software Developer’s Manual. Intel                    C. Lewis, X. Gao, and G. Klein. seL4: From general purpose to a proof
+     Corp., Dec. 2016. Ref. #325462-061US.                                                  of information flow enforcement. In IEEE Symposium on Security and
+[46] S. P. Johnson, U. R. Savagaonkar, V. R. Scarlata, F. X. McKeen, and C. V.              Privacy, pages 415–429, May 2013. doi: 10.1109/SP.2013.35.
+     Rozas. Technique for supporting multiple secure enclaves, Dec. 2010.              [63] K. T. Nguyen. Introduction to Cache Allocation Technology in the
+     US Patent 8,972,746.                                                                   Intel Xeon Processor E5 v4 family, Feb. 2016. https://software.intel.
+[47] U. Kanonov and A. Wool. Secure containers in Android: The Samsung                      com/en-us/articles/introduction-to-cache-allocation-technology.
+     KNOX case study. In 6th Workshop on Security and Privacy in Smart-                [64] NXP. i.MX 7Solo, i.MX 7Dual applications processors, 2017. URL
+     phones and Mobile Devices, pages 3–12, 2016. ISBN 978-1-4503-4564-4.                   http://www.nxp.com/iMX7.
+     doi: 10.1145/2994459.2994470.                                                     [65] O. Ohrimenko, F. Schuster, C. Fournet, A. Mehta, S. Nowozin,
+[48] D. Kaplan, J. Powell, and T. Woller.            AMD memory encryp-                     K. Vaswani, and M. Costa.            Oblivious multi-party machine
+     tion. http://developer.amd.com/wordpress/media/2013/12/AMD_                            learning on trusted processors.            In 25th USENIX Security
+     Memory_Encryption_Whitepaper_v7-Public.pdf, Apr. 2016.                                 Symposium, pages 619–636, 2016.                ISBN 978-1-931971-32-
+[49] G. Klein, J. Andronick, K. Elphinstone, T. Murray, T. Sewell, R. Kolanski,             4.      URL https://www.usenix.org/conference/usenixsecurity16/
+     and G. Heiser. Comprehensive formal verification of an OS microkernel.                 technical-sessions/presentation/ohrimenko.
+     ACM Transactions on Computer Systems, 32(1):2:1–2:70, Feb. 2014. ISSN             [66] M. Orenbach, P. Lifshits, M. Minkin, and M. Silberstein. Eleos: ExitLess
+     0734-2071. doi: 10.1145/2560537.                                                       OS services for SGX enclaves. In EuroSys Conference, Apr. 2017. doi:
+[50] R. B. Lee, P. C. S. Kwan, J. P. McGregor, J. Dwoskin, and Z. Wang.                     10.1145/3064176.3064219.
+     Architecture for protecting critical secrets in microprocessors. In 32nd          [67] E. Owusu, J. Guajardo, J. McCune, J. Newsome, A. Perrig, and A. Va-
+     International Symposium on Computer Architecture, pages 2–13, 2005.                    sudevan. OASIS: On achieving a sanctuary for integrity and secrecy
+                                                                                  18
+Komodo                                                                                                  SOSP ’17, October 28, 2017, Shanghai, China
+
+     on untrusted platforms. In 20th ACM Conference on Computer and                   [78] S. Shinde, Z. L. Chua, V. Narayanan, and P. Saxena. Preventing page
+     Communications Security, pages 13–24, 2013. ISBN 978-1-4503-2477-9.                   faults from telling your secrets. In 11th ACM Asia Conference on
+     doi: 10.1145/2508859.2516678.                                                         Computer and Communications Security, pages 317–328, 2016. ISBN
+[68] R. Pires, M. Pasin, P. Felber, and C. Fetzer. Secure content-based                    978-1-4503-4233-9. doi: 10.1145/2897845.2897885.
+     routing using Intel software guard extensions. In 17th International             [79] T. Simonite. Intel puts the brakes on Moore’s Law. MIT Technology
+     Middleware Conference, pages 10:1–10:10, 2016. ISBN 978-1-4503-4300-                  Review, Mar. 2016. URL https://www.technologyreview.com/s/601102.
+     8. doi: 10.1145/2988336.2988346.                                                 [80] R. Sinha, S. Rajamani, S. Seshia, and K. Vaswani. Moat: Verifying
+[69] H. Raj, D. Robinson, T. B. Tariq, P. England, S. Saroiu, and A. Wolman.               confidentiality of enclave programs. In 22nd ACM Conference on Com-
+     Credo: Trusted computing for guest VMs with a commodity hypervisor.                   puter and Communications Security, pages 1169–1184, 2015. ISBN
+     Technical Report MSR-TR-2011-130, Microsoft Research, Dec. 2011.                      978-1-4503-3832-5. doi: 10.1145/2810103.2813608.
+[70] H. Raj, S. Saroiu, A. Wolman, R. Aigner, J. Cox, P. England, C. Fen-             [81] R. Sinha, M. Costa, A. Lal, N. P. Lopes, S. Rajamani, S. A. Seshia, and
+     ner, K. Kinshumann, J. Loeser, D. Mattoon, M. Nystrom, D. Robinson,                   K. Vaswani. A design and verification methodology for secure isolated
+     R. Spiger, S. Thom, and D. Wooten. fTPM: A software-only imple-                       regions. In 37th ACM SIGPLAN Conference on Programming Language
+     mentation of a TPM chip. In 25th USENIX Security Symposium, pages                     Design and Implementation, PLDI ’16, pages 665–681, 2016. ISBN 978-
+     841–856, 2016. ISBN 978-1-931971-32-4. URL https://www.usenix.org/                    1-4503-4261-2. doi: 10.1145/2908080.2908113.
+     conference/usenixsecurity16/technical-sessions/presentation/raj.                 [82] J. Szefer and R. B. Lee. Architectural support for hypervisor-secure
+[71] A. Reid. Trustworthy specifications of ARM v8-A and v8-M system                       virtualization. In 17th International Conference on Architectural Support
+     level architecture. In Formal Methods in Computer-Aided Design, pages                 for Programming Languages and Operating Systems, pages 437–450,
+     161–168, Oct. 2016. doi: 10.1109/FMCAD.2016.7886675.                                  2012. ISBN 978-1-4503-0759-8. doi: 10.1145/2150976.2151022.
+[72] A. Reid, R. Chen, A. Deligiannis, D. Gilday, D. Hoyes, W. Keen, A. Pathi-        [83] TPM Main Specification Level 2. Trusted Computing Group, Mar. 2011.
+     rane, O. Shepherd, P. Vrabel, and A. Zaidi. End-to-end verification                   Version 1.2, Revision 116.
+     of ARM processors with ISA-formal. In 28th International Confer-                 [84] A. Vasudevan, S. Chaki, P. Maniatis, L. Jia, and A. Datta. überspark:
+     ence on Computer Aided Verification, pages 42–58, July 2016. ISBN                     Enforcing verifiable object abstractions for automated composi-
+     978-3-319-41540-6. doi: 10.1007/978-3-319-41540-6_3.                                  tional security analysis of a hypervisor. In 25th USENIX Se-
+[73] A. Sabelfeld and A. C. Myers. A Model for Delimited Information                       curity Symposium, pages 87–104, 2016.               ISBN 978-1-931971-
+     Release, pages 174–191. Springer, Oct. 2004. ISBN 978-3-540-37621-7.                  32-4. URL https://www.usenix.org/conference/usenixsecurity16/
+     doi: 10.1007/978-3-540-37621-7_9.                                                     technical-sessions/presentation/vasudevan.
+[74] N. Santos, H. Raj, S. Saroiu, and A. Wolman. Using ARM TrustZone                 [85] A. Waterman, Y. Lee, R. Avizienis, D. A. Patterson, and K. Asanović.
+     to build a trusted language runtime for mobile applications. In 19th                  The RISC-V instruction set manual volume II: Privileged architecture
+     International Conference on Architectural Support for Programming                     version 1.7. Technical Report UCB/EECS-2015-49, UC Berkeley EECS,
+     Languages and Operating Systems, pages 67–80, 2014. ISBN 978-1-4503-                  May 2015.
+     2305-5. doi: 10.1145/2541940.2541949.                                            [86] R. Wojtczuk and J. Rutkowska. Attacking Intel TXT via SINIT code
+[75] F. Schuster, M. Costa, C. Fournet, C. Gkantsidis, M. Peinado, G. Mainar-              execution hijacking. http://invisiblethingslab.com/resources/2011/
+     Ruiz, and M. Russinovich. VC3: Trustworthy data analytics in the                      Attacking_Intel_TXT_via_SINIT_hijacking.pdf, Nov. 2011.
+     cloud using SGX. In IEEE Symposium on Security and Privacy, May                  [87] R. Wojtczuk, J. Rutkowska, and A. Tereshkin. Another way to circum-
+     2015. doi: 10.1109/SP.2015.10.                                                        vent Intel Trusted Execution Technology. http://invisiblethingslab.
+[76] M. Schwarz, S. Weiser, D. Gruss, C. Maurice, and S. Mangard. Mal-                     com/resources/misc09/Another%20TXT%20Attack.pdf, Dec. 2009.
+     ware guard extension: Using SGX to conceal cache attacks. In 14th                [88] Y. Xu, W. Cui, and M. Peinado. Controlled-channel attacks: Determinis-
+     International Conference on Detection of Intrusions and Malware, and                  tic side-channels for untrusted operating systems. In IEEE Symposium
+     Vulnerability Assessment (DIMVA), pages 3–24. Springer, July 2017.                    on Security and Privacy, May 2015. doi: 10.1109/SP.2015.45.
+     ISBN 978-3-319-60876-1. doi: 10.1007/978-3-319-60876-1_1.                        [89] J. Yang and C. Hawblitzel. Safe to the last instruction: Automated veri-
+[77] M.-W. Shih, S. Lee, T. Kim, and M. Peinado. T-SGX: Eradicating                        fication of a type-safe operating system. In ACM SIGPLAN Conference
+     controlled-channel attacks against enclave programs. In Annual Net-                   on Programming Language Design and Implementation, pages 99–110,
+     work and Distributed System Security Symposium (NDSS), Feb. 2017.                     2010. ISBN 978-1-4503-0019-3. doi: 10.1145/1806596.1806610.
+
+
+
+
+                                                                                 19
+

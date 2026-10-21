@@ -1,0 +1,1209 @@
+    Efficient Scalable Thread-Safety-Violation Detection
+                        Finding thousands of concurrency bugs during testing
+                Guangpu Li                                        Shan Lu                              Madanlal Musuvathi
+           University of Chicago                          University of Chicago                           Microsoft Research
+
+                                       Suman Nath                                      Rohan Padhye
+                                    Microsoft Research                        University of California, Berkeley
+
+Abstract                                                                       Keywords thread-safety violation; concurrency bugs;
+Concurrency bugs are hard to find, reproduce, and debug.                       debugging; reliability; scalability
+They often escape rigorous in-house testing, but result in                    ACM Reference Format:
+large-scale outages in production. Existing concurrency-                      Guangpu Li, Shan Lu, Madanlal Musuvathi, Suman Nath,
+bug detection techniques unfortunately cannot be part                         and Rohan Padhye. 2019. Efficient Scalable Thread-Safety-
+of industry’s integrated build and test environment due                       Violation Detection: Finding thousands of concurrency bugs
+to some open challenges: how to handle code developed                         during testing. In ACM SIGOPS 27th Symposium on Oper-
+by thousands of engineering teams that uses a wide                            ating Systems Principles (SOSP ’19), October 27–30, 2019,
+variety of synchronization mechanisms, how to report lit-                     Huntsville, ON, Canada. ACM, New York, NY, USA, 19 pages.
+                                                                              https://doi.org/10.1145/3341301.3359638
+tle/no false positives, and how to avoid excessive testing
+resource consumption.
+   This paper presents TSVD, a thread-safety violation
+detector that addresses these challenges through a new
+design point in the domain of active testing. Unlike pre-                      1   Introduction
+vious techniques that inject delays randomly or employ                         Concurrency bugs are hard to find, reproduce, and debug.
+expensive synchronization analysis, TSVD uses light-                           Race conditions can hide in rare thread interleavings
+weight monitoring of the calling behaviors of thread-                          that do not occur during testing but nevertheless show
+unsafe methods, not any synchronization operations, to                         up in production. Thus, it is not uncommon for even the
+dynamically identify bug suspects. It then injects corre-                      simplest of concurrency bugs to escape rigorous testing
+sponding delays to drive the program towards thread-                           but result in large-scale outages in production. Even
+unsafe behaviors, actively learns from its ability or in-                      when detected, these bugs are hard to reproduce in the
+ability to do so, and persists its learning from one test                      small. As such, tools for finding concurrency bugs is an
+run to the next. TSVD is deployed and regularly used                           actively studied research area [7, 22, 43, 47, 58] with
+in Microsoft and it has already found over 1000 thread-                        many open challenges.
+safety violations from thousands of projects. It detects                          This paper specifically deals with a class of concur-
+more bugs than state-of-the-art techniques, mostly with                        rency errors we call thread-safety violations or TSVs.
+just one test run.                                                             Libraries and classes specify an informal thread-safety
+                                                                               contract that determines when a client can and cannot
+CCS Concepts • Software and its engineering → Soft-                            concurrently call into the library/class. A TSV occurs
+ware maintenance tools; Empirical software validation;                         when a client violates this contract. Figure 1 shows an
+• Computer systems organization → Reliability;                                 example. The implementation of the Dictionary class
+                                                                               allows multiple threads to concurrently call read oper-
+Permission to make digital or hard copies of all or part of this
+                                                                               ations, such as ContainsKey, but requires write opera-
+work for personal or classroom use is granted without fee provided             tions, such as Add, to only be called in exclusive contexts.
+that copies are not made or distributed for profit or commercial               By violating this contract, Figure 1 contains a TSV.
+advantage and that copies bear this notice and the full citation                  This paper is motivated by the prevalence of such
+on the first page. Copyrights for components of this work owned                TSVs in production code. In fact, our evaluation discov-
+by others than ACM must be honored. Abstracting with credit is
+permitted. To copy otherwise, or republish, to post on servers or
+                                                                               ered that the pattern in Figure 1 is fairly common as
+to redistribute to lists, requires prior specific permission and/or a          developers erroneously assume that concurrent accesses
+fee. Request permissions from permissions@acm.org.                             on different keys are “thread safe.” TSVs, while common,
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                          can have drastic consequences, including unexpected
+© 2019 Association for Computing Machinery.
+ACM ISBN 978-1-4503-6873-5/19/10. . . $15.00                                   Guangpu Li is supported by an SOSP 2019 student scholarship
+https://doi.org/10.1145/3341301.3359638                                        from the National Science Foundation.
+
+
+
+
+                                                                        162
+1   // Dictionary dict                                                                                    DataCollider, …
+
+
+
+
+                                                                                   # of delay locations
+2   // Thread 1:
+3   dict . Add ( key1 , value )
+4   // Thread 2:
+5   dict . ContainsKey ( key2 )
+                                                                                                              TSVD
+    Figure 1. A thread-safety violation (TSV) bug                                                                           RaceFuzzer, CTrigger, …
+
+                                                                                               Cost of identifying delay locations
+crashes or worse, silent data corruption that are difficult
+to diagnose and fix.                                                       Figure 2. The design space of active testing
+   This paper describes TSVD, a dynamic-analysis tool
+for detecting TSVs. The tool is specifically designed to be
+used in an integrated build and test environment, such as            performing analysis, either through run-time overhead
+Bazel [4] or CloudBuild [15]. Here, hundreds to thousands            for dynamic analysis or the inscalability of precise static
+of machines build and run tests on software modules from             analysis required for identifying potentially conflicting
+thousands of engineering groups. We have designed the                accesses.
+system end to end to operate at this scale. For instance,               At the other extreme, as illustrated in the upper-left
+it is important to design tools that produce little to               corner of Figure 2, tools like DataCollider [14] conduct
+no false bug reports. A small loss of productivity per-              little to no analysis, but instead probabilistically inject
+user in chasing false bugs can quickly multiply to huge              delays at many program locations. Such tools require
+productivity losses across the organization. Similarly, it           many repeated executions of the same test to find a bug,
+is important to design tools that incur small resource               which we deem unacceptable in our context as described
+overhead. For instance, if a tool incurs a 10× run-time              above.
+overhead or requires rerunning the same test 10× times,                 The goal of TSVD is to explore the middle ground in
+then the test environment needs to allocate 10× more                 the design space of delay-injection tools, as illustrated
+machines to provide the same turnaround time to its                  in Figure 2. TSVD uses lightweight instrumentation and
+users.                                                               dynamic analysis to identify potential conflicting accesses
+   Since TSVs generalize the notion of data races to                 without paying the overhead while being effective in
+coarser-grain objects, techniques for detecting TSVs are             finding bugs.
+naturally related to data-race detection (Section 2 has                 First, TSVD performs a lightweight near-miss tracking
+more discussion). But existing approaches fall short for             to identify potential thread-safety violations. It dynami-
+our purposes.                                                        cally tracks threads that invoke conflicting methods to
+   Considering the goal about having little to no false bug          the same object close to each other in real time, without
+reports, the approach of active delay-injection [14, 47, 58]         monitoring or analyzing synchronization operations.
+is promising. This approach directs program threads                     Second, TSVD uses a happens-before (HB) inferenc-
+towards making conflicting accesses by delaying threads              ing technique that leverages the feedback from delay
+at strategic locations at run time. Consequently, this               injections to prune call pairs that are likely ordered by
+approach only reports bugs that are validated at runtime,            the happens-before relation [34] and thus cannot execute
+and thus are not false bugs.                                         concurrently. The key observation is that if there is a HB
+   Considering the goal about having small overhead                  relationship between two events 𝑎 and 𝑏, then a delay
+however, existing active delay-injection techniques do               in 𝑎 will cause a delay in 𝑏. By inferring this causal-
+not work. To better understand their limitations, we                 ity, TSVD avoids injecting delays at these pruned pairs
+can broadly classify them based on the inherent tradeoff             subsequently. Note, that unlike HB analysis performed
+between the cost of injecting too many delays versus                 by dynamic data-race detectors, HB inference does not
+the sophistication of analysis required to select where to           require modeling, identifying, and analyzing synchroniza-
+inject delays:                                                       tion operations in a program, which is expensive and
+   At one extreme, as illustrated in the lower-right corner          complicated given the wide variety of synchronization
+of Figure 2, tools like RaceFuzzer [58] and CTrigger [47]            mechanisms in production software.
+conduct static or dynamic analysis of memory accesses                   An interesting benefit of the near-miss tracking and
+and synchronization operations in a program to identify              the HB inferencing is that it only requires local instrumen-
+potential buggy locations, and selectively inject delays             tation. That is, only the libraries/classes whose thread-
+only at these locations. While this reduces the number               safety contract is checked need to be instrumented. All
+of delays injected, these techniques bear the cost of                other parts of the code, including synchronizations such
+
+
+
+                                                               163
+as forks, joins, locks, volatile accesses, and ad-hoc syn-          2   Motivation and Background
+chronization, do not need to be instrumented. This mod-             2.1 Why Concurrency Testing in the Large?
+ularity dramatically reduces the runtime overhead. Fur-
+                                                                    The broader goal of this paper is to find concurrency
+thermore, it enables incremental “pay-as-you-go” thread-
+                                                                    errors during testing, ideally “in the small.” Our spe-
+safety checking of different classes and libraries, greatly
+                                                                    cific goal here is to build a concurrency testing tool as
+simplifying the deployment of TSVD to thousands of
+                                                                    part of integrated build and test environments that are
+engineering groups, who can configure the tool based on
+                                                                    becoming popular in software companies today [4, 15].
+their needs.
+                                                                    Such an environment provides a centralized code reposi-
+   Another key benefit of TSVD is that it is independent
+                                                                    tory for all the different engineering groups. The code
+of the underlying concurrency programming model and
+                                                                    is incrementally built on every commit and on specific
+oblivious to synchronization semantics, and thus can work
+                                                                    successful builds; a collection of servers automatically
+across different programming models, such as threads,
+                                                                    run unit and functional tests. It is not uncommon to
+task-based programming, asynchronous programming,
+                                                                    have hundreds of servers dedicated to run tests from
+etc., and be applied to software using a variety of syn-
+                                                                    tens of thousands of modules written by many different
+chronization primitives.
+                                                                    groups.
+   Finally, TSVD compacts its delay injections, delay-
+                                                                       Testing at this scale introduces key challenges: to
+location identification and adjustment all into the same
+                                                                    minimize productivity loss, tools should have little/no
+run. In contrast, RaceFuzzer and CTrigger, require at
+                                                                    false positives; to reduce overheads, the tools should have
+least two runs, first to do the analysis and the second
+                                                                    minimal runtime overhead and not require rerunning the
+to inject delays. In many cases, as our evaluation shows,
+                                                                    test too many times; for wide adoption across a variety
+TSVD finds a large fraction of bugs in the first test run,
+                                                                    of product groups, the tool should be “push button”
+making the best use of testing resources. This also allows
+                                                                    requiring little or no configuration and support a variety
+TSVD to be effective where running many repetitions of
+                                                                    of programming models. TSVD discussed in this paper
+the same test is not feasible due to large test setup and
+                                                                    is one such tool.
+shutdown overheads.
+   We evaluate TSVD on tests from roughly 43,000 soft-
+                                                                    2.2 Why Thread-Safety Violations?
+ware modules developed by various product teams at
+Microsoft. By design, TSVD produces no false error re-              A data race occurs when two threads concurrently access
+ports, with each report containing stack traces of the              the same variable and at least one of these accesses is
+two conflicting operations that violate the thread-safety           a write. Thread-safety violations are a generalization of
+contract. Overall, TSVD has found over 1,000 previously-            data races to objects and data structures. Each class
+unknown bugs, involving over 1,000 unique static pro-               or library specifies, sometimes implicitly, a thread-safety
+gram locations and over 20𝐾 unique call-stacks. To                  contract that determines the set of functions that can
+validate our results, we drilled into reports from four             be called concurrently by threads in the program. For
+product teams in Microsoft. These groups confirmed                  instance, a dictionary implementation might allow two
+that all the bugs reported are real bugs, 48% have been             threads to concurrently perform lookups, while another
+classified as high-priority bugs that would have otherwise          implementation might disallow such calls if lookups can
+resulted in service outages, and 70% have been fixed so             sometimes trigger a “rebalance” operation. In the ex-
+far. Our evaluation also shows that TSVD introduces an              treme, a lock-free implementation might concurrently
+acceptable overhead to the testing process — about 33%              allow any pairs of calls.
+overhead for multi-threaded test cases while traditional               A thread-safety violation occurs when the client fails
+techniques incur several times slowdowns.                           to meet the thread-safety contract of a class or library,
+   TSVD is incorporated into the integrated build and               as discussed earlier in Figure 1. While the notion of
+test environment at Microsoft. Over last one year, 1,500+           thread-safety contract can be more general, in this paper
+software projects under active development at Microsoft             we will assume that the methods of a data structure
+have been tested with TSVD. An open-source version                  can be grouped into two sets — the read set and the
+of TSVD is available at https://github.com/microsoft/               write set, such that two concurrent methods violate the
+TSVD.                                                               thread-safety contract if and only if at least one of them
+                                                                    belongs to the write set. All the data structures we study
+                                                                    in this paper have this property.
+                                                                       Thread-safety violations are easy to make but hard to
+                                                                    find in code reviews. Sometimes programmers deliber-
+                                                                    ately make such concurrent accesses due to their misun-
+                                                                    derstanding of the thread-safety contract. In fact, TSVD
+
+
+
+                                                              164
+is particularly inspired by a thread-safety violation simi-          1   async Task < double > getSqrt ( double x ,
+lar to Figure 1 that caused a significant customer-facing            2                   Dict < double , double > dict ) {
+service outage for days and took weeks to debug and fix.             3     if ( dict . ContainsKey ( x )) {
+   Focusing on thread-safety violations solves some of the           4       return dict [ x ];        // fetch from cache
+issues with data race detection. By definition, every TSV            5     } else {
+is a concurrency error while a data race can either be a             6       Task < double > t = Task . Run (() = >
+                                                                     7            Math . sqrt ( x )); // background work
+concurrency error or a benign one [44] (that is neverthe-
+                                                                     8       double s = await t ; // resume when done
+less disallowed by modern language standards [11, 41]).
+                                                                     9       dict . Add (x , s );      // save to cache
+Since thread-safety violations are defined at a larger              10       return s ; }}
+granularity of objects and libraries, TSVD needs not to             11
+monitor every shared-memory access as data-race detec-              12   /* Assumes `a ` , `b ` , and ` dict ` exist */
+tors do, which is one, but not all, of the reasons for the          13   Task < double > sqrtA = getSqrt (a , dict );
+good performance of TSVD.                                           14   Task < double > sqrtB = getSqrt (b , dict );
+   Note that in common parlance the term “thread safety”            15   Console . WriteLine ( sqrtA . Result   // blocks
+is defined ambiguously. Our notion here is different from           16                      + sqrtB . Result ); // blocks
+high-level data race [46]. Similarly, Pradel and Gross
+[49] use “thread-safety” as a synonym to linearizability.           Figure 3. Example of task parallelism in C#. TSVs can
+Instead, throughout the paper, we will use TSVs to refer            occur due to concurrent accesses of dict.
+the violation of the thread-safety contract as defined
+above.
+                                                                small number of threads, or (2) having many more data
+2.3 Why Not Happens-Before (HB) Analysis?                       accesses than synchronization operations [19, 48, 60], or
+                                                                (3) having task forks and task joins in a structured task
+Happens-before [34] analysis is widely used in data-race
+                                                                parallel program restricted to series-parallel graphs only
+and general concurrency-bug detection. In theory, once
+                                                                [17, 51, 52].
+we capture all the synchronization/causal operations
+                                                                   These assumptions however do not hold for the pro-
+at run time and figure out all the happens-before rela-
+                                                                grams TSVD targets: (1) these programs dynamically
+tionships, we can accurately tell which operations can
+                                                                create many tasks, many more than the number of
+execute in parallel. Unfortunately, in practice, this is ex-
+                                                                threads, and dispatch them to execute on concurrent
+tremely challenging to conduct accurately and efficiently.
+                                                                background threads; (2) the number of data accesses
+We discuss the challenges in the context of TSVD below,
+                                                                no longer dominates that of synchronization operations,
+which motivates the design of HB inference, instead of
+                                                                which include frequent task creations and joins , because
+HB analysis, in TSVD. We will also design a variant of
+                                                                data accesses are traced and checked at the granularity
+TSVD that conducts HB analysis (Section 3.5), which
+                                                                of thread-unsafe method calls and hence have a much
+allows us to compare TSVD with different detection
+                                                                smaller quantity in TSV detection; (3) these programs
+techniques.
+                                                                pass around task handles as first-class values and join
+General challenges First, it is difficult to capture all        with any task via its handle — forks and joins no longer
+synchronization actions, as programs developed by thou-         follow series-parallel graphs. Such paradigms include not
+sands of engineering teams use numerous concurrent              only traditional threading libraries like POSIX threads in
+libraries, system calls, asynchronous data structures,          C, Java’s Thread class, and System.Threading in .NET,
+volatile variables, and others for communication and co-        but also task-parallel libraries built on top of such prim-
+ordination. Missing an HB-edge associated with such an          itives, like java.util. concurrent and std::future
+action can result in false bug reports, while a spurious        in C++.
+edge can hide true bugs.                                           For example, in .NET Task-Parallel Library (TPL),
+   Second, the cost of tracking and analyzing all synchro-      asynchronous work units are represented by Task ob-
+nization actions, including many library calls, volatile/atomic jects. Tasks can be forked explicitly through APIs like
+variable accesses, and others, is high. Particularly, the       Task.Run, or implicitly through data-parallel APIs like
+analysis of HB relationships in programs that allow asyn-       Parallel.ForEach, or through C# async/await para-
+chronous concurrency, like all C# programs TSVD tar-            digm. Any task can join with any other task using vari-
+gets, is extremely memory and time consuming [26, 40,           ous mechanisms, such as explicit Task.Wait or implicitly
+53, 56].                                                        blocking on a task’s result via Task.Result. Task-level
+                                                                parallelism is hence unstructured.
+Challenges for arbitrary task parallelism Previous work
+lowers the cost of dynamic HB tracking and analysis             An example To illustrate the arbitrary task parallelism
+based on certain assumptions, such as (1) a fixed or            and TSVs, Figure 3 shows a simple C# code snippet that
+
+
+
+                                                              165
+    13    3a     6a   8a      14     3b     6b    8b        15                16         1    OnCall ( thread_id , obj_id , op_id ){
+                                                            join         join
+               fork                                                                      2      chec k_for_trap ( thread_id , obj_id , op_id )
+                            7a            9a     10a
+                                                                                         3      if ( should_delay ( op_id )){
+                                          fork         7b          9b   10b              4           set_trap ( thread_id , obj_id , op_id )
+           Thread safety violation
+                                                                                         5           delay ()
+                                                                                         6           clear_trap ( thread_id , obj_id , op_id ) }}
+Figure 4. Happens-before graph for Figure 3, assuming
+neither a nor b is in the dict. The nodes show the exe-
+cuted line#; subscripts distinguish multiple executions                                  Figure 5. The trap mechanism used by TSVD and its
+of the same line.                                                                        variants
+
+
+uses explicit task creation and the async/await paradigm.                                program with calls to TSVD right at these TSVD points.
+Its core is the function getSqrt, which gets the square-                                 The only interface to TSVD is the OnCall with arguments
+root of its first argument by either retrieving from a                                   that show the thread making the call thread_id, the
+table (lines 3–4) or computing from scratch (line 7).                                    object being accessed obj_id, and the operation being
+   Figure 4 illustrates the execution order of this code                                 performed op_id.
+snippet when neither a nor b is in the lookup table, with                                   The trap mechanism works as follows. Consider a
+the happens-before relation highlighted in arrows. As we                                 thread calling the OnCall method. On some calls chosen
+can see, a call to getSqrt from lines 13 quickly leads                                   by the should_delay function at line 3, the thread sets a
+to the fork of a Task by line 6 to carry out the compu-                                  trap by registering the current method call in some global
+tation (7a) in a concurrent background thread, while                                     table at line 4. A trap is identified by the triple of the
+the getSqrt itself returns the spawned task immediately                                  identifiers of the thread, the object, and the operation.
+and moves on to the next call of getSqrt on line 14,                                     Then, the thread calls the delay method to sleep for
+denoted by 8a→ 14 in Figure 4. Later on, when the com-                                   some period, during which the trap is “set.”
+putation of the forked task completes, the continuation                                     Every other thread on entering OnCall checks if it con-
+after the await statement is resumed from line 9 (i.e.,                                  flicts with the traps currently registered at line 2. For-
+9a and 10a in Figure 4). Meanwhile, any attempt to                                       mally, if a trap 𝑡𝑖𝑑1 , 𝑜𝑏𝑗1 , 𝑜𝑝1 is set and another thread
+retrieve the task’s result like that on line 15 blocks until                             enters the method with the triple 𝑡𝑖𝑑2 , 𝑜𝑏𝑗2 , 𝑜𝑝2 , this
+the corresponding continuation returns from getSqrt                                      pair results in a TSV iff 𝑡𝑖𝑑1 , 𝑡𝑖𝑑2 , 𝑜𝑏𝑗1 = 𝑜𝑏𝑗2 , and at
+after line 10, illustrated by the Join arrow in Figure 4.                                least one of the two operations 𝑜𝑝1 and 𝑜𝑝2 is a write.
+   As shown in Figure 4, two instances of dict.Add (9a                                      When such a conflict occurs, we have caught both
+and 9b) are concurrent with each other and form a write-                                 threads “red handed” as they are at their respective
+write TSV. Similarly, dict.Add (9a) and dict.ContainsKey                                 program counters making the conflicting method calls to
+(3b) form a read-write TSV. Detecting them via precise                                   a common object. We can report the TSV with enough
+happens-before analysis in a large program is difficult                                  information gleaned from the current state for root caus-
+due to challenges discussed earlier.                                                     ing this bug, such as the stack trace of the two threads.
+                                                                                         In theory, we could report other relevant information
+3        Algorithm                                                                       such as object content, but we have not found the need
+This section describes the design of TSVD along with                                     to do so in our experience with TSVD so far.
+its variants that represent alternative designs and will                                    When the first thread wakes up from its delay, irre-
+be used to compare with TSVD in our evaluation.                                          spective of whether a conflict was found or not, it clears
+                                                                                         the trap at line 6 and returns from the OnCall method.
+3.1 Overview
+                                                                                         TSVD and its variants differ in their answers to two
+TSVD and its variants share the same trap framework                                      key design questions about should_delay:
+shown in Figure 5, similar with that in DataCollider [14].
+   We assume a static analysis that identifies all the                                       1. Where to inject delays? Which program locations
+call sites to relevant data structures’ methods whose                                           are eligible for should_delay to suggest delay in-
+thread-safety needs to be checked in the code (Section                                          jections.
+4 will provide more details of such a list of methods                                        2. When to inject delays? In which program runs
+used in TSVD). This analysis is straightforward and it                                          and at which dynamic instances of an eligible de-
+reports call sites without checking their calling contexts                                      lay location, should should_delay suggest a delay
+(e.g., even if they are used within locks). We will refer                                       injection.
+to these call sites as TSVD points. We also assume                                       When making the design decisions above, we have to
+an instrumentation framework that can instrument the                                     keep the following goals and constraints in mind:
+
+
+
+                                                                                   166
+   Runtime overheads — since the should_delay function                Comparing with DynamicRandom, where to inject
+is called inside every OnCall function, it is important to          delays does not change, still all the TSVD points, but
+limit its complexity to reduce the runtime overhead. At             when to inject delays differentiates code paths from hot
+the same time, if this function is not selective enough,            paths.
+we will inject too many delays, which in turn increases
+the runtime overhead.                                               3.4 TSVD
+   Number of testing runs — if the should_delay function            Our motivation for TSVD came after our initial experi-
+is too selective, then it can either miss bugs or require           ence implementing DynamicRandom and StaticRandom
+running the test too many times, increasing the testing-            in our setting. While these variants were finding bugs,
+resource requirements.                                              many of the bugs required running the same test tens
+   Accuracy goals — no/little false positives are demanded;         of times, which was unacceptable in our setting. On
+few false negatives without consuming too much resource             investigating further, we found that these variants were
+is desired.                                                         injecting a large fraction of its delays at the “wrong”
+   Complexity constraints — we would like the tool to               places — either when the program is executing in a
+work across code from many engineering teams. Specifi-              single-threaded context, say when all other threads are
+cally, the tool should handle a variety of synchronization          waiting for external events, or when the program was
+mechanisms that developers can use to prevent TSVs.                 accessing the data structure in a “safe” manner - say by
+Moreover, sophisticated static analysis for arbitrary C#            holding the right lock. In both cases, a delay directly
+is challenging. For instance, a ForEach.Parallel block can          translates to an end-to-end slowdown, forcing us to drop
+sometimes be translated to a sequential loop when only              the probability of delays to reduce the runtime overhead.
+one physical thread is available, and to a parallel loop            This, in turn, resulted in missed bugs or a proportionally
+otherwise. Determining this statically is a hard prob-              more number of runs to find true bugs.
+lem. For this paper, we restrict ourselves to dynamic                  TSVD is specifically designed to avoid these problems.
+techniques. As any dynamic analysis tool, TSVD cannot               As illustrated in Figure 2, TSVD explores a new design
+guarantee to find all TSVs in the program. However, by              point. It uses local instrumentation and no synchroniza-
+guaranteeing to not report any false errors, it guarantees          tion modeling or happens-before analysis to reduce the
+“soundness of bugs” [23].                                           runtime overhead, while identifying potential candidates
+   Next, we present the variants that take different design         for delay injection. By focusing on more likely candidates
+points in the design space in Figure 2. We start with               of thread-safety violations, it can achieve much better
+two simple variants that occupy the top-left corner in              bug-exposing capability with no more, much less in fact,
+Figure 2 and serves as baselines for TSVD.                          resource consumptions.
+
+3.2 DynamicRandom                                                   3.4.1 Where to inject delays?
+The simplest algorithm takes every TSVD point as an                 At high level, TSVD uses lightweight analysis to dy-
+eligible delay location (where), and injects delays at              namically maintain a set, called trap set, of dangerous-
+random moment (when). In other words, the call to                   pairs of program locations that can likely contribute to
+should_delay return true with some (small) probability.             thread-safety violations and injects delays at only these
+Once deciding to delay a thread, the thread sleeps for a            locations.
+random amount of time.                                                 During a testing run, the size of the trap set grows
+                                                                    as TSVD discovers new dangerous pairs, or shrinks as
+                                                                    TSVD prunes existing dangerous pairs.
+3.3 StaticRandom
+                                                                       TSVD identifies a pair of program locations as a dan-
+Previous work that uses delay injections to expose data             gerous pair if (1) they correspond to a near-miss TSV
+races, such as DataCollider [14], observed that dynamic             (§3.4.2) — intuitively, TSVD hopes to turn previous near
+sampling is ineffective, as it tends to insert a lot more           misses into true conflicts, and (2) at least one of these
+delays along hot paths and ignore cold paths where even             two locations runs in a concurrent phase with multiple
+more bugs may be hidden. To avoid redundantly intro-                active threads of the program (§3.4.3).
+ducing delays in hot paths and to focus on cold paths,                 A dangerous pair is pruned from the trap set if (1)
+DataCollider samples memory accesses “statically” —                 TSVD infers a likely happen-before relationship between
+that is, static program locations are sampled uniformly             the two locations (§3.4.4) and hence the pair is unlikely
+irrespective of the number of times a particular location           to violate thread-safety, or (2) a violation is already
+is sampled. We emulated this algorithm in our Stati-                found at the pair.
+cRandom variant, where static call sites of relevant data              Finally, the delay injection is probabilistic—each pro-
+structures’ methods are sampled uniformly.                          gram location 𝑙𝑜𝑐 in the trap set is associated with a
+
+
+
+                                                              167
+probability 𝑃𝑙𝑜𝑐 at which delay is injected at location                                 t0
+                                                                                               >𝛿ℎ𝑏 ∗ 𝑑𝑒𝑙𝑎𝑦_𝑡𝑖𝑚𝑒
+                                                                                                                      t2
+𝑙𝑜𝑐. TSVD sets 𝑃𝑙𝑜𝑐 = 1 when a dangerous pair contain-
+ing 𝑙𝑜𝑐 is added to the trap set, and the probability is                 Thd2         𝑙𝑜𝑐0                         𝑙𝑜𝑐2    𝑙𝑜𝑐…   𝑙𝑜𝑐𝑘ℎ𝑏
+decayed with time (§3.4.5). This probabilistic design
+can help avoid excessive overhead caused by too many
+delays for dangerous pairs that are actually not bugs.                   Thd1                delay:d           𝑙𝑜𝑐1
+  We now describe the lightweight mechanisms TSVD
+uses to infer the key components required to make the                             𝑡1𝑠𝑡𝑎𝑟𝑡                  𝑡1𝑒𝑛𝑑
+above decisions. Note that, our evaluation section will
+show thorough parameter-sensitivity study of all the                   Figure 6. Happens-before inference in TSVD (the thick
+thresholds/parameters mentioned below.                                 arrows indicate inferred happens-before relationship)
+
+
+                                                                       3.4.4 Inferring likely HB relationship
+3.4.2 Identifying near misses                                          TSVD’s identification of dangerous pairs based on near-
+                                                                       misses and concurrent phases can potentially be incor-
+Intuitively, if a pair of program locations never even
+                                                                       rect. For instance, two accesses that are consistently
+get close to creating a thread-safety violation under the
+                                                                       protected by the same lock can happen close to each
+intensive testing environment, they might just never be
+                                                                       other. TSVD will fail to convert these near misses into
+able to create one due to underlying program seman-
+                                                                       true conflicts due to the dynamic happens-before (HB)
+tics and synchronization operations. On the other hand,
+                                                                       relation between the two accesses. Rather than track
+say an access1 happens at program location 𝑙𝑜𝑐1 with
+                                                                       synchronizations to calculate this HB relation, TSVD
+the access triple 𝑡𝑖𝑑1 , 𝑜𝑏𝑗1 , 𝑜𝑝1 at time 𝑡1 and another
+                                                                       uses the lightweight technique below to infer likely HB
+access happens at program location 𝑙𝑜𝑐2 with the access
+                                                                       relationships.
+triple 𝑡𝑖𝑑2 , 𝑜𝑏𝑗2 , 𝑜𝑝2 at time 𝑡2 . TSVD considers the pair
+                                                                          TSVD’s dynamic HB inference works based on the
+𝑙𝑜𝑐1 , 𝑙𝑜𝑐2 as a dangerous pair if 𝑡𝑖𝑑1 , 𝑡𝑖𝑑2 , 𝑜𝑏𝑗1 = 𝑜𝑏𝑗2 ,
+                                                                       following crucial observation. If 𝑙𝑜𝑐1 happens-before 𝑙𝑜𝑐2
+at least one of 𝑜𝑝1 and 𝑜𝑝2 is a write, and |𝑡1 − 𝑡2 | ≤ 𝛿
+                                                                       in an execution, then a delay right before 𝑙𝑜𝑐1 will cause
+for some time threshold 𝛿.
+                                                                       a proportional delay of 𝑙𝑜𝑐2 . As shown in Figure 6,
+   To make this judgment, TSVD maintains a list of
+                                                                       consider the case when 𝑙𝑜𝑐1 and 𝑙𝑜𝑐2 are consistently
+accesses per object since 𝛿 time ago. For implementation
+                                                                       protected by a lock and 𝑙𝑜𝑐1 occurs first. When one
+simplicity, rather than storing this state in the object
+                                                                       injects a delay right before 𝑙𝑜𝑐1 , this delay occurs when
+metadata, TSVD maintains a global hash table indexed
+                                                                       the thread executing 𝑙𝑜𝑐1 is still holding the lock. Thus,
+by the object’s hash-code containing this list of previous
+                                                                       when the thread executing 𝑙𝑜𝑐2 tries to acquire this lock
+accesses. On each access, TSVD consults this list to
+                                                                       (which it needs to before accessing 𝑙𝑜𝑐2 ), it will block.
+identify dangerous pairs.
+                                                                       By dynamically tracking this causality between program
+                                                                       locations, TSVD infers likely HB relationships between
+                                                                       them.
+                                                                          Tracking this causality works as follows. Apart from
+3.4.3 Inferring Concurrent Phases                                      per-object history described above, TSVD additionally
+Synchronization operations like forks, joins, barriers,                maintains a history of the most recent access made by
+and locks could lead to sequential execution phases                    every thread. Consider a delay 𝑑1 injected right before
+during the execution of a concurrent program, like ini-                access 𝑙𝑜𝑐1 that starts at 𝑡1start and ends at 𝑡1end . At
+tialization phase, clean-up phase, join-after-fork phase,              a subsequent access at 𝑙𝑜𝑐2 in a different thread 𝑇 ℎ𝑑2
+and so on, and a TSVD point inside such a sequential                   happening at time 𝑡2, we will check when the previous
+phase can never execute in parallel with another TSVD                  access from 𝑇 ℎ𝑑2 occurred, denoted as 𝑡0, and infer a
+point.                                                                 dynamic HB relationship between 𝑙𝑜𝑐1 and 𝑙𝑜𝑐2 if (1)
+   TSVD infers concurrent execution phases by checking                 there is a long gap between 𝑙𝑜𝑐2 and that previous access,
+the execution history of TSVD points. Specifically, it                 𝑡2 − 𝑡0 ≥ 𝛿ℎ𝑏 * 𝑑𝑒𝑙𝑎𝑦_𝑡𝑖𝑚𝑒, a causal delay threshold
+maintains a global history buffer with a fixed number                  and (2) the long gap overlaps with the injected delay,
+of most recently executed TSVD points. If the TSVD                     𝑡0 ≤ 𝑡1end . If multiple delays {𝑑 at 𝑙𝑜𝑐} satisfy the
+points in this buffer come from more than one thread,                  inferring condition for 𝑇 ℎ𝑑2 and 𝑙𝑜𝑐2 , we contribute the
+TSVD considers the execution to be inside a concurrent                 1 For the ease of discussion, we do not differentiate an access to
+phase.                                                                 an object and a thread-unsafe method call of an object in this
+                                                                       section.
+
+
+
+
+                                                                 168
+long gap in 𝑇 ℎ𝑑2 to the most recently finished delay 𝑑              set from the file, allowing it to inject delays at pairs even
+and infer the HB relationship accordingly. Considering               at their first occurrences.
+the transitivity of happens-before relationship, the next
+                                                                     Parallel delay injection There are clear trade-off among
+𝑘ℎ𝑏 accesses in thread 𝑇 ℎ𝑑2 are also considered as likely
+                                                                     injecting only one delay or multiple delays throughout a
+happens-after 𝑙𝑜𝑐1 . Again, 𝑘ℎ𝑏 is a tunable parameter
+                                                                     run, and allowing only one thread or multiple threads to
+and we will evaluate its sensitivity in the evaluation
+                                                                     be delayed at a time: when multiple delays are injected,
+section.
+                                                                     they could cancel each other’s effect; when few delays are
+3.4.5 Delay Decaying                                                 injected, we will need too many runs to test all possible
+                                                                     delay situations.
+Of course, all the inferences above, including the near-
+                                                                        TSVD decides to conduct delay injection in an ag-
+miss tracking, the concurrent phase inference, and the
+                                                                     gressive way — delays are inserted strictly following the
+likely HB-relationship inference, still do not guarantee
+                                                                     dangerous pair list and the decay-probability scheme,
+to prune out all non-TSV pairs. Consequently, for every
+                                                                     regardless of whether another thread is already blocked.
+dangerous pair {𝑝1 , 𝑝2 } in the dangerous list, every delay
+                                                                     Note that, although this aggressive strategy can cause
+injection at either 𝑝1 or 𝑝2 that fails to make 𝑝1 and
+                                                                     some injected delays to overlap with each other, the
+𝑝2 execute in parallel with the same object accessed
+                                                                     overlaps will only be partial and are unlikely to cancel
+will cause TSVD to decay the probability of future delay
+                                                                     each other out. This is because different threads will be
+injection at 𝑝1 and 𝑝2 . When the probability of a location
+                                                                     unblocked at different time and our decay-probability
+𝑙𝑜𝑐 drops to 0, all its related pairs are removed from the
+                                                                     scheme also helps avoid too many threads blocked at the
+trap set.
+                                                                     same time. On the other hand, an alternative design that
+3.4.6 When to inject delays?                                         strictly avoids delay overlaps would lead to too few delay
+                                                                     injections and hence hurts our chance of exposing bugs
+Different from previous work that separates delay plan-
+                                                                     within the tight testing budget, as we will demonstrate
+ning and delay injection into different runs [47, 58]
+                                                                     in the evaluation section.
+and/or using many runs to gradually inject delays to
+all planned locations [14, 47, 58], TSVD conducts its                3.5 TSVD with happens-before analysis
+delay planning and injections in the same run, making
+                                                                     To compare TSVD with existing techniques that rely on
+the best use of testing resources.
+                                                                     HB analysis, we designed a variant of TSVD, referred
+Planning & injection in the same run Once TSVD iden-                 to as TSVDHB , that follows the approach of RaceFuzzer
+tifies a dangerous pair of program locations (that nearly            [58]. Note that, TSVDHB uses a few optimizations to
+missed each other), TSVD does not wait until the next                speed up traditional HB analysis following the type of
+run to expose a potential thread-safety violation between            bugs it targets.
+them. The rationale is that most instructions execute
+                                                                     Where to inject delays? Just like that in TSVD, TSVDHB
+more than once and hence most bugs have multiple
+                                                                     dynamically maintains a trap set, with every program
+chances to manifest. This is confirmed by our experimen-
+                                                                     location appearing in the trap set a delay-injection can-
+tal results in Section 5 showing that TSVD hits the same
+                                                                     didate. At run time, TSVDHB adds a pair of program
+bug multiple times. Consequently, TSVD can still try
+                                                                     locations {𝑙𝑜𝑐1 , 𝑙𝑜𝑐2 } into the trap set, if the correspond-
+to expose a bug after an initial near-miss. Specifically,
+                                                                     ing accesses 𝑡𝑖𝑑1 , 𝑜𝑏𝑗1 , 𝑜𝑝1 and 𝑡𝑖𝑑1 , 𝑜𝑏𝑗1 , 𝑜𝑝1 satisfy that
+whenever a program location 𝑙𝑜𝑐 is going to be executed,
+                                                                     𝑡𝑖𝑑1 , 𝑡𝑖𝑑2 , 𝑜𝑏𝑗1 = 𝑜𝑏𝑗2 , 𝑜𝑝1 and 𝑜𝑝2 conflict, and most
+TSVD checks if 𝑙𝑜𝑐 is part of the current trap set. If it
+                                                                     importantly they do not have happens-before relation-
+is, TSVD will insert a delay at 𝑙𝑜𝑐 with probability 𝑃𝑙𝑜𝑐 .
+                                                                     ship with each other.
+Multiple testing runs The above delay injection scheme                  TSVDHB monitors synchronization operations, such
+would miss a bug if the near-miss situation observed                 as locks, forks, and joins, and uses vector clocks [18] to
+by TSVD was actually the only chance to expose the                   compute the happens-before relation between accesses.
+bug; i.e., if the dangerous pair of locations never run                 TSVDHB optimizes traditional race detection to speed
+together after the pair is identified. When the testing              up its HB analysis following the observation that, dif-
+resource allows, TSVD runs the program for another                   ferent from traditional race detection, where execution
+time, carrying the knowledge obtained from the first run,            traces contain few synchronization operations but many
+to help discover these bugs.                                         memory accesses, TSVDHB faces many synchronization
+   During the first run, TSVD records its trap set in                operations (the large number of async/await in C#
+a persistent trap file. At the end of the run, the trap              cloud service modules) yet relatively few accesses (i.e.,
+file contains the final set of dangerous pairs. At the               TSVD points — invocations of thread-unsafe methods
+beginning of the second run, TSVD initializes its trap               of some data structures).
+
+
+
+                                                               169
+   The first optimization is to increase local timestamps
+at accesses (TSVD points), which are relatively few at               1   List < int > listObject = new List < int >();
+run time, but not at synchronization operations, which               2   listObject . Add (15);
+are relatively frequent, opposite from traditional race                                (a) Original code
+detection [19].
+                                                                     1   List < int > listObject = new List < int >();
+   The second optimization is that TSVDHB uses im-
+                                                                     2   int op_id = GetOpId ();
+mutable data structures—AVL tree-maps—to represent                   3   Proxy_123 ( listObject , 15 , op_id );
+vector clocks, unlike traditional implementations which
+                                                                                    (b) Instrumented code
+use mutable arrays or hashtables. For vector clocks with
+𝑛 components, a message-send (or other similar types                 1   void Proxy_123 ( Object obj , int x , int op_id ) {
+of synchronization) event requires an 𝑂𝑛-time/memory                 2     var thread_id = G et C ur re n tT h re ad I d ();
+copy with traditional mutable tables, whereas immutable              3     var obj_id = obj . GetHashCode ();
+clocks can be passed by reference in 𝑂1-time. On the flip            4     OnCall ( thread_id , obj_id , op_id );
+side, TSVDHB requires 𝑂log 𝑛 time/memory to perform                  5     obj . Add ( x ); }
+increment operations, whereas mutable clocks can be                                    (c) Proxy method
+updated in-place in 𝑂1 time. Fortunately, TSVDHB re-
+stricts increment operations to infrequent TSVD points                         Figure 7. TSVD instrumentation
+only. Finally, message-receive (or other similar type of
+synchronization) events require 𝑂𝑛 time with both data             TSVD can be easily implemented for other languages
+structures, since an element-wise max must be computed.            and runtimes.
+Fortunately, in the relatively common case where tasks             TSVD Instrumenter This takes a list of application
+fork and join without going through any TSVD points,               binaries and a list of target thread-unsafe APIs. In
+the vector clocks associated with the join-message and             the current prototype of TSVD, we focus on 14 C#
+with the receiving thread are exactly the same object;             thread-unsafe classes (e.g., List, Dictionary) and manu-
+such an operation can be optimized to 𝑂1 by simply                 ally identified 59 of their APIs to be write-APIs and 64
+checking for reference equality.                                   as read-APIs. This process is straightforward for these
+When to inject delays Unlike RaceFuzzer, which uses                data-structure classes and has a small cost that is easily
+many runs that are each targeted at a specific pair of             amortized by reusing this list for all C# program test-
+potential data races, TSVDHB aims to expose bugs in                ing. It then instruments the binaries by replacing each
+a small number of testing runs just like TSVD. Conse-              thread-unsafe API call with an automatically generated
+quently, just like that TSVD, TSVDHB injects delays in             proxy call, as shown in Figure 7. The proxy wraps the
+the same run as the happens-before analysis and trap-              original call; but, before making the original call, it calls
+set fill-up; it can delay multiple threads simultaneously.         the OnCall method (Figure 5) implemented in TSVD
+When one testing run is finished, those remaining pairs            runtime library. TSVD uses Mono.Cecil [28] to do the
+in the trap set are recorded and fed to the testing run,           instrumentation.
+if there is one. Like TSVD, TSVDHB uses a probability                 The TSVD instrumenter can be used as a command
+decay to prune possibly spurious dangerous pairs.                  line tool or with Visual Studio (as a post-build step).
+                                                                   To allow a developer to use TSVD without additional
+4   Implementation                                                 configuration, TSVD comes with an extensible list of
+                                                                   thread-unsafe APIs in .NET standard libraries. The list
+We have implemented TSVD for .NET applications (e.g.,
+                                                                   also includes information about whether the APIs are
+C# and F#). It has two key components: (1) TSVD
+                                                                   read- or write-APIs.
+runtime library that implements the core algorithm, and
+(2) TSVD instrumenter that, given a .NET binary, au-               TSVD Runtime This implements the OnCall method,
+tomatically incorporates TSVD runtime library into it              which executes the core TSVD algorithm (Figure 5).
+by static binary instrumentation. We chose static in-              In addition, (1) it logs runtime contexts when a bug
+strumentation of application binary as this enables us             is detected. The contexts include bug locations (e.g.,
+to use TSVD instrumented binaries with unmodified,                 method name and source code line number) and stack
+existing test pipeline (unlike framework instrumenta-              traces of racing threads. (2) It tracks total delay injected
+tion [65], which requires updating test pipeline with              per thread and per request so that one can limit the
+instrumented Common Language Runtime (CLR) or                      maximum delay per thread or request. This helps in
+dynamic instrumentation [2], which requires modifica-              avoiding test timeouts. (3) It tracks test coverage of
+tion of test environment). While our implementation is             instrumented APIs. (4) Finally, it updates signatures of
+specific to .NET, we believe the techniques underlying             instrumented signed binaries.
+
+
+
+                                                             170
+   While using TSVD in Microsoft, we observed that                                            Test Targets
+many asynchronous programs using async/await run syn-                  # of projects                                      1,657
+chronously in test settings, and therefore, TSVD cannot                # of test modules                                  ≈ 43𝐾
+find thread-safety bugs that could manifest in produc-                 # of binaries                                      ≈ 89𝐾
+tion runs when the programs do run asynchronously.                     # of tests                                         ≈ 122𝐾
+We found that the underlying reason is a .NET run-                                       Bugs found
+time optimization that executes fast async functions syn-             # of unique bugs (location pairs)       1,134
+chronously. This affects many tests that replace async                # of unique bug locations               1,180
+I/O calls with fast mock implementations. To address                  # of unique stack trace pairs           21,013
+this, TSVD instruments async/await code to force all                  % of projects with bugs                 9.8%
+async functions, slow or fast, to run asynchronously.                 % of modules with bugs                  1.9%
+Note that, in our experiments (Section 5), this strat-                                 Bugs properties
+egy will be applied to not only TSVD but also all the                 % of read-write bugs                    48%
+techniques that will be compared with TSVD.                           % of same location bugs                 34%
+   An open-source version of TSVD is available at https:              % of bugs in async code                 70%
+//github.com/microsoft/TSVD.                                          Avg. (Median) occurrence of a bug loca- 36(4)
+                                                                      tion
+5   Evaluation                                                        Avg. (Median) # stack trace pairs/bug 18.5(3)
+5.1 Methodology                                                       Avg. Stack depth                        9.1
+Benchmarks For our evaluation, we collected approxi-                  % of Dictionary bugs                    55%
+mately 43𝐾 software modules from 1,657 projects under                 % of List bugs                          37%
+active development at Microsoft. We call this the Large               Table 1. Summary of bugs found by TSVD tools.
+benchmark. These modules are regularly tested in an
+integrated build and test environment. Each module
+contains a collection of unit tests as well as all binaries         5.2 Overall Results
+required to execute the tests. Together, they contain               Bugs Found Over last few months, we have been us-
+a total of around 122𝐾 multi-threaded unit tests and                ing variants of TSVD on the Large benchmark. Table 1
+89𝐾 program binaries. To test a module with TSVD,                   summarizes the results. Overall we found 1,134 bugs,
+we instrument its binaries and run its existing unit tests.         uniquely identified by the pair of static program loca-
+2% of the modules also included long-running end-to-end             tions participating in the TSV, involving 1,180 unique
+tests, that we also run. Of all the software modules that           static program locations.2 1,009 of these bugs were found
+were available in the integrated environment we selected            using the core TSVD we present in this paper; while
+those modules which a) were written in a .NET language              the remaining bugs came from our previous attempts of
+such as C# or F# as TSVD is currently implemented                   using variants of TSVD, namely DynamicRandom and
+for .NET programs, b) passed all their tests over the               TSVDHB .
+past 2 builds, ensuring that these modules are stable and              For each bug, TSVD produces a pair of stack traces
+well-tested, and c) used multithreading primitives or C#            that shows two threads actively participating in a thread-
+async/await mechanisms at least once. We will use this              safety violation. Note that the same bug can manifest
+to evaluate the bug-exposing capability and performance             at multiple stack trace pairs. On the other hand, mul-
+of TSVD.                                                            tiple bugs in a high-level data structure might show
+   To evaluate TSVD against alternate designs and pa-               up as a conflict in a low-level data structure with the
+rameter settings, we sampled 1000 modules randomly                  same program-location pair. Overall, we found the above
+from the Large benchmark. We call this the Small bench-             bugs in 21,013 different stack trace pairs (i.e., 18.5 stack
+mark. Together, this suite consists of 3350 multi-threaded          trace pairs per bug). Due to our inability to identify
+unit tests.                                                         whether two different stack-trace pairs correspond to
+Experiment Setting We run the small benchmark suite                 the same “bug” or not, we will use the conservative
+on a small server (S1), with Intel(R) Xeon(R) E5-1620               program-location pair for unique bug counts.
+CPU, 16G Memory, and 1T SSD. Since all the software                    On average, we found at least one bug in 9.8% of the
+modules under test are independent with each other, we              projects and 1.9% of the modules. As TSVD find these
+run 10 modules at a time on S1. We run the big suite                2 Note that unsynchronized accesses to 𝑛 locations can theoretically
+on a large server (S2), with Intel(R) Xeon(R) E5-2650               result in 𝑛2 location pairs. However, our reported bug count (i.e.,
+CPU, 128G memory, and 6T SSD. Both S1 and S2 use                    1,134 location-pairs) is not bloated by this phenomenon (for 1,180
+Windows10 operating system.                                         locations).
+
+
+
+
+                                                              171
+bugs while running existing tests provided by developers,                                        # bug
+TSVD does not report false error reports.                                                 Total Run1 Run2 overhead # delay
+Bug Validation We contacted four product teams in                        DataCollider      25     22      3    378%     77402
+Microsoft to validate all bugs TSVD found in their soft-                 DynamicRandom     13      6      7    178%     31456
+ware (total 80). All of the bugs were confirmed as true                  TSVDHB            41     25     16    310%     3328
+bugs. Of these, 77 were new bugs previously not known                    TSVD              53     42     11     33%     22632
+to the developers and the remaining 3 were concurrently                Table 2. Comparing TSVD with other detection tech-
+found by other means. We are still in the process of                   niques.
+contacting other teams.
+Bug Quality 38 of these bugs were confirmed as “high                   async/await or Task Parallel Library. Many of these
+priority.” This internal classification of bugs signifies that         bugs were found benefiting from TSVD’s instrumenta-
+these bugs, if manifested in production, would result in               tion design that forces all async functions, slow or fast,
+a customer-facing outage and thus needs to be fixed                    to run asynchronously (§4). 34% of the bugs manifest
+immediately. These bugs were immediately fixed by the                  due to two threads executing the same operation. Av-
+developers. 22 bugs were of “moderate priority” of which               erage stack depth of the bug location from test code is
+18 have been fixed so far. The remaining 20 bugs were in               9.1, indicating that many of the bugs appear deep inside
+non-critical code, such as the test driver or mock code                production code. Note that the same bug location can
+written for unit testing. While these bugs are in lower                appear in multiple bugs (counted as location-pairs) and
+priority, they nevertheless need to be fixed for preventing            the same bug can appear multiple times during the same
+nondeterministic test failures.                                        test run. In our experiments, a bug location appeared
+                                                                       35.6 times on average (median 4 times). Despite repeated
+Actionable Reports Overall, the developers found the                   appearances, the buggy locations remained undetected
+error reports to be sufficiently actionable. The stack                 with existing test techniques in Microsoft. More than
+traces of the two conflicting threads provide enough                   half of the bugs involve the Dictionary data structure.
+detail to root cause the problem. In many cases, the                   Note that .NET’s standard library includes thread-safe
+fix involves introducing additional synchronization or                 ConcurrentDictionary. Yet, our results show that de-
+replacing the data-structure with a thread-safe version                velopers often use thread-unsafe Dictionary in multi-
+of the data structure.                                                 threaded applications, without necessary synchronization
+   Apart from the error reports, TSVD also reports sta-                primitives. Talking to developers, we found one inter-
+tistics on the instrumentation points that were hit during             esting cause behind such incorrect usage: erroneously
+the test in any context and in a concurrent context. One               assuming that two writes to a dictionary would be thread-
+team found these “coverage” statistics to be very useful               safe as long as the keys are different.
+and identified a few blind spots in their testing, such as
+critical parts only called in sequential contexts during               5.3 Comparison with other detection techniques
+unit testing etc.
+                                                                       We compare TSVD with DataCollider and other detec-
+Bug Nontriviality Note that all these software teams                   tion techniques discussed in Section 3 using the 1000-
+employ their usual production test pipelines to uncover                module Small benchmark suite. We compare them in
+various types of bugs. The bugs TSVD found had been in                 terms of the number of bugs found in two rounds of run
+their systems for many months but remained undetected                  and the overhead , which is computed based on the addi-
+by the test pipelines. To further confirm that the bugs                tional amount of time imposed by a tool upon uninstru-
+TSVD finds are not easy-to-find, we worked closely with                mented baseline testing runs. Results are summarized
+one of the teams to track and compare the bugs found                   in Table 2 (DynamicRandom uses 0.05 probability in its
+by TSVD and those found by their usual test pipeline.                  delay injection).
+During a 3-months period, TSVD found 15 thread-safety
+                                                                       Number of bugs found TSVD found the most number
+bugs (all confirmed as “priority one” and immediately
+                                                                       of bugs: 42 bugs in the first round, and 11 additional bugs
+fixed) in their code, none of which was found by the test
+                                                                       in the second run. Each of these 11 bugs contains a TSVD
+pipeline during the same period.
+                                                                       point that only executes once during the unit testing,
+Bug Characteristics 49% of the 1,134 bugs we found                     and hence cannot be exposed after the near-miss at the
+were due to concurrent read-write conflicts on thread-                 first run. DynamicRandom and DataCollider detected
+unsafe objects. An interesting root cause of such bugs                 significantly smaller number of bugs as they have a small
+is locking only writes, but not reads, to a thread unsafe              probability (0.05 for DynamicRandom) injecting delay
+object. 70% of the bugs were triggered by code using                   at a TSVD point. They can potentially find more bugs
+
+
+
+                                                                 172
+                                                                   Number of bugs after more runs Given the non-deterministic
+                                                                   nature of TSVs and the probabilistic nature of some of
+                                                                   these techniques, we ran each of these techniques 50
+                                                                   times with the Small benchmark suite to see how many
+                                                                   bugs can be found at the end. As we can see in Figure 8,
+                                                                   even after many more runs, the bug detection advan-
+                                                                   tage of TSVD still holds over the other techniques. All
+                                                                   the four techniques altogether discovered 79 bugs at the
+                                                                   end, with 73 of them discovered by TSVD, 54 of them
+                                                                   discovered by TSVDHB , and much fewer by the other
+                                                                   two. Furthermore, most of these bugs (close to 70%) can
+   Figure 8. Number of bugs found after more runs                  indeed get caught with just two runs of TSVD! We will
+                                                                   use these results to help understand the false negatives
+                                                                   of TSVD next.
+if run additional rounds, but it would take many rounds
+                                                                   False positives of TSVD TSVD does not report any
+for them to catch the bug-reporting capability of TSVD.
+                                                                   false positives. Every bug reported by TSVD is a true bug
+TSVD outperforms TSVDHB because TSVDHB can both
+                                                                   — a thread-safety violation can and is already triggered
+miss Happens-Before edges and add spurious ones, just
+                                                                   by TSVD.
+like other dynamic Happens-Before-based techniques [47].
+The huge analysis overhead of TSVDHB also interferes               False negatives of TSVD Given the non-deterministic
+more with bug exposing at run time.                                nature of TSVs and the tight testing budget TSVD
+   We observed a similar trend in a larger benchmark of            faces, TSVD inevitably has false negatives. Since it is
+8000 modules. In two rounds of run, TSVD found 256                 impractical to know the ground truth about how many
+bugs (227 in the first round), while TSVDHB found 192              TSVs exist in our benchmarks3 , we use the 79 bugs
+bugs and DynamicRandom found 79 bugs.                              discovered by 4 tools at the end of accumulated 200 runs
+   One interesting observation from Table 2 is that TSVD           in Figure 8 as our best-effort ground truth. We analyzed
+found more bugs in its first round alone than other                the 26 bugs that were missed by TSVD in its merely 2
+techniques found in two rounds. Moreover, TSVD’s first             testing runs and put them into three categories:
+round found about 80% of all bugs found by all tools.                 (1) Near-miss false negatives. For 19 bugs, the two
+Both these observations hold for our full benchmark                racing operations execute close to each other only under
+suite as well. This justifies our design of not separating         rare schedules (e.g., a resource usage and a resource
+delay planning and injection into different runs. It also          de-allocation). In most runs, there is a long time gap be-
+provides a more resource-conserving option for using               tween them, like more than a few seconds. Consequently,
+TSVD: while testing under severe resource constraints,             the near-miss tracking in TSVD did not identify them as
+one can choose to run TSVD for only one round and                  a dangerous pair and hence injected no delays to expose
+still capture vast majority of the bugs.                           the bug in two runs. After running TSVD for 50 runs,
+   Note that even though TSVDHB found more new                     15 out of these 19 bugs were caught.
+bugs than TSVD in the second round in Table 2, they                   (2) Happens-before inference false negatives. For 2
+both found comparable numbers of total bugs: 41 and 53             bugs, TSVD’s HB inference mistakenly treats two con-
+respectively.                                                      current operations as happens-before ordered, and hence
+                                                                   lost the opportunity of triggering the bug. Even after 50
+Performance comparison As we can see in Table 2,                   runs, these 2 bugs still cannot be detected by TSVD.
+TSVD not only finds the most bugs, but also with the                  (3) Delay-injection false negatives. For 5 bugs, the
+least overhead. The performance advantage of TSVD                  timing during the two testing runs happens to be that
+over all other variants comes from two aspects. Compar-            the injected delay was not long enough to trigger the
+ing with DynamicRandom, TSVD injects most delays                   bug. After running a couple of more runs, these bugs
+when program running with multiple threads. Dynami-                were all discovered by TSVD.
+cRandom injects many delays in sequential phase which                 Finally, given the design goal of TSVD, it will natu-
+never detects bugs but also introduces huge overhead.              rally miss timing bugs that are not TSVs. For example,
+Comparing with TSVDHB , TSVD and TSVDHB both in-                   a recent study of real-world incidents in Azure software
+ject delay in the concurrent phase, yet TSVDHB spends
+much time in analyzing the happens-before relationship             3 Note that, before the use of TSVD, few TSVs were known in the
+at run time, which introduces 270% run-time overhead               code base tested by TSVD, which is exactly the motivation behind
+on average in our experiments.                                     TSVD.
+
+
+
+
+                                                             173
+[37], a similar set of software projects that TSVD ex-                                                        # bug
+periments target, showed that many more incidents are                                                   Total Run1 Run2 overhead
+caused by timing bugs than that in traditional single-
+                                                                        TSVD                             53   42      11    33%
+machine systems and about half of these timing bugs are
+                                                                        No HB-inference                  45   36       9    84%
+related to concurrent accesses to persistent data. The                  No windowing in near-miss        46   35      11   143%
+current prototype of TSVD only focuses on in-memory                     No concurrent phase detection    54   42      12    61%
+data structures and hence cannot detect these persistent-
+                                                                      Table 3. Removing one technique at a time from TSVD
+data bugs. Future research can extend the idea of TSVD
+to detect other types of timing bugs.
+                                                                      Buffer size of concurrent phase detection Figure 9(f)
+5.4 Evaluating TSVD parameters                                        indicates that the overhead and the number of detected
+We now use the 1000-module small benchmark suite for                  bugs both grow with the size of the global history buffer
+parameter-sensitivity experiments.                                    — with a large buffer, TSVD may mistakenly treat sequen-
+                                                                      tial operations as concurrent and generate dangerous
+Probabilistic nature of TSVD Since TSVD injects de-                   pairs that do not lead to any bugs; yet, with a small
+lays probabilistically, one may wonder how much the                   buffer, real concurrent operations can be mistakenly
+results of TSVD may vary across different tries. Fig-                 treated as sequential. TSVD uses a default size of 16
+ure 9(a) shows the number of detected bugs and the                    that gives a good trade-off between overhead and bug
+overhead of TSVD across 12 tries. In every try, TSVD                  count.
+uses the same default parameter setting and is applied
+to two consecutive runs, just like that in Table 2. As we             Delay injection Figure 9(g) shows the impact of decay-
+can see in the figure, the results indeed vary across tries,          ing delay injection probability at each TSVD point. A
+but only slightly: the number of detected bugs varies                 particularly bad configuration is when the factor is 0,
+from 52 to 54 and the overhead varies between 30% and                 meaning that TSVD injects delay in all occurrences of
+35%, with a median of 53 bugs and 33% overhead.                       these TSVD points without any decay. This configura-
+                                                                      tion would introduce too much overhead: for 3% mod-
+Near-miss tracking parameters TSVD uses two param-                    ules, the overhead of zero decay was more than 100%
+eters for tracking near-misses: the number 𝑁𝑛𝑚 of recent              (maximum overhead we observed was 6600% for one
+accesses that TSVD keeps for each object and the physi-               module!). These modules use TSVD points repeatedly
+cal time window 𝑇𝑛𝑚 that TSVD considers two accesses                  and frequently (e.g., they are inside loops). Figure 9(h)
+as a near miss. As shown in Figure 9(b) and (c) (note                 shows the impact of the amount of delay TSVD injects
+log-scale of the x-axis), roughly speaking, both bug count            at one trap point. As expected, longer delay increases
+and overhead increase with both parameters. Using too                 runtime overhead, but also creates more opportunities
+small a value (e.g., 𝑁𝑛𝑚 = 1 or 𝑇𝑛𝑚 = 1𝑚𝑠) misses many                for conflicting operations to overlap in time. TSVD uses
+bugs because of not identifying dangerous pairs. TSVD’s               100ms as the default value.
+default values of 𝑁𝑛𝑚 = 5 and 𝑇𝑛𝑚 = 100𝑚𝑠 finds al-
+most all the bugs, with small overhead. Larger values                 Effectiveness of various TSVD techniques Table 3 shows
+do not significantly increase bug count, but increases                how TSVD performs when one of its core components is
+overhead (especially for 𝑁𝑛𝑚 ).                                       disabled at a time. (In “No windowing”, TSVD treats
+                                                                      conflicting accesses by different threads in the entire his-
+HB inference parameters TSVD uses two parameters                      tory as near-misses.) As the results show, HB-inferencing
+for HB inference: a causal-delay blocking threshold 𝛿ℎ𝑏               and windowing are the most crucial techniques for find-
+and an inference window of 𝑘ℎ𝑏 accesses (Section 3.4.4).              ing bugs—without them bug counts drop from 53 to
+Figure 9(d) shows the effect of varying 𝛿ℎ𝑏 from 0 to 0.8.            45 and 46. Windowing is the most important factor in
+A value too small like 0 infers many non-existing HB                  reducing overhead—without it, overhead increases from
+relationships, and hence misses many bugs; a larger value             33% to 143%. Overall, all the techniques are needed for
+has stricter constraints in inferring HB relationship. As             TSVD’s effectiveness.
+shown, the overheads and bug counts do not change much
+beyond TSVD’s default value of 0.5. Figure 9(e) shows                 5.5 TSVD CPU/Memory Consumption
+the effect of varying 𝑘ℎ𝑏 . A larger value translates to more         To understand the detailed resource consumption of
+HB relationship, reducing the number of dangerous pairs,              TSVD, we ran every unit test in the Small benchmark
+and eventually the number of bugs and overhead. Too                   suite with and without TSVD, while recording the largest
+large a value drastically reduces the bug count. TSVD’s               memory usage and average CPU usage in each run.
+default value of 𝑘ℎ𝑏 = 5 gives a sweet spot between bug               Across all the unit tests, the median increase on maxi-
+count and overhead.                                                   mum memory is 17% and the median increase on average
+
+
+
+                                                                174
+             (a) Tries                (b) Obj history(𝑁𝑛𝑚 )             (c) Window size(𝑇𝑛𝑚 )       (d) Blocking threshold(𝛿ℎ𝑏 )
+
+
+
+
+      (e) Inference size(𝑘ℎ𝑏 )            (f) Buffer size                  (g) Decay factor               (h) Delay time
+
+
+                                 Figure 9. Sensitivity analysis of various parameters of TSVD.
+
+                                                                       a thread responsible for listening from multiple clients.
+  1    Async Task <T > Cl i en tS t at us U pd at e ( int clientID ,   Whenever the manager receives a message from a client,
+  2            Status s ){                                             this listening thread will create an asynchronous task
+  3            ...
+                                                                       shown in Figure 10(a) to update the status of the corre-
+  4            GlobalStatus [ clientID ] = s ;
+                                                                       sponding client, and continue its listening. A concurrent
+  5    }
+                                                                       write violation on the Dictionary class could happen
+                                                                       when two clients send messages at similar time, which
+                     (a) Device Manager
+                                                                       could then cause two concurrent execution of Line 4
+  1    Parallel . ForEach ( hostlist ,                                 in the figure and hence two concurrent Dictionary-set
+  2         delegate ( string host ){                                  operations. As a result, the GlobalStatus Dictionary
+  3       ConfigLevel cl = GetConfigLevel ( host );                    could get silently corrupted.
+  4       configureCache [ host ] = cl ;
+  5       ...                                                          Network Validation Figure 10(b) shows another exam-
+  6    } );                                                            ple of concurrent- write violation on a Dictionary class,
+                   (b) Network Validation                              which has a very different code pattern from the first
+                                                                       example. When a network service starts up, a validator
+                    Figure 10. Examples                                needs to verify the configuration information of every
+                                                                       host, which involves reading a host’s configuration in-
+CPU utility is 82%. The extra memory is mainly used                    formation (Line 3) and storing it to a configureCache
+for keeping the near-miss pairs and the access history                 Dictionary for further verification. To speed up this pro-
+of every thread-unsafe object. The extra CPU utility is                cess, the validator uses a Parallel.ForEach primitive
+mainly due to our instrumentation that forces all async                (Line 1) to parallelize the validation for different hosts.
+functions to run asynchronously, as explained in Section               The Parallel.ForEach automatically generates multi-
+4. In comparison, without TSVD, the .NET optimization                  ple concurrent threads and when some of these threads
+makes many async functions run synchronously, using                    concurrently execute Line 4, a concurrent-write violation
+much fewer cores.                                                      occurs to corrupt configureCache.
+5.6 Examples of bugs found by TSVD                                     Production-Incident Example This is a bug about two
+Device Manager As shown in Figure 10(a), a device                      threads trying to sort a list at the same time in a pro-
+manager uses a Dictionary GlobalStatus to maintain                     duction run. The sorting result of an unprotected list
+the status of every client, where client ID is the key and             is undetermined when two threads are doing that con-
+the client status is the value. The device manager has                 currently. This undetermined behavior propagated and
+
+
+
+                                                                175
+    Project                   LoC # tests # run # TSV overhead     positives [30, 45, 58]. Several techniques have used sam-
+    ApplicationInsights [3]  67.5K    934    2      1   15.31%     pling to reduce the runtime overhead [5, 31, 42], but like
+    DataTimeExtention [12]    3.2K    169    1      3   18.51%     DataCollider [14], they need to repeatedly run the test
+    FluentAssertion [20]     78.3K   3076    1      2    8.89%     many times to expose bugs.
+    K8s-client [33]         332.3K     76    2      1   11.79%
+    Radical [50]             96.9K    965    1      3 1552.13%        Another type of passive detection tools like AVIO [38]
+    Sequolocity [59]          6.6K    209    1      3    2.97%     and Bugaboo [39] catches concurrency bugs when they
+    Stastd [62]               2.5K     34    2      1    9.72%     manifest at run time. Since they do not predict or expose
+    System.Linq.Dynamic [63] 1.2K       7    1      1   41.39%     bugs that have not manifested yet, which TSVD does,
+    Thunderstruck [64]        1.1K     52    1      2    3.33%
+                                                                   they do not need to analyze happens-before relation but
+      Table 4. TSVD results on open source projects.               are also fundamentally unsuitable for the build and test
+                                                                   environment TSVD targets.
+finally caused the service to go down for several hours.              Race detection was studied for asynchronous event-
+TSVD can reproduce this bug without any prior knowl-               driven programs such as Android apps and Web applica-
+edge and help the developers reduce the debugging effect.          tions [25, 26, 40, 53]. There, the key challenge is to model
+                                                                   and analyze the causality between asynchronous requests
+5.7 TSVD on Open Source Projects                                   and responses, which incurs huge run-time slowdowns.
+                                                                   TSVD instead automatically infers happens-before rela-
+To evaluate whether TSVD can be used beyond Mi-
+                                                                   tionships. While not the focus of this paper, techniques
+crosoft, we applied TSVD to 9 open source C# projects
+                                                                   behind TSVD can work for applications targeted by
+(Table 4). Without any existing C# bug benchmark
+                                                                   these works.
+suite, we searched Github using “race condition” key-
+word and identified these 9 that contain (1) confirmed             Systematic Testing Systematic testing techniques dis-
+bug reports about TSVs on standard library APIs and                cover concurrency errors by driving the program towards
+(2) developer-written test cases.                                  different possible interleavings [6, 7, 21, 22, 24, 35, 43].
+   Using exactly the same parameters as before, TSVD               These techniques are either guided by the need to cover
+successfully detects and triggers all the TSVs under test          all interleavings within some bound [21, 22, 35, 43], or a
+in at most 2 runs. For all but 3 projects, TSVD detects            coverage notion [6, 24], or provide a probabilistic guar-
+these bugs using the original test cases released with the         antee of finding bugs [7]. While these techniques can
+buggy software — if TSVD was used, these bugs would                find general concurrency bugs, they are not designed to
+have been caught before code release. For Thunderstruck,           discover most bugs in a small number of runs. Instead,
+TSVD detects one TSV that was not part of the original             TSVD is specifically designed for finding TSVs within the
+bug report.                                                        first few runs and without paying the cost of controlling
+   We also evaluated the performance of TSVD on all                the thread scheduler.
+the test cases. The overhead is mostly <20%, consistent
+with earlier performance results. Two projects incur large         Generating Unit Tests Tools were proposed to synthe-
+overhead, as they have many short-running tests (<1                size unit tests to help expose concurrency bugs inside
+ms). The average slowdown for their tests is actually less         library functions [9, 49, 54, 55]. Given multi-threaded
+than 400ms.                                                        libraries that are expected to allow safe concurrent in-
+                                                                   vocations, these tools synthesize concurrent method-call
+6      Related Work                                                sequences to help expose bugs inside the library imple-
+                                                                   mentation. They are orthogonal to TSVD: TSVD focuses
+Data Race Detection Since the tolerance for false error            on improving the efficiency of exposing thread-safety vi-
+reports is low in our context, we do not focus on static           olation bugs through existing unit tests of software that
+data-race-detection techniques [13, 16, 36, 66]. TSVD              uses thread-unsafe libraries.
+is closely related to dynamic active data-race detection
+techniques [47, 58], as discussed in Section 1 and Fig-            Timing hypothesis Snorlax [29] reproduced and diag-
+ure 2.                                                             nosed in-production concurrency bugs leveraging a coarse
+   Dynamic passive detection techniques [19, 48, 57, 60,           interleaving hypothesis. Snorlax experiments showed that
+65] perform happens-before analysis, lock-set analysis, or         the time elapsed between events leading to concurrency
+a combination of the two to predict whether a data race            bugs ranges between 154 and 3505 micro-seconds, based
+could have manifested. Recent work [27, 32, 61] infer              on which Snorlax could reproduce concurrency bugs
+more data races by generalizing beyond executions that             without fine granularity monitoring and recording. This
+are happens-before equivalent to the current execution.            coarse-interleaving hypothesis and TSVD’s near-miss
+These techniques pay the runtime cost of monitoring                tracking look at different aspects of concurrency bug’s
+synchronization operations and also suffer from false              timing window characteristics — Snorlax believes the
+
+
+
+                                                             176
+timing window is not as small as people used to think,              [2] Aleksandr Mikunov. [n. d.]. Rewrite MSIL Code
+and TSVD believes conflicting accesses in small windows                 on the Fly with the .NET Framework Profiling
+are more likely to lead to real bugs — and leverage the                 API. https://www.cnblogs.com/WCFGROUP/p/
+characteristics in different ways.                                      5136703.html.
+                                                                    [3] ApplicationInsights. [n. d.].          Broadcast pro-
+Causality inference Past work has used run-time trace                   cessor is dropping telemetry due to race
+analysis to infer happens-before relationship among mes-                condition.             https://github.com/Microsoft/
+sage sending/receiving operations or distributed sys-                   ApplicationInsights-dotnet/issues/994.
+tem tasks in the context of system-performance analysis             [4] Bazel. [n. d.]. Bazel: Build and test software of any
+[1, 10] and network-dependency analysis [8]. Due to the                 size, quickly and reliably. https://bazel.build/.
+different usage scenarios, the exact inference algorithms           [5] Michael D. Bond, Katherine E. Coons, and
+differ between TSVD and these previous tools. Previous                  Kathryn S. McKinley. 2010. PACER: propor-
+tools all require a large number of un-perturbed system                 tional detection of data races. In Proceedings of
+traces, and statistically infer happens-before relation-                the 2010 ACM SIGPLAN Conference on Program-
+ship based on whether two operations never flip execu-                  ming Language Design and Implementation, PLDI
+tion order [10] or always execute with a nearly constant                2010, Toronto, Ontario, Canada.
+physical-time gap in between [8]. Different from previous           [6] Arkady Bron, Eitan Farchi, Yonit Magid, Yarden
+tools, TSVD works in the unique testing environment                     Nir, and Shmuel Ur. 2005. Applications of syn-
+where the system trace contains much perturbation in-                   chronization coverage. In Proceedings of the ACM
+troduced by TSVD; TSVD also faces the unique goal                       SIGPLAN Symposium on Principles and Practice of
+of finding bugs in a small number of runs, and hence                    Parallel Programming, PPOPP, Chicago, IL, USA.
+cannot wait until a large number of traces become avail-            [7] Sebastian Burckhardt, Pravesh Kothari, Madanlal
+able. Consequently, TSVD’s happens-before inference                     Musuvathi, and Santosh Nagarakatte. 2010. A Ran-
+is uniquely designed based on observing delays in each                  domized Scheduler with Probabilistic Guarantees of
+testing run.                                                            Finding Bugs. In Proceedings of the Fifteenth Edi-
+                                                                        tion of ASPLOS on Architectural Support for Pro-
+7   Conclusion                                                          gramming Languages and Operating Systems (ASP-
+This paper presents a new thread-safety violation detec-                LOS XV). 167–178.
+tion technique TSVD. Being part of an integrated build              [8] Xu Chen, Ming Zhang, Zhuoqing Morley Mao, and
+and test environment, TSVD provides a push-button no-                   Paramvir Bahl. 2008. Automating Network Appli-
+false-positive bug detection for .NET programs that use                 cation Dependency Discovery: Experiences, Limita-
+complex multi-threaded and asynchronous programming                     tions, and New Solutions.. In OSDI, Vol. 8. 117–130.
+models with a wide variety of synchronization mecha-                [9] Ankit Choudhary, Shan Lu, and Michael Pradel.
+nisms. TSVD provides a starting point for exploring                     2017. Efficient Detection of Thread Safety Violations
+the wide design space of active testing and resource-                   via Coverage-guided Generation of Concurrent Tests.
+conscious delay injection design. Future research can                   In Proceedings of the 39th International Conference
+further explore how to balance bug exposing capability,                 on Software Engineering (ICSE).
+accuracy, and cost.                                                [10] Michael Chow, David Meisner, Jason Flinn, Daniel
+                                                                        Peek, and Thomas F Wenisch. 2014. The mystery
+Acknowledgments                                                         machine: End-to-end performance analysis of large-
+                                                                        scale internet services. In 11th USENIX Symposium
+We would like to thank Lenin Ravindranath Sivalingam,
+                                                                        on Operating Systems Design and Implementation
+for his help in building the first prototype, Suresh Thum-
+                                                                        (OSDI 14). 217–231.
+malapenta, for his help with our experiments, our shep-
+                                                                   [11] Csharpmm. [n. d.]. Standard ECMA-334 C# Lan-
+herd and the anonymous reviewers for their helpful feed-
+                                                                        guage Specification. http://www.ecma-international.
+back. This work was supported in part by NSF grants
+                                                                        org/publications/standards/Ecma-334.htm.
+funding CNS-1563956 and CNS-1514256.
+                                                                   [12] DateTimeExtensions. [n. d.]. Resolve a random
+                                                                        race condition. https://github.com/joaomatossilva/
+References                                                              DateTimeExtensions/pull/86.
+ [1] Marcos K Aguilera, Jeffrey C Mogul, Janet L                   [13] Dawson R. Engler and Ken Ashcraft. 2003. Rac-
+     Wiener, Patrick Reynolds, and Athicha Muthi-                       erX: effective, static detection of race conditions and
+     tacharoen. 2003. Performance debugging for dis-                    deadlocks. In Proceedings of the 19th ACM Sym-
+     tributed systems of black boxes. In ACM SIGOPS                     posium on Operating Systems Principles , SOSP ,
+     Operating Systems Review, Vol. 37. ACM, 74–89.                     Bolton Landing, NY, USA.
+
+
+
+                                                             177
+[14] John Erickson, Madanlal Musuvathi, Sebastian Bur-           [25] Chun-Hung Hsiao, Satish Narayanasamy, Essam
+     ckhardt, and Kirk Olynyk. 2010. Effective Data-                  Muhammad Idris Khan, Cristiano L. Pereira, and
+     Race Detection for the Kernel.. In OSDI, Vol. 10.                Gilles A. Pokam. 2017. AsyncClock: Scalable In-
+     1–16.                                                            ference of Asynchronous Event Causality. In Pro-
+[15] Hamed Esfahani, Jonas Fietz, Qi Ke, Alexei Kolomi-               ceedings of the Twenty-Second International Con-
+     ets, Erica Lan, Erik Mavrinac, Wolfram Schulte,                  ference on Architectural Support for Programming
+     Newton Sanches, and Srikanth Kandula. 2016.                      Languages and Operating Systems, ASPLOS, Xi’an,
+     CloudBuild: Microsoft’s Distributed and Caching                  China.
+     Build Service. In SEIP (seip ed.). IEEE - Institute         [26] Chun-Hung Hsiao, Cristiano Pereira, Jie Yu, Gilles
+     of Electrical and Electronics Engineers.       https:            Pokam, Satish Narayanasamy, Peter M. Chen, Ziyun
+     //www.microsoft.com/en-us/research/publication/                  Kong, and Jason Flinn. 2014. Race Detection for
+     cloudbuild-microsofts-distributed-and-caching-build-service/     Event-Driven Mobile Applications. In PLDI.
+[16] Facebook. [n. d.]. A tool to detect bugs in Java and        [27] Jeff Huang, Patrick O’Neil Meredith, and Grigore
+     C/C++/Objective-C code before it ships. https:                   Rosu. 2014. Maximal Sound Predictive Race De-
+     //fbinfer.com/.                                                  tection with Control Flow Abstraction. In Proceed-
+[17] Mingdong Feng and Charles E. Leiserson. 1997. Ef-                ings of the 35th ACM SIGPLAN Conference on
+     ficient Detection of Determinacy Races in Cilk Pro-              Programming Language Design and Implementation
+     grams. In Proceedings of the Ninth Annual ACM                    (PLDI).
+     Symposium on Parallel Algorithms and Architec-              [28] Jb Evain. [n. d.]. Mono.Cecil. https://github.com/
+     tures (SPAA ’97). ACM, New York, NY, USA, 1–11.                  jbevain/cecil.
+     https://doi.org/10.1145/258492.258493                       [29] Baris Kasikci, Weidong Cui, Xinyang Ge, and Ben
+[18] Colin J Fidge. 1987. Timestamps in message-passing               Niu. 2017. Lazy Diagnosis of In-Production Concur-
+     systems that preserve the partial ordering. (1987).              rency Bugs. In Proceedings of the 26th Symposium
+[19] Cormac Flanagan and Stephen N. Freund. 2009.                     on Operating Systems Principles (SOSP).
+     FastTrack: Efficient and Precise Dynamic Race De-           [30] Baris Kasikci, Cristian Zamfir, and George Candea.
+     tection. In Proceedings of the 30th ACM SIGPLAN                  2012. Data races vs. data race bugs: telling the
+     Conference on Programming Language Design and                    difference with portend. In Proceedings of the 17th
+     Implementation (PLDI).                                           International Conference on Architectural Support
+[20] FluentAssertion. [n. d.].            Race condition              for Programming Languages and Operating Systems,
+     in           SelfReferenceEquivalencyAssertionOp-                ASPLOS , London, UK.
+     tions.GetEqualityStrategy.       https://github.com/        [31] Baris Kasikci, Cristian Zamfir, and George Candea.
+     fluentassertions/fluentassertions/issues/862.                    2013. RaceMob: crowdsourced data race detection.
+[21] Pedro Fonseca, Rodrigo Rodrigues, and Björn B                    In ACM SIGOPS 24th Symposium on Operating
+     Brandenburg. 2014. SKI: Exposing Kernel Con-                     Systems Principles, SOSP, Farmington, PA, USA.
+     currency Bugs through Systematic Schedule Explo-            [32] Dileep Kini, Umang Mathur, and Mahesh
+     ration. In 11th USENIX Symposium on Operating                    Viswanathan. 2017. Dynamic Race Prediction in
+     Systems Design and Implementation (OSDI 14). 415–                Linear Time. In Proceedings of the 38th ACM SIG-
+     431.                                                             PLAN Conference on Programming Language De-
+[22] Patrice Godefroid. 1997. Model checking for pro-                 sign and Implementation (PLDI).
+     gramming languages using VeriSoft. In Proceedings           [33] kubernetes-client. [n. d.]. fix a race condition. https:
+     of the 24th ACM SIGPLAN-SIGACT symposium                         //github.com/kubernetes-client/csharp/pull/212.
+     on Principles of programming languages. ACM, 174–           [34] Leslie Lamport. 1978. Time, clocks, and the ordering
+     186.                                                             of events in a distributed system. Commun. ACM
+[23] Patrice Godefroid. 2005. The Soundness of Bugs                   21, 7 (1978), 558–565.
+     is What Matters. In PLDI’2005 Workshop on                   [35] Tanakorn Leesatapornwongsa, Mingzhe Hao, Pallavi
+     the Evaluation of Software Defect Detection Tools                Joshi, Jeffrey F Lukman, and Haryadi S Gunawi.
+     (BUGS’2005).                                                     2014. SAMC: Semantic-Aware Model Checking for
+[24] Shin Hong, Jaemin Ahn, Sangmin Park, Moonzoo                     Fast Discovery of Deep Bugs in Cloud Systems. In
+     Kim, and Mary Jean Harrold. 2012. Testing Con-                   11th USENIX Symposium on Operating Systems
+     current Programs to Achieve High Synchronization                 Design and Implementation (OSDI 14). 399–414.
+     Coverage. In Proceedings of the 2012 International          [36] Bozhen Liu and Jeff Huang. 2018. D4: Fast Con-
+     Symposium on Software Testing and Analysis (IS-                  currency Debugging with Parallel Differential Anal-
+     STA).                                                            ysis. In Proceedings of the 39th ACM SIGPLAN
+                                                                      Conference on Programming Language Design and
+
+
+
+                                                             178
+     Implementation (PLDI).                                        [48] Eli Pozniansky and Assaf Schuster. 2007. MultiRace:
+[37] Haopeng Liu, Shan Lu, Madan Musuvathi, and                         Efficient On-the-fly Data Race Detection in Multi-
+     Suman Nath. 2019. What bugs cause production                       threaded C++ Programs: Research Articles. Con-
+     cloud incidents?. In Proceedings of the Workshop on                curr. Comput. : Pract. Exper. 19, 3 (March 2007),
+     Hot Topics in Operating Systems. ACM, 155–162.                     327–340. https://doi.org/10.1002/cpe.v19:3
+[38] Shan Lu, Joseph Tucek, Feng Qin, and Yuanyuan                 [49] Michael Pradel and Thomas R. Gross. 2012. Fully
+     Zhou. 2006. AVIO: detecting atomicity violations                   Automatic and Precise Detection of Thread Safety
+     via access interleaving invariants. In Proceedings of              Violations. In Proceedings of the 33rd ACM SIG-
+     the 12th International Conference on Architectural                 PLAN Conference on Programming Language De-
+     Support for Programming Languages and Operating                    sign and Implementation (PLDI ’12). ACM, New
+     Systems, ASPLOS, San Jose, CA, USA.                                York, NY, USA, 521–530. https://doi.org/10.1145/
+[39] Brandon Lucia and Luis Ceze. 2009. Finding Con-                    2254064.2254126
+     currency Bugs with Context-aware Communica-                   [50] Radical. [n. d.]. MessageBroker internal subscrip-
+     tion Graphs. In Proceedings of the 42Nd Annual                     tion(s) list is not thread safe. https://github.com/
+     IEEE/ACM International Symposium on Microar-                       RadicalFx/Radical/issues/108.
+     chitecture (MICRO).                                           [51] Raghavan Raman, Jisheng Zhao, Vivek Sarkar,
+[40] Pallavi Maiya, Aditya Kanade, and Rupak Majum-                     Martin Vechev, and Eran Yahav. 2010. Efficient
+     dar. 2014. Race Detection for Android Applications.                Data Race Detection for Async-finish Parallelism.
+     In PLDI.                                                           In Proceedings of the First International Conference
+[41] J. Manson, W. Pugh, and S. Adve. 2005. The Java                    on Runtime Verification (RV’10). Springer-Verlag,
+     memory model. In Proceedings of POPL. ACM, 378–                    Berlin, Heidelberg, 368–383. http://dl.acm.org/
+     391.                                                               citation.cfm?id=1939399.1939430
+[42] Daniel Marino, Madanlal Musuvathi, and Satish                 [52] Raghavan Raman, Jisheng Zhao, Vivek Sarkar, Mar-
+     Narayanasamy. 2009. LiteRace: effective sampling                   tin Vechev, and Eran Yahav. 2012. Scalable and
+     for lightweight data-race detection. In Proceedings                Precise Dynamic Datarace Detection for Structured
+     of the 2009 ACM SIGPLAN Conference on Pro-                         Parallelism. In Proceedings of the 33rd ACM SIG-
+     gramming Language Design and Implementation,                       PLAN Conference on Programming Language De-
+     PLDI 2009, Dublin, Ireland.                                        sign and Implementation (PLDI ’12). ACM, New
+[43] Madan Musuvathi and Shaz Qadeer. 2006. CHESS:                      York, NY, USA, 531–542. https://doi.org/10.1145/
+     Systematic stress testing of concurrent software. In               2254064.2254127
+     International Symposium on Logic-based Program                [53] Veselin Raychev, Martin T. Vechev, and Manu Srid-
+     Synthesis and Transformation. Springer, 15–16.                     haran. 2013. Effective Race Detection for Event-
+[44] S. Narayanasamy, Z. Wang, J. Tigani, A. Edwards,                   Driven Programs. In OOPSLA.
+     and B. Calder. 2007. Automatically Classifying Be-            [54] Malavika Samak and Murali Krishna Ramanathan.
+     nign and Harmful Data Races Using Replay Analy-                    2014. Multithreaded Test Synthesis for Deadlock
+     sis.                                                               Detection. In Proceedings of the 2014 ACM Interna-
+[45] Satish Narayanasamy, Zhenghao Wang, Jordan                         tional Conference on Object Oriented Programming
+     Tigani, Andrew Edwards, and Brad Calder. 2007.                     Systems Languages & Applications (OOPSLA ’14).
+     Automatically classifying benign and harmful data             [55] Malavika Samak, Murali Krishna Ramanathan, and
+     racesallusing replay analysis. In Proceedings of the               Suresh Jagannathan. 2015. Synthesizing Racy Tests.
+     ACM SIGPLAN 2007 Conference on Programming                         In Proceedings of the 36th ACM SIGPLAN Confer-
+     Language Design and Implementation (PLDI), San                     ence on Programming Language Design and Imple-
+     Diego, California, USA.                                            mentation (PLDI).
+[46] Robert O’Callahan and Jong-Deok Choi. 2003. Hy-               [56] Anirudh Santhiar and Aditya Kanade. 2017. Static
+     brid Dynamic Data Race Detection. In Proceed-                      Deadlock Detection for Asynchronous C# Programs.
+     ings of the Ninth ACM SIGPLAN Symposium on                         In Proceedings of the 38th ACM SIGPLAN Confer-
+     Principles and Practice of Parallel Programming                    ence on Programming Language Design and Imple-
+     (PPoPP).                                                           mentation (PLDI).
+[47] Soyeon Park, Shan Lu, and Yuanyuan Zhou. 2009.                [57] Stefan Savage, Michael Burrows, Greg Nelson,
+     CTrigger: exposing atomicity violation bugs from                   Patrick Sobalvarro, and Thomas Anderson. 1997.
+     their hiding places. In ACM SIGARCH Computer                       Eraser: A Dynamic Data Race Detector for Multi-
+     Architecture News, Vol. 37. ACM, 25–36.                            threaded Programs. ACM Trans. Comput. Syst. 15,
+                                                                        4 (Nov. 1997), 391–411. https://doi.org/10.1145/
+                                                                        265924.265927
+
+
+
+                                                             179
+[58] Koushik Sen. 2008. Race directed random testing
+     of concurrent programs. ACM Sigplan Notices 43,
+     6 (2008), 11–21.
+[59] Sequelocity.NET. [n. d.].        Race condition on
+     TypeCacher. https://github.com/AmbitEnergyLabs/
+     Sequelocity.NET/pull/23.
+[60] Konstantin Serebryany and Timur Iskhodzhanov.
+     2009. ThreadSanitizer: data race detection in prac-
+     tice. In Proceedings of the workshop on binary in-
+     strumentation and applications. ACM, 62–71.
+[61] Yannis Smaragdakis, Jacob Evans, Caitlin Sadowski,
+     Jaeheon Yi, and Cormac Flanagan. 2012. Sound
+     Predictive Race Detection in Polynomial Time. In
+     Proceedings of the 39th Annual ACM SIGPLAN-
+     SIGACT Symposium on Principles of Programming
+     Languages (POPL).
+[62] statsd.net. [n. d.]. Race conditions when updat-
+     ing guage value. https://github.com/lukevenediger/
+     statsd.net/issues/29.
+[63] System.Linq.Dynamic. [n. d.]. Fix the multi-
+     threading issue at ClassFactory.GetDynamicClass.
+     https://github.com/kahanu/System.Linq.Dynamic/
+     pull/48.
+[64] Thunderstruck. [n. d.]. Race condition in Con-
+     nectionStringBuffer singleton. https://github.com/
+     19WAS85/Thunderstruck/issues/3.
+[65] Yuan Yu, Tom Rodeheffer, and Wei Chen. 2005.
+     Racetrack: efficient detection of data race conditions
+     via adaptive tracking. In ACM SIGOPS Operating
+     Systems Review, Vol. 39. ACM, 221–234.
+[66] Sheng Zhan and Jeff Huang. 2016. ECHO: instan-
+     taneous in situ race detection in the IDE. In Pro-
+     ceedings of the 24th ACM SIGSOFT International
+     Symposium on Foundations of Software Engineering,
+     FSE 2016, Seattle, WA, USA.
+
+
+
+
+                                                              180
+

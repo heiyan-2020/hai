@@ -1,0 +1,1443 @@
+     FBDetect: Catching Tiny Performance Regressions
+      at Hyperscale through In-Production Monitoring
+        Dong Young Yoon1 Yang Wang1† Miao Yu1† Elvis Huang1 Juan Ignacio Jones1
+     Abhinay Kukkadapu1 Osman Kocas1 Jonathan Wiepert1 Kapil Goenka1 Sherry Chen1
+        Yanjun Lin1 Zhihui Huang1 Jocelyn Kong1 Michael Chow1 Chunqiang Tang1
+                                                  1 Meta Platforms           † The Ohio State University
+
+
+
+Abstract                                                                                1             Introduction
+This paper presents Meta’s FBDetect system, which advances                              Meta operates a private cloud with millions of servers. At this
+the state of the art in performance regression detection by                             scale, even a minor performance regression can result in the
+catching regressions as small as 0.005% in noisy production                             waste of many servers. These small regressions are common.
+environments. FBDetect monitors around 800,000 time series                              For example, among approximately 800 regressions per year
+covering various types of metrics (e.g., throughput, latency,                           in our serverless platform, about one-tenth result in only a
+CPU and memory usage) to detect regressions caused by                                   0.005% to 0.01% increase in CPU usage, yet these tiny regres-
+code or configuration changes in hundreds of services run-                              sions collectively would have wasted around 4,000 servers
+ning on millions of servers. FBDetect introduces advanced                               if left undetected. Moreover, the median CPU regression is
+techniques to capture stack traces fleet-wide, measure fine-                            also small, at just 0.048%. These data highlight the critical
+grained subroutine-level performance differences, filter out                            need for accurate detection of small regressions.
+deceptive false-positive regressions, deduplicate correlated                                Moreover, it is essential to detect small regressions in pro-
+regressions, and analyze root causes. Beyond these individ-                             duction. While pre-production performance testing [14, 25,
+ual techniques, a key strength of FBDetect over prior work                              67] is necessary, some issues may slip through due to the
+is its battle-tested robustness, proven by seven years of pro-                          difficulty of precisely replicating complex production envi-
+duction use, and each year catching regressions that would                              ronments in testing. Additionally, catching tiny regressions
+have wasted millions of servers if left undetected.                                     requires a massive amount of performance data samples,
+                                                                                        which are more feasible to gather from a large production
+CCS Concepts: • General and reference → Measure-                                        fleet than a small test environment.
+ment; Performance.                                                                          Meta’s FBDetect system performs in-production regression
+Keywords: performance regression, anomaly detection.                                    detection by identifying anomalies in service time-series data
+                                                                                        (e.g., CPU usage) triggered by code or configuration changes.
+ACM Reference Format:                                                                   We illustrate several challenges it faces through examples.
+Dong Young Yoon, Yang Wang, Miao Yu, Elvis Huang, Juan Ignacio                          While Figure 1(a) appears to show no regression, and Fig-
+Jones, Abhinay Kukkadapu, Osman Kocas, Jonathan Wiepert, Kapil                          ures 1(b) and 1(c) seem to show obvious regressions, the
+Goenka, Sherry Chen, Yanjun Lin, Zhihui Huang, Jocelyn Kong,                            reality is the opposite. Figure 1(a) contains a minor regres-
+Michael Chow, and Chunqiang Tang. 2024. FBDetect: Catching Tiny                         sion of 0.005%, indicated by a barely visible change in the
+Performance Regressions at Hyperscale through In-Production                             straight line representing the population mean. Despite this
+Monitoring. In ACM SIGOPS 30th Symposium on Operating Sys-
+                                                                                        subtlety, FBDetect must accurately detect it by managing the
+tems Principles (SOSP ’24), November 4–6, 2024, Austin, TX, USA.
+                                                                                        high noise. Figure 1(b) shows a rise in a specific subroutine’s
+ACM, New York, NY, USA, 19 pages. https://doi.org/10.1145/3694715.
+3695977
+                                                                                                                                              Throughput/sec
+
+
+
+
+                                                                                                    100%                      0.05%                            140
+                                                                                                     90%
+                                                                                        CPU Usage
+
+
+
+
+                                                                                                                  CPU Usage
+
+
+
+
+                                                                                                     80%                                                       120
+                                                                                                                              0.04%
+                                                                                                     70%                                                       100
+                                                                                                     60%                      0.03%                            80
+                                                                                                     50%
+                                                                                                     40%                      0.02%                            60
+                                                                                                     30%                                                       40
+Permission to make digital or hard copies of all or part of this work for                            20%                      0.01%
+                                                                                                                                                               20
+                                                                                                     10%
+personal or classroom use is granted without fee provided that copies are                             0%                      0.00%                             0
+                                                                                                           Time                       Time                           Time
+not made or distributed for profit or commercial advantage and that copies
+bear this notice and the full citation on the first page. Copyrights for third-         (a) True regression         (b) False positive       (c) False positive due
+party components of this work must be honored. For all other uses, contact                but barely visible.        due to cost shift.        to transient issues.
+the owner/author(s).
+SOSP ’24, November 4–6, 2024, Austin, TX, USA
+                                                                                        Figure 1. Challenges for FBDetect: It must catch the barely
+© 2024 Copyright held by the owner/author(s).
+ACM ISBN 979-8-4007-1251-7/24/11
+                                                                                        visible tiny regression in Figure (a). It also must filter out the
+https://doi.org/10.1145/3694715.3695977                                                 deceptive false-positive regressions in Figures (b) and (c).
+
+
+
+                                                                                  522
+CPU usage, but FBDetect must filter out this false-positive                interpreter’s stack trace, instead of the Python program’s
+regression, as it is caused by code refactoring that moves                 stack trace. To address this issue, we introduce PyPerf, which
+code across subroutines without increasing their total CPU                 uses a kernel eBPF profiler to sample and map the Python
+usage. Figure 1(c) shows a drop in throughput, but FBDetect                interpreter’s stack trace to the Python program’s stack trace.
+must filter out this false-positive regression caused by tran-             To our knowledge, PyPerf is the first profiler capable of
+sient issues, such as server failures, maintenance operations,             deriving an end-to-end stack trace across a Python program
+load spikes, software rolling updates, canary tests, and traffic           and the native C/C++ libraries it invokes.
+shifts, which can last from seconds to hours. Existing meth-
+                                                                           Filtering transient issues. FBDetect accurately classifies
+ods struggle to handle these transient issues. For instance,
+                                                                           99.7% of regressions, such as the one shown in Figure 1(c),
+typical change-point detection algorithms [3] would result
+                                                                           as false positives caused by transient issues, using a com-
+in a 99.7% false positive rate in our environment.
+                                                                           bination of sophisticated techniques. These include change
+   To address these and other challenges, we propose a com-
+                                                                           point detection [3] to identify anomalies, trend analysis [17]
+prehensive set of techniques, as summarized below.
+                                                                           to remove seasonality, Symbolic Aggregate approXimation
+Subroutine-level regression detection. We significantly                    (SAX) [43] to distinguish anomalies caused by different fac-
+reduce the variance (i.e., noise) in performance data by mea-              tors, and methods that examine beyond a single change point
+suring CPU usage at the subroutine level rather than at the                to assess whether an anomaly recovers autonomously.
+overall service level. Detecting a tiny 0.005% regression in a
+                                                                           Deduplicating regressions. A single code change can lead
+service’s overall CPU usage is a daunting task, as illustrated
+                                                                           to anomalies in numerous monitoring metrics, resulting in
+in Figure 1(a). However, if this 0.005% regression originates
+                                                                           an overwhelming number of incident reports. FBDetect lever-
+from a single subroutine that consumes 0.1% of the total
+                                                                           ages clustering algorithms to merge regressions likely caused
+CPU, the relative change at the subroutine level is 0.005%
+                                                     0.1% =5%,             by the same change. While clustering algorithms are well-
+which is much more substantial. Consequently, small regres-
+                                                                           known, our unique contributions include: (1) proposing a
+sions are easier to detect at the subroutine level. This effect
+                                                                           hybrid clustering algorithm that combines the efficiency of
+occurs because CPU metrics exhibit lower variance at the
+                                                                           Self-Organizing Map [36] with the accuracy of pairwise clus-
+subroutine level than at the overall service level (§2).
+                                                                           tering, and (2) introducing effective domain-specific features
+Filtering subroutine-level false positives. Unfortunately,                 for clustering, such as regression root-cause candidates, sub-
+isolated subroutine level metrics can be misleading, as sim-               routine names, and performance-metric names.
+ply moving code from subroutine 𝐴 to subroutine 𝐵 may
+                                                                           Root cause analysis. FBDetect combines multiple tech-
+create the illusion of regression in subroutine 𝐵, like the one
+                                                                           niques to identify the code change responsible for a regres-
+in Figure 1(b). Our evaluation shows that 34% of subroutine-
+                                                                           sion: 1) code and stack-trace analysis, where for a regression
+level regressions are false positives caused by these cost
+                                                                           in subroutine 𝐴, code changes that modify downstream sub-
+shifts—an issue not addressed by existing algorithms. FBDe-
+                                                                           routines transitively invoked by 𝐴 are flagged as potential
+tect employs code analysis to filter out these false positives. It
+                                                                           suspects; 2) text analysis, which calculates a similarity score
+examines higher-level cost domains such as upstream callers
+                                                                           between the regression context (e.g., stack trace) and the code
+or the encapsulating class of the subroutine under investi-
+                                                                           change context (e.g., change description); and 3) time series
+gation. If the cost change in a higher-level cost domain is
+                                                                           correlation, which identifies metrics that strongly correlate
+negligible, FBDetect considers the regression merely a cost
+                                                                           with the regression’s timing.
+shift and will not report it.
+                                                                           Contributions. Our primary contribution is a comprehen-
+Subroutine-level measurement. Instrumenting every sub-
+                                                                           sive set of techniques that enables FBDetect to detect re-
+routine in every service to track subroutine-level CPU usage
+                                                                           gressions as small as 0.005%—a level of precision previously
+is not only cumbersome to deploy but also incurs high run-
+                                                                           unreported. Moreover, a key strength of FBDetect over prior
+time overhead. To address this issue, we elevate the stack-
+                                                                           work is its battle-tested robustness, proven over seven years
+trace sampling approach to hyperscale, enabling efficient
+                                                                           of production use and each year catching regressions that
+measurement of CPU usage for every subroutine across all
+                                                                           would have wasted millions of servers if left undetected.
+services. FBDetect leverages eBPF or a language runtime’s
+ability to periodically collect stack-trace samples fleet-wide.            2   Feasibility of Detecting Tiny Regressions
+From these samples, it derives each subroutine’s relative
+CPU usage. For example, if 100 stack-trace samples are col-                At first glance, detecting the tiny regression in Figure 1(a)
+lected for a service, and a subroutine foo appears in 8 of these           seems implausible, so we first address its feasibility.
+samples, the normalized CPU usage of foo is calculated as 8%.                We develop a simple analytic model to aid in the dis-
+   However, sampling the stack trace of a program written                  cussion. Suppose we collect 𝑛 performance samples after
+in interpreted languages like Python results in retrieving the
+
+
+
+
+                                                                     523
+                                                                                                   50.060%                                                   50.015%
+
+a code change to assess its performance impact. Let 𝜎 2 de-                                        50.040%
+                                                                                                                                50.010%
+                                                                                                                                                             50.010%
+
+
+
+note the sample variance, and Δthreshold denote the detection
+                                                                                                                                50.005%                      50.005%
+
+
+
+
+                                                                                                                    CPU Usage
+
+
+
+
+                                                                                                                                                 CPU Usage
+                                                                                       CPU Usage
+                                                                                                   50.020%
+                                                                                                                                50.000%                      50.000%
+                                                                                                   50.000%
+threshold—the smallest performance difference that can be                                          49.980%
+                                                                                                                                49.995%                      49.995%
+
+                                                                                                                                                             49.990%
+                                                                                                                                49.990%
+reliably detected, such as a 0.005% difference in CPU usage.                                       49.960%
+                                                                                                                                49.985%
+                                                                                                                                                             49.985%
+
+                                                                                                                                                             49.980%
+In Appendix A.2, we derive the following expression, where                                                   Time                         Time                         Time
+
+
+the symbol ∝ denotes proportionality.                                                    (a) 𝑚=500,000.       (b) 𝑚=5,000,000.   (c) 𝑚=50,000,000.
+                                   √︁                                                  Figure 2. The average of 𝑚 time series from 𝑚 servers mea-
+                      Δthreshold ∝ 𝜎 2 /𝑛                     (1)
+                                                                                       suring Linux-process-level CPU usage. As 𝑚 increases, noise
+   We lower the detection threshold Δthreshold by simultane-                           reduces. This effect can be explained using the Law of Large
+ously reducing 𝜎 2 and increasing 𝑛. While a hyperscale en-                            Numbers, as described in Appendix A.1.
+vironment can more easily increase 𝑛 by collecting samples
+                                                                                                   0.210%                                                    0.190%
+across many servers, it also exhibits high variance (𝜎 2 ) due                                     0.200%
+                                                                                                                                0.188%
+
+                                                                                                                                0.186%                       0.188%
+
+                                                                                                                                0.184%                       0.185%
+to factors like mixed server generations and diverse request
+
+
+
+
+                                                                                                                                                 CPU Usage
+                                                                                                                    CPU Usage
+                                                                                       CPU Usage
+                                                                                                   0.190%
+                                                                                                                                0.182%                       0.182%
+
+                                                                                                   0.180%                       0.180%                       0.180%
+types. Thus, relying solely on fleet size to increase 𝑛, without                                                                0.178%                       0.178%
+                                                                                                   0.170%
+
+FBDetect’s optimizations to reduce 𝜎 2 , would take weeks to                                       0.160%
+                                                                                                                                0.176%
+
+                                                                                                                                0.174%
+                                                                                                                                                             0.175%
+
+                                                                                                                                                             0.172%
+
+
+years to collect enough samples for a low Δthreshold , even at                                     0.150%
+                                                                                                             Time
+                                                                                                                                0.172%
+                                                                                                                                          Time
+                                                                                                                                                             0.170%
+                                                                                                                                                                       Time
+
+Meta’s hyperscale. FBDetect’s optimizations reduce 𝜎 2 by                                  (a) 𝑚=500.          (b) 𝑚=5,000.        (c) 𝑚=50,000.
+100-10000 times, obtaining sufficient samples within hours                             Figure 3. The average of 𝑚 time series from 𝑚 servers mea-
+or a few days (§3). Additionally, reducing variance is crucial                         suring subroutine-level CPU usage. This figure uses samples
+for minimizing fleet-wide resource waste (Appendix A.4).                               from 1000 times fewer servers than Figure 2.
+Subroutine-level measurements. To lower Δthreshold , we
+reduce the variance 𝜎 2 by measuring CPU usage at the sub-
+routine level rather than at the Linux process level. For
+simplicity, assume a process comprises 𝑘 subroutines with
+independent and identically distributed (IID) CPU usage.1                              subroutine-level metrics, such as latency, throughput, and
+Let random variables 𝑋 process and 𝑋 subroutine denote the CPU                         error rate per RPC endpoint. However, memory and other
+usage of the process and each subroutine, respectively, with                           application-level metrics require manual instrumentation if
+           Í
+𝑋 process = 𝑘𝑖=1 𝑋 subroutine𝑖 . Then,                                                 subroutine-level detection is desired.
+          Variance(𝑋 subroutine ) = Variance(𝑋 process )/𝑘.               (2)          Validation via simulation. Production evaluation of our
+                                                                                       approach for detecting small regressions will be presented
+According to Expression 1, the smaller variance at the subrou-
+                                                                                       in §6. Here, we validate its feasibility through simulations.
+tine level allows detection of regressions √1 times smaller.
+                                             𝑘                                         In these simulations, we conservatively set 𝑘=1000.
+   While this analysis shows that using a subroutine 𝐴’s
+                                                                                          Figure 1(a) simulates CPU usage data collected from a sin-
+absolute-CPU-usage metric 𝑋𝐴 can detect small regressions,
+                                                                                       gle server, sampling from a normal distribution with mean
+Appendix A.3 shows that using the relative-CPU-usage met-
+                                                         𝑋𝐴                            𝜇=0.5 (i.e., 50% CPU usage) and variance 𝜎 2 =0.01, while cap-
+ric gCPU𝐴 achieves the same effect, where gCPU𝐴 = 𝑋process   .                         ping sample values within [0, 1]. In the second half of the
+We prefer gCPU𝐴 over 𝑋𝐴 because gCPU𝐴 can be more eas-                                 time series, the mean increases to 50.005%, representing a
+ily calculated from stack-trace samples. For example, if 100                           0.005% regression, though this change is barely visible.
+stack-trace samples are collected, and subroutine 𝐴 appears                               Figure 2 simulates sampling from many servers. We sam-
+in 8 of these samples, gCPU𝐴 =8%.                                                      ple from 𝑚 servers, generate 𝑚 time series like the one in
+   For a hyperscale service, its number of subroutines (𝑘 in                           Figure 1(a), average them, and plot the average for various
+Expression 2) can be very large. Excluding negligible sub-                             values of 𝑚. To simulate servers of different generations, the
+routines, we call those with a gCPU of 0.001% or higher                                𝑚 servers exhibit different performance. Samples from half
+as “non-trivial.” The non-trivial subroutines in our server-                           of the 𝑚 servers have 𝜇=40% and 𝜎 2 =0.01, with the mean
+less platform have a median gCPU of 0.0083%. Accordingly,                              changing to 𝜇=40.003% mid-series to simulate a 0.003% regres-
+we estimate the 𝑘 in Expression 2 as 𝑘=1/0.0083%=12,048.                               sion. The other half have 𝜇=60% and 𝜎 2 =0.02, with the mean
+The large value of 𝑘 significantly reduces the variance in                             changing to 𝜇=60.007% mid-series. The regression amounts,
+Expression 2, enabling detection of small regressions.                                 0.003% and 0.007%, differ because a code change may perform
+   In addition to CPU metrics, FBDetect can support other                              differently across server generations. Figure 2(c) shows that
+1 Although subroutines generally do not follow the IID assumption and are              the tiny regression can be detected with sufficient samples,
+hard to analyze mathematically, the essence of this simplified analysis holds—
+                                                                                       though sampling from 50,000,000 servers is impractical.
+the process-level variance is decomposed across numerous subroutines,                     Figure 3 simulates subroutine-level measurements. The
+resulting in much smaller variance at the subroutine level.                            Linux-process-level CPU usage in Figure 2 is distributed
+
+
+
+                                                                                 524
+across 𝑘=1000 subroutines.2 The lower variance at the sub-
+routine level (see Expression 2) enables Figure 3 to detect the
+tiny regression by sampling from 1000 times fewer servers
+than Figure 2, making it practical for production use.
+   Although the simulation focuses on large services,
+subroutine-level measurements also enable accurate regres-
+sion detection in small services. For instance, FBDetect can
+detect regressions as small as 0.5% for our Invoicer service
+running on only 16 servers, as described in the next section,
+
+3    Workloads                                                                  Figure 4. Time windows used in regression detection.
+In this section, we summarize the diverse workloads sup-
+ported by FBDetect. While prior methods have demonstrated
+effectiveness on certain workloads, for large-scale adoption,                 can annotate its stack frame by calling SetFrameMetadata()
+the biggest challenge is ensuring a method’s robustness                       to provide additional context. This is useful for detecting
+across diverse workloads. Robustness is a key strength of                     regressions that occur only under certain conditions, e.g.,
+FBDetect. Currently, FBDetect monitors around 800,000 time                    processing requests on behalf of a specific category of users.
+series to detect regressions in hundreds of services. These                      Table 1 shows two FBDetect configurations that are used
+time series are from a wide range of metrics, including CPU,                  for FrontFaaS simultaneously. One detects large regressions
+memory, throughput, latency, error rate, coredump count,                      (3%) more quickly, while the other detects small regressions
+and many application-level metrics.                                           (0.005%) but needs to wait longer to collect more data.
+   Among services supported by FBDetect, about 500 use                        PythonFaaS is Meta’s serverless platform for Python code.
+stack-trace sampling. Their size, i.e., the number of servers                 For PythonFaaS, FBDetect detects regressions in subroutines
+they consume, varies from five to more than half a million                    and endpoints, as well as per-data-type I/O regressions to
+servers. The P5 (5th percentile), P10, P50, and P90 of the                    the downstream database (see TAO below).
+service sizes are 23, 64, 1,251, and 40,527, respectively. This
+shows that FBDetect works for services big and small.                         TAO [12] is a graph database. For its traffic from FrontFaaS
+   As the workload descriptions involve the setup of detec-                   and PythonFaaS, FBDetect detects regressions in subroutines,
+tion windows, we explain the concept below. FBDetect peri-                    endpoints, and per-data-type I/Os. For other traffic, FBDetect
+odically scans a service’s time-series data to detect regres-                 detects regressions in query-processing throughput.
+sions. It divides the time series into three parts, as shown in               AdServing is a group of ultra-large services that work to-
+Figure 4: (1) the historic window, which serves as the baseline               gether to serve ads to different products.
+for comparison; (2) the analysis window, where regressions
+are reported by comparing its data against that of the his-                   Invoicer is a small service running on just 16 servers to
+toric window; and (3) the extended window, which evaluates                    generate billing invoices. To ensure sufficient stack-trace
+whether an observed regression persists or disappears. Be-                    samples, eBPF collects about one sample per server per sec-
+low, we describe several workload examples.                                   ond for Invoicer, compared to one sample per server per
+                                                                              minute for FrontFaaS. Additionally, it uses long historical,
+FrontFaaS is Meta’s serverless platform for PHP code. It runs                 analysis, and extended windows of 14 days, 1 day, and 1 day,
+on more than half a million servers, and tens of thousands of                 respectively. These settings enable FBDetect to collect suf-
+developers write code for it, with thousands of code commits                  ficient samples for detecting gCPU regressions as small as
+every workday. We use the Xenon [55] profiler in the PHP                      0.5% in this small service.
+runtime to sample its stack traces.
+  Besides subroutine-level regressions, FBDetect detects                      Capacity Triage (CT). CT is a tool that leverages FBDe-
+endpoint-level regressions for FrontFaaS. An endpoint is a                    tect to detect throughput regressions for a diverse set of
+user-facing URL. As an endpoint request may involve asyn-                     services. CT relies on Kraken [76] to benchmark a service’s
+chronous and concurrent processing across multiple threads,                   per-server maximum throughput. If this maximum through-
+we use end-to-end tracing [30] to aggregate the costs of all                  put unexpectedly drops, it is a regression on the supply side
+subroutines involved. Regressions in this aggregated cost are                 (“CT-supply” in Table 1). Additionally, if the total peak re-
+called endpoint-level regressions. Moreover, FBDetect detects                 quests to a service’s all servers unexpectedly increase, it is a
+metadata-annotated regressions for FrontFaaS. A subroutine                    regression on the demand side (“CT-demand” in Table 1).
+2 The sample mean in Figure 3 is higher than 𝜇=50%/1000=0.05% because         Summary: The examples in Table 1 demonstrate FBDetect’s
+filtering out negative samples from the normal distribution with mean         ability to detect regressions across diverse workloads. Their
+𝜇=0.05% raises the sample mean above 0.05%.                                   historical, analysis, and extended windows range from hours
+
+
+
+                                                                        525
+                       Number of       Number of                Leverage     Detection
+                                                                                                  Re-run    Historical Analysis Extended
+       Name             servers          servers     Language    Stack      Threshold
+                                                                                                 Interval   Window Window Window
+                         used         saved yearly               Trace       (Δthreshold )
+ FrontFaaS (large)                                                                3%           30 minutes    10 days            3 hours         N/A
+                       O(100,000)      O(100,000)      PHP        Yes
+ FrontFaaS (small)                                                             0.005%            2 hours     10 days            4 hours      6 hours
+ PythonFaaS (large)                                                              0.5%            1 hour      10 days            6 hours         N/A
+                       O(100,000)      O(100,000)     Python      Yes
+ PythonFaaS (small)                                                             0.03%            4 hours     10 days            6 hours      6 hours
+ TAO (FrontFaaS)                                                                0.05%            2 hours     10 days            4 hours        1 day
+                       O(100,000)      O(10,000)       C++        Yes
+ TAO (non-FrontFaaS)                                                            0.05%            1 hour      10 days             1 day        6 hour
+ AdServing (short)                                                               0.2%            6 hours     10 days             1 day       12 hours
+                       O(1,000,000)    O(10,000)       C++        Yes
+ AdServing (long)                                                                0.1%             1 day      16 days             9 days         N/A
+ Invoicer (short)         O(10)        Negligible      C++        Yes            0.5%           12 hours     14 days             1 day         1 day
+ CT-supply (short)                                                          5% (relative)       12 hours     7 days              1 day         1 day
+ CT-supply (long)        Diverse       O(10,000)      Diverse     No        5% (relative)       12 hours     10 days             7 days        1 day
+ CT-demand                                                                  5% (relative)       12 hours     7 days              1 day          N/A
+
+Table 1. Configurations of FBDetect for different workloads. Periodically, at every “re-run interval,” FBDetect analyzes data
+within the most recent historical window, analysis window, and extended window to detect regressions. FBDetect can be
+configured to use either an absolute threshold (first nine rows) or a relative threshold (last three rows). For example, an increase
+of gCPU from 1% to 1.1% is a 0.1% absolute change and a 10% relative change.
+
+
+
+to days. These long windows allow FBDetect to gather suf-                Native
+                                                                         subroutines        ……                                                 ……
+ficient samples to enable a small detection threshold. This
+                                                                                          C-lib-foo                                          C-lib-foo
+highlights the importance of using fine-grained subroutine-                            _PyEval_Eval                                          Py-funZ
+level measurements to reduce variance. Without significantly                           FrameDefault            Py-funZ
+                                                                         Python
+                                                                                            ……                   …..                           ……
+reducing variance, it would take 100-10000 times longer to               subroutines
+                                                                                       _PyEval_Eval            Py-funX                       Py-funX
+obtain enough samples, causing unacceptable delays.                                    FrameDefault
+                                                                                            ……                                                 ……
+                                                                        CPython
+4 Performance Profiling Using Stack Traces                              subroutines        _start                                             _start
+
+                                                                                                             Python virtual
+Before detailing FBDetect’s regression detection algorithms,                           System stack          call stack (VCS)             Merged stack
+we describe how FBDetect collects performance data as its
+inputs, focusing on fine-grained subroutine-level CPU data.
+                                                                             Figure 5. How PyPerf reconstructs the stack trace.
+   We periodically collect stack traces across the entire fleet
+to infer relative time spent in each subroutine. For example,
+if 100 stack-trace samples are collected for a service, and
+subroutine foo appears in 8 samples, its normalized CPU                 by the Python program. Our key insight is that each _PyE-
+usage (gCPU) is 8%. Note that the gCPU of a subroutine                  val_EvalFrameDefault call in CPython’s C code maps pre-
+includes not only the cost of the subroutine itself but also            cisely to a corresponding call in the Python code. This en-
+the child subroutines recursively invoked by the subroutine.            ables us to reconstruct the end-to-end stack trace as follows.
+   However, sampling the stack trace of a program written in               CPython maintains a virtual call stack (VCS) for a Python
+interpreted languages results in retrieving the interpreter’s           program, akin to the call stack in C programs. The VCS is
+stack trace, instead of the program’s stack trace. To address           a linked list of frames, each containing information about
+this, we use different solutions for different interpreted lan-         the source-code address of the corresponding Python sub-
+guages. Java and PHP virtual machines offer built-in support            routine. The head of the VCS is stored at a fixed location
+for generating stack traces [54, 55]. For Python, we developed          within CPython. PyPerf’s eBPF probe walks through the
+an eBPF-based profiler called PyPerf, which handles various             VCS, starting from its head, to reconstruct the call stack of
+Python versions and provides end-to-end stack traces across             the Python program by mapping _PyEval_EvalFrameDefault
+both Python code and the C/C++ native libraries it invokes.             calls to subroutines recorded in the VCS.
+   PyPerf utilizes an eBPF probe in the Linux kernel to col-               PyPerf produces a precise end-to-end stack trace by merg-
+lect stack traces from CPython, as shown in Figure 5. The               ing 1) the native call stack from CPython, 2) the Python
+stack trace comprises: 1) a sequence of calls internal to               code’s call stack as described above, and 3) the native call
+CPython, 2) a sequence of _PyEval_EvalFrameDefault calls,               stack of C/C++ libraries invoked by the Python code. In con-
+and 3) a sequence of calls to native C/C++ libraries invoked            trast, the state-of-the-art Python profiler, Scalene [8], can
+                                                                        only approximate the time spent in C/C++ libraries since its
+                                                                        Python-level profiling cannot reach into C/C++ code.
+
+
+
+                                                                  526
+                            Analysis Window
+                                                                                                          Short-term Regression Detection
+                                                                                              x
+        Time
+                                                      1. Change Point                   2. Went-away                      3. Seasonality
+        Series
+                                                          Detector                         Detector                          Detector
+        Database
+
+
+
+
+                                                                  Long-term Regression Detection
+
+
+               PreProcessor
+
+
+
+
+                                                                        5. Cost Shift                                               7. Root Cause
+                     Profilers                4. SOMDedup                                              6. PairwiseDedup
+                                                                          Detector                                                     Analysis
+                   (PyPerf, etc)
+                    Servers
+
+                                                                                                                Regressions found in
+                                                                                                                prior windows
+
+
+                                                Figure 6. Workflow of FBDetect.
+
+   Although Python 3.12 introduced stack-trace collection                   low analysis to efficiently deduplicate regressions likely
+support in October 2023 [24], FBDetect has required this                    caused by the same change. (§5.5.1)
+capability since 2017. Python 3.12 adds to the call stack a             5. The cost shift detector filters out regressions resulting
+frame with the corresponding Python function name for each                  from code refactoring that merely shifts cost between
+_PyEval_EvalFrameDefault call, enabling tools like Linux’s                  subroutines, like the one in Figure 1(b). (§5.4)
+perf to map _PyEval_EvalFrameDefault to Python functions.
+                                                                        6. The PairWiseDedup clustering algorithm performs a slower,
+However, this approach has several limitations. First, the
+                                                                            more thorough comparison to further deduplicate remain-
+additional frame introduces significant overhead [56, 68],
+                                                                            ing regressions. (§5.5.2)
+which cannot be mitigated by sampling. Second, it may inter-
+fere with Just-In-Time (JIT) optimizations, leading to further          7. Finally, root cause analysis is applied to each remaining
+performance degradation [68].                                               regression to pinpoint the specific code or configuration
+                                                                            change responsible for the regression. (§5.6)
+5     Regression Detection Algorithms                                   The specific ordering of steps 2–6 is designed to execute
+                                                                        faster algorithms in the early steps to filter out as many
+In this section, we present FBDetect’s detection algorithms,
+                                                                        regressions as possible, thereby reducing computation in the
+starting with an overview and then providing detailed expla-
+                                                                        later, more resource-intensive steps.
+nations of FBDetect’s individual techniques.
+                                                                           For ease of operation, FBDetect runs on a common server-
+5.1   Overview                                                          less platform at Meta, scanning different time series in par-
+We follow Figure 6 to provide an overview of FBDetect. In               allel. Overall, it utilizes capacity equivalent to hundreds of
+the bottom left of the figure, profilers such as PyPerf period-         servers, analyzing approximately 800,000 time series to de-
+ically capture stack-trace samples on all servers (§4), which           tect regressions across hundreds of services.
+are then converted to subroutine-level gCPU time series.                   In the subsequent sections, we detail FBDetect’s individual
+FBDetect periodically examines these time series within a               techniques outlined in Figure 6.
+recent time window to detect regressions. The “short-term               5.2      Short-Term Regression Detection
+regression detection” path in Figure 6 executes the following
+                                                                        We define a regression as a shift in the mean of a time series.
+steps in sequence:
+                                                                        Without loss of generality, we assume that an increase in
+1. The change point detector applies change point detec-
+                                                                        a metric’s value means a regression. There are two types
+   tion [3] to identify anomalies, which are regression can-
+                                                                        of regressions: a sudden change resembling a step function
+   didates. (§5.2.1)
+                                                                        and a gradual incremental change over a longer period. Ac-
+2. The went-away detector filters out regressions that dis-             cordingly, we have designed two separate algorithms for
+   appear spontaneously, like the one in Figure 1(c). (§5.2.2)          short-term and long-term regression detection. The short-
+3. The seasonality detector applies trend analysis [17] to              term algorithm is more sensitive to sudden changes but is
+   filter out regressions caused by seasonality. (§5.2.3)               carefully designed to filter out noisy, transient changes, while
+4. The SOMDedup clustering algorithm performs a fast, shal-             the long-term algorithm is insensitive to sudden changes and
+                                                                        focuses on the long-term trend.
+
+
+
+
+                                                                  527
+    To detect short-term regressions, we use a three-step pro-            the regression at the end of the time series is a false positive.
+cess: (1) The change-point detector identifies regression can-            In practice, we found that this happens quite frequently.
+didates. (2) The went-away detector filters out false-positive               In the third iteration, which is our current version, we
+transient regressions. (3) The seasonality detector further               added an additional logic to further improve robustness. If
+filters out false-positive regressions caused by seasonality.             the values within the time window after a change point are
+5.2.1 Change Point Detector. This detector applies the                    “very different” from those within the window after another
+Cumulative Sum (CUSUM) [6] and Expectation Maximiza-                      change point, we consider them to be caused by different
+tion (EM) [47] algorithms iteratively to identify change points.          reasons. With this method, we can identify that, in Figure 7,
+This process continues until it converges at the change point             the regression at the end and the spike in the middle are
+with the maximum likelihood of having different means                     caused by different reasons.
+before and after the change point, or until it uses up the com-              For real-number values, determining whether they are
+putation time. Once a change point is identified, FBDetect                “very different” can be challenging, as all numbers differ to
+conducts a statistical hypothesis test to validate it:                    some extent. To address this, FBDetect discretizes the time
+                                                                          series into a string representation using Symbolic Aggregate
+• Null hypothesis H0: there is no change point in the time                approXimation (SAX) [43]. SAX divides the value range into
+  series and there is only one mean 𝜇;                                    buckets, replacing values in each bucket with a correspond-
+• Alternative hypothesis H1: there is one change point 𝑡 in               ing letter. For example, a time series like [1.1, 2.0, 3.1, 4.2,
+  the time series, the mean before 𝑡 is 𝜇0 and after 𝑡 is 𝜇1 .            3.5, 2.3, 1.1] can be represented as the string ‘abcdcba’, using
+FBDetect conducts the likelihood-ratio chi-squared test [75]              four buckets where ‘a’ represents [1, 2) and ‘b’ represents
+with the significance level of 0.01, and reports a regression             [2, 3), and so on. SAX is configurable: among 𝑁 buckets, a
+only if the null hypothesis is rejected.                                  bucket is considered valid only if it contains at least 𝑋 % of
+    Overall, we find change-point detection algorithms neces-             the data points. We tested various combinations of 𝑁 and
+sary but insufficient for detecting small regressions in noisy            𝑋 and settled on 𝑁 =20 and 𝑋 =3%, which proved robust to
+environments. Specifically, for transient issues like the one             outliers without missing obvious regressions.
+in Figure 1(c), they either require a long time window to                    After outlining the key ideas of the went-away detector,
+filter them out as noise, which delays regression detection,              we now present it formally. FBDetect marks a regression as
+or a large threshold, which fails to catch small regressions.             true if the following predicate evaluates to true:
+This prompted us to introduce the went-away detector.                          NewPattern OR [SignificantRegression AND
+                                                                                     LastingTrend AND (NOT RegressionGoneAway)].
+5.2.2 Went-away Detector. Filtering out transient regres-
+                                                                          The terms are defined as follows.
+sions is challenging, and our algorithm has undergone mul-
+tiple iterations. In the first iteration, FBDetect conducted an            • NewPattern: This term checks if the post-regression
+additional CUSUM analysis using the data after the change                    pattern significantly differs from historical patterns. If so,
+point. The purpose was to find an inverse regression and                     FBDetect reports the regression as true. In the SAX string
+check whether its magnitude sufficiently compensates for                     representation, a letter is valid if its number of occur-
+the original regression. However, this method was too sensi-                 rences exceeds a predefined threshold. If most letters
+tive to transient issues after true regressions. For instance, if            in the post-regression SAX string are invalid, FBDetect
+the time series temporarily dips and then quickly recovers                   treats the post-regression time series as a new pattern
+after a true regression, this method would incorrectly filter                and reports a regression, unless the average value is lower
+out this true regression.                                                    than the lowest valid bucket in historical data, indicating
+   In the second iteration, to improve robustness, we used                   no significant cost increase despite the new pattern.
+the average trend instead of a single change point. We added               • SignificantRegression: This term checks if the regres-
+a short-term trend analysis using the Mann-Kendall test [34,                 sion magnitude is significant. FBDetect considers the
+45] to check whether the end result of a given regression                    regression significant if the largest letter in the post-
+shows a decreasing trend, which might indicate the regres-                   regression analysis window is greater than or equal to
+sion went away. However, a decreasing trend itself is insuffi-
+cient, since the value needs to recover to the normal level
+for the regression to be considered went-away. Therefore, if
+the Mann-Kendall test shows a decreasing trend, FBDetect
+further compares the end values of the regression with val-
+ues in a historical window. Unfortunately, choosing the right
+historical window turned out to be difficult. For example,
+in Figure 7, if the algorithm happens to choose the window
+with a spike as the baseline, it will mistakenly conclude that
+                                                                                 Figure 7. Catching the regression at the end.
+
+
+                                                                    528
+   the largest valid letter pre-regression. Additionally, FB-            and change-point detection. FBDetect first uses the STL al-
+   Detect verifies that the 90th percentile of values after              gorithm to decompose the original time series into season-
+   the change point exceeds both the 95th percentile of the              ality, trend, and residual. FBDetect then conducts regres-
+   historical window and the 90th percentile of the previous             sion detection on the trend time series alone to determine
+   day, confirming the regression’s significance.                        if a regression is present. If so, FBDetect runs change-point
+ • LastingTrend: This term assesses whether a regression                 detection to locate the change point. The following presents
+   trend persists after the change point. FBDetect performs              these three steps in detail.
+   the Mann-Kendall test on both the post-regression and                    In the regression-detection step, FBDetect calculates the
+   the entire analysis window to detect monotonic upward                 means at the start of the analysis window and the historical
+   trends. If a trend is found, FBDetect uses Theil-Sen’s                window, and uses the bigger one as the baseline. Similarly,
+   Slope Estimator [69] to measure its magnitude and inter-              FBDetect computes the means at the end of the analysis
+   cept. The window with the lower slope is used to avoid                window and the extended window, and uses the smaller one
+   over- or under-estimation. FBDetect then compares the                 as the current value. If the difference between current
+   slope to a regression threshold, calculated as the Median             and baseline is above a given threshold, FBDetect reports it
+   Absolute Deviation [41] with a normality constant of                  as a long-term regression.
+   1.4826, and applies a regression coefficient (default 1.5)               In the change-point detection step, FBDetect checks if the
+   for sensitivity. The final regression threshold is set to             regression represents a gradual change by running a linear
+   coefficient × median × 1.4826.                                        regression model to fit the normalized trend and calculat-
+                                                                         ing the root mean square deviation (RMSE). If the RMSE is
+ • RegressionGoneAway: This term checks whether the
+                                                                         smaller than a given threshold, FBDetect sets the change
+   regression has gone away in the last few data points,
+                                                                         point at the beginning of the trend. Otherwise, FBDetect
+   serving as the final sanity check.
+                                                                         uses the normal loss and dynamic programming search [72]
+The combination of these terms form a robust predicate that              to find the change point. It aims to identify the partition
+helps FBDetect effectively filter out transient issues.                  point that minimizes the variance on both sides, with the
+                                                                         partition point being the change point.
+5.2.3 Seasonality Detector. This detector removes sea-
+                                                                            The long-term detection algorithm is similar to the short-
+sonality from the time series and then checks if the regres-
+                                                                         term one but has several key differences. First, the long-term
+sion still exists. To determine if seasonality is present in the
+                                                                         algorithm runs seasonality detection as the first step, while
+time series, FBDetect applies an autocorrelation function and
+                                                                         the short-term one runs seasonality detection as the last
+checks if the correlation is significant. If so, FBDetect runs
+                                                                         step. This is because seasonality detection smooths the time
+the Seasonal and Trend decomposition using Loess (STL)
+                                                                         series, which is beneficial for detecting gradual regression
+algorithm [17] to decompose the time series into three parts:
+                                                                         but harmful for detecting sudden changes. Moreover, the
+seasonality, trend, and residual. FBDetect then removes
+                                                                         long-term detection algorithm does not use the went-away
+seasonality and computes the difference between the me-
+                                                                         detector, as it already focuses on long-term patterns.
+dian of the sum of trend and residual before the CUSUM
+change point and the median after the point. Finally, FBDe-              5.4   Cost-shift Detector
+tect normalizes the difference by the standard deviation of              Subroutine-level metrics help detect small regressions by
+the residual and calculates the pseudo ‘z-score’. If the ‘z-             reducing variance but may cause false positives due to cost
+score’ is smaller than a given threshold, FBDetect filters out           shifts from code refactoring, such as moving code from one
+the regression as a false positive caused by seasonality. FBDe-          subroutine to another. The cost-shift detector utilizes the
+tect computes the z-score in both the analysis window and                concept of cost domains to help filter out such false posi-
+the extended window, and requires both to be smaller than                tives. A cost domain is a group of subroutines within which
+the threshold. Overall, we find that this method can remove              a cost shift is likely to occur. FBDetect provides several de-
+most false positives caused by seasonality while introducing             fault detectors for common cost domains. For instance, one
+very few false negatives.                                                detector analyzes stack traces to find upstream callers of a
+Discussion of alternatives. As an alternative to the STL                 subroutine and treats them as a cost domain. Another treats
+algorithm, we also experimented with using the moving-                   all subroutines within the same class as a cost domain. Ad-
+average algorithm [10] to handle seasonality. We found that              ditionally, a detector uses user-defined metadata to group
+STL is superior because it is sensitive to slight changes in             subroutines with the same metadata prefix, while another
+seasonality while being robust against sudden changes. .                 considers endpoints with matching name prefixes. A further
+                                                                         detector groups all subroutines modified by a code commit.
+5.3   Long-term Regression Detection                                     Finally, FBDetect allows developers to create custom detec-
+The long-term regression detection algorithm consists of                 tors for specific cost domains.
+three steps: seasonality decomposition, regression detection,               Given a regression and its associated cost domain, the cost-
+
+
+
+                                                                   529
+shift detector performs the following checks to determine                FBDetect; therefore, the exact root cause is unknown at this
+whether a regression is caused by a cost shift:                          step. However, with the information already available, FBDe-
+• If the domain does not exist before the regression, e.g., a            tect can narrow down the potential root causes and use them
+  new subroutine, the regression is not a cost shift within              as a feature. Specifically, FBDetect finds a list of potential
+  the domain.                                                            root causes for a regression by searching for changes that
+                                                                         modify the regressed subroutine and are introduced right
+• If the domain’s cost is significantly larger than the re-
+  gression’s cost change, we exclude the domain from the                 before the regression starts. FBDetect encodes this list as a
+  cost-shift detector. For instance, when examining a domain             bitmap feature, where each bit represents whether a change
+  with a 20% CPU cost to investigate a 0.005% CPU regres-                may be the root cause of the regression.
+  sion, the domain’s seasonal pattern alone could obscure                   Another distinguishing feature is the metric ID, a concate-
+                                                                         nation of the subroutine name and metric name. Regressions
+  the regression’s effect.
+                                                                         with similar metric IDs are likely to share the same root
+• If the domain’s cost change is negligible compared to the              cause. To avoid the scalability issues of pairwise compar-
+  regression’s cost change, we consider the regression a cost            isons, we convert metric IDs into integers using TF-IDF [66]
+  shift within the domain. For example, if a class’s method              with 2- and 3-gram lengths.
+  𝑋 ’s cost increases significantly while the total cost of all             After grouping related regressions using SOM, within each
+  the class’s methods hardly changes, it is likely that the cost         group, FBDetect presents the regression with the highest
+  just shifts from another method 𝑌 in the class to method 𝑋 .           ImportanceScore to developers as the representative.
+The cost-shift detector runs between the deduplication steps,            ImportanceScore = 𝑤 1 × RelativeCostChange +
+SOMDedup and PairwiseDedup, which will be explained                                        𝑤 2 × AbsoluteCostChange +
+in the next section. This execution order prioritizes faster                               𝑤 3 × (1 − PopularityScore) +
+algorithms like SOMDedup to filter out regressions early,                                  𝑤 4 × PotentialRootCauseFound
+minimizing the computational load in the later, slower steps.            Here 𝑤𝑖 are tunable weights with default values: 𝑤 1 =0.2,
+5.5   Regression Deduplication                                           𝑤 2 =0.6, 𝑤 3 =0.1, 𝑤 4 =0.1. RelativeCostChange and Abso-
+                                                                         luteCostChange represent the magnitude of change in
+FBDetect deduplicates regressions caused by the same code
+                                                                         the regression; we aim to select a representative regression
+or configuration change. For instance, a regressed subroutine
+                                                                         with significant changes. PopularityScore indicates the
+may trigger regressions in all its upstream callers. Addition-
+                                                                         probability of the regressed subroutine appearing in a ran-
+ally, a single change might impact various metrics, such as
+                                                                         dom stack trace sample; we aim to avoid widely invoked
+CPU usage and throughput.
+                                                                         subroutines. PotentialRootCauseFound is a boolean in-
+   While classic clustering algorithms can deduplicate 𝑛 re-
+                                                                         dicating whether any potential root causes are found; we
+gressions by comparing each pair with a complexity 𝑂 (𝑛 2 ),
+                                                                         prefer regressions with known root causes.
+Self-Organizing Maps (SOM) [36] offer a more scalable so-
+lution, with a complexity of 𝑂 (𝑛). To reduce running time,              Discussion of alternatives. To identify a scalable cluster-
+FBDetect employs a two-step approach for regression dedu-                ing algorithm, we considered several alternatives, including
+plication. First, SOMDedup uses SOM to deduplicate metrics               K-Nearest Neighbors (KNN) [18] and hierarchical cluster-
+of the same type (e.g., different subroutines’ gCPUs) within             ing [28]. Ultimately, we chose SOM due to its robustness
+the same analysis window, often reducing regressions by two              in setting hyperparameters. Each algorithm has hyperpa-
+orders of magnitude. For example, it addresses cases where               rameters that significantly impact its effectiveness, such as
+multiple subroutines call the same regressed subroutine. The             the number of clusters in KNN, the cut-level in hierarchical
+remaining regressions are then processed by PairwiseDedup,               clustering, and the grid size in SOM.
+which applies a pairwise-comparison clustering algorithm                    For KNN and hierarchical clustering, automatically setting
+to further merge regressions across different metrics (e.g.,             these hyperparameters to be robust across diverse workloads
+gCPU and throughput) and time windows.                                   proved challenging. Determining the number of clusters (K)
+                                                                         in KNN beforehand is impractical due to the varying number
+5.5.1 SOMDedup. SOMDedup is optimized for speed. It
+                                                                         of regressions, and iterating over different K values is compu-
+uses SOM to map high-dimensional features into a lower-
+                                                                         tationally expensive. Similarly, the cut-level in hierarchical
+dimensional space and merge nearby items into a cluster.
+                                                                         clustering depends on the data distribution. We attempted
+Each regression is represented as an item, and the features
+                                                                         to automate cut-level selection by testing different values
+used for clustering include typical time-series metrics like
+                                                                         and evaluating their Silhouette scores [62], which measure
+Fourier frequencies, variance, and change points, along with
+                                                                         clustering quality. However, we found that these scores often
+several distinguishing features we have introduced.
+                                                                         do not converge to an optimal value.
+  One distinguishing feature is candidate root causes. Find-
+                                                                            In contrast, SOM’s hyperparameter can be set   √ in a robust
+ing the exact root cause of a regression is the ultimate goal of
+                                                                         way. Using a grid size of 𝐿 × 𝐿, where 𝐿 = ⌈ 4 𝑛⌉ and 𝑛 is
+
+
+
+                                                                   530
+the number of regressions, consistently yields good results               erates a set of candidates by examining code or configura-
+across diverse workloads. Therefore, we chose SOM.                        tion changes deployed immediately before the regression
+5.5.2 PairwiseDedup. The second pass of regression dedu-                  occurred. It then ranks these candidates based on a set of
+plication, PairwiseDedup, is optimized for quality by max-                weighted factors that measure the candidates’ relevance to
+imizing deduplication. While SOMDedup focuses on dedu-                    the regression. Finally, developers are presented with these
+plicating regressions within the same analysis window and                 ranked candidates to guide their investigation.
+with the same type of metrics, PairwiseDedup aims to dedu-                   Below are the commonly used factors that measure the
+plicate regressions across different analysis windows and                 relevance between a candidate change and a regression.
+with different types of metrics such as gCPU and throughput.              Without loss of generality, our description focuses on code
+   PairwiseDedup takes as input a list of representative re-              changes but can be applied to configuration changes as well.
+gressions newly identified by SOMDedup and filtered by                    Subroutine gCPU. For services using stack-trace sampling,
+cost-shift analysis, along with a list of past representative re-         this factor measures the fraction of the reported regression
+gressions already grouped by prior rounds of PairwiseDedup                in gCPU that can be attributed to the subroutines affected by
+execution. It compares each new regression with existing                  a code change. We illustrate this using an example. Suppose
+groups, merging it into the most similar group if above a                 a regression in subroutine 𝐵’s gCPU is detected. Table 2 lists
+threshold or creating a new group otherwise. While Pair-                  the stack-trace samples that contain 𝐵, where 𝐴 to 𝐺 are
+wiseDedup offers higher accuracy than SOMDedup, its scal-                 subroutines and 𝐴->𝐵 means 𝐴 invokes 𝐵. The gCPU of 𝐵 is
+ability is limited by pairwise comparisons.                               0.09 before the regression and 0.14 after the regression, as
+   PairwiseDedup computes similarity scores for a set of fea-             shown in the last row of Table 2. Therefore, 𝐵’s regression
+tures between a new source regression and a target group.                 magnitude is R=0.14-0.09=0.05.
+It then applies user-defined rules based on these scores to                  Suppose a code change modifies subroutines 𝐴 and 𝐸. The
+determine whether the source should be merged into the                    stack-trace samples involving 𝐴 or 𝐸 are 𝐴->𝐵->𝐶, 𝐵->𝐸-
+target. Users can define the metrics to consider for merge                >𝐹 , and 𝐵->𝐸->𝐷. The gCPU before the regression for these
+(e.g., gCPU and throughput), the similarity threshold for each            three samples is 0.01+0.02+0.04=0.07. The gCPU after the
+feature, and how to combine multiple features to make the                 regression for these three samples is 0.02+0.03+0.06=0.11.
+final decision. For example, the merge may require all or a               Therefore, among B’s samples, those involving 𝐴 and 𝐸 cause
+subset of feature scores to exceed certain thresholds. If the             a regression magnitude of L=0.11-0.07=0.04. The fraction
+source can be merged into multiple targets, we choose the                 of the regression in 𝐵 that can be attributed to this code
+one with the highest aggregate feature scores.                            change (i.e., 𝐴 and 𝐸) is L/R=0.04/0.05=80%. A higher value
+   Below are some examples of the most useful features for                indicates the change is more likely to be the root cause.
+which we compute similarity scores:
+                                                                          Text similarity. Text similarity can help identify the root
+• Pearson time series correlation coefficient [7]. We compute             cause. For example, suppose FBDetect detects a regression
+   the coefficient between the source regression and each                 in subroutine foo and cannot find code changes that directly
+   regression in the target group, and use the maximal value.             modify it. However, there may be another code change with
+• Text cosine similarity [64]. We compute the similarity be-              a description like “loosening constraints for foo.” We can
+   tween the metric ID of the source regression and the                   use this information to rank that change higher than others.
+   metric ID of each regression in the target group, and use              Concretely, FBDetect computes text similarity between a re-
+   the maximal value.                                                     gression and a code change by tokenizing both into feature
+• Stack-trace overlap. Since multiple subroutines may ap-                 vectors. The regression vector is based on timing, metric
+   pear in one stack-trace sample, the sample can be used to              name, metric type, stack traces (if available), and other fac-
+   calculate gCPU for all these subroutines. The stack-trace-             tors. The code change vector is based on the descriptive title,
+   overlap feature measures the percentage of shared samples              summary, file name, change content, and more. FBDetect
+   used for calculating two subroutines’ gCPU. If the target
+   group consists of multiple time series, we use the union                           Stack-trace gCPU before gCPU after
+   of their stack traces to compare with those of the source.                           samples    regression regression
+5.6   Root Cause Analysis                                                              A->B->C        0.01       0.02
+                                                                                       B->E->F        0.02       0.03
+We define the root cause of a regression as the specific code                          D->B->C        0.02       0.02
+or configuration change causing it. For example, tens of                               B->E->D        0.04       0.06
+thousands of developers write code on FrontFaaS, leading                               G->B->D Does not exist    0.01
+to hundreds or even thousands of changes per release. As a                               Total        0.09       0.14
+result, identifying the root cause can be challenging.                    Table 2. Example of gCPU changes involving subroutine 𝐵.
+   To identify the root cause of a regression, FBDetect gen-
+
+
+
+                                                                    531
+measures relevance as the cosine similarity between these                SOMDedup filters out 72%, cost-shift analysis filters out 34%,
+feature vectors.                                                         and PairwiseDedup filters out 49% of their respective in-
+                                                                         put regressions. Overall, short-term change points are more
+Time series correlation. A service may record a time series
+                                                                         prevalent and noisier than long-term ones, necessitating
+that does not directly reflect its performance but indicates
+                                                                         more aggressive filtering.
+a certain setup of the service, such as which algorithm is
+being used for processing requests. Since such metrics do                6.2   False Positive and False Negative
+not represent performance, FBDetect cannot directly run                  Evaluating FBDetect’s false positives (i.e., reporting regres-
+regression detection on them. However, if the time series of             sions when they do not actually exist) and false negatives
+such a metric strongly correlates with a regression, it may              (i.e., real regressions missed by FBDetect) faces several chal-
+indicate a root cause. We compute the Pearson correlation                lenges. First, it is difficult to rely on tens of thousands of
+between the time series for such a metric and the time series            developers consistently to perform manual classification.
+for a found regression. The higher the correlation coefficient,          Moreover, sometimes the ground truth is unknown. For ex-
+the more likely the change caused the regression.                        ample, if a true 0.005% regression is missed by FBDetect, it
+                                                                         is less likely to be caught by developers as well, so it will
+6   Evaluation                                                           remain unknown. Despite these challenges, we use different
+Our evaluation answers the following questions:                          data to corroborate the evaluation, focusing on FrontFaaS,
+                                                                         because it involves tens of thousands of developers and its
+ • Among many techniques included in FBDetect, what
+                                                                         manually tagged data is more complete than other services.
+   is the breakdown of each technique’s contribution to
+   filtering out spurious performance anomalies?                         False negative. Given FBDetect’s aggressive filtering of
+ • How many false positives and false negatives are reported             performance anomalies by three to four orders of magni-
+   by FBDetect?                                                          tude (Table 3), false negatives could be a concern, as many
+                                                                         true regressions could be mistakenly filtered out. To eval-
+ • What is the accuracy of FBDetect’ root cause analysis?
+                                                                         uate the false negatives of FBDetect, we use FrontFaaS’s
+ • Does FBDetect indeed catch regressions as small as 0.005%?            performance-related incidents in production as the ground
+ • How does FBDetect compare with prior art?                             truth and evaluate how many of them should have been
+ • Does PyPerf’s stack-trace sampling add high overhead?                 caught by FBDetect. This ground truth, though not theoreti-
+                                                                         cally complete, serves as a high bar, as FrontFaaS is closely
+6.1 Contribution of FBDetect’s Individual Techniques                     monitored by a dedicated team, and all of its incidents are
+Due to high noise levels in production environments, service             rigorously recorded and reviewed.
+performance metrics frequently exhibit anomalies, many of                   For the entire year of 2023, only four performance-related
+which are false positives. This section demonstrates how                 incidents were recorded for FrontFaaS, despite its highly dy-
+each of FBDetect’s techniques reduces the number of perfor-              namic and incident-prone environment (§3)—thousands of
+mance anomalies requiring developers’ attention.                         code commits daily and automated code deployment every
+    Table 3 shows, over one month for several workloads, the             three hours. This low incident count is not because Front-
+number of remaining performance anomalies after being                    FaaS rarely has performance regressions; each year, FBDe-
+filtered by FBDetect’s different techniques in sequence. We              tect catches regressions in FrontFaaS that, if left unchecked,
+use FrontFaaS as an example to demonstrate how to read the               would waste more than half a million servers.
+table. Running the short-term regression detection algorithm                Among the four performance incidents, two were detected
+for FrontFaaS detects 3.96 million change points. The value              by FBDetect but were not acted upon by developers in time.
+of “1/3536” at the intersection of the row “after SOMDedup”              The third incident occurred because the developer did not
+and the column “FrontFaaS short-term regression” means that,             configure the regressed metric to be exported to FBDetect,
+after executing all the steps between “went-away detection”              and the last one was due to a capacity-management issue
+and “SOMDedup,” the number of remaining performance                      unrelated to code or configuration changes. Overall, for all of
+                                 1                                       FrontFaaS’s performance incidents in 2023, FBDetect did not
+anomalies is filtered down to 3536  of the original 3.96 million
+change points detected.                                                  miss any that it was supposed to catch. However, this does
+    As shown in Table 3, FBDetect reduces the number of                  not imply that FBDetect never misses regressions larger than
+performance anomalies that developers need to investigate                0.005% for FrontFaaS; it only means that the missed regres-
+by three to four orders of magnitude, greatly boosting pro-              sions are not significant enough to be noticed by developers.
+ductivity. Among the techniques, the went-away detector                     We further searched all site incidents in the past three
+is the most effective, filtering out 99.7% of detected change            years (not limited to FrontFaaS) and found a single one
+points. The seasonality detector further removes 22% of the              caused by FBDetect’s false negative. In this incident, FBDe-
+regressions output by the went-away detector. Additionally,              tect’s cost-shift detector mistakenly filtered out a regression
+
+
+
+
+                                                                   532
+                   Execution sequence                         FrontFaaS         PythonFaaS             AdServing
+                 of FBDetect techniques               Short-term Long-term Short-term Short-term Long-term
+                                                       regression regression regression regression regression
+        # Change points detected (§5.2.1 and §5.3)       3.96M         1.09K      324.85k        239.67K        1.9K
+            After went-away detection (§5.2.2)           1/365          ——          1/82           1/47         ——
+            After seasonality detection (§5.2.3)         1/468          ——          1/111          1/58         ——
+            After threshold filtering (Table 1)          1/769        1/1.03        1/295          1/165       1/1.03
+             After SameRegressionMerger                  1/861         1/9.6        1/500          1/320         1/7
+                 After SOMDedup (§5.5.1)                 1/3536         1/28       1/1775          1/776        1/18
+              After cost-shift analysis (§5.4)           1/6092         1/73       1/4010          1/776        1/18
+               After PairwiseDedup (§5.5.2)             1/18857         1/91       1/5240         1/1180        1/30
+                            Total                                                  1/7779
+Table 3. Effectiveness of individual techniques in filtering out spurious change points. All non-first-row numbers are relative
+ratios to those in the first row. PythonFaaS skips long-term regression detection, while AdServing skips cost-shift analysis.
+SameRegressionMerger deduplicates the same regression that shows up in multiple overlapping analysis windows.
+
+and caused a large service to experience a 0.015% error rate.          match well with the same magnitudes and similar timings of
+Since then, we have improved the detector’s algorithm and              regressions recorded by Meta’s canary-test tool, which is a
+tuned its threshold.                                                   strong indicator that they are true regressions caused by code
+                                                                       changes. However, since we lack explicit confirmation from
+False positive. Surprisingly, false positives are not a major
+                                                                       developers, we still consider the ground truth unknown.
+concern for FBDetect. Over a one-month evaluation period,
+                                                                          Some of the resolved cases simply went away without
+FBDetect reported 217 regressions for FrontFaaS. At this rate,
+                                                                       any data indicating how they were fixed. This suggests that
+and with tens of thousands of developers writing code for
+                                                                       FBDetect’s went-away detector might be able to filter them
+FrontFaaS (and thousands of code commits daily), a Front-
+                                                                       out if longer extended windows were used (Figure 4). How-
+FaaS developer, on average, will be assigned a ticket by FB-
+                                                                       ever, this would delay the timeliness of regression detection.
+Detect to investigate a regression only once every four years.
+                                                                       This trade-off is challenging and requires future research.
+This ideal situation is thanks to FBDetect’s capability of ag-
+gressively filtering performance anomalies by three to four            6.3   Root Cause Analysis
+orders of magnitude before reporting them to developers.               In this section, we evaluate the accuracy of FBDetect’s root
+   Among the 217 regressions reported by FBDetect, devel-              cause analysis for FrontFaaS. Given a regression, FBDetect
+opers explicitly confirmed either true regressions or false            suggests root-cause candidates only if its confidence in the
+positives for only 70 of them, marked another 123 as re-               recommendation is sufficiently high; otherwise, it will not
+solved, and did not act on the remaining 24.                           suggest any root cause. Out of the 217 regressions reported by
+   Among the 70 confirmed cases, 49 are true regressions               FBDetect over a one-month period, FBDetect suggested root
+and 21 are false positives. Assuming the same ratio (49:21)            causes for 75 of them. Of these, 71 were confirmed correct
+holds for the 217 reported regressions, a FrontFaaS developer          by developers, meaning the real root cause was among the
+would only need to investigate one false-positive regression           top-three change candidates suggested by FBDetect.
+approximately once every 13 years. The 21 false positives                 Among the 142 regressions for which FBDetect did not
+include 1 duplicate regression that was not merged, 15 cost            suggest root causes, developers manually root-caused an
+shifts that were not filtered out, 1 temporary spike missed by         additional six. While the success rate of FBDetect’s root
+the went-away detector, and 4 miscellaneous cases. Given               cause analysis seems mediocre (75/217=35%), even devel-
+that 15 of the 21 false positives are due to cost shifts, this         opers’ manual efforts could only marginally improve it to
+will be a focus of future research.                                    (75+6)/217=37%. This indicates that root cause analysis in
+   For the 123 regressions that are marked as resolved by              complex production environments is challenging. Despite
+developers, unfortunately, there is no ground truth regarding          the limitations, FBDetect still significantly improves devel-
+whether they are true regressions or false positives. Data             oper productivity, as the majority of successful root cause
+suggests that many of them are likely true regressions. For            analysis is automated by FBDetect, with developers con-
+example, for 24 of them, FBDetect’s regression report pro-             tributing only an additional 2%. Moreover, in most cases,
+vided root causes, and developers confirmed the accuracy               FBDetect’s behavior of not pinpointing a single root cause
+of those root causes, even though those regressions are still          is actually appropriate, as explained below.
+marked as resolved instead of true regressions. The authors               To understand why FBDetect does not pinpoint root causes
+of the paper, not the FrontFaaS developers, manually inves-
+tigated some resolved cases and found that many of them
+
+
+
+                                                                 533
+for certain regressions, we manually investigated 61 regres-                                          Smallest  P10    P50    P90    P99  Largest
+sions marked as true regressions by developers but not root-                                   All     0.005% 0.010% 0.043% 0.232% 0.948% 15.094%
+caused by FBDetect. Note that, to find a sufficient number of                                  TR      0.005% 0.011% 0.048% 0.241% 0.809% 3.862%
+                                                                                               FP      0.006% 0.012% 0.062% 0.442% 4.003% 15.094%
+such cases, these 61 cases are beyond the time period covered
+                                                                         Table 4. Magnitude of detected regressions (TR=true regres-
+by Table 3. Below is a breakdown of these 61 cases based on
+                                                                         sions; FP=false positives). The 0.01% cell at the intersection
+why they were not root-caused by FBDetect:
+                                                                         of the “All” row and the “P10” column means that the 10th
+  • 28 cases do not have a clear root cause. The most common             percentile of all regressions detected by FBDetect is 0.010%.
+    reason is that the regression is caused by a new feature
+    release, which is expected to consume more resources.
+    Moreover, the new feature involves many code changes,                positives. As discussed in §6.2, false positives are mostly cost
+    and no single change dominates the regression. There-                shifts, indicating an area for future research.
+    fore, FBDetect’s behavior of not pinpointing a single root           6.5                         Comparison with Yahoo’s EGADS
+    cause is appropriate.
+                                                                         We compare FBDetect with Yahoo’s EGADS [39], which of-
+  • 5 cases are caused by failures in production. As they are            fers multiple anomaly detection algorithms. The test data
+    not caused by code or configuration changes, it is appro-            consists of a random set of 107 time series where FBDetect
+    priate for FBDetect not to report root causes for them.              reported regressions and around 35K time series where FB-
+  • 11 cases are caused by changes not exported to FBDetect.             Detect reported no regressions. Manual analysis of the 107
+    Therefore, it is appropriate for FBDetect not to report root         positive cases reveals 76 true positives and 31 false posi-
+    causes for them. Future enhancements require FBDetect                tives. We report the false positive rate (i.e., the fraction of
+    to be integrated with a broader set of change sources.               the “35K+31” true negatives classified as positives) and the
+  • 5 cases have their root causes reported by FBDetect, but             false negative rate (i.e., the fraction of the 76 true positives
+    they are not ranked among the top three candidates.                  classified as negatives).
+                                                                            FBDetect’s false positive rate is 31/(35K+31)=0.00088. Since
+  • 12 cases have their root causes considered by FBDetect,
+                                                                         FBDetect has almost no false negatives based on the results
+    but they are filtered out because their relevance scores
+                                                                         in §6.2, we assume its false negative rate is zero. FBDetect’s
+    fall below certain thresholds.
+                                                                         false-positive and false-negative rates are shown in Figure 8.
+After analyzing these cases, we conclude that the success                   The EGADS algorithms have sensitivity parameters that
+rate of FBDetect’s root cause analysis is significantly higher           can be tuned to reduce either false positives or false nega-
+than it initially appears (35%). Only the last two categories            tives, but not both. We tune these parameters and show the
+represent true failures of FBDetect’s algorithm. Assuming                tradeoff in Figure 8. For a fair comparison, EGADS uses the
+the two periods we investigated (the period reporting 217                same historical time window as FBDetect but combines FBDe-
+regressions and the period reporting 61 regressions not root             tect’s analysis and extended windows as EGADS’s analysis
+caused by FBDetect) have the same failure rate, and excluding            window. EGADS struggles with transient issues like the one
+the 11 cases caused by changes not exported to FBDetect,                 in Figure 1(c) because using a large threshold to filter them
+we estimate the true failure rate of FBDetect’s root cause               would miss small regressions, while using a small threshold
+analysis to be only (1-35%)*17/(61-11)=22%.                              would incorrectly flag many of them as regressions.
+6.4   Catching Small Regressions                                            Given 76 true positive cases in the test data, if an algo-
+                                                                         rithm reports 760 or more positive cases for developers to
+FBDetect is effective at catching small regressions, as shown            investigate manually, over 90% of these investigations would
+in Table 4, where “All” means all regressions reported by
+FBDetect, and “TR” and “FP” mean true regressions and false                                    1.0
+                                                                         False Negative Rate
+
+
+
+
+positives explicitly confirmed by developers. The smallest                                     0.9                    EGADS algorithm 1 (adaptive kernel density)
+true regression is indeed 0.005% as expected, while the largest                                0.8                    EGADS algorithm 2 (extreme low density)
+                                                                                               0.7                    EGADS algorithm 3 (K-Sigma)
+is 3.9%. The difference in distributions between true regres-                                  0.6
+                                                                                                                      FBDetect
+sions and all regressions is minor, whereas their difference                                   0.5
+with respect to false positives is more pronounced.                                            0.4
+                                                                                               0.3
+   One might expect that for the tiny regressions between                                      0.2
+0.005% and 0.01%, FBDetect’s false positive rate would be                                      0.1
+                                                                                                      FBDetect (0.00088,0)
+higher as they are more likely to be caused by noise. How-                                     0.0
+                                                                                                      0.0   0.1     0.2      0.3   0.4   0.5   0.6   0.7   0.8   0.9   1.0
+ever, the data shows that the false positive rate is not higher
+                                                                                                                             False Positive Rate
+for tiny regressions, because the P10 for all regressions, true
+regressions, and false positives are nearly identical. Inter-
+                                                                         Figure 8. EGADS’s algorithms cannot simultaneously re-
+estingly, the reported largest regressions tend to be false
+                                                                         duce both false negatives and false positives.
+
+
+
+                                                                   534
+be futile, eroding developer’s trust in the algoritm. Thus,                 FBDetect further introduces the went-away detector to filter
+we require a false positive rate below 760/(35K+31) ≈ 0.02.                 out transient issues, which can account for up to 99.7% of all
+Among the EGADS algorithms in Figure 8, only “EGADS                         regressions in our production environment.
+algorithm 1” can meet this false positive rate, but at the cost
+                                                                            Stack trace sampling. Existing tools can collect stack traces
+of a 0.84 false negative rate, meaning it would miss 84% of
+                                                                            for services written in C/C++ [53], Java [27, 54], Python [8,
+true regressions. This shows that EGADS algorithms are
+                                                                            15, 23, 24, 35, 52, 59–61, 71], Go [19], Ruby [31], etc. To our
+ineffective in simultaneously achieving both low false posi-
+                                                                            knowledge, PyPerf is the first profiler capable of deriving a
+tives and low false negatives. In contrast, with the help of
+                                                                            precise end-to-end stack trace across a Python program and
+the went-away detector, FBDetect catches nearly all small
+                                                                            the C/C++ libraries it invokes.
+regressions without introducing many false positives.
+6.6   PyPerf Profiling Overhead                                             Root cause analysis. Prior works have attempted to local-
+                                                                            ize a bug to lines of code [29], files [37, 38, 48, 51, 57, 63, 78,
+To measure PyPerf’s overhead in collecting stack traces                     80, 82], commits [9, 77, 79], or deployments [42]. They also
+for Python programs, we created a CPU-intensive micro-                      rely on stack traces and text similarity to find the correspond-
+benchmark that repeatedly serializes a large data structure,                ing locations. Recently, several works have leveraged large
+compresses it, and writes it to a file. We compare its through-             language models for the same purpose [1, 13, 83]. Many of
+put with and without PyPerf.                                                these works require a user-written bug report or at least an
+   PyPerf’s sampling rate for PythonFaaS is one sample per                  error message to start with. FBDetect does not require such
+server every 30 minutes. At this rate, we do not observe any                information. Furthermore, none have tried to find the root
+noticeable overhead on the micro-benchmark. To understand                   cause of a tiny performance regression.
+the worst-case scenario, we configured PyPerf to collect one
+sample per server per second. This is the highest rate used                 8    Conclusion and Future Work
+in production and is only applied to the smallest services
+                                                                            We have presented FBDetect, an in-production performance-
+that run on just a few servers to collect sufficient samples.
+                                                                            regression detection system. It saves millions of servers each
+At this sampling rate, PyPerf reduces the throughput of the
+                                                                            year and reduces the number of performance anomalies re-
+micro-benchmark by about 0.8%, which is rather moderate.
+                                                                            quiring developers’ attention by three to four orders of mag-
+Moreover, note that the overhead for collecting stack traces
+                                                                            nitude. Our contributions include the went-away detector,
+for Python programs is higher than for C/C++ programs.
+                                                                            cost-shift detector, and several algorithms that work in con-
+7     Related Work                                                          cert to catch regressions as small as 0.005% in noisy produc-
+                                                                            tion environments.
+Performance testing and monitoring. Performance re-
+                                                                               A major direction for future work is regression detection
+gression can be detected before production [32, 46, 84] or
+                                                                            for GPU training. Currently, GPU profiling is less mature, and
+during production [2, 25, 40, 76]. ServiceLab [14] and FBDe-
+                                                                            the synchronous training pattern significantly differs from
+tect are representatives for these two categories, and they are
+                                                                            the traditional microservice pattern. Additionally, we aim to
+used at Meta in complementary ways. Due to their different
+                                                                            reduce the false-positive rate for traditional services, with
+operating environments, they differ in major ways: 1) Ser-
+                                                                            a focus on improving cost-shift analysis. Planned capacity
+viceLab controls its testing environment, such as selecting
+                                                                            changes also trigger false positives, so we plan to correlate
+testing servers to reduce variance, whereas FBDetect have
+                                                                            regressions with these known changes. Finally, potential
+no such control and must rely on subroutine-level measure-
+                                                                            new application domains for FBDetect include detecting
+ments and a larger number of samples to manage higher
+                                                                            anomalies in site and hardware reliability.
+variance. 2) ServiceLab assumes a stationary environment
+and does not need FBDetect ’s complex techniques, such                      Acknowledgments
+as the went-away detector and trend analysis, for handling
+non-stationary conditions. 3) ServiceLab faces the challenge                This work involves several teams at Meta, including FBDe-
+of faithfully mirroring interdependent production services in               tect, Web Efficiency, Core Data Efficiency Experience, In-
+its testing environment, whereas FBDetect’s in-production                   stagram Efficiency, Ads Serving Platform/Efficiency, MRS
+monitoring approach avoids this problem.                                    Foundation Serving Infra, and Infrastructure Data Science.
+                                                                            We thank those who have contributed to FBDetect: Adwait
+Change point and seasonality detection. Change point                        Sathye, Ayichew Hailu. Chinnappa Pattada, Cindy Weng,
+detection tries to identify points where the statistical proper-            David Ehrmann, Diego Plascencia, Ismail Dalgic, Jeff Song,
+ties of a time series change [5, 6, 11, 16, 26, 33, 44, 58, 81, 85,         Joshua Louie, Kevin Jeong, Nipun Gupta, Samuel Cheng,
+86]. Seasonality detection tries to identify the presence of                Saurabh Jain, Tola Liadi, Trung Nguyen Ba, and
+regular and periodic changes [17, 50, 65, 70]. Several indus-               Varun Thangavelu. We also thank all reviewers, especially
+trial systems have adopted these methods [20, 22, 49, 73, 74].              our shepherd, Ding Yuan, for their insightful comments.
+
+
+
+
+                                                                      535
+References                                                                                  Yunqi Zhang, Rodrigo Paim, Mack Ward, Ivor Huang, Matt Mc-
+                                                                                            Nally, Daniel Hodges, Zoltan Farkas, Caner Gocmen, Elvis Huang,
+ [1] Toufique Ahmed, Supriyo Ghosh, Chetan Bansal, Thomas Zimmer-
+                                                                                            and Chunqiang Tang. 2024. ServiceLab: Preventing Tiny Perfor-
+     mann, Xuchao Zhang, and Saravan Rajmohan. 2023. Recommending
+                                                                                            mance Regressions at Hyperscale through Pre-Production Testing.
+     Root-Cause and Mitigation Steps for Cloud Incidents Using Large Lan-
+                                                                                            In 18th USENIX Symposium on Operating Systems Design and Imple-
+     guage Models. In Proceedings of the 45th International Conference on
+                                                                                            mentation (OSDI 24). USENIX Association, Santa Clara, CA, 545–562.
+     Software Engineering (Melbourne, Victoria, Australia) (ICSE ’23). IEEE
+                                                                                            https://www.usenix.org/conference/osdi24/presentation/chow
+     Press, 1737–1749. https://doi.org/10.1109/ICSE48619.2023.00149
+                                                                                       [15] Sümer Cip. 2024. Yappi: Yet Another Python Profiler. https://github.
+ [2] Amazon CloudWatch - Creating a Canary 2024.                       https:
+                                                                                            com/sumerc/yappi.
+     //docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/
+                                                                                       [16] Ian Cleland, Manhyung Han, Chris Nugent, Hosung Lee, Sally Mc-
+     CloudWatch_Synthetics_Canaries_Create.html.
+                                                                                            Clean, Shuai Zhang, and Sungyoung Lee. 2014. Evaluation of Prompted
+ [3] Samaneh Aminikhanghahi and Diane J. Cook. 2016. A Survey of
+                                                                                            Annotation of Activity Data Recorded from a Smart Phone. Sensors
+     Methods for Time Series Change Point Detection. Knowledge and
+                                                                                            14, 9 (27 Aug. 2014), 15861–15879. https://doi.org/10.3390/s140915861
+     Information Systems 51, 2 (8 Sept. 2016), 339–367. https://doi.org/10.
+                                                                                       [17] Robert B Cleveland, William S Cleveland, Jean E McRae, and Irma
+     1007/s10115-016-0987-z
+                                                                                            Terpenning. 1990. STL: A Seasonal-Trend Decomposition. Journal of
+ [4] Approximations for Mean and Variance of a Ratio 2024. https://www.
+                                                                                            Official Statistics 6, 1 (1990), 3–73.
+     stat.cmu.edu/%7Ehseltman/files/ratio.pdf.
+                                                                                       [18] Thomas Cover and Peter Hart. 1967. Nearest Neighbor Pattern Classi-
+ [5] Daniel Barry and J. A. Hartigan. 1993. A Bayesian Analysis for Change
+                                                                                            fication. IEEE transactions on information theory 13, 1 (1967), 21–27.
+     Point Problems. J. Amer. Statist. Assoc. 88, 421 (1993), 309–319. http:
+                                                                                            https://doi.org/10.1109/TIT.1967.1053964
+     //www.jstor.org/stable/2290726
+                                                                                       [19] Russ Cox and Shenghou Ma. 2013. Profiling Go Programs. https:
+ [6] Michele Basseville, Igor V Nikiforov, and others. 1993. Detection of
+                                                                                            //go.dev/blog/pprof.
+     Abrupt Changes: Theory and Application. Vol. 104. prentice Hall Engle-
+                                                                                       [20] David Daly, William Brown, Henrik Ingo, Jim O’Leary, and David
+     wood Cliffs.
+                                                                                            Bradford. 2020. The Use of Change Point Detection to Identify
+ [7] Jacob Benesty, Jingdong Chen, Yiteng Huang, and Israel Cohen. 2009.
+                                                                                            Software Performance Regressions in a Continuous Integration Sys-
+     Pearson Correlation Coefficient. In Noise Reduction in Speech Processing.
+                                                                                            tem. In Proceedings of the ACM/SPEC International Conference on Per-
+     Springer Berlin Heidelberg, Berlin, Heidelberg, 1–4. https://doi.org/
+                                                                                            formance Engineering (Edmonton AB, Canada) (ICPE ’20). Associa-
+     10.1007/978-3-642-00296-0_5
+                                                                                            tion for Computing Machinery, New York, NY, USA, 67–75. https:
+ [8] Emery D. Berger, Sam Stern, and Juan Altmayer Pizzorno. 2023. Trian-
+                                                                                            //doi.org/10.1145/3358960.3375791
+     gulating Python Performance Issues with SCALENE. In 17th USENIX
+                                                                                       [21] Wilfrid J Dixon and Frank J Massey Jr. 1957. Introduction to Statistical
+     Symposium on Operating Systems Design and Implementation, OSDI
+                                                                                            Analysis. McGraw-Hill.
+     2023, Boston, MA, USA, July 10-12, 2023. USENIX Association, 51–64.
+                                                                                       [22] Matt Fleming, Piotr Kolaczkowski, Ishita Kumar, Shaunak Das, Sean
+     https://www.usenix.org/conference/osdi23/presentation/berger
+                                                                                            McCarthy, Pushkala Pattabhiraman, and Henrik Ingo. 2023. Hunter:
+ [9] Ranjita Bhagwan, Rahul Kumar, Chandra Sekhar Maddila, and
+                                                                                            Using Change Point Detection to Hunt for Performance Regres-
+     Adithya Abraham Philip. 2018. Orca: Differential Bug Localization
+                                                                                            sions. In Proceedings of the 2023 ACM/SPEC International Confer-
+     in Large-Scale Services. In 13th USENIX Symposium on Operating
+                                                                                            ence on Performance Engineering (Coimbra, Portugal) (ICPE ’23). As-
+     Systems Design and Implementation (OSDI 18). USENIX Association,
+                                                                                            sociation for Computing Machinery, New York, NY, USA, 199–206.
+     Carlsbad, CA, 493–509. https://www.usenix.org/conference/osdi18/
+                                                                                            https://doi.org/10.1145/3578244.3583719
+     presentation/bhagwan
+                                                                                       [23] Ben Frederickson. 2024. py-spy: Sampling profiler for Python pro-
+[10] G. E. P. Box and David A. Pierce. 1970. Distribution of Residual Au-
+                                                                                            grams. https://github.com/benfred/py-spy.
+     tocorrelations in Autoregressive-Integrated Moving Average Time
+                                                                                       [24] Pablo Galindo. 2022. Python Support for the Linux perf Profiler.
+     Series Models. J. Amer. Statist. Assoc. 65, 332 (1970), 1509–1526.
+                                                                                            "https://docs.python.org/3.12/howto/perf_profiling.html.
+     http://www.jstor.org/stable/2284333
+                                                                                       [25] Boris Grubic, Yang Wang, Tyler Petrochko, Ran Yaniv, Brad Jones,
+[11] Sofiane Brahim-Belhouari and Amine Bermak. 2004. Gaussian Process
+                                                                                            David Callies, Matt Clarke-Lauer, Dan Kelley, Soteris Demetriou,
+     for Nonstationary Time Series Prediction. Computational Statistics
+                                                                                            Kenny Yu, and Chunqiang Tang. 2023. Conveyor: One-Tool-Fits-All
+     Data Analysis 47, 4 (2004), 705–712. https://doi.org/10.1016/j.csda.
+                                                                                            Continuous Software Deployment at Meta. In 17th USENIX Symposium
+     2004.02.006
+                                                                                            on Operating Systems Design and Implementation (OSDI 23). USENIX As-
+[12] Nathan Bronson, Zach Amsden, George Cabrera, Prasad Chakka, Pe-
+                                                                                            sociation, Boston, MA, 325–342. https://www.usenix.org/conference/
+     ter Dimov, Hui Ding, Jack Ferris, Anthony Giardullo, Sachin Kulka-
+                                                                                            osdi23/presentation/grubic
+     rni, Harry Li, Mark Marchukov, Dmitri Petrov, Lovro Puzar, Yee Jiun
+                                                                                       [26] Manhyung Han, La The Vinh, Young-Koo Lee, and Sungyoung Lee.
+     Song, and Venkat Venkataramani. 2013. TAO: Facebook’s Distributed
+                                                                                            2012. Comprehensive Context Recognizer Based on Multimodal Sen-
+     Data Store for the Social Graph. In 2013 USENIX Annual Technical
+                                                                                            sors in a Smartphone. Sensors 12, 9 (17 Sept. 2012), 12588–12605.
+     Conference (USENIX ATC 13). USENIX Association, San Jose, CA,
+                                                                                            https://doi.org/10.3390/s120912588
+     49–60. https://www.usenix.org/conference/atc13/technical-sessions/
+                                                                                       [27] HPROF: A Heap/CPU Profiling Tool 2024. https://docs.oracle.com/
+     presentation/bronson
+                                                                                            javase/8/docs/technotes/samples/hprof.html.
+[13] Yinfang Chen, Huaibing Xie, Minghua Ma, Yu Kang, Xin Gao, Liu Shi,
+                                                                                       [28] Stephen C Johnson. 1967. Hierarchical Clustering Schemes. Psychome-
+     Yunjie Cao, Xuedong Gao, Hao Fan, Ming Wen, Jun Zeng, Supriyo
+                                                                                            trika 32, 3 (1967), 241–254.
+     Ghosh, Xuchao Zhang, Chaoyun Zhang, Qingwei Lin, Saravan Rajmo-
+                                                                                       [29] James A. Jones, Mary Jean Harrold, and John Stasko. 2002. Visualiza-
+     han, Dongmei Zhang, and Tianyin Xu. 2024. Automatic Root Cause
+                                                                                            tion of Test Information to Assist Fault Localization. In Proceedings
+     Analysis via Large Language Models for Cloud Incidents. In Proceedings
+                                                                                            of the 24th International Conference on Software Engineering (Orlando,
+     of the Nineteenth European Conference on Computer Systems (Athens,
+                                                                                            Florida) (ICSE ’02). Association for Computing Machinery, New York,
+     Greece) (EuroSys ’24). Association for Computing Machinery, New
+                                                                                            NY, USA, 467–477. https://doi.org/10.1145/581339.581397
+     York, NY, USA, 674–688. https://doi.org/10.1145/3627703.3629553
+                                                                                       [30] Jonathan Kaldor, Jonathan Mace, Michał Bejda, Edison Gao, Wik-
+[14] Mike Chow, Yang Wang, William Wang, Ayichew Hailu, Rohan Bopar-
+                                                                                            tor Kuropatwa, Joe O’Neill, Kian Win Ong, Bill Schaller, Pingjia
+     dikar, Bin Zhang, Jialiang Qu, David Meisner, Santosh Sonawane,
+
+
+
+
+                                                                                 536
+     Shan, Brendan Viscomi, Vinod Venkataraman, Kaushik Veeraragha-                  [45] Henry B. Mann. 1945. Nonparametric Tests Against Trend. Economet-
+     van, and Yee Jiun Song. 2017. Canopy: An End-to-End Performance                      rica 13, 3 (1945), 245–259. http://www.jstor.org/stable/1907187
+     Tracing And Analysis System. In Proceedings of the 26th Sympo-                  [46] Aleksander Maricq, Dmitry Duplyakin, Ivo Jimenez, Carlos Maltzahn,
+     sium on Operating Systems Principles (Shanghai, China) (SOSP ’17).                   Ryan Stutsman, and Robert Ricci. 2018. Taming Performance Vari-
+     Association for Computing Machinery, New York, NY, USA, 34–50.                       ability. In 13th USENIX Symposium on Operating Systems Design and
+     https://doi.org/10.1145/3132747.3132749                                              Implementation (OSDI 18). USENIX Association, Carlsbad, CA, 409–425.
+[31] Aman Gupta Karmani. 2024. stackprof - a sampling call-stack profiler                 https://www.usenix.org/conference/osdi18/presentation/maricq
+     for Ruby 2.1+. https://github.com/tmm1/stackprof.                               [47] T.K. Moon. 1996. The Expectation-Maximization Algorithm. IEEE
+[32] Harshad Kasture and Daniel Sanchez. 2016. Tailbench: A Benchmark                     Signal Processing Magazine 13, 6 (1996), 47–60. https://doi.org/10.1109/
+     Suite and Evaluation Methodology for Latency-Critical Applications.                  79.543975
+     In 2016 IEEE International Symposium on Workload Characterization               [48] Laura Moreno, John Joseph Treadway, Andrian Marcus, and Wuwei
+     (IISWC). 1–10. https://doi.org/10.1109/IISWC.2016.7581261                            Shen. 2014. On the Use of Stack Traces to Improve Text Retrieval-Based
+[33] Yoshinobu Kawahara, Takehisa Yairi, and Kazuo Machida. 2007.                         Bug Localization. In 2014 IEEE International Conference on Software
+     Change-Point Detection in Time-Series Data Based on Subspace Iden-                   Maintenance and Evolution. 151–160. https://doi.org/10.1109/ICSME.
+     tification. In Seventh IEEE International Conference on Data Mining                  2014.37
+     (ICDM 2007). IEEE, 559–564. https://doi.org/10.1109/ICDM.2007.78                [49] Stefan Mühlbauer, Sven Apel, and Norbert Siegmund. 2021. Identify-
+[34] Maurice George Kendall. 1948. Rank Correlation Methods. Griffin.                     ing Software Performance Changes across Variants and Versions. In
+[35] Robert Kern. 2024. line_profiler: Line-by-line profiling for Python.                 Proceedings of the 35th IEEE/ACM International Conference on Auto-
+     https://github.com/pyutils/line_profiler.                                            mated Software Engineering (Virtual Event, Australia) (ASE ’20). As-
+[36] T. Kohonen. 1990. The self-organizing map. Proc. IEEE 78, 9 (1990),                  sociation for Computing Machinery, New York, NY, USA, 611–622.
+     1464–1480. https://doi.org/10.1109/5.58325                                           https://doi.org/10.1145/3324884.3416573
+[37] Anil Koyuncu, Tegawendé F. Bissyandé, Dongsun Kim, Kui Liu,                     [50] Marc Nerlove. 1964. Spectral Analysis of Seasonal Adjustment Pro-
+     Jacques Klein, Martin Monperrus, and Yves Le Traon. 2019. DC: A                      cedures. Econometrica 32, 3 (1964), 241–286. http://www.jstor.org/
+     Divide-and-Conquer Approach to IR-based Bug Localization. (2019).                    stable/1913037
+     arXiv:1902.02703 [cs.SE] https://arxiv.org/abs/1902.02703                       [51] Anh Tuan Nguyen, Tung Thanh Nguyen, Jafar Al-Kofahi, Hung Viet
+[38] An Ngoc Lam, Anh Tuan Nguyen, Hoan Anh Nguyen, and Tien N.                           Nguyen, and Tien N. Nguyen. 2011. A Topic-Based Approach for
+     Nguyen. 2015. Combining Deep Learning with Information Retrieval                     Narrowing the Search Space of Buggy Files from a Bug Report. In Pro-
+     to Localize Buggy Files for Bug Reports. In Proceedings of the 30th                  ceedings of the 26th IEEE/ACM International Conference on Automated
+     IEEE/ACM International Conference on Automated Software Engineering                  Software Engineering (ASE ’11). IEEE Computer Society, USA, 263–272.
+     (Lincoln, Nebraska) (ASE ’15). IEEE Press, 476–481. https://doi.org/10.              https://doi.org/10.1109/ASE.2011.6100062
+     1109/ASE.2015.73                                                                [52] Vincent Pelletier. 2024. pprofile: Line-granularity, thread-aware
+[39] Nikolay Laptev, Saeed Amizadeh, and Ian Flint. 2015. Generic and Scal-               deterministic and statistic pure-Python profiler. https://github.com/
+     able Framework for Automated Time-series Anomaly Detection. In                       vpelletier/pprofile.
+     Proceedings of the 21th ACM SIGKDD International Conference on Knowl-           [53] perf 2024. https://perf.wiki.kernel.org/index.php/Main_Page.
+     edge Discovery and Data Mining (Sydney, NSW, Australia) (KDD ’15).              [54] Perf-Map-Agent: A Java Agent to Generate Method Mappings to Use
+     Association for Computing Machinery, New York, NY, USA, 1939–1947.                   with the Linux ‘perf‘ Tool 2024. https://github.com/jvm-profiling-
+     https://doi.org/10.1145/2783258.2788611                                              tools/perf-map-agent.
+[40] Jaewon Lee, Changkyu Kim, Kun Lin, Liqun Cheng, Rama Govindaraju,               [55] PHP Profiler Xenon 2024. https://github.com/facebook/hhvm/wiki/
+     and Jangwoo Kim. 2018. WSMeter: A Performance Evaluation Method-                     Profiling.
+     ology for Google’s Production Warehouse-Scale Computers. SIGPLAN                [56] Python 3.12 Preview: Support For the Linux perf Profiler 2024. https:
+     Not. 53, 2 (March 2018), 549–563. https://doi.org/10.1145/3296957.                   //realpython.com/python312-perf-profiler/.
+     3173196                                                                         [57] Mohammad Masudur Rahman and Chanchal K. Roy. 2018. Improving
+[41] Christophe Leys, Christophe Ley, Olivier Klein, Philippe Bernard, and                IR-Based Bug Localization with Context-Aware Query Reformulation.
+     Laurent Licata. 2013. Detecting outliers: Do not use standard deviation              In Proceedings of the 2018 26th ACM Joint Meeting on European Software
+     around the mean, use absolute deviation around the median. Journal                   Engineering Conference and Symposium on the Foundations of Software
+     of Experimental Social Psychology 49, 4 (2013), 764–766. https://doi.                Engineering (Lake Buena Vista, FL, USA) (ESEC/FSE 2018). Association
+     org/10.1016/j.jesp.2013.03.013                                                       for Computing Machinery, New York, NY, USA, 621–632. https://doi.
+[42] Ze Li, Qian Cheng, Ken Hsieh, Yingnong Dang, Peng Huang, Pankaj                      org/10.1145/3236024.3236065
+     Singh, Xinsheng Yang, Qingwei Lin, Youjiang Wu, Sebastien Levy,                 [58] Sasank Reddy, Min Mun, Jeff Burke, Deborah Estrin, Mark Hansen,
+     and Murali Chintalapati. 2020. Gandalf: An Intelligent, End-To-End                   and Mani Srivastava. 2010. Using Mobile Phones to Determine Trans-
+     Analytics Service for Safe Deployment in Large-Scale Cloud Infras-                   portation Modes. ACM Trans. Sen. Netw. 6, 2, Article 13 (March 2010),
+     tructure. In 17th USENIX Symposium on Networked Systems Design                       27 pages. https://doi.org/10.1145/1689239.1689243
+     and Implementation (NSDI 20). USENIX Association, Santa Clara, CA,              [59] Joe Rickerby. 2024. pyinstrument: Call stack profiler for Python.
+     389–402. https://www.usenix.org/conference/nsdi20/presentation/li                    https://github.com/joerick/pyinstrument.
+[43] Jessica Lin, Eamonn Keogh, Stefano Lonardi, and Bill Chiu. 2003. A              [60] Brett Rosen and Ted Czotter. 2024. The Python Profilers (cProfile).
+     Symbolic Representation of Time Series, with Implications for Stream-                https://docs.python.org/3.8/library/profile.html.
+     ing Algorithms. In Proceedings of the 8th ACM SIGMOD Workshop on                [61] Jim Roskind. 2024. The Python Profilers (profile). https://docs.
+     Research Issues in Data Mining and Knowledge Discovery (San Diego,                   python.org/3.8/library/profile.html.
+     California) (DMKD ’03). Association for Computing Machinery, New                [62] Peter J. Rousseeuw. 1987. Silhouettes: A Graphical Aid to the Interpre-
+     York, NY, USA, 2–11. https://doi.org/10.1145/882082.882086                           tation and Validation of Cluster Analysis. J. Comput. Appl. Math. 20
+[44] Song Liu, Makoto Yamada, Nigel Collier, and Masashi Sugiyama. 2013.                  (1987), 53–65. https://doi.org/10.1016/0377-0427(87)90125-7
+     Change-Point Detection in Time-Series Data by Relative Density-Ratio            [63] Ripon K. Saha, Matthew Lease, Sarfraz Khurshid, and Dewayne E.
+     Estimation. Neural Networks 43 (July 2013), 72–83. https://doi.org/10.               Perry. 2013. Improving Bug Localization Using Structured Information
+     1016/j.neunet.2013.01.012                                                            Retrieval. In Proceedings of the 28th IEEE/ACM International Conference
+
+
+
+
+                                                                               537
+     on Automated Software Engineering (Silicon Valley, CA, USA) (ASE ’13).                   Crash Reports. In Proceedings of the 40th International Conference
+     IEEE Press, 345–355. https://doi.org/10.1109/ASE.2013.6693093                            on Software Engineering (, Gothenburg, Sweden,) (ICSE ’18). Asso-
+[64] Hinrich Schütze, Christopher D Manning, and Prabhakar Raghavan.                          ciation for Computing Machinery, New York, NY, USA, 536. https:
+     2008. Introduction to Information Retrieval. Vol. 39. Cambridge Univer-                  //doi.org/10.1145/3180155.3182516
+     sity Press Cambridge.                                                               [80] Rongxin Wu, Hongyu Zhang, Shing-Chi Cheung, and Sunghun Kim.
+[65] Christopher A. Sims. 1974. Seasonality in Regression. J. Amer. Statist.                  2014. CrashLocator: Locating Crashing Faults Based on Crash Stacks.
+     Assoc. 69, 347 (1974), 618–626. http://www.jstor.org/stable/2285991                      In Proceedings of the 2014 International Symposium on Software Testing
+[66] Karen Sparck Jones. 1988. A statistical interpretation of term speci-                    and Analysis (San Jose, CA, USA) (ISSTA 2014). Association for Com-
+     ficity and its application in retrieval. Taylor Graham Publishing, GBR,                  puting Machinery, New York, NY, USA, 204–214. https://doi.org/10.
+     132–142.                                                                                 1145/2610384.2610386
+[67] Chunqiang Tang, Thawan Kooburat, Pradeep Venkatachalam, Akshay                      [81] Kenji Yamanishi and Jun-ichi Takeuchi. 2002. A Unifying Framework
+     Chander, Zhe Wen, Aravind Narayanan, Patrick Dowell, and Robert                          for Detecting Outliers and Change Points from Non-Stationary Time
+     Karl. 2015. Holistic Configuration Management at Facebook. In Pro-                       Series Data. In Proceedings of the eighth ACM SIGKDD international
+     ceedings of the 25th Symposium on Operating Systems Principles (Mon-                     conference on Knowledge discovery and data mining (KDD ’02). As-
+     terey, California) (SOSP ’15). Association for Computing Machinery,                      sociation for Computing Machinery, New York, NY, USA, 676–681.
+     New York, NY, USA, 328–343. https://doi.org/10.1145/2815400.2815401                      https://doi.org/10.1145/775047.775148
+[68] The performance of Python with ‘perf‘ support is not great, and                     [82] Xin Ye, Razvan Bunescu, and Chang Liu. 2014. Learning to Rank
+     is going to get a lot worse 2024. https://discuss.python.org/t/the-                      Relevant Files for Bug Reports Using Domain Knowledge. In Pro-
+     performance-of-python-with-perf-support-is-not-great-and-is-                             ceedings of the 22nd ACM SIGSOFT International Symposium on Foun-
+     going-to-get-a-lot-worse/25280.                                                          dations of Software Engineering (Hong Kong, China) (FSE 2014). As-
+[69] Theil–Sen Estimator 2024. https://en.wikipedia.org/wiki/Theil-Sen_                       sociation for Computing Machinery, New York, NY, USA, 689–699.
+     estimator.                                                                               https://doi.org/10.1145/2635868.2635874
+[70] J. J. Thomas and Kenneth F. Wallis. 1971. Seasonal Variation in Regres-             [83] Dylan Zhang, Xuchao Zhang, Chetan Bansal, Pedro Las-Casas, Ro-
+     sion Analysis. Journal of the Royal Statistical Society. Series A (General)              drigo Fonseca, and Saravan Rajmohan. 2024. LM-PACE: Confidence
+     134, 1 (1971), 57–72. http://www.jstor.org/stable/2343974                                Estimation by Large Language Models for Effective Root Causing of
+[71] Gabriele N. Tornetta. 2024. austin: A Frame Stack Sampler for                            Cloud Incidents. , 11 pages. https://doi.org/10.1145/3663529.3663858
+     cPython. https://github.com/P403n1x87/austin.                                       [84] Yunqi Zhang, David Meisner, Jason Mars, and Lingjia Tang. 2016.
+[72] Charles Truong, Laurent Oudre, and Nicolas Vayatis. 2020. Selective                      Treadmill: Attributing the Source of Tail Latency through Precise Load
+     Review of Offline Change Point Detection Methods. Signal Processing                      Testing and Statistical Inference. In Proceedings of the 43rd International
+     167 (2020), 107299. https://doi.org/10.1016/j.sigpro.2019.107299                         Symposium on Computer Architecture (Seoul, Republic of Korea) (ISCA
+[73] Martin Valdez-Vivas, Caner Gocmen, Andrii Korotkov, Ethan Fang,                          ’16). IEEE Press, 456–468. https://doi.org/10.1109/ISCA.2016.47
+     Kapil Goenka, and Sherry Chen. 2018. A Real-time Framework for De-                  [85] Yu Zheng, Yukun Chen, Quannan Li, Xing Xie, and Wei-Ying Ma. 2010.
+     tecting Efficiency Regressions in a Globally Distributed Codebase. In                    Understanding Transportation Modes Based on GPS Data for Web
+     Proceedings of the 24th ACM SIGKDD International Conference on Knowl-                    Applications. ACM Trans. Web 4, 1, Article 1 (Jan. 2010), 36 pages.
+     edge Discovery & Data Mining (London, United Kingdom) (KDD ’18).                         https://doi.org/10.1145/1658373.1658374
+     Association for Computing Machinery, New York, NY, USA, 821–829.                    [86] Yu Zheng, Like Liu, Longhao Wang, and Xing Xie. 2008. Learning
+     https://doi.org/10.1145/3219819.3219858                                                  Transportation Mode from Raw Gps Data for Geographic Applications
+[74] Owen Vallis, Jordan Hochenbaum, and Arun Kejariwal. 2014. A                              on the Web. In Proceedings of the 17th International Conference on World
+     Novel Technique for Long-Term Anomaly Detection in the Cloud.                            Wide Web (Beijing, China) (WWW ’08). Association for Computing
+     In 6th USENIX Workshop on Hot Topics in Cloud Computing (HotCloud                        Machinery, New York, NY, USA, 247–256. https://doi.org/10.1145/
+     14). USENIX Association, Philadelphia, PA. https://www.usenix.org/                       1367497.1367532
+     conference/hotcloud14/workshop-program/presentation/vallis
+[75] Aad W Van der Vaart. 2000. Asymptotic statistics. Vol. 3. Cambridge
+     university press.
+[76] Kaushik Veeraraghavan, Justin Meza, David Chou, Wonho Kim, Sonia
+     Margulis, Scott Michelson, Rajesh Nishtala, Daniel Obenshain, Dmitri
+     Perelman, and Yee Jiun Song. 2016. Kraken: Leveraging Live Traffic
+     Tests to Identify and Resolve Resource Utilization Bottlenecks in Large
+     Scale Web Services. In 12th USENIX Symposium on Operating Systems
+     Design and Implementation (OSDI 16). USENIX Association, Savannah,
+     GA, 635–651. https://www.usenix.org/conference/osdi16/technical-
+     sessions/presentation/veeraraghavan
+[77] Ming Wen, Rongxin Wu, and Shing-Chi Cheung. 2016. Locus: Locating
+     Bugs from Software Changes. In Proceedings of the 31st IEEE/ACM In-
+     ternational Conference on Automated Software Engineering (Singapore,
+     Singapore) (ASE ’16). Association for Computing Machinery, New
+     York, NY, USA, 262–273. https://doi.org/10.1145/2970276.2970359
+[78] Chu-Pan Wong, Yingfei Xiong, Hongyu Zhang, Dan Hao, Lu Zhang,
+     and Hong Mei. 2014. Boosting Bug-Report-Oriented Fault Localization
+     with Segmentation and Stack-Trace Analysis. In 2014 IEEE International
+     Conference on Software Maintenance and Evolution. 181–190. https:
+     //doi.org/10.1109/ICSME.2014.40
+[79] Rongxin Wu, Ming Wen, Shing-Chi Cheung, and Hongyu Zhang.
+     2018. ChangeLocator: Locate Crash-Inducing Changes Based on
+
+
+
+
+                                                                                   538
+A     Appendix                                                                  where 𝑇critical is a threshold determined by 𝑛 1 , 𝑛 2 , and the
+Following the practice at SOSP’24, we declare that the ap-                      required probability (e.g., 99%) of making a correct decision.
+pendix was not peer reviewed by the SOSP committee.                             In FBDetect, 𝑛 1 ≫ 𝑛 2 because we prioritize detecting regres-
+                                                                                sions quickly after a change, and thus do not have time to
+A.1    Leveraging the Law of Large Numbers                                      collect as many samples as were collected before the change.
+The Law of Large Numbers (LLN) [21] states that given a                         Thus, as an approximation, we can eliminate the 𝑛11 term in
+random variable 𝑥 with a finite mean 𝜇 and variance 𝜎 2 ,                       Expression 5, which simplifies to:
+as the sample size 𝑛 approaches infinity, the sample mean                                             √
+                                                                                                 𝑡 ≈ 𝑛 2 (𝑥 1 − 𝑥 2 )/𝑠 ≥ 𝑇critical .         (6)
+converges to 𝜇. Lete Variance(𝑥) denote the variance of 𝑥.
+We have:                                                                        Reusing the symbol in Expression 1, let Δthreshold be the min-
+                     𝑛                                                          imal value of 𝑥 1 − 𝑥 2 that satisfies Expression 6. We obtain
+                  1 ∑︁
+             𝑥=         𝑥𝑖 and lim 𝑥 = 𝜇               (3)                                                     √︁
+                  𝑛 𝑖=1           𝑛→∞                                                             Δthreshold ≈ 𝑠 2 /𝑛 2 𝑇critical .         (7)
+                                                                                This simplified analysis provides the basis for Expression 1.
+      Variance(𝑥) = 𝜎 2 /𝑛      and     lim Variance(𝑥) = 0. (4)
+                                       𝑛→∞                                      While it does not fully capture   FBDetect’s complexity, the
+                                                                                relationship Δthreshold ∝ 𝜎 2 /𝑛 generally applies to methods
+                                                                                                         √︁
+   Suppose we introduce a code change and want to deter-
+mine whether its impact on a performance metric is sta-                         comparing two sample groups to detect changes.
+tistically significant by comparing two groups of samples                       A.3   Subroutine-level Measurements using gCPU
+collected before and after the change. According to the LLN,
+as the sample size increases, we can more accurately infer                      We demonstrate that, similar to Expression 2, subroutine-
+the two groups’ means 𝜇1 and 𝜇2 . Thus, even a small dif-                       level measurements using the gCPU metric also reduce vari-
+ference between 𝜇1 and 𝜇2 can be detected, as reflected in                      ance, enabling detection of small regressions.
+Expression 1, where lim𝑛→∞ Δthreshold =0. The LLN can also                         We first define the following notations. Let 𝑟 be a sub-
+explain why the noise in Figures 2 and 3 decreases as the                       routine in a Linux process, with random variables 𝑋𝑟 and
+number of servers (𝑚) increases.                                                𝑋𝑃 representing the CPU usage of 𝑟 and the Linux process,
+   Although the LLN explains why minor regressions are                          respectively. Let 𝜇𝑟 and 𝜇𝑃 denote their means, and 𝜎𝑟2 and
+detectable with a large number of samples, it is crucial to                     𝜎𝑃2 denote their variances. Define gCPU𝑟 = 𝑋𝑟 /𝑋𝑃 .
+recognize that both the LLN and Expression 1 assume station-                       Assume that the Linux process consists of 𝑘 independent
+                                                                                                         𝜇                   𝜎2
+ary random variables and do not account for non-stationary,                     subroutines like 𝑟 , so 𝜇𝑃𝑟 = 𝑘1 and 𝜎𝑟2 = 𝑘𝑃 . Based on the
+transient issues like the one in Figure 1(c). Therefore, pro-                   approximation for the variance of a ratio [4], we have:
+duction realities are more challenging.                                                                              𝑋𝑟
+                                                                                      Variance(𝑔𝐶𝑃𝑈𝑟 ) = Variance( )                       (8)
+A.2    Calculating the Detection Threshold                                                                           𝑋𝑃
+                                                                                                                                    2
+                                                                                                𝜇2 𝜎 2      Covariance(𝑋𝑟 , 𝑋𝑃 ) 𝜎𝑃
+While the Law of Large Numbers provides valuable intuition,                                   ≈ 𝑟2 [ 𝑟2 − 2                     + 2]       (9)
+a direct analysis of FBDetect would be ideal. However, its                                      𝜇 𝑃 𝜇𝑟             𝜇𝑟 𝜇 𝑃          𝜇𝑃
+complexity renders precise analysis impractical. As an alter-                                   𝜇2 𝜎 2 𝜎 2
+                                                                                              < 𝑟2 [ 𝑟2 + 𝑃2 ]                            (10)
+native, we examine a simpler yet representative problem, as                                     𝜇 𝑃 𝜇𝑟 𝜇 𝑃
+described below, to gain meaningful insights.                                                   (𝑘 + 1) 𝜎𝑃2
+    Suppose we introduce a code change and want to deter-                                     =         · 2                               (11)
+                                                                                                   𝑘2     𝜇𝑃
+mine its impact on a performance metric. Let the two groups                                       1
+of samples collected before and after the code change have                                    ≈ 2 𝜎𝑃2                                     (12)
+                                                                                                𝑘𝜇𝑃
+population means 𝜇1 and 𝜇2 , population variances 𝜎12 and                                       1
+                                                                                              < 𝜎𝑃2 .                                     (13)
+𝜎22 , sample sizes 𝑛 1 and 𝑛 2 , sample means 𝑥 1 and 𝑥 2 , and                                 𝑘
+sample variances 𝑠 12 and 𝑠 22 , respectively. For simplicity, as-              The simplification from Expression 9 to Expression 10 holds
+sume the two groups have identical population variances                         because the covariance between 𝑋𝑟 and 𝑋𝑃 is positive. The
+(𝜎12 = 𝜎22 = 𝜎 2 ) and identical sample variances (𝑠 12 = 𝑠 22 = 𝑠 2 ).         simplification from Expression 12 to Expression 13 assumes
+    We use Student’s t-test [21] to examine two hypotheses:                     𝜇𝑃 > 1, which typically holds in a production environment.
+      • H0: 𝜇1 = 𝜇2 (i.e., there is no performance difference).                 For example, a production server typically has 80 or more
+                                                                                cores. If half of them are utilized, 𝜇𝑃 ≥ 40. Expression 13
+      • H1: 𝜇1 ≠ 𝜇2 (i.e., there is a performance difference).
+                                                                                shows that, similar to Expression 2, subroutine-level mea-
+To reject H0, the t-statistic must exceed a threshold:                          surements using the gCPU metric also reduce variance, en-
+                         𝑥1 − 𝑥2                                                abling detection of small regressions.
+                    𝑡 = √︃         ≥ 𝑇critical,                    (5)             Next, we show that for a small subroutine, a small regres-
+                       𝑠 𝑛11 + 𝑛12                                              sion in its gCPU directly corresponds to a small regression in
+
+
+
+                                                                          539
+its absolute CPU usage. Thus, despite being a relative metric,             the total number of servers in the fleet), and assume the
+gCPU is appropriate for regression detection.                              number of collected samples (i.e., 𝑛 in Expression 1) is pro-
+        𝑔                                       𝑔   𝜇
+   Let 𝜇𝑟 denote the mean of gCPU𝑟 , where 𝜇𝑟 = 𝜇𝑃𝑟 . Let ℎ%               portional to 𝑚. From Expression 1, it can be derived that the
+denote the change in 𝜇𝑟 after 𝜇𝑟 increases by Δ:
+                        𝑔                                                  resource waste as a fraction of the fleet size is given by:
+                      𝜇𝑟 + Δ 𝜇𝑟        Δ(𝜇𝑃 − 𝜇𝑟 )    Δ
+                                                                                                         √︁
+             𝑔    𝑔                                                                              𝑊 /𝑚 ∝ 𝜎 2 /𝑚.
+      ℎ% = 𝜇˜𝑟 − 𝜇𝑟 =         −     =              ≈     .
+                      𝜇𝑃 + Δ 𝜇𝑃        𝜇𝑃 (𝜇𝑃 + Δ) 𝜇𝑃                      This indicates that the waste fraction decreases as the fleet
+The last step assumes that 𝜇𝑟 and Δ are small relative to 𝜇𝑃 .             size increases, which
+                                                                                            √ is positive. However, the total waste 𝑊
+   In summary, we have shown that, when the gCPU of a sub-                 still grows with 𝑚:
+routine is small, which is common in production, a small ℎ%                                             √
+                                                                                                   𝑊 ∝ 𝜎 2𝑚.
+absolute regression in gCPU approximately corresponds to
+an ℎ% relative regression in the Linux process’s absolute CPU              In conclusion, to minimize fleet-wide waste due to unde-
+usage. Thus, gCPU is appropriate for regression detection.                 tectable small regressions, it is crucial to also reduce variance
+                                                                           (𝜎 2 ). FBDetect significantly reduces variance by measuring
+A.4 Resource Waste Due to Undetectable Regressions
+                                                                           CPU usage at the subroutine level rather than at the overall
+Let 𝑊 denote the aggregate fleet-wide resource waste due to                service level, as shown in Expression 2.
+undetectable regressions smaller than the detection thresh-
+old Δthreshold in Expression 1. Let 𝑚 denote the fleet size (i.e.,
+
+
+
+
+                                                                     540
+

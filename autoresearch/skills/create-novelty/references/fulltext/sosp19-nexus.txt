@@ -1,0 +1,1363 @@
+           Nexus: A GPU Cluster Engine for Accelerating
+                    DNN-Based Video Analysis
+                 Haichen Shen                                            Lequn Chen                                     Yuchen Jin
+              Amazon Web Services                                University of Washington                        University of Washington
+
+                 Liangyu Zhao                                           Bingyu Kong                                 Matthai Philipose
+           University of Washington                           Shanghai Jiao Tong University                          Microsoft Research
+
+                                     Arvind Krishnamurthy                                       Ravi Sundaram
+                                      University of Washington                               Northeastern University
+
+Abstract                                                                                workload are Deep Neural Networks (DNNs), which are
+We address the problem of serving Deep Neural Networks                                  networks of dense linear algebra computations. Specialized
+(DNNs) efficiently from a cluster of GPUs. In order to realize                          hardware accelerators for DNNs, in the form of Graphic
+the promise of very low-cost processing made by accelera-                               Processing Units (GPUs, which this paper focuses on) and
+tors such as GPUs, it is essential to run them at sustained                             even more specialized Tensor Processing Units (TPUs) have
+high utilization. Doing so requires cluster-scale resource                              emerged in the recent past. GPU accelerators process DNNs
+management that performs detailed scheduling of GPUs, rea-                              orders of magnitude faster and cheaper than CPUs in many
+soning about groups of DNN invocations that need to be co-                              cases. However, GPUs are expensive and very-high-capacity:
+scheduled, and moving from the conventional whole-DNN                                   modern devices each provide over 100 TFLOPS. Cost-savings
+execution model to executing fragments of DNNs. Nexus is                                from using them depends critically on operating them at
+a fully implemented system that includes these innovations.                             sustained high utilization. A fundamental problem, therefore,
+In large-scale case studies on 16 GPUs, when required to stay                           is to distribute the large incoming workload onto a cluster
+within latency constraints at least 99% of the time, Nexus                              of accelerators at high accelerator utilization and acceptable
+can process requests at rates 1.8-12.7× higher than state of                            latency. We address this problem in this paper.
+the art systems can. A long-running multi-application de-                                   Conceptually, this problem can be thought of as sharding
+ployment stays within 84% of optimal utilization and, on a                              inputs via a distributed frontend onto DNNs on backend
+100-GPU cluster, violates latency SLOs on 0.27% of requests.                            GPUs. Several interacting factors complicate this viewpoint.
+                                                                                        First, given the size of GPUs, it is often necessary to place
+ACM Reference Format:                                                                   different types of networks on the same GPU. It is then
+Haichen Shen, Lequn Chen, Yuchen Jin, Liangyu Zhao, Bingyu                              important to select and schedule them so as to maximize
+Kong, Matthai Philipose, Arvind Krishnamurthy, and Ravi Sun-
+                                                                                        their combined throughput while satisfying latency bounds.
+daram. 2019. Nexus: A GPU Cluster Engine for Accelerating DNN-
+                                                                                        Second, many applications consist of groups of DNNs that
+Based Video Analysis. In SOSP ’19: Symposium on Operating Systems
+Principles, October 27–30, 2019, Huntsville, ON, Canada. ACM, New                       feed into each other. It is important to be able to specify
+York, NY, USA, 16 pages. https://doi.org/10.1145/3341301.3359658                        these groups and to schedule the execution of the entire
+                                                                                        group on the cluster so as to maximize performance. Third,
+1    Introduction                                                                       it is well known that dense linear algebra computations such
+                                                                                        as DNNs execute much more efficiently when their inputs
+Consider a cloud-scale video analysis service that allows                               are batched together. Batching complicates scheduling and
+thousands of tenants to analyze thousands of streams each                               routing because (a) it benefits from cross-tenant and cross-
+concurrently. Increasingly, the core computations for this                              request coordination and (b) it forces the underlying bin-
+Permission to make digital or hard copies of all or part of this work for               packing-based scheduling algorithms to incorporate batch
+personal or classroom use is granted without fee provided that copies are not           size. Fourth, the increasingly common use of transfer learning
+made or distributed for profit or commercial advantage and that copies bear             in today’s workloads has led to specialization of networks,
+this notice and the full citation on the first page. Copyrights for components          where two tasks that formerly used identical networks now
+of this work owned by others than ACM must be honored. Abstracting with
+                                                                                        use networks that are only mostly identical. Since batching
+credit is permitted. To copy otherwise, or republish, to post on servers or to
+redistribute to lists, requires prior specific permission and/or a fee. Request         works only when multiple inputs are applied to the same
+permissions from permissions@acm.org.                                                   model in conventional DNN execution systems, the benefits
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                   of batching are lost.
+© 2019 Association for Computing Machinery.                                                 Nexus is a GPU cluster for DNN execution that addresses
+ACM ISBN 978-1-4503-6873-5/19/10. . . $15.00                                            these problems to attain high execution throughput under
+https://doi.org/10.1145/3341301.3359658
+
+
+
+
+                                                                                  322
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                    H. Shen, L. Chen, Y. Jin, L. Zhao, B. Kong, M. Philipose, A. Krishnamurthy, and R. Sundaram
+
+
+                                                                                                                  CPU     GPU      CPU        TPU        GPU
+                              light-         DNN-                                                     Model        lat.    lat.   cost ($)   cost ($)   cost ($)
+ video     frame                                                             video
+                             weight          based         aggregation                                            (ms)    (ms)    (0.1TF     (180TF     (125TF
+ stream   sampling                                                           analysis
+                             analysis       analysis
+                                                                             outputs                                               peak)      peak)      peak)
+                     frame        query + windows      DNN outputs                                    Lenet5       6      <0.1     $0.01       $0.00      $0.00
+                                                                                                      VGG7         44      <1      0.13        0.01        0.01
+Figure 1: A typical vision processing pipeline. Nexus is de-
+                                                                                                     Resnet50     1130    6.2      4.22        0.48        0.12
+signed to provide DNN-based analysis for tens of thousands
+                                                                                                    Inception4    2110     7.0     8.09        0.93       0.23
+of streams.
+                                                                                                    Darknet53     7210    26.3     24.74       2.85        0.70
+latency Service Level Objectives (SLOs). It uses three main
+                                                                                              Table 1: DNN execution latencies and estimated costs per
+techniques to do so. First, it relies on a novel batching-aware
+                                                                                              1000 invocations.1 Acceleration may be necessary to meet
+scheduler (Section 6.1) that performs bin packing when the
+                                                                                              latency deadlines, but can also be cheaper, given low
+balls being packed into bins have variable size, depending                                    cost/TFLOPS.
+on the size of the batch they are in. This schedule specifies
+the GPUs needed, the distribution of DNNs across them, and                                       Typically, a stream is sampled a few times a second or
+the order of their execution so as to maximize execution                                      minute, and the DNN query should complete execution in
+throughput while staying within latency bounds. Second,                                       tens to hundreds of milliseconds (for “live” applications) or
+it allows groups of related DNN invocations to be written                                     within several hours for (“batch” applications). The execution
+as queries and provides automated query optimization to                                       of DNNs dominates the computation pipeline, and the cost
+assign optimal batch sizes to the components of the query                                     of executing them dominates the cost of the vision service.
+so as to maximize overall execution throughput of the query                                   Nexus provides a standalone service that implements the
+while staying within its latency bounds (Section 6.2). Finally,                               DNN-based analysis stage for vision pipelines.
+Nexus breaks from orthodoxy and allows batching of parts of                                   2.1    Accelerators and the challenge of utilizing them
+networks with different batch sizes. This enables the batched
+                                                                                              As Table 1 shows, a key to minimizing the cost of executing
+execution of specialized networks (Section 6.3).
+                                                                                              DNNs is the use of specialized accelerators such as GPUs
+   Nexus is completely implemented as a containerized sys-
+                                                                                              and TPUs, which are highly optimized to execute the dense
+tem deployable on a commercial cloud and comprises of
+                                                                                              linear algebra computations that comprise DNN models. The
+roughly 10k lines of C++. We have deployed Nexus on a
+                                                                                              table shows the execution latency and the dollar cost of 1000
+100-GPU cluster. On focused 16-GPU experiments compared
+                                                                                              invocations for a few common models on CPUs and GPUs.
+with existing DNN serving systems (Tensorflow Serving [25]
+                                                                                              Execution times on CPUs can be orders of magnitude slower
+and Clipper [6]), we measure the maximal request rate pro-
+                                                                                              than that on GPUs. For many applications, therefore, latency
+cessed by these systems on fixed applications such that at
+                                                                                              constraints alone may dictate GPU-accelerated execution.
+least 99% of requests are handled within latency SLOs. By
+                                                                                                 Perhaps more fundamentally, GPUs and TPUs promise
+this metric, Nexus is able to handle 1.8-4.4× more requests
+                                                                                              much lower cost per operation than even highly accelerated
+on a traffic monitoring application, and 9.4-12.7× on a game-
+                                                                                              CPUs: Table 1 lower-bounds the cost of executing a model
+stream analysis case study. On a much larger experiment on
+                                                                                              by assuming that models can be executed at peak speed
+an 100-GPU cluster, 7 applications and 12 different models,
+                                                                                              on each platform. Even compared to state of the art CPUs,
+Nexus achieves a maximal request rate of over 98.7% while
+                                                                                              accelerators can yield a cost advantage of up to 9× (for TPUs)
+maintaining similar high throughputs.
+                                                                                              and 34× (for GPUs). On the other hand, accelerators have
+2    Background                                                                               extremely high computational capacities (e.g., 125 TFLOPS
+                                                                                              for the NVIDIA V100). To realize their cost savings, it is critical
+A vision-based application aggregates visual information                                      to sustain high utilization of this capacity. Sustaining high
+from one or more video streams using custom “business”                                        utilization is hard, however. For instance, the LeNet model of
+logic. Each stream is processed using a pipeline similar to                                   Table 1 consumes 20 MOPs to run, implying that a single V100
+that in Figure 1. CPU-based code, either on the edge or in                                    would require 125 TFLOPS ÷ 20 MOPs = 6.25M inputs/second
+the cloud, selects frames from the stream for processing,                                     to run at full utilization!
+applies business logic to identify what parts (or windows)                                       No single stream, or even most applications, can yield such
+of the image need deeper analysis, applies a DNN query to                                     rates. By aggregating inputs across streams and applications,
+these windows, and aggregates the results in an application-                                  Nexus is designed to funnel adequate work to each accelera-
+specific way, often writing to a database. A query may rep-                                   tor. However, as we discuss next, having “enough” work is
+resent a single DNN applied to the window, but often it may
+represent a sequence of dependent DNN applications, e.g.,                                     1 Per-device prices for 1000 invocations assuming peak execution rates on
+running an object detector on the window and running a car                                    on-demand instances of AWS c5.large (Intel AVX 512), p2.xlarge (NVIDIA
+make/model detector on all sub-windows containing cars.                                       K80), p3.2xlarge (NVIDIA V100) and GCP Cloud TPU.
+
+
+
+
+                                                                                        323
+Nexus: A GPU Cluster Engine for Accelerating DNN-Based Video Analysis                        SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+not sufficient to achieve high utilization: it is important to                3   Related work
+group the right type of work in the right place.
+
+                                                                              The projects most closely related to Nexus are Clipper [6]
+                                                                              and Tensorflow Serving [25]. Clipper is a “prediction serving
+2.2   Placing, packing and batching DNNs
+                                                                              system” that serves a variety of machine learning models
+                                                                              including DNNs, on CPUs and GPUs. Given a request to
+DNNs are networks of dense linear algebra operations (e.g.,
+                                                                              serve a machine learning task, Clipper selects the type of
+matrix multiplication and convolution), called layers or ker-
+                                                                              model to serve it, batches requests, and forwards the batched
+nels. Networks are also called models. By default, the GPU
+                                                                              requests to a backend container. By batching requests, and
+simply executes the kernels presented to it in the order re-
+                                                                              adapting batch sizes online under a latency SLO, Clipper
+ceived. The kernels themselves are often computationally in-
+                                                                              takes a significant step toward Nexus’s goal of maximizing
+tensive, requiring MFLOPs to GFLOPs to execute, and range
+                                                                              serving throughput under latency constraints. Clipper also
+in size from one MB to hundreds of MBs. These facts have
+                                                                              provides approximation and caching services, complemen-
+important implications for GPU utilization.
+                                                                              tary to Nexus’s focus on executing all requests exactly but
+   First, loading models into memory can cost hundreds of
+                                                                              efficiently. Tensorflow Serving can be viewed as a variant of
+milliseconds to seconds. When serving DNNs at high volume,
+                                                                              Clipper that does not provide approximation and caching,
+therefore, it is usually essential to place the DNN on a par-
+                                                                              but also has additional machinery for versioning models.
+ticular GPU by pre-loading it on to GPU memory and then
+                                                                                 To the basic batched-execution architecture of Clipper,
+re-using it across many subsequent invocations. Placement
+                                                                              Nexus builds along the dimensions of scale, expressivity and
+brings with it the traditional problems of efficient packing.
+                                                                              granularity. These techniques address the challenges brought
+Which models should be co-located on each GPU, and how
+                                                                              up earlier in this section and thus reflect Nexus’s focus on
+should they be scheduled to minimize mutual interference?
+                                                                              executing DNNs on GPUs at high efficiency and scale.
+   Second, it is well known that the processor utilization
+                                                                              Scale: Nexus provides the machinery to scale serving to
+achieved by kernels depends critically upon batching, i.e.,
+                                                                              large, changing workloads. In particular, it automates the al-
+grouping input matrices into higher-dimensional ones be-
+                                                                              location of GPU resources and the placement and scheduling
+fore applying custom “batched” implementations of the ker-
+                                                                              of models across allocated resources. It provides a distributed
+nels. Intuitively, batching allows kernels to avoid stalling on
+                                                                              frontend that scales with requests. These functions are per-
+memory accesses by operating on each loaded input many
+                                                                              formed on a continuing basis to adapt to workloads.
+more times than without batching. On an NVIDIA GTX1080,
+                                                                              Expressivity: Nexus provides a query mechanism that (a)
+batching improves the throughput of model execution by
+                                                                              allows related DNN execution tasks to be specified jointly,
+4.7-13.3× for batch sizes of 32 for VGG, ResNet, and Incep-
+                                                                              and (b) allows the user to specify the latency SLO just at
+tion models relative to executing them individually. Further,
+                                                                              the whole-query level. Nexus then analyzes the query and
+our empirical measurements indicate that we can often use a
+                                                                              allocates latency bounds and batch sizes to constituent DNN
+linear model to fit the batched execution latency as follows:
+                                                                              tasks so as to maximize the throughput of the whole query.
+                     batch_lat(b) = αb + β,                  (1)              Granularity: Where Clipper limits the granularity of batched
+where β is the fixed cost to invoke a model and α is the cost                 execution to whole models, Nexus automatically identifies
+of each additional task in the batch. Large batches amortize                  common subgraphs of models and executes them in a batch.
+the fixed cost β and help achieve higher throughputs.                         This is critical for batching on specialized models, which
+   Although batching is critical for utilization, it complicates              often share all but the output layer, as described previously.
+the resource allocation and scheduling decisions made in-                        Other work has explored system-level optimization for
+side of a cluster. We elaborate on these issues in Section 4.                 DNN inference. They address goals other than Nexus’s focus
+Further, batching is conventionally only feasible when the                    on improving accelerator utilization via aggressive batching
+same model is invoked with different inputs. For instance,                    and are broadly complementary. MCDNN [14] is an early
+we expect many applications to use the same well-known,                       example of a system that exploited shared model prefixes
+generally applicable, models (e.g., Resnet50 for object recog-                resulting from specialization on mobile CPUs. However, like
+nition). However, the generality of these models comes at the                 Mainstream [19] after it, which provided a more sophisti-
+price of higher resource use. It has become common practice                   cated infrastructure for managing specialization on server
+[12, 24] to use smaller models specialized (using “transfer                   CPUs, it focused on shared prefixes that applied to a com-
+learning”) to the few objects, faces, etc. relevant to an ap-                 mon input, with the goal of avoiding redundant computation
+plication by altering (“re-training”) just the output layers of               across prefixes. Nexus, on the other hand, focuses on shared
+the models. Since such customization destroys the unifor-                     prefixes that operate on different inputs with the goal of
+mity required by conventional batching, making specialized                    utilizing the underlying GPU hardware more efficiently via
+models play well with batching is often critical to efficiency.               batching.
+
+
+
+                                                                        324
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada   H. Shen, L. Chen, Y. Jin, L. Zhao, B. Kong, M. Philipose, A. Krishnamurthy, and R. Sundaram
+
+
+   A common theme in these and other systems is to automat-                          Model A                Model B                Model C
+ically select approximately equivalent, but more performant,                Batch      Lat Req/s    Batch    Lat Req/s     Batch     Lat Req/s
+models for a task. MCDNN [14] introduced the notion of                           4     50    80      4       50     80       4      60     66.7
+selecting from a catalog of variants of models that trade                        8     75    107     8       90     89       8      95      84
+off accuracy for performance. VideoStorm [42] generalized                       16     100   160     16      125    128      16     125    128
+the notion of exploiting such tradeoffs to all parameters of              Table 2: Batching profiles for models used in the example.
+the computer vision system, not just those related to DNNs.               Lat is the latency (ms) for processing a batch, and Req/s is
+NoScope [20] proposed specializing models to queries to                   the throughput achieved.
+speed up query execution. More recent work [35] proposes
+cascading small dynamically specialized models that han-                     Fundamentally, the algorithm for packing models on GPUs
+dle the common case with larger backup models. Focus [17]                 needs to take into account the fact that the processing cost
+applies cascading to the video indexing scenario, backing                 of an input is “squishy”, i.e., it varies with the size of the
+up a small, frequent ingest-time indexing DNN with a large                batch within which that input is processed. Further, the la-
+but infrequent query-time DNN. Nexus focuses on providing                 tency of execution also depends on the batch size. This new
+an engine for non-approximating execution of the incoming                 version of bin packed scheduling, which we dub squishy bin
+models, a facility that can potentially be used as a backend              packing, needs to reason explicitly about batching. Second,
+for these approximation-based systems.                                    batching complicates query processing. If a certain latency
+   Serving DNNs at scale is similar to other large-scale short-           SLO (Service Level Objective) is allocated to the query as
+task serving problems. These systems have distributed front               a whole, the system needs to partition the latency across
+ends that dispatch low-latency tasks to queues on the back-               the DNN invocations that comprise the query so that each
+end servers. Sparrow [27] focuses on dispatch strategies to               latency split allows efficient batched execution of the re-
+reduce the delays associated with queuing in such systems.                lated DNN invocation. We call this complex query scheduling.
+Slicer [3] provides a fast, fault-tolerant service for dividing           Third, in addition to batching-aware resource allocation, the
+the back end into shards and load balancing across them.                  runtime dispatch engine also has to determine what requests
+Both systems assume that the backend server allocation                    are batched and what requests are dropped during periods
+and task placement is performed at a higher (application)                 of bursty arrival. We now use examples and measurements
+level, using cluster resource managers such as Mesos [16]                 to elaborate on these underlying scheduling and resource
+or Omega [33]. Nexus shares the philosophy of these sys-                  allocation challenges.
+tems of having a fast data plane that dispatches incoming
+                                                                          4.1        Squishy bin packing
+messages from the frontend to backend GPUs and a slower
+control plane that performs more heavyweight scheduling                   Consider a workload that consists of three different types
+tasks, such as resource allocation, packing and load balanc-              of tasks that invoke different DNN models. Let the desired
+ing. On the other hand, compared to these generic systems,                latency SLOs for tasks invoking models A, B, and C be 200ms,
+Nexus provides query processing, task allocation, and sub-                250ms, and 250ms, respectively. Table 2 provides the batch
+task scheduling functionality that is targeted to better batch-           execution latency and throughput at different batch sizes
+ing over DNN-based workloads.                                             (i.e., the “batching profile”) for each model.
+   Much work has focused on producing faster models of-                       We first explore the basic scenario where all three types of
+ten at small losses in accuracy [2, 31, 41] Further, models               tasks are associated with high request rates so that multiple
+of varying accuracy can be combined to maintain high ac-                  GPUs are required to handle each task type. To maximize
+curacy and performance [6, 14, 17, 20, 35]. Nexus views the               GPU efficiency, we need to choose the largest possible batch
+optimization, selection, and combination of models as best                size while still meeting the latency SLO. Note that the batch
+done by the application, and provides no special support                  execution cost for a given task type cannot exceed half of
+for these functions. Our mechanisms are also orthogonal to                the task’s latency SLO; a task that missed being scheduled
+the scheduling, placement, and time-sharing mechanisms in                 with a batch would be executed as part of the next batch,
+training systems [13, 30, 38] since DNN serving has to be                 and thus its latency would be twice the batch execution cost.
+performed within tight latency SLOs while maintaining high                For example, the latency SLO for Model A tasks is 200 ms,
+utilization.                                                              so the maximum batch size we can use is 16. Therefore, the
+                                                                          maximum throughput that Model A can achieve on a single
+4   Scheduling problems in batched execution                              GPU is 160 reqs/sec, and the number of GPUs to be allocated
+Batched execution of models improve GPU utilization but                   for Model A should r A /160, where r A is the observed request
+also raises many challenges in determining how cluster                    rate. Similarly, the number of GPUs for models B and C
+resources are allocated to different applications and how                 should be r B /128 and rC /128, where r B and rC are the request
+to batch model invocations without violating latency con-                 rates for models B and C respectively. Figure 2(a) depicts the
+straints.                                                                 desired schedules for the different models.
+
+
+
+                                                                    325
+Nexus: A GPU Cluster Engine for Accelerating DNN-Based Video Analysis                                                 SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+           100 ms                   200 ms                  duty cycle: 125 ms     75 ms
+                                                                                                       4.2   Complex query scheduling
+Model A   prev batch     batch 16                 Model A   prev batch             batch 8
+
+Model B     prev batch        batch 16                                                  200 ms
+                                                                                                       Applications often comprise of dependent computations of
+                                                  Model B                batch 4
+                                                                                                       multiple DNN models. For example, a common pattern is a
+Model C     prev batch        batch 16            Model C                batch 4
+                                                                                                       detection and recognition pipeline that first detects certain
+             125 ms                      250 ms                          60 ms
+                                                                                                       objects from the image and then recognizes each object. The
+          (a) Saturate workload                             (b) Residual workload                      developer will specify a latency SLO for the entire query,
+              Figure 2: Resource allocation example.                                                   but since the system would host and execute the constituent
+                                                                                                       models on different nodes, it would have to derive latency
+   We next consider a situation where the request rates for                                            SLOs for the invoked models and the schedules that meet
+the models are lower, with each one requiring less than a                                              these latency SLOs. We discussed the latter issue in the pre-
+GPU. In this case, the scheduler needs to consolidate multiple                                         vious example, and we now focus on the former issue.
+types of DNN tasks onto the same GPU to optimize resource                                                 Consider a query that executes Model X and feeds its
+utilization. Consider a workload where Model A receives 64                                             output to Model Y. Suppose we have a 100ms latency budget
+reqs/sec, and Model B and Model C receive 32 reqs/sec each.                                            for processing this query, and suppose that every invocation
+We consider schedules where multiple models are assigned                                               of X yields γ outputs (on average). When γ < 1, X operates
+to a GPU. The GPU then executes batches of different types                                             as a filter; when γ = 1, X maps an input to an output; when
+of models in a round-robin manner, and it cycles through                                               γ > 1, X yields multiple outputs from an input (e.g., detection
+them over a time period that we refer to as the duty cycle.                                            of objects within a frame).
+The worst-case latency for a task is no longer twice the batch                                            Assume that Figure 3 depicts the batch execution latency
+execution cost but rather the sum of the duty cycle and the                                            and throughput of models X and Y. The system has to decide
+batch execution cost for that task type.                                                               what latency SLOs it has to enforce on each model such that
+   Given this setup, Model A tasks can be scheduled in batches                                         the overall latency is within 100ms and the GPU utilization
+of 8 as part of a duty cycle of 125ms; note that the resulting                                         of the query as a whole is maximized. For this example, we
+throughput is the desired rate of 64 reqs/sec, the batch exe-                                          consider a limited set of latency split plans for models X and
+cution cost for 8 tasks is 75ms, and the worst-case execution                                          Y: (a) 40ms and 60ms, (b) 50ms and 50ms, (c) 60ms and 40ms.
+delay of 200ms matches the latency SLO (see Figure 2(b)).                                              It would appear that plan (a) should work best since the sum
+We then check whether the GPU has sufficient slack to ac-                                              of the throughputs is largest among the three plans, but a
+commodate tasks associated with models B or C. Within a                                                closer examination reveals some interesting details.
+duty cycle of 125ms, we would need to execute 4 tasks of                                                  For workloads involving a large number of requests, let
+either B or C to meet the desired rate of 32 reqs/sec. The                                             us assume that p and q GPUs execute X and Y, respectively.
+batch execution cost of 4 model B tasks is 50ms, which can fit                                         We then have γ · p · TX = q · TY , where TX and TY are
+into the residual slack in the duty cycle. On the other hand,                                          per-GPU throughputs of X and Y, such that the pipeline
+a batch of 4 model C tasks would incur 60ms and cannot                                                 won’t be bottlenecked by any model. We define the average
+be scheduled inside the duty cycle. Further, the worst-case                                            throughput as the pipeline throughput divided by the total
+latency for model B is the sum of the duty cycle and its own                                           number of GPUs, which is p · TX /(p + q). We evaluate the
+batch execution cost, 175ms(= 125 + 50), which is lower than                                           average throughputs for the three latency split plans with
+its latency SLO 250ms. Thus, it is possible to co-locate Model                                         γ = 0.1, 1, 10. Figure 4 shows that each of the plans achieves
+B, but not Model C, on the same GPU as Model A.                                                        the best performance for different γ values. In fact, there is
+   We now make a few observations regarding the scenario                                               no universal best split: it depends on γ , which can vary over
+discussed above and why the associated optimization prob-                                              time.
+lem cannot be addressed directly by known scheduling al-                                                  We note two observations from this example. First latency
+gorithms. First, unlike vanilla bin-packing that would pack                                            split for complex query impacts overall efficiency, and it is
+fixed-size balls into bins, the tasks here incur lower costs                                           necessary to account both batch performance and workload
+when multiple tasks of the same type are squished together                                             statistics to make the best decision. Second, latency split
+into a GPU. Second, in addition to the capacity constraints                                            should not be static but rather adapted over time in accor-
+associated with the GPU’s compute and/or memory capa-                                                  dance with the current workload. Section 6.2 describes how
+bilities, there are also latency constraints in generating a                                           Nexus automatically and continually derives latency splits.
+valid schedule. Third, there are many degrees of freedom in
+generating a valid schedule. The batch size associated with                                            4.3   Rate control and adaptive batching
+a model execution is not only a function of the request rate
+                                                                                                       Model serving systems need to perform adaptive batching
+but also of the duty cycle in which the batch is embedded. In
+                                                                                                       based on the number of requests received. When there is a
+Section 6.1, we describe how to extend traditional algorithms
+                                                                                                       burst of requests, the system needs to drop certain requests
+to handle this setting.
+                                                                                                       in order to serve the remaining requests within the latency
+
+
+
+                                                                                                 326
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                         H. Shen, L. Chen, Y. Jin, L. Zhao, B. Kong, M. Philipose, A. Krishnamurthy, and R. Sundaram
+
+
+                                                                                                                                              40%
+
+         Model X                  Model Y                             Latency budget                Avg Throughput (reqs/s)                   30%
+
+
+
+
+                                                                                                                                   Bad rate
+       Lat Reqs/s               Lat Reqs/s                            X        Y                   γ = 0.1 γ = 1 γ = 10
+                                                                                                                                              20%
+       40          200          40           300                                                                      40.0
+                                                                      40             60             192.3   142.9                                         uniform
+       50          250          50           400                      50             50             235.3   153.8     34.5                    10%
+       60          300          60           500                                                                                                          poisson
+                                                                      60             40             272.7   150.0     27.3
+                                                                                                                                              0%
+Figure 3: Batch execution la-                                                                                                                       1.0   1.2   1.4      1.6   1.8
+tency (ms) and throughput of                                         Figure 4: The average throughput with                                                      α (ms)
+models.                                                              three latency split plans for varying γ .
+                                                                                                                                     Figure 5: Performance of lazy dropping.
+
+                    Cluster Manager                                        User requests                          this is appropriate for video stream analysis, as the next sam-
+                                                   Workload                                                       pled frame would typically be processed even if the earlier
+                                                    stats
+                                                                      Application Container
+                                                                        Application Docker
+                  Global Scheduler                                                                                one is dropped. We also note that we could configure our sys-
+                                                                           Nexus Library         Frontend
+          Every               Monitor if
+          epoch           workload changes
+                                                                                                                  tem to simply delay the execution of requests that miss their
+                                                                                                                  deadlines to a later time and at a lower priority; many of our
+                   Epoch scheduling
+                Update latency split from                                                     Backend             techniques would still be effective in improving efficiency in
+                  query latency SLO                                                         prefix model
+                                                          Backend                                                 such a setting.
+                                                                                           suﬃx1    suﬃx2
+               Determine whether models
+                 can be prefix batched                model A    model B                                             Nexus works on three planes (as depicted by Figure 6). The
+                                                                                           common prefix
+
+               Perform squishy bin packing             GPU scheduler                       GPU scheduler          management plane allows developers to ingest and deploy ap-
+                                                               GPU                              GPU
+                                                                                                                  plications and models, at a timescale of hours to weeks. The
+                        Model
+                                                                                                                  control plane, via the global scheduler, is responsible for re-
+Model ingest
+                       Database                                                                                   source allocation and scheduling at a typical timescale of sec-
+                                                   Data flow          Control flow
+                                                                                                                  onds to minutes. The data plane, comprised of in-application
+                Figure 6: Nexus runtime system overview.                                                          Nexus library instances and backend modules (together, the
+                                                                                                                  Nexus runtime), dispatches and executes user requests at the
+SLO. One approach is to perform lazy dropping, i.e., drop                                                         timescale of milliseconds to seconds. The global scheduler
+a request only when it has already missed its deadline, and                                                       interacts with the underlying cluster resource manager (e.g.,
+determine the batch size based on the time budget remaining                                                       Mesos [16], Azure Scale Sets [23]) to acquire CPUs/GPUs
+for the earliest request in the queue (as in Clipper [6]). We                                                     for the frontend/backend. A load balancer (not shown) from
+use simulation to evaluate this approach for different batch-                                                     the underlying cluster spreads user requests across Nexus’s
+ing profiles (as modeled by Equation 1). We fix latency SLO                                                       distributed frontend. We sketch the three planes.
+to 100ms and optimal model throughput on a single GPU
+to 500 reqs/s, and vary α. Given the fixed throughput, the                                                        Management plane: Models are stored in a model database
+fixed cost of β reduces as we increase α. The workload is                                                         and may be accompanied by either a sample data set or a
+generated using uniform and Poisson arrivals with the mean                                                        batching profile. Nexus uses the sample dataset, if available,
+request rate set to 90% of the optimal throughput. We define                                                      to derive a batching profile. A profiler measures the execution
+the bad rate to be the percentage of requests that exceed                                                         latency and memory use for different batch sizes when the
+the deadline or get dropped. Figure 5 shows that the lazy                                                         models are uploaded to Nexus. Applications are containers
+dropping strategy performs poorly for Poisson distributions                                                       that provide the Nexus library to client programs. Devel-
+when α is small and β is correspondingly high. Since the sys-                                                     opers store these application containers in cluster-provided
+tem always attempts to execute the oldest received request,                                                       container repositories and may instruct Nexus to ingest a
+it often has to resort to a small batch size in order to meet the                                                 container, at which point it is loaded from the repository
+deadline, but this causes the dispatcher to fall behind further                                                   onto a frontend CPU.
+given the high fixed cost is not amortized over sufficient                                                        Control plane: The global scheduler is a cluster-wide re-
+requests. This experiment indicates that even the runtime                                                         source manager that uses load statistics from the runtime.
+needs to consider batch efficiency in determining what tasks                                                      It uses this profile to add or remove frontend and backend
+to dispatch.                                                                                                      nodes from the cluster, invokes the epoch scheduler to decide
+                                                                                                                  which models to execute and at what batch size, and which
+5     Nexus architecture                                                                                          backend to place the models on so as to balance the load
+The primary goal of Nexus is to attain high execution effi-                                                       and maximize utilization. Multiple models may be mapped
+ciency on GPU clusters while serving video analysis requests                                                      onto a single backend, albeit with an execution schedule that
+within a specified latency SLO. Our service model assumes                                                         ensures they do not interfere as in Section 4.1. The mapping
+that the system can drop requests if it cannot execute them                                                       from models to backends is captured in a routing table that is
+within their deadlines (following prior work [5]). Note that
+
+
+
+                                                                                                            327
+Nexus: A GPU Cluster Engine for Accelerating DNN-Based Video Analysis                        SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+sent to frontends. The matching execution schedule for each                      Notation    Description
+backend is captured in a schedule that is sent to backends.
+On receiving a routing table, frontends update their current                        Si       Session i
+routing table. On receiving a schedule, backends load ap-                          Mki       DNN model ki for session Si
+propriate models into GPU memory and set their execution                            Li       Latency constraint for session Si
+schedule.                                                                           Ri       Request rate for session Si
+  Allocation, scheduling, and routing updates happen at the                       ℓki (b)    Execution cost for Mki and batch size b
+granularity of an epoch, typically 30-60s, although a new                                           Table 3: Notation
+epoch can also be triggered by large changes in workload. To
+                                                                              structure of bin-packing [21], but we need to address the
+prevent oscillation from frequent reconfiguration, we limit
+                                                                              "squishiness" of tasks and the need to meet latency SLOs.
+the minimum period between two epochs to 10 seconds.
+Epoch scheduling involves the following:                                      Inputs: The scheduler is provided the request rate for a
+                                                                              model at a given latency SLO. We refer to the requests for a
+• Produce an updated split of the latency SLO for the indi-
+                                                                              given model and latency SLO as a session. Note that a session
+  vidual models inside a query (see Section 6.2).
+                                                                              would correspond to classification requests from different
+• Combine two or more models that share a prefix and
+                                                                              users and possibly different applications that invoke the
+  latency SLO into a new prefix-batched model (see Sec-
+                                                                              model with a given latency constraint. Table 3 describes
+  tion 6.3).
+                                                                              the notation used below. Formally, a session Si specifies a
+• Perform profile-guided squishy bin packing to allocate the
+                                                                              model Mki and a latency constraint Li , and there is a request
+  GPU resources for each model. (see Section 6.1).
+                                                                              rate of Ri associated with it. The scheduler is also provided
+   Because epoch scheduling reacts to workload change at                      with the batching profiles of different models. The latency
+the granularity of an epoch at best, Nexus relies on admis-                   of executing b invocations of Mki is ℓki (b). We assume that
+sion control that drops excessive requests to make sure that                  throughput is non-decreasing with batch size b.
+most (targeted for 99% in the evaluation) requests can be                     Scheduling overview: The scheduler allocates one or more
+served within their latency constraints within an epoch. Re-                  sessions to each GPU and specifies their target batch sizes.
+quests are dropped using an early-drop policy (see Adaptive                   Each GPU node n is then expected to cycle through the ses-
+Batching in Section 6.3).                                                     sions allocated to it, execute invocations of each model in
+Data plane: When a user request comes into (a replica of)                     batched mode, and complete one entire cycle of batched ex-
+an application container, the application invokes DNNs via                    ecutions within a duty cycle of dn . For sessions that have a
+the Nexus library API. The library consults the local routing                 sufficient number of user requests, one or more GPU nodes
+table to find a suitable backend for that model, dispatches the               are allocated to a single session. The integer programming
+request to the backend, and delivers responses back to the                    formulation and a greedy approximation algorithm described
+application. The application is responsible for packaging and                 below computes the residual workload for such sessions (af-
+delivering the end-result of the query to the user. A backend                 ter allocating an integral number of GPUs) and then attempts
+module uses multiple threads to queue requests from various                   to perform bin packing with the remaining smaller sessions.
+frontends, selects and executes models on these inputs in a                   Scheduling Large Sessions: For session Si , we first com-
+batched mode according to the current schedule, and sends                     pute the peak throughput of Mki when executed in isolation
+back the results to frontends. It can utilize one or more GPUs                on a GPU. With a batch size b, the worst case latency for any
+on a given node, with each GPU managed by a GPU scheduler                     given request is 2ℓki (b), as we explained in Section 4.1. De-
+that schedules tasks on it.                                                   note batch size Bi as the maximum value for b that meets the
+                                                                              constraint 2ℓki (b) ≤ Li . Therefore, the maximal throughput,
+6     Batch-aware scheduling and dispatch
+                                                                              denoted by Ti , for session Si on a single GPU is Bi /ℓki (Bi ).
+We now describe the algorithms used by the global scheduler                   The number of GPU nodes we allocate to execute just Si
+and the node dispatcher. First, we consider the case of sched-                requests is n = ⌊Ri /Ti ⌋. There will be a residual unallocated
+uling streams of individual DNN task requests, given their                    load for session Si after taking into account this allocated
+expected arrival rates and latency SLOs. We next consider                     load. Note that n = 0 for sessions that don’t have sufficient
+how to schedule streams of more complex queries/jobs that                     requests to utilize an entire GPU. (Function ScheduleSatu-
+invoke multiple DNN tasks. We then describe how the node                      rate in Algorithm 1 provides the pseudocode.)
+runtime cycles through DNNs and performs batching.
+                                                                              Optimization problem for scheduling residual work-
+6.1    Scheduling streams of individual DNN tasks                             load: We next consider the problem of scheduling the resid-
+We build upon the discussion presented in Section 4.1. The                    ual loads, i.e., a workload where none of the models have
+scheduler identifies for each cluster node the models hosted                  sufficient load to need an entire GPU. The optimization prob-
+by it. As discussed earlier, the scheduling problem has the                   lem can be expressed as an integer programming problem.
+
+
+
+
+                                                                        328
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada      H. Shen, L. Chen, Y. Jin, L. Zhao, B. Kong, M. Philipose, A. Krishnamurthy, and R. Sundaram
+
+
+                                                                               Algorithm 1 Squishy Bin Packing Algorithm
+ Decision Variables Definition
+                                                                                     SqishyBinPacking(Sessions)
+    дj ∈ {0, 1}            Whether GPU j is in use                              1: nodes, residue_loads ← ScheduleSaturate(Sessions)
+    si j ∈ {0, 1}          Whether session i is assigned to GPU j               2: nodes ← nodes ⊕ ScheduleResidule(residue_loads)
+     bi j ∈ R ≥0           Batch size of session i on GPU j                     3: return nodes
+
+  We need to minimize: j дj , while subject to:
+                             Í
+                                                                                     ScheduleSaturate(Sessions)
+            s i j = 1 → дj = 1               ∀j              (a)                4: nodes, residue_loads ← [], []
+            Õ                                                                   5: for S i = ⟨Mki , Li , R i ⟩ in Sessions do
+                   si j = 1                  ∀i              (b)                       Bi ← argmaxb (2ℓki (b) ≤ Li )
+                 j                                                              6:
+              s i j = 0 → bi j = 0             ∀i, j               (c)          7:    Ti ← Bi /ℓki (Bi )
+                                                                                8:     let Ri = n · Ti + r i
+              s i j = 1 → bi j ≥ 1             ∀i, j              (d)           9:     nodes ← nodes ⊕ n GPU nodes for Mki with batch Bi
+                                                                                       residue_loads ← residue_loads ⊕⟨Mki , Li , r i ⟩
+                          Õ
+                     dj =          ℓki (bi j ) ∀j                  (e)         10:
+                                i:t i j =1
+                                                                               11: return nodes, residue_loads
+       d j + ℓki (bi j ) ≤ Li                  ∀i, j (si j = 1)    (f)
+               bi j ≥ r i d j          ∀i, j (si j = 1) (g)                          ScheduleResidue(residue_loads)
+                                                                               12: for ⟨Mki , Li , r i ⟩ in residue_loads do
+The constraints correspond to the following requirements.
+                                                                               13:    bi ← argmaxb (ℓki (b) + b/r i ≤ Li )
+  (a) Sessions can only be assigned to GPUs that are in use.                   14:    di ← bi /r i
+  (b) Each session can only be assigned to one GPU.                            15:    occ i ← ℓki (bi )/di
+  (c) bi j is 0 if i is not assigned to GPU j.                                 16: sort residue_loads by occ i in descending order
+  (d) bi j is at least 1 if i is assigned to GPU j.                            17: nodes ← []
+  (e) Length of a duty cycle as a function of assigned ses-                    18: for ⟨Mki , Li , r i , bi , di , occ i ⟩ in residue_loads do
+      sions.                                                                   19:    max_occ ← 0
+  (f) Latency SLO constraint.                                                  20:    max_node ← NULL
+                                                                               21:    for n = ⟨b, d, occ⟩ in nodes do
+  (g) Scheduled rate meets the request rate requirement.
+                                                                               22:        n ′ ← MergeNodes(n, ⟨bi , di , occ i ⟩)
+Note that some of the constraints are not linear, and we                       23:        if n ′ , NULL and n ′ .occ > max_occ then
+omit details on how to express them in a strictly linear way.                  24:             max_occ ← n ′ .occ
+We used the CPLEX package to solve this formulation on                         25:             max_node ← n ′
+benchmark workloads. Even after incorporating optimiza-                        26:    if max_node , NULL then
+                                                                               27:        replace max_node for its original node in nodes
+tions, such as using a greedy algorithm to provide both an
+                                                                               28:    else
+initial feasible solution and an upper bound for the number of
+                                                                               29:        nodes ← nodes ⊕⟨bi , di , occ i ⟩
+GPUs needed, solving the integer program is expensive. For
+                                                                               30: return nodes
+example, computing the minimum number of GPUs for 25
+sessions takes several hours, even though the upper bound,                     them into existing duty cycles that have the highest alloca-
+determined via a greedy algorithm, is 8 GPUs. Further this                     tions, thus following the design principle behind the best-fit
+optimization problem is proven to be strongly NP-hard (see                     decreasing technique for traditional bin packing.
+Appendix A). We, therefore, resort to the following greedy                        We now elaborate on this greedy scheduling algorithm
+scheduling algorithm.                                                          (which is also depicted in function ScheduleResidue of
+Greedy scheduling algorithm for residual loads: For                            Algorithm 1). Denote r i to be the request rate of a residual
+the bin packing process, the scheduler inspects each residual                  load. Suppose we execute the residual load with batch size b,
+session in isolation and computes the largest batch size and                   the duty cycle d for gathering b inputs is b/r i . Then, the worst
+the corresponding duty cycle in order to meet the through-                     case latency is d + ℓki (b). Therefore, we have the constraint:
+put and SLO needs. The intuition behind choosing the largest                                     d + ℓki (b) = b/r i + ℓki (b) ≤ Li           (2)
+batch size is to have an initial schedule wherein the GPU op-                     We begin residual load scheduling (Line 12-15) by choos-
+erates at the highest efficiency. This initial schedule, however,              ing for session Si the maximum batch size bi that satisfies the
+is not cost-effective as it assumes that each GPU is running                   above constraint. The corresponding duty cycle di is also at
+just one session within its duty cycle, so the algorithm then                  its maximal value. Denote occupancy (occ) as the fraction of
+attempts to merge multiple sessions within a GPU’s duty                        the duty cycle di occupied by Si ’s residual load invocations:
+cycle. In doing so, it should not violate the latency SLOs, so                 occi (bi ) = ℓki (bi )/di .
+we require that the merging process only reduces the duty                         Next, we start to merge these fractional GPU nodes into
+cycle of the combined allocation. The algorithm considers                      fewer nodes (Line 16-30 in Algorithm 1). This part resembles
+sessions in decreasing order of associated work and merges
+
+
+
+                                                                         329
+Nexus: A GPU Cluster Engine for Accelerating DNN-Based Video Analysis                         SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+                                duty cycle d1
+                                                                                                                       car
+            Node 1
+
+            Node 2                                                                            input           SSD              output
+
+                     batch b2
+
+            Node 1
+                                                                                                                      face
+
+            Node 2
+                                                                                Figure 8: Dataflow graph of traffic analysis application.
+
+            Merged                                                            determine the latency SLO splits for the constituent models.
+             Node                                                             The output of this analysis is given as input to the scheduling
+Figure 7: Merge two nodes into one. Use the smaller duty cy-                  algorithm of Section 6.1 that works with individual models.
+cle as new duty cycle for both nodes. Update the batch size                      Query analysis extracts the dataflow dependency graph
+accordingly and re-estimate the batch latency. If sum of la-                  between model invocations in application code. For example,
+tencies doesn’t exceed new duty cycle, the two nodes can be                   Figure 8 depicts a traffic analysis application that first uses
+merged.                                                                       the SSD model to detect objects and recognizes cars and faces
+                                                                              correspondingly. We formulate the scheduling of queries
+the classic bin packing algorithm that first sorts sessions by
+                                                                              as the following optimization problem. Suppose the query
+decreasing occupancy and merges two nodes into a single
+                                                                              involves a set of models Mi with request rate Ri , and the
+node by best fit. The primary difference is how to determine
+                                                                              end-to-end latency SLO is L. The objective is to find the best
+whether two nodes can be merged such that their sessions
+                                                                              latency SLO split Li for each model Mi to minimize the total
+won’t violate the latency SLOs. Figure 7 depicts the process
+                                                                              number of GPUs that are required for the query. Because
+of merging two nodes. Suppose we have two sessions S 1 and
+                                                                              latency Li is determined by batch size bi , the optimization
+S 2 on separate nodes, with request rates r 1 and r 2 , assigned
+                                                                              problem is equivalent to finding the best batch sizes that
+batch sizes b1 and b2 , and duty cycles d 1 and d 2 . We use
+                                                                              minimizes GPU count, while meeting the latency SLO along
+d = min(d 1 , d 2 ) as the new duty cycle of a combined node.
+                                                                              every path from the root model (M root ) to the leaf models.
+Without loss of generality, we assume d = d 2 . We then use                                          Õ
+b1′ = d · r 1 ≤ b1 as the new batch size for S 1 . Note that                            minimize         Rv lv (bv )/bv
+                                                                                            {bv }
+the worst case latency of requests in S 1 now becomes d +                                                 v
+                                                                                                          Õ
+ℓk1 (b1′ ) ≤ d 1 + ℓk1 (b1 ) ≤ Li , and we won’t violate the latency                     subject to             lu (bu ) ≤ L   ∀v ∈ leaf
+constraint for S 1 by this adjustment. If ℓk1 (b1′ ) + ℓk2 (b2 ) ≤ d                                  u:M root {Mv
+and memory capacity permits, a single node can handle                            We use dynamic programming to solve this optimization
+the computation of both S 1 and S 2 , and we allocate these                   problem for the case of fork-join dependency graphs, but
+two sessions to the same node. While the above discussion                     limit our exposition to the simpler case of tree-like depen-
+considers merging two sessions, the underlying principle                      dency graphs. For example, Figure 8 can be treated as a
+generalizes to nodes containing multiple sessions.                            tree-structured dependency graph models (we can as the out-
+    Note that this algorithm does not assume the linear rela-                 put does not invoke additional DNN models. Denote f (u, t)
+tionship between execution latency and batch size mentioned                   as the minimum number of GPUs required to run models
+in Equation 1. The algorithm only assumes that the latency                    represented by u and the subtree at u within the time budget
+per input, ℓ(b)/b, is non-decreasing with batch size b.                       t. For a non-leaf node u, the algorithm allocates a time bud-
+    Finally, we extend the algorithm to be incremental across                 get k for node u and at most t − k for the rest of the subtree,
+epochs, thus minimizing the movement of models across                         and it then enumerates all k ≤ t to find the optimal split.
+nodes. If the overall workload decreases, the scheduler at-                   More formally,
+tempts to move sessions from the least utilized backends to                                    (                                                  )
+                                                                                                           lu (b)                  Õ
+other backends. If a backend no longer executes any session,                  f (u, t) = min       min Ru         + ′ min              f (v, t ′)
+the scheduler releases the backend. If workload increases                               k :k ≤t b:lu (b)≤k   b     t :t ′ ≤t −k
+                                                                                                                                v:M →M
+                                                                                                                                    u      v
+such that a backend becomes overloaded, we evict the cheap-                      Since the dynamic programming cannot handle contin-
+est sessions on this backend until it is no longer overloaded                 uous state space, we approximate the state space of time
+and perform bin packing again to relocate these evicted ses-                  budget with L/ε pieces of segments, where ε is the length of
+sions.                                                                        a segment. The time complexity is quadratic in L/ε.
+
+6.2   Scheduling complex queries                                              6.3   Batch-aware dispatch
+We now present the query analysis algorithm that operates                     We now briefly describe the runtime mechanisms that con-
+on dataflow representations of application queries in order to                trol the execution of DNN tasks on backend nodes.
+
+
+
+                                                                        330
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada   H. Shen, L. Chen, Y. Jin, L. Zhao, B. Kong, M. Philipose, A. Krishnamurthy, and R. Sundaram
+
+
+Overlapping CPU and GPU computation: DNN tasks                                                         500
+
+
+
+
+                                                                                  Throughput (req/s)
+can be decomposed into three stages: pre-processing (includ-                                           400
+ing decoding and batching images), forwarding, and post-
+                                                                                                       300
+processing. Pre- and post-processing are usually done on the
+                                                                                                       200
+                                                                                                                   lazy drop
+CPU since they are not compute-intensive, whereas forward-
+                                                                                                                   early drop
+ing of a neural network model runs on the GPU. In order to                                             100
+                                                                                                                   optimal
+achieve maximum GPU utilization, it is necessary to over-                                               0
+lap the CPU computation and GPU computation. Therefore,                                                      1.0    1.2     1.4      1.6   1.8
+                                                                                                                            α (ms)
+the Nexus backend uses a thread pool of workers that pre-
+process the requests for the next batch and post-process the              Figure 9: Maximal throughput achieved by lazy drop and
+outputs of the previous batch on CPU, while another thread                early drop policy under various α.
+is dedicated to launching batched executions on the GPU.
+We observe experimentally that it usually takes 4 to 5 CPU                global scheduler for a given session. It stops at the first re-
+cores to saturate GPU throughput, depending on the amount                 quest that has enough budget for batched execution latency
+of computation in the models. Nexus uses an event-driven                  of the entire window and drops all earlier requests. We use
+approach [28] to handling I/O, pre- and post-processing.                  simulation to compare the lazy drop and early drop policy.
+                                                                          Similar to Figure 5, we fix latency SLO to 100ms and optimal
+GPU Multiplexing: DNN frameworks provide no specific
+                                                                          throughput to 500 reqs/s. Figure 9 depicts the throughput
+support for the concurrent execution of multiple models. For
+                                                                          achieved by lazy drop and early drop policy under different
+example, if two models that share a GPU execute in two pro-
+                                                                          α when 99% of requests are served within latency SLO. The
+cesses or containers, they will independently issue requests
+                                                                          results show that early drop can achieve up to 25% higher
+to execute layers/kernels to the underlying GPU. The GPU
+                                                                          throughput than lazy drop.
+runtime will typically serve these requests in first-come-first-
+served fashion, resulting in an arbitrary interleaving of the
+operations for the two models. The interleaving increases                 7     Evaluation
+the execution latency of both models and makes it hard to                 We implemented Nexus in roughly 10k lines of C++ code.
+predict the latency. Instead, the Nexus node runtime man-                 Nexus supports the execution of models trained by various
+ages the execution of all models on a GPU, so it is able to               frameworks including Caffe [18], Caffe2 [9], Tensorflow (TF)
+pick batch sizes and execution schedules for all models in                [1], and Darknet [32]. Nexus can be deployed in a cluster
+a round-robin fashion to make sure models abide by their                  using Docker Swarm [7] (used below) or Kubernetes [11]. In
+latency SLOs. In addition, Nexus overlaps the pre- and post-              our evaluation, we use this implementation to answer the
+processing in CPU with the GPU execution to increase GPU                  following questions. (1) Does using Nexus result in better
+utilization.                                                              cluster utilization while meeting SLOs with respect to exist-
+Prefix Batching: Another important observation is that                    ing systems? (2) Does high performance persist when Nexus
+transfer learning [8, 26, 34, 36, 40] adapts a model from one             is used at a large scale? (3) How do the new techniques in
+dataset to another or from one task to another by re-training             Nexus contribute to its performance? (4) What determines
+only the last few layers. DNN frameworks assume that if                   how well each of these techniques work?
+models differ in any layer, they cannot be executed in a                     For a given workload and cluster, we refer to the maximum
+batched fashion at all. However, in the common setting of                 rate of queries that Nexus can process such that 99% of them
+model specialization, several models may differ only by their             are served within their latency SLOs as its throughput. We
+output layer. Batching the execution of all but the output                use throughput as the primary measure of cluster utilization.
+layer can yield substantial batching gains. Nexus computes
+the hash of every sub-tree of the model schema and compares               7.1    Workload
+it with the existing models in the database to identify com-              Our basic approach is to run Nexus (and its various configu-
+mon sub-trees when a model is uploaded. At runtime, models                rations and competitors) on either a small (16-GPU) or a large
+with known common sub-trees are loaded partially in the                   (100-GPU) cluster on various mixes of the applications and
+backend and batched at the sub-tree (or prefix) granularity.              input videos specified in Table 4. These applications are mod-
+The different suffix parts are then executed sequentially.                eled closely on widely-known video analysis scenarios, but
+Adaptive Batching: As discussed in Section 4.3, lazy drop-                we implemented each of them since we are unaware of freely
+ping during dispatch could lead to small batch sizes and low              available, widely used versions. They encompass a wide va-
+efficiency. In Nexus, we use an early drop policy that skips              riety of characteristics. Some (e.g., game and traffic, which
+over requests that would cause sub-optimal batching. Specif-              implements Figure 8) are based on 24/7 live video streams,
+ically, the dispatcher scans through the queue using a sliding            whereas others (e.g., dance and logo) apply to footage of
+window whose length is the batch size determined by the                   individual performances. Some require simple queries (e.g.,
+
+
+
+                                                                    331
+Nexus: A GPU Cluster Engine for Accelerating DNN-Based Video Analysis                                                                  SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+           brief                models                video                  Nexus
+ name                                                                                                                                              4120
+                                                                                                                               4000
+
+
+
+
+                                                                                                         Throughput (reqs/s)
+           description          used                  input                  features used
+                                                                                                                                                           3628
+ game      analyze streamed     text, object rec.     Twitch [37] streams,   SS, ED, QA-1,
+           video games                                1 week, 50 streamers   PB                                                3000
+                                                                                                                                                                  2489   2413
+ traffic   surveil traffic on   object det., face     traffic cameras, 1     SS, ED, QA-2
+           streets              rec.                  week, 20 cameras                                                         2000
+ dance     rate dance perfor-   person det., pose     dance videos from      SS, ED, QA-2
+           mances               rec.                  YouTube, 2 hrs
+                                                                                                                               1000
+ bb        gauge response       person, face det.,    game show audience     SS, ED, QA-3,                                             324   440                                325
+           to public bill-      gaze, age, sex rec.   videos, 12 hours       PB
+                                                                                                                                 0
+           board
+                                                                                                                                        TF Clipper Nexus   -PB    -SS    -ED    -OL
+ bike      find bike-rack oc-   object, text det./    traffic cameras, 1     SS, ED, QA-4,                                            serving
+           cupancy on buses     rec./ trk.            week, 10 cameras       PB
+
+ amber     match vehicle to     object det., car      dashcam videos from    SS, ED, QA-4,                                        Figure 10: Game analysis ablation study.
+           "Amber Alert" de-    make+model rec.,      YouTube, 12 hours      PB
+           scription            text det./rec.
+                                                                                                   model replicas. In contrast, TF does not provide a frontend
+ logo      audit corporate      person        icon,   NFL, NBA game          SS, ED, QA-5,
+           logo placeement      pose, text, person    videos, 24 hours       PB                    load balancer, nor does it allow the specification of latency
+                                det./rec.                                                          SLOs per request. We, therefore, provide a dispatcher and
+Table 4: Evaluated application and input data. Squishy                                             pick the maximum batch size for each model, so its SLO is
+scheduling, early drop, complex query analysis and prefix-                                         not violated.
+batching are abbreviated as SS, ED, QA and PB. QA-k indi-
+                                                                                                   7.3               Single-application case studies
+cates that the related complex query has k stages. Models
+for detection, recognition and tracking are abbreviated ‘det.’,                                    To compare our performance with those of Clipper and TF
+‘rec.’ and ‘trk.’                                                                                  Serving, we ran the game and traffic applications sepa-
+game, designated "QA-1" has 1 stage), and others more com-                                         rately on a 16-GPU cluster. In each case, we ran an ablation
+plex ones (e.g., the 5-stage logo, designated "QA-5", seeks to                                     study on Nexus features to gauge their impact.
+detect people, find their torsos, look for logos, and if found,                                    7.3.1                       Game analysis
+detect and recognize the player’s number). Most use multiple                                       When analyzing game streams, we seek to recognize six
+specialized versions of models and are therefore amenable to                                       numbers (e.g., number of kills, number of players alive) and
+prefix batching, designated "PA". For each workload, we have                                       one object icon on each frame. We use versions of LeNet [22]
+collected several hours and many streams (for live streams)                                        specialized to the game’s font and the number of digits to
+or files (for episodes) of video, which sample and play in                                         recognize numbers, and ResNet-50 [15] with its last layer
+a loop to preserve temporal characteristics while allowing                                         specialized to recognize the icon. We include 20 games in
+arbitrarily long simulations. Unless otherwise mentioned,                                          the case study, and consider a latency SLO of 50ms (sensi-
+we sample inter-arrival time between frames uniformly.                                             tivity to SLOs is analyzed in Section 7.5). The request rates
+7.2      Using Clipper and Tensorflow as baselines                                                 of frames from the 20 games follow the Zipf-0.9 distribution.
+Clipper and TF Serving assume cluster scheduling and la-                                           We noticed that both Clipper and TF show extremely poor
+tency SLOs for DNN invocations are handled externally.                                             throughput on the tiny LeNet model. We conjecture, but
+Careful scheduling and latency allocation are two of Nexus’s                                       could not confirm, that this is because of inadequate paral-
+core contributions. To provide a basis for comparison, we                                          lelism between CPU and GPU processing. To be maximally
+furnish simple default versions of each. A batch-oblivious                                         fair to them, we allow the two baselines to invoke just the
+scheduler2 greedily allocates to each model/SLO a share of                                         ResNet model. Their resulting throughput, which we report,
+the cluster proportional to its request rate and inversely pro-                                    is better by over 4× than including LeNet. Finally, we addi-
+portional to its maximum single-node throughput. Further,                                          tively turn off prefix batching (PB), squishy scheduling (SS),
+we split the latency for a query evenly across its stages. The                                     early drop (ED), and overlapped processing in the CPU and
+oblivious scheduler may map multiple models onto a Clip-                                           GPU (OL, see Section 6.3). The game query has only 1 stage
+per GPU, in which case we launch one container per model                                           and, therefore, does not exercise query analysis (QA).
+on the GPU. We rely on Clipper’s load balancer to manage                                              Figure 10 shows the results. Nexus increases through-
+                                                                                                   put significantly, by 9.4 and 12.7× relative to Clipper and
+2 Note that we retain Clipper’s adaptive batching, which is orthogonal to                          TF Serving on this application. Several of Nexus’s tech-
+the scheduling scheme used, in all experiments. Adaptive batching groups                           niques contribute, with OL the most (incrementally dis-
+requests into batches on a single backend node, adapting the batch size                            abling OL results in an additional 7.4× throughput reduction),
+dynamically to get higher throughput. Scheduling, on the other hand, works                         and ED the least (disabling it results in a 3% reduction). Note
+at cluster-scale over a coarse epoch granularity and performs resource
+                                                                                                   that even though OL is the dominant technique for this appli-
+allocation. In particular, it determines how many replicas to use for each
+model, and which GPUs to place them on. Clipper assumes an external
+                                                                                                   cation, the other Nexus techniques together result in a 48%
+scheduler, so we had to provide a batch-oblivious scheduler as a reasonable                        fall in throughput (from 4120 to 2143 req/s) when disabled.
+baseline.                                                                                          ED is designed to address variability in requests. When we
+
+
+
+                                                                                             332
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                     H. Shen, L. Chen, Y. Jin, L. Zhao, B. Kong, M. Philipose, A. Krishnamurthy, and R. Sundaram
+
+
+                           600
+                                               534                                                                                                                      534
+                                                                                                                                    TF serving
+     Throughput (reqs/s)
+
+
+
+
+                                                                                                  Throughput (reqs/s)
+                           500                                                                                          500
+                                                      433                                                                           Clipper                       433
+                           400                                                                                          400         Nexus w/o QA
+                                                            337   326
+                                        297                                                                                         Nexus                   297
+                           300                                                                                          300
+                                                                                                                                          254   264
+                                  227                                   216                                                                           227
+                           200                                                                                          200
+                                                                                                                              146
+                           100
+                                                                                                                        100          61
+                            0
+                                   TF Clipper Nexus   -QA   -SS   -ED   -OL                                              0
+                                 serving                                                                                            rush hour          non-rush hour
+
+                             Figure 11: Traffic analysis ablation study.                    Figure 12: Diurnal throughput variation for traffic analysis.
+
+re-ran the experiments with frame inter-arrival rates sam-                                  much smaller in this application: disabling OL incremen-
+pled from a Poisson distribution as opposed to uniform, the                                 tally results in throughput falling only by a further 34%
+significance of ED increases, and throughput drops by a more                                (from 326 to 216 req/s), as opposed to the previous 7.4×
+significant 8.5%.                                                                           drop. Through more detailed analysis, we confirm that the
+   Disabling OL causes a dramatic reduction in throughput                                   more relaxed SLO enables large-batch execution, which to-
+for this application because of a complex interaction between                               gether with the large model forwarding time renders the
+its tight (50ms) SLO, relatively high preprocessing times                                   preprocessing time relatively small (so less of the GPU stays
+(roughly 10ms), and the low forwarding times of the models                                  idle) and allows high throughput due to batch execution.
+(roughly 6ms for ResNet-50 and under 0.1ms for LeNet).                                         Unlike game, traffic is a two-stage application: the first
+Serializing preprocessing with GPU execution for each batch                                 stage detects vehicles or people, and the second stage recog-
+results in roughly half the cycles of the GPU remaining idle.                               nizes their make/model or identity. Query Analysis (QA) is
+Further, given the tight SLO and the latency of preprocessing,                              thus applicable. Instead of splitting latency evenly (which is
+batch sizes need to remain close to 1 to guarantee timely                                   the baseline, represented by -QA the figure), QA allocates
+execution. These small batch sizes have many times lower                                    345ms of the 400ms latency to object detection via SSD. Dis-
+throughput than the optimal large batches. Taken together,                                  abling QA results in a significant throughput loss, with
+these factors result in a large throughput loss, making                                     throughput falling by 19% (from 534 to 433 req/s).
+OL critical in the tight-SLO/small model regime. As the                                        An interesting aspect of the traffic application is that the
+analysis for the traffic monitoring application (Figure 11)                                 nature of data analysis depends strongly on whether the
+below shows, with more relaxed SLOs and larger models, the                                  traffic being analyzed is rush-hour. Figure 12 summarizes
+importance of overlapped preprocessing (OL) is diminished.                                  throughput achieved on non-rush-hour vs rush-hour traffic.
+                                                                                            Three points are worth noting. First, throughput achieved
+7.3.2                      Traffic monitoring                                               during rush hour is significantly less than that during non-
+traffic uses SSD [4], VGG-Face [29] and GoogleNet-car [39]                                  rush hour. This is because rush-hour traffic is more complex:
+for object detection, face recognition and car make/model                                   more vehicles are detected, and require follow-on analysis,
+analysis on 20 long-running traffic streams with a latency                                  on every frame. Second, although during rush hour, the ben-
+SLO of 400ms. These models are larger than those used in                                    efit of Nexus relative to the TF Serving baseline falls (from
+the game analysis case: the largest (SSD), which is invoked                                 534/227 = 2.4× during non-rush hour to 264/146 = 1.8× dur-
+on every frame, runs for 47ms at batchsize 1 and the smallest                               ing rush hour)4 , the benefit provided by Nexus is still
+(Googlenet) runs for 4.2ms, compared to 6.2ms/0.1ms for                                     significant. In particular, the relative benefit of the QA tech-
+gaming.                                                                                     nique also falls. This seems to be because various subsystems
+   Our first experiment replicates the cumulative ablation                                  are over-subscribed during rush hour.
+test that we performed on gaming analysis in the previ-
+                                                                                            7.4                         Long-running multi-application deployment
+ous section. Figure 11 shows the results for analyzing non-
+rush-hour traffic data.3 Once again, maximum through-                                       To check whether Nexus maintains its gains when run at
+put comes from many Nexus techniques working to-                                            large scale, especially in the face of significant workload
+gether. All techniques other than OL, when disabled to-                                     variation across multiple applications, we deployed Nexus
+gether, result in a signficant 39% performance drop relative                                on a cluster ranging from 16 to 100 GPUs on a commercial
+to full Nexus (throughput falls from 534 to 326 req/s). Further,                            cloud, running all applications from Table 4 simultaneously
+the contribution of ED is small.                                                            for a period of several hours. We focused on two metrics.
+   On the other hand, the relative contribution of OL is                                    First, how close to optimal is GPU utilization during this
+                                                                                            4 We were unable to determine why the relative performance of Clipper fell
+3 See the analysis below comparing rush-hour with non-rush-hour results.                    so sharply on rush-hour data.
+
+
+
+
+                                                                                      333
+Nexus: A GPU Cluster Engine for Accelerating DNN-Based Video Analysis                                                                 SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+
+
+                                                                               GPU cluster usage Workload (reqs/s)
+period? Second, how well does Nexus react to workload
+                                                                                                                     6000
+changes?
+                                                                                                                     4000
+   We first study the optimality of Nexus by using the uni-
+                                                                                                                     2000
+form distribution to generate highly controlled workloads for
+                                                                                                                        0
+the applications and perform the evaluation on a cluster of 16                                                       100%
+
+GTX 1080Ti GPUs. To bound the optimal (smallest) number                                                              75%
+
+of GPUs needed for a session, we assumed that its model is                                                           50%
+
+fully (not just prefix) batchable, that its SLO allows it to run                                                     25%
+
+at the optimal batch size, and that it has enough requests                                                            0%
+
+coming in to be scheduled back-to-back on GPUs. Of course,                                                  10.0%
+
+
+
+
+                                                                              Bad rate
+real sessions often violate one or more of these assumptions
+                                                                                                                     1.0%
+and will have lower throughput. Nexus achieved a bad rate of
+less than 1% consistently and used 11.7 GPUs on average. We                                                          0.1%
+
+then computed the theoretical lower bound of the number                                                                     0             200             400                                    600              800            1000
+                                                                                                                                                                 Time (s)
+of GPUs required based on the maximal throughput that a
+model can achieve on a single GPU. The lower bound for                        Figure 13: A 1000 sec window from our large-scale deploy-
+this workload is 9.8 GPUs on average. It indicates that Nexus                 ment.
+scheduler can achieve 84% of GPU efficiency compared to                                                                         Clipper             TF serving                                         Nexus-parallel         Nexus
+                                                                                                                                                                                          1400
+
+
+
+
+                                                                                     Throughput (reqs/sec)
+
+
+
+
+                                                                                                                                                                  Throughput (reqs/sec)
+the theoretical lower bound.                                                                                         1200
+                                                                                                                                                                                          1200
+                                                                                                                     1000                                                                 1000
+   Next, we deploy Nexus on 100 K80s and evaluate work-                                                               800                                                                 800
+loads with varying Poisson arrival rates. In particular, we                                                           600                                                                 600
+                                                                                                                      400                                                                 400
+fixed the number of model sessions, designated by a given
+                                                                                                                      200                                                                 200
+model and its latency SLO, per application (e.g., game had                                                             0                                                                    0
+                                                                                                                            2        3          4           5                                    50        100          150     200
+50 model sessions, traffic had 20), but varied the request                                                                        Number of models                                                       Latency SLO (ms)
+
+rate per session by varying the rate at which each submitted
+                                                                                                                                     (a)                                                                    (b)
+frames.
+   Figure 13 shows Nexus adapting to a change in workload                     Figure 14: Impact on throughput of varying numbers of
+during a 1000-sec window of the deployment. The top panel                     models served (a) and latency SLOs (b) under GPU multiplex-
+shows a stacked graph of requests over time, the middle                       ing.
+one the number of GPUs allocated and the bottom one the
+                                                                              GPU, and not waiting for fixed target batch sizes to fill up
+bad rate, with instantaneous bad rates above 1% marked in
+                                                                              before dispatch to the GPU).
+red. Around 326s into the window, the number of requests
+                                                                                 Figure 14 analyzes the importance of these features by
+increases and starts varying significantly. Nexus, which is
+                                                                              comparing the throughput of Nexus with those of Clipper,
+running with 30s epochs, starts dropping requests, detects
+                                                                              TF Serving, and a version of Nexus ("Nexus-parallel") that
+the change within 12s (this could have been as long as 30s)
+                                                                              issues models in parallel and does not control interference.
+and allocates more GPUs. It deallocates GPUs (this time with
+                                                                              This experiment runs increasing numbers of copies of the In-
+a roughly 10s lag) at the 644s mark when demand subsides.
+                                                                              ception model with a latency SLO of 100ms. Throughputs of
+Nexus violates the latency SLOs on 0.27% of requests on
+                                                                              all four models suffer, TF Serving less than Clipper because
+average. The sporadic high bad rate (>1%) is mainly due to
+                                                                              it runs models in a round-robin fashion whereas Clipper de-
+scheduling reconfiguration triggered by workload changes.
+                                                                              ploys them in independent containers that interfere. Nexus
+   These results illustrate that Nexus responds well to
+                                                                              achieves 1.4–2.1× throughput compared to TF serving, and
+variable workloads at large scale and is able to allocate
+                                                                              1.9–9.8× throughput compared to Clipper on a single GPU.
+close to the aggressive theoretical lower bound.
+                                                                              Nexus-parallel fares better because it avoids idling (but still
+7.5   Sensitivity analysis of Nexus features                                  suffers from interference), and Nexus fares the best. We see
+                                                                              similar trends across other models. Figure 14(b) compares
+We now present micro-benchmarks to analyze the main com-
+                                                                              the throughput while varying the latency SLO from 50ms
+ponents of Nexus. Overall, we find that Nexus’s core tech-
+                                                                              to 200ms, with the number of models fixed at 3. When la-
+niques are quite robust to variations in key design parame-
+                                                                              tency SLO becomes higher, the greater scheduling slack gives
+ters.
+                                                                              Nexus-parallel higher throughput.
+GPU Multiplexing. The Nexus runtime (Section 6.3) fo-
+                                                                              Prefix Batching. Figure 15 examines how the throughput
+cuses on minimizing interference on GPU between execut-
+                                                                              and memory benefits of prefix batching scale as the num-
+ing models (by avoiding interleaving during their execution),
+                                                                              ber of variants of Resnet50 that differ only in the last layer
+and idling while switching between models (by overlapping
+                                                                              increases, on a single GPU. Figure 15(a), compares prefix
+pre/post-processing on CPU with model execution on the
+
+
+
+                                                                        334
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                                       H. Shen, L. Chen, Y. Jin, L. Zhao, B. Kong, M. Philipose, A. Krishnamurthy, and R. Sundaram
+
+
+                        500                                                    10000       w/o prefix                1 FC                                                      Baseline                                                          Nexus
+                                                                                           batch
+Throughput (reqs/sec)
+
+
+
+
+                                                                                                                     2 FC
+                        400                                                    8000                                  3 FC
+
+
+
+
+                                                                 Memory (MB)
+
+
+
+
+                                                                                                                                   Relative throughput
+                                                                                                                                                           1.50
+                        300                                                    6000
+
+
+
+
+                                                                                                                                                                       6736
+
+
+
+
+                                                                                                                                                                                       3040
+
+
+
+
+                                                                                                                                                                                                           3710
+
+
+
+
+                                                                                                                                                                                                                            1271
+
+
+
+
+                                                                                                                                                                                                                                               4736
+                                                                                                                                                           1.25
+                        200                                                    4000
+
+
+                        100       w/o prefix batch                             2000                                                                        1.00
+                                  w/ prefix batch
+                         0                                                        0                                                                        0.75
+                              2        4       6        8   10                         2        4       6        8     10
+                                     Number of models                                         Number of models
+                                                                                                                                                           0.50
+
+                                        (a)                                                     (b)                                                        0.25
+
+                                                                                                                                                           0.00
+Figure 15: Impact on throughput (a) and memory use (b) of                                                                                                            Mix SLOs         Mix SLOs            Mix rates        Mix rates      Mix models
+varying numbers of batched models under prefix batching.                                                                                                             Inception         ResNet             Inception         ResNet          & SLOs
+
+
+batching to unbatched execution of the variants. Without                                                                          Figure 16: Impact on throughput of varying model- and SLO-
+prefix batching, the variants have to execute on smaller                                                                          mixes under squishy scheduling.
+"sub-batches" to satisfy their SLOs, yielding worse aggregate
+                                                                                                                                                          350         Baseline          Nexus
+throughput. With prefix batching, since many models can
+execute in one batch, the sub-batches can be aggregated into                                                                                              300
+
+
+
+
+                                                                                                                                  Throughput (reqs/sec)
+large batches that maintain up to 110% higher throughput.                                                                                                 250
+
+   Similarly, when the (unshared) model suffixes are small                                                                                                200
+("1 FC", indicating one "fully connected" unshared layer, in
+                                                                                                                                                          150
+Figure 15(b)), additional model variants use negligible extra
+                                                                                                                                                          100
+GPU memory. As the number of unshared layers increase ("2
+FC" and "3 FC" add two and three fully connected layers to                                                                                                50
+
+the shared prefix), the memory benefits fall. Without prefix                                                                                               0
+                                                                                                                                                                  γ = 0.1      γ=1    γ = 10    γ = 0.1     γ=1   γ = 10      γ = 0.1    γ=1          γ = 10
+batching (black line), however, we quickly run out of GPU                                                                                                                     300ms                       400ms                         500ms
+                                                                                                                                                                                                Query latency SLO
+memory even if a model has only one unshared layer.
+Squishy Scheduling. We now examine the sensitivity of                                                                             Figure 17: Impact on throughput of varying query latency
+squishy scheduling to model types, request rates, and SLOs.                                                                       SLO and γ (see Section 4.2) under complex query analysis.
+We compare the throughput of Nexus with squishy schedul-
+ing to a baseline version of Nexus that uses batch-oblivious                                                                      8                        Conclusion
+scheduling instead. Both need to allocate 16 sessions on 8                                                                        We present a scalable and efficient system design for serving
+GPUs under 5 scenarios: (a) Inception or (b) ResNet models                                                                        Deep Neural Network (DNN) applications. Instead of serving
+with mixed SLOs ranging from 50ms to 200ms, (c) Inception                                                                         the entire application in an opaque CPU-based container
+or (d) ResNet models with mixed request rates following                                                                           with models embedded in it, which leads to sub-optimal
+Zipf-0.9 distribution, (e) 8 different model architectures, each                                                                  GPU utilization, our system operates directly on models and
+associated with two SLOs, 50ms and 100ms. Figure 16 depicts                                                                       GPUs. This design enables several optimizations in batching
+the relative throughput of standard Nexus with regard to                                                                          and allows more efficient resource allocation. Our system is
+baseline. Nexus outperforms baseline across all mixes, with                                                                       fully implemented, in C++, and evaluation shows that Nexus
+the highest gains (up to 64%) coming from handling varying                                                                        can achieve 1.8-12.7× more throughput relative to state-of-
+request rates, and the lowest (11%) coming from handling                                                                          the-art baselines while staying within latency constraints
+varying request mixes.                                                                                                            (achieving a “good rate”) over 99% of the time.
+Complex Query Analysis. To evaluate the performance
+gain of the query analyzer, we compare the throughput of                                                                          Acknowledgements
+Nexus with and without the query analyzer. The baseline                                                                           We thank Lenin Sivalingam, Peter Bodik, anonymous review-
+simply splits the latency SLO evenly across the various stages                                                                    ers, and our shepherd, Ion Stoica, for their helpful feedback.
+in the query. The query includes two stages: (a) the first stage                                                                  We also thank the Watch For team at Microsoft Research
+executes SSD, and then (b) invokes Inception model for γ                                                                          for insights and suggestions on game stream analysis and
+times. The experiment is performed on 8 GPUs. We vary the                                                                         large-scale video processing. This work was supported by
+latency SLO from 300ms to 500ms and choose γ to be 0.1, 1,                                                                        NSF award CNS-1614717.
+and 10. Figure 17 shows that Nexus with the query analyzer
+achieves 13–55% higher throughput than the baseline.
+
+
+
+
+                                                                                                                            335
+Nexus: A GPU Cluster Engine for Accelerating DNN-Based Video Analysis                                   SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+References                                                                                 Mesos: A Platform for Fine-Grained Resource Sharing in the Data Cen-
+                                                                                           ter. In Proceedings of the 8th USENIX Symposium on Networked Systems
+ [1] Martín Abadi, Paul Barham, Jianmin Chen, Zhifeng Chen, Andy Davis,                    Design and Implementation, NSDI 2011, Boston, MA, USA, March 30 -
+     Jeffrey Dean, Matthieu Devin, Sanjay Ghemawat, Geoffrey Irving,
+                                                                                           April 1, 2011. USENIX Association.
+     Michael Isard, Manjunath Kudlur, Josh Levenberg, Rajat Monga, Sherry
+                                                                                      [17] Kevin Hsieh, Ganesh Ananthanarayanan, Peter Bodík, Shivaram
+     Moore, Derek Gordon Murray, Benoit Steiner, Paul A. Tucker, Vijay Va-
+                                                                                           Venkataraman, Paramvir Bahl, Matthai Philipose, Phillip B. Gibbons,
+     sudevan, Pete Warden, Martin Wicke, Yuan Yu, and Xiaoqiang Zheng.
+                                                                                           and Onur Mutlu. 2018. Focus: Querying Large Video Datasets with
+     2016. TensorFlow: A System for Large-Scale Machine Learning. In
+                                                                                           Low Latency and Low Cost. In 13th USENIX Symposium on Operating
+     12th USENIX Symposium on Operating Systems Design and Implemen-
+                                                                                           Systems Design and Implementation, OSDI 2018, Carlsbad, CA, USA,
+     tation, OSDI 2016, Savannah, GA, USA, November 2-4, 2016. USENIX                      October 8-10, 2018. USENIX Association, 269–286.
+     Association, 265–283.                                                            [18] Yangqing Jia, Evan Shelhamer, Jeff Donahue, Sergey Karayev, Jonathan
+ [2] Ahmad Abdelfattah, Azzam Haidar, Stanimire Tomov, and Jack Don-
+                                                                                           Long, Ross Girshick, Sergio Guadarrama, and Trevor Darrell. 2014.
+     garra. 2017. Fast Cholesky factorization on GPUs for batch and native
+                                                                                           Caffe: Convolutional architecture for fast feature embedding. In Pro-
+     modes in MAGMA. Journal of Computational Science 20 (2017), 85–93.
+                                                                                           ceedings of the 22nd ACM international conference on Multimedia. ACM,
+ [3] Atul Adya, Daniel Myers, Jon Howell, Jeremy Elson, Colin Meek,
+                                                                                           675–678.
+     Vishesh Khemani, Stefan Fulger, Pan Gu, Lakshminath Bhuvanagiri,
+                                                                                      [19] Angela H Jiang, Daniel L-K Wong, Christopher Canel, Lilia Tang, Is-
+     Jason Hunter, Roberto Peon, Larry Kai, Alexander Shraer, Arif Mer-
+                                                                                           han Misra, Michael Kaminsky, Michael A Kozuch, Padmanabhan Pillai,
+     chant, and Kfir Lev-Ari. 2016. Slicer: Auto-Sharding for Datacenter
+                                                                                           David G Andersen, and Gregory R Ganger. 2018. Mainstream: Dy-
+     Applications. In 12th USENIX Symposium on Operating Systems Design
+                                                                                           namic stem-sharing for multi-tenant video processing. In 2018 USENIX
+     and Implementation, OSDI 2016, Savannah, GA, USA, November 2-4,
+                                                                                           Annual Technical Conference (USENIX ATC 18). 29–42.
+     2016. USENIX Association, 739–753.
+                                                                                      [20] Daniel Kang, John Emmons, Firas Abuzaid, Peter Bailis, and Matei
+ [4] Liang-Chieh Chen, George Papandreou, Iasonas Kokkinos, Kevin Mur-
+                                                                                           Zaharia. 2017. NoScope: optimizing neural network queries over video
+     phy, and Alan L Yuille. 2018. Deeplab: Semantic image segmentation
+                                                                                           at scale. Proceedings of the VLDB Endowment 10, 11 (2017), 1586–1597.
+     with deep convolutional nets, atrous convolution, and fully connected
+                                                                                      [21] Bernhard Korte and Jens Vygen. 2008. Bin-Packing. In Combinato-
+     crfs. IEEE transactions on pattern analysis and machine intelligence 40,
+                                                                                           rial Optimization: Theory and Algorithms. Springer Berlin Heidelberg,
+     4 (2018), 834–848.
+                                                                                           Berlin, Heidelberg, 449–465. https://doi.org/10.1007/978-3-540-71844-
+ [5] Clipper contributors. 2019. Clipper v0.4. https://github.com/ucbrise/                 4_18
+     clipper/tree/release-0.4.                                                        [22] Yann LeCun, Léon Bottou, Yoshua Bengio, and Patrick Haffner. 1998.
+ [6] Daniel Crankshaw, Xin Wang, Giulio Zhou, Michael J. Franklin,                         Gradient-based learning applied to document recognition. Proc. IEEE
+     Joseph E. Gonzalez, and Ion Stoica. 2017. Clipper: A Low-Latency
+                                                                                           86, 11 (1998), 2278–2324.
+     Online Prediction Serving System. In 14th USENIX Symposium on Net-
+                                                                                      [23] Microsoft. 2018. Virtual Machine Scale Sets. https://docs.microsoft.
+     worked Systems Design and Implementation, NSDI 2017, Boston, MA,
+                                                                                           com/en-us/azure/virtual-machine-scale-sets/virtual-machine-scale-
+     USA, March 27-29, 2017. USENIX Association, 613–627.
+                                                                                           sets-overview.
+ [7] Docker. 2014. Docker Swarm. https://github.com/docker/swarm.
+                                                                                      [24] Microsoft. 2019. Custom Vision. https://azure.microsoft.com/en-us/
+ [8] Jeff Donahue, Yangqing Jia, Oriol Vinyals, Judy Hoffman, Ning Zhang,                  services/cognitive-services/custom-vision-service/.
+     Eric Tzeng, and Trevor Darrell. 2014. DeCAF: A Deep Convolutional
+                                                                                      [25] Christopher Olston, Noah Fiedel, Kiril Gorovoy, Jeremiah Harmsen, Li
+     Activation Feature for Generic Visual Recognition. In Proceedings of the
+                                                                                           Lao, Fangwei Li, Vinu Rajashekhar, Sukriti Ramesh, and Jordan Soyke.
+     31th International Conference on Machine Learning, ICML 2014, Beijing,
+                                                                                           2017. Tensorflow-serving: Flexible, high-performance ml serving.
+     China, 21-26 June 2014 (JMLR Workshop and Conference Proceedings),
+                                                                                           arXiv preprint arXiv:1712.06139 (2017).
+     Vol. 32. JMLR.org, 647–655.
+                                                                                      [26] Maxime Oquab, Leon Bottou, Ivan Laptev, and Josef Sivic. 2014. Learn-
+ [9] Facebook. 2018. Caffe2: A New Lightweight, Modular, and Scalable
+                                                                                           ing and transferring mid-level image representations using convo-
+     Deep Learning Framework. https://caffe2.ai/.
+                                                                                           lutional neural networks. In Proceedings of the IEEE conference on
+[10] Michael R. Garey and David S. Johnson. 1979. Computers and In-
+                                                                                           computer vision and pattern recognition. 1717–1724.
+     tractability: A Guide to the Theory of NP-Completeness. W. H. Freeman
+                                                                                      [27] Kay Ousterhout, Patrick Wendell, Matei Zaharia, and Ion Stoica. 2013.
+     & Co., New York, NY, USA.                                                             Sparrow: distributed, low latency scheduling. In Proceedings of the
+[11] Google. 2014. Kubernetes: Production-Grade Container Orchestration.                   Twenty-Fourth ACM Symposium on Operating Systems Principles. ACM,
+     https://kubernetes.io/
+                                                                                           69–84.
+[12] Google. 2019. Cloud AutoML Vision. https://cloud.google.com/vision/
+                                                                                      [28] Vivek S Pai, Peter Druschel, and Willy Zwaenepoel. 1999. Flash:
+     automl/docs/.
+                                                                                           An efficient and portable Web server. In USENIX Annual Technical
+[13] Juncheng Gu, Mosharaf Chowdhury, Kang G Shin, Yibo Zhu, Myeong-
+                                                                                           Conference, General Track. 199–212.
+     jae Jeon, Junjie Qian, Hongqiang Liu, and Chuanxiong Guo. 2019.
+                                                                                      [29] Omkar M. Parkhi, Andrea Vedaldi, and Andrew Zisserman. 2015. Deep
+     Tiresias: A GPU Cluster Manager for Distributed Deep Learning. In
+                                                                                           Face Recognition. In Proceedings of the British Machine Vision Confer-
+     16th USENIX Symposium on Networked Systems Design and Implemen-
+                                                                                           ence 2015, BMVC 2015, Swansea, UK, September 7-10, 2015. BMVA Press,
+     tation (NSDI 19). 485–500.                                                            41.1–41.12. https://doi.org/10.5244/C.29.41
+[14] Seungyeop Han, Haichen Shen, Matthai Philipose, Sharad Agar-                     [30] Yanghua Peng, Yixin Bao, Yangrui Chen, Chuan Wu, and Chuanxiong
+     wal, Alec Wolman, and Arvind Krishnamurthy. 2016. MCDNN: An
+                                                                                           Guo. 2018. Optimus: an efficient dynamic resource scheduler for deep
+     approximation-based execution framework for deep stream processing
+                                                                                           learning clusters. In Proceedings of the Thirteenth EuroSys Conference.
+     under resource constraints. In Proceedings of the 14th Annual Interna-
+                                                                                           ACM, 3.
+     tional Conference on Mobile Systems, Applications, and Services. ACM,
+                                                                                      [31] Mohammad Rastegari, Vicente Ordonez, Joseph Redmon, and Ali
+     123–136.
+                                                                                           Farhadi. 2016. Xnor-net: Imagenet classification using binary convolu-
+[15] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. 2016. Deep
+                                                                                           tional neural networks. In European Conference on Computer Vision.
+     residual learning for image recognition. In Proceedings of the IEEE
+                                                                                           Springer, 525–542.
+     conference on computer vision and pattern recognition. 770–778.                  [32] Joseph Redmon. 2013–2016. Darknet: Open Source Neural Networks
+[16] Benjamin Hindman, Andy Konwinski, Matei Zaharia, Ali Ghodsi, An-
+                                                                                           in C. http://pjreddie.com/darknet/.
+     thony D. Joseph, Randy H. Katz, Scott Shenker, and Ion Stoica. 2011.
+
+
+
+
+                                                                                336
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada            H. Shen, L. Chen, Y. Jin, L. Zhao, B. Kong, M. Philipose, A. Krishnamurthy, and R. Sundaram
+
+
+[33] Malte Schwarzkopf, Andy Konwinski, Michael Abd-El-Malek, and                      A    Hardness of Fixed-rate GPU Scheduling Prob-
+     John Wilkes. 2013. Omega: flexible, scalable schedulers for large
+                                                                                            lem (FGSP)
+     compute clusters. In Proceedings of the 8th ACM European Conference
+     on Computer Systems. ACM, 351–364.                                                We now justify the use of an approximate algorithm for GPU
+[34] Ali Sharif Razavian, Hossein Azizpour, Josephine Sullivan, and Stefan             cluster scheduling. We define the Fixed-rate GPU Schedul-
+     Carlsson. 2014. CNN features off-the-shelf: an astounding baseline for
+                                                                                       ing Problem (FGSP), which is a highly restricted version of
+     recognition. In Proceedings of the IEEE conference on computer vision
+     and pattern recognition workshops. 806–813.                                       the general problem, and we show that even the restricted
+[35] Haichen Shen, Seungyeop Han, Matthai Philipose, and Arvind Krish-                 version is intractable.
+     namurthy. 2017. Fast video classification via adaptive cascading of               FGSP:
+     deep models. In Proceedings of the IEEE conference on computer vision             Input - models Mi , 1 ≤ i ≤ n with corresponding latencies
+     and pattern recognition. 3646–3654.
+                                                                                       Li , latency bounds Bi and GPU count C. (The latencies cor-
+[36] Karen Simonyan and Andrew Zisserman. 2014. Two-stream convolu-
+     tional networks for action recognition in videos. In Advances in neural           respond to the fixed rates.)
+     information processing systems. 568–576.                                          Output - Partition of the models into C sets soÍthat in each
+[37] Twitch. 2011. Twitch. https://www.twitch.tv/.                                     set S we have D + Li ≤ Bi , ∀i ∈ S where D = i ∈S Li is the
+[38] Wencong Xiao, Romil Bhardwaj, Ramachandran Ramjee, Muthian Si-                    duty cycle for the set.
+     vathanu, Nipun Kwatra, Zhenhua Han, Pratyush Patel, Xuan Peng,
+                                                                                           We show that FGSP is strongly NP-hard by reduction from
+     Hanyu Zhao, Quanlu Zhang, Fan Yang, and Lidong Zhou. 2018. Gan-
+     diva: Introspective Cluster Scheduling for Deep Learning. In 13th                 3-PARTITION [10].
+     USENIX Symposium on Operating Systems Design and Implementation
+                                                                                       Theorem 1. FGSP is strongly NP-complete.
+     (OSDI 18). USENIX Association, Carlsbad, CA, 595–610.
+[39] Linjie Yang, Ping Luo, Chen Change Loy, and Xiaoou Tang. 2015. A                  Proof. We start with a given instance of 3-PARTITION which
+     large-scale car dataset for fine-grained categorization and verification.
+                                                                                       consists of a bound B and 3n B4 ≤ a 1 , a 2 . . . , a 3n ≤ B2 ; the
+     In Proceedings of the IEEE Conference on Computer Vision and Pattern
+     Recognition. 3973–3981.                                                           goal of 3-PARTITION is to partition the ai s into triples such
+[40] Jason Yosinski, Jeff Clune, Yoshua Bengio, and Hod Lipson. 2014. How              that the sum of each triple is B. Observe that wlog we may
+                                                                                       assume that 1≤i ≤3n ai = nB.
+                                                                                                       Í
+     transferable are features in deep neural networks?. In Advances in
+     neural information processing systems. 3320–3328.                                    From the given instance of 3-PARTITION we create an
+[41] Dong Yu, Frank Seide, Gang Li, and Li Deng. 2012. Exploiting Sparse-
+                                                                                       instance of FGSP by setting Li = 2B + ai , Bi = 9B + ai , ∀1 ≤
+     ness In Deep Neural Networks For Large Vocabulary Speech Recog-
+     nition. In Proceedings of IEEE International Conference on Acoustics,             i ≤ 3n, C = n.
+     Speech, and Signal Processing (ICASSP).                                              It is clear that if there exists a solution to the 3-PARTITION
+[42] Haoyu Zhang, Ganesh Ananthanarayanan, Peter Bodik, Matthai Phili-                 instance then the same partition into n triples yields a parti-
+     pose, Paramvir Bahl, and Michael J Freedman. 2017. Live video analyt-             tion of the FGSP instance into C = n sets so that D + Li ≤
+     ics at scale with approximation and delay-tolerance. In 14th USENIX
+                                                                                       9B + ai since D = 7B and Li = 2B + ai . In the other direction
+     Symposium on Networked Systems Design and Implementation (NSDI
+     17). 377–392.                                                                     suppose there exists a solution to FGSP. Observe that in any
+                                                                                       solution to FGSP every set can have at most 3 models be-
+                                                                                       cause otherwise the duty cycle D would exceed 8B and then
+                                                                                       the constraint D + Li ≤ Bi would be violated for any i in the
+                                                                                       set, since D + Li > 10B but Bi < 10B. Since there are a total
+                                                                                       of 3n models and C = n sets every set must have exactly
+                                                                                       3 models, i.e. every set must be a triple. Since D + Li ≤ Bi
+                                                                                       for any i in the set, we have that D + 2B + ai ≤ 9B + ai or
+                                                                                       D ≤ 7B. But this implies that in every triple the sum of the
+                                                                                       Li s is at most 7B or the sum of the corresponding ai s is at
+                                                                                       most B. But since the sum of all the n triples is nB and each
+                                                                                       triple is at most B it must be that the sum of each triple is
+                                                                                       exactly B. This means that the partition of models of the
+                                                                                       FGSP instance into sets is also a solution for the partition of
+                                                                                       the corresponding ai into triples in 3-PARTITION.
+                                                                                                                                                         □
+
+
+
+
+                                                                                 337
+

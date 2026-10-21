@@ -1,0 +1,1539 @@
+  Ensō : A Streaming Interface for NIC-Application
+                  Communication
+Hugo Sadok and Nirav Atre, Carnegie Mellon University; Zhipeng Zhao, Microsoft;
+Daniel S. Berger, Microsoft Research and University of Washington; James C. Hoe,
+ Carnegie Mellon University; Aurojit Panda, New York University; Justine Sherry,
+                   Carnegie Mellon University; Ren Wang, Intel
+             https://www.usenix.org/conference/osdi23/presentation/sadok
+
+
+
+
+         This paper is included in the Proceedings of the
+         17th USENIX Symposium on Operating Systems
+                  Design and Implementation.
+                       July 10–12, 2023 • Boston, MA, USA
+                                 978-1-939133-34-2
+
+
+                                       Open access to the Proceedings of the
+                                       17th USENIX Symposium on Operating
+                                        Systems Design and Implementation
+                                                 is sponsored by
+          Ensō: A Streaming Interface for NIC-Application Communication
+                    Hugo Sadok     Nirav Atre     Zhipeng Zhao     Daniel S. Berger
+                      James C. Hoe     Aurojit Panda   Justine Sherry     Ren Wang
+        Carnegie Mellon University        Intel        Microsoft     New York University              University of Washington
+
+                          Abstract                                   remains challenging. We demonstrate that this is because of
+                                                                     inefficiencies in how software communicates with the NIC.
+Today, most communication between the NIC and software
+                                                                     While NICs and the software that communicate with them
+involves exchanging fixed-size packet buffers. This packetized
+                                                                     have themselves changed significantly in the last decade,
+interface was designed for an era when NICs implemented few
+                                                                     the NIC-to-software interface has remained unchanged for
+offloads and software implemented the logic for translating
+                                                                     decades.1
+between application data and packets. However, both NICs and
+networked software have evolved: modern NICs implement                  Most NICs currently provide an interface where all com-
+hardware offloads, e.g., TSO, LRO, and serialization offloads        munication between software and the NIC requires sending
+that can more efficiently translate between application data and     (and receiving) a sequence of fixed-size buffers, which we
+packets. Furthermore, modern software increasingly batches           call packet buffers in this paper. Packet buffer size is dictated
+network I/O to reduce overheads. These changes have led to           by software, and is usually chosen to be large enough to fit
+a mismatch between the packetized interface, which assumes           MTU-sized packets, e.g., Linux uses 1536 byte packet buffers
+that the NIC and software exchange fixed-size buffers, and           (sk_buffs) and DPDK [19] uses 2kB packet buffers (mbufs)
+the features provided by modern NICs and used by modern              by default. We use the term packetized NIC interface to refer
+software. This incongruence between interface and data adds          to any NIC-to-software interface that uses packet buffers
+software complexity and I/O overheads, which in turn limits          for communication. We observe that two changes in how
+communication performance.                                           NICs are used today have led to an impedance mismatch
+                                                                     with packetized interfaces.
+   This paper proposes Ensō, a new streaming NIC-to-software
+interface designed to better support how NICs and software              First, many NIC offloads such as TCP Segmentation Of-
+interact today. At its core, Ensō eschews fixed-size buffers, and   floading (TSO) [20, 39], Large Receive Offloading (LRO) [14],
+instead structures communication as a stream that can be used        serialization offloads [44, 71, 86], and transport offloads [3,
+to send arbitrary data sizes. We show that this change reduces       14, 27, 77] take inputs (and produce outputs) that can span
+software overheads, reduces PCIe bandwidth requirements, and         multiple packets and vary in size. In using these offloads
+leads to fewer cache misses. These improvements allow an Ensō-      with a packetized interface, software must needlessly split
+based NIC to saturate a 100 Gbps link with minimum-sized             (and recombine) data into multiple packet buffers when com-
+packets (forwarding at 148.8 Mpps) using a single core, improve      municating with the NIC.
+throughput for high-performance network applications by 1.5–            Second, software logic for sending (and receiving) packets
+6×, and reduce latency by up to 43%.                                 uses batches of multiple packets to reduce I/O overheads. In
+                                                                     the common case, NICs and software process packets in a
+                                                                     batch sequentially. However, packetized interfaces cannot
+1   Introduction                                                     ensure that packets in a batch are in contiguous and sequen-
+                                                                     tial memory locations, reducing the effectiveness of several
+Network performance dictates application performance for             CPU and IO optimizations.
+many of today’s distributed and cloud computing applica-                This mismatch between how modern NICs are used and
+tions [48]. While growing application demands have led to            what the packetized interface provides causes three problems
+a rapid increase in link speeds from 100 Mbps links [31] in          that affect application performance:
+2003 to 100 Gbps in 2020 [89] and 200 Gbps in 2022 [58], a
+slowdown in CPU scaling has meant that applications of-              Packetized abstraction: While imposing fixed-size buffers
+ten cannot fully utilize these links. Consequently, recent           works reasonably well when software always needs to ex-
+changes to NICs and networked software have focused on               change MTU-sized packets, it becomes clumsy when used
+reducing the number of CPU cycles required for communica-            with higher-level abstractions such as application-level mes-
+tion: NIC offloads allow the NIC to perform common tasks             sages (e.g., RPCs), bytestreams, or even simpler offloads such
+(e.g., segmentation) previously implemented in software; and         as LRO. When using this interface, the NIC (or software)
+more efficient network I/O libraries and interfaces, includ-         must split messages that are larger than the packet buffer
+ing DPDK and XDP, allow applications to reduce processing            into multiple packet buffers. Applications then need to deal
+in the network stack. We begin with the observation that                1 Osiris [22], published in 1994, describes an interface that is nearly
+
+despite these changes, utilizing 100 Gbps or 400 Gbps links          identical to the one adopted by many modern NICs.
+
+
+
+
+USENIX Association                           17th USENIX Symposium on Operating Systems Design and Implementation                       1005
+with input that is split across multiple packet buffers. Do-       buffers. Ensō treats buffers as opaque data, and does not
+ing so either requires that they first copy data to a separate     impose any requirements on their content, structure or size,
+buffer, or that the application logic itself be designed to deal   thus allowing them to be used to transfer arbitrary data,
+with packetized data. Indeed, implementing any offload or          whose size can be as large as the ring buffer itself. Ensō
+abstraction that deals with more than a single packet’s worth      also significantly reduces PCIe bandwidth overhead due to
+of data (e.g., transport protocols, such as TCP, that provide a    metadata, because it is able to aggregate notifications for
+bytestream abstraction) in a NIC that implements the packe-        multiple chunks of data written to the same buffer. Finally,
+tized interface requires copying data from packet buffers to       it enables better use of the CPU prefetcher to mask memory
+a stream. This additional copy can add significant overhead,       latency, thus further improving application performance.
+negating some of the benefits of such offloads [72, 88].              Although the insight behind this design is simple, it is chal-
+                                                                   lenging to implement in practice. For example, CPU-NIC
+Poor cache interaction: Because the packetized interface
+                                                                   synchronization can easily lead to poor cache performance:
+forces incoming and outgoing data to be scattered across
+                                                                   any approach where the NIC and CPU poll for changes at
+memory, it limits the effectiveness of prefetchers and other
+                                                                   a particular memory location will lead to frequent cache in-
+CPU optimizations that require predicting the next memory
+                                                                   validation. Ensō avoids this obstacle by relying on explicit
+address that software will access—a phenomenon that we
+                                                                   notifications for CPU-NIC synchronization. Unfortunately,
+refer to as chaotic memory access. As we show in §7, chaotic
+                                                                   explicit notifications require additional metadata to be sent
+memory accesses can significantly degrade application per-
+                                                                   over the CPU-NIC interconnect, which can negate any bene-
+formance, particularly those that deal with small requests
+                                                                   fits for interconnect bandwidth utilization. Ensō mitigates
+such as object caches [9, 57] and key-value stores [4, 52].
+                                                                   this overhead by sending notifications reactively. We dis-
+Metadata overhead: Since the packetized interface relies           cuss our synchronization strategy in detail, as well as other
+on per-packet metadata, it spends a significant portion of         challenges to the Ensō design in §4.
+the PCIe bandwidth transferring metadata—as much as 39%               To understand its performance, we fully implement Ensō
+of the available bandwidth when using small messages. This         using an FPGA-based SmartNIC. We describe our hardware
+causes applications that deal with small requests to be bottle-    and software implementations in §5 and how Ensō can be
+necked by PCIe, which prevents them from scaling beyond            used depending on the functionality offered by the NIC in
+a certain number of cores. The use of per-packet metadata          §6. In §7 we present our evaluation of Ensō, including its
+also contributes to an increase in the number of memory            use in four applications: the Maglev load balancer [23], a
+accesses required for software to send and receive data, fur-      network telemetry application based on NitroSketch [54],
+ther reducing the cycles available for the application. We         the MICA key-value store [52], and a log monitor inspired by
+observed scalability issues due to PCIe bottleneck in our          AWS CloudWatch Logs [6]. We also implemented a software
+implementation of Google’s Maglev Load Balancer [23].              packet generator that we use in most of the experiments.2
+   In this paper, we propose Ensō, a new interface for NIC-       We observe speedups of up to 6× relative to a DPDK imple-
+application communication that breaks from the lower-level         mentation for Maglev, and up to 1.47× for MICA with no
+concept of packets. Instead, Ensō provides a streaming ab-        hardware offloads.
+straction that the NIC and applications can use to commu-             Finally, while Ensō is optimized for applications that pro-
+nicate arbitrary-sized chunks of data. Doing so not only           cess data in order, we show that Ensō also outperforms the
+frees the NIC and application to use arbitrary data formats        existing packetized interface when used by applications that
+that are more suitable for the functionality implemented by        process packets out of order (e.g., virtual switches), despite
+each one but also moves away from the performance issues           requiring an additional memory copy (§7.2.2).
+present in the packetized interface. Because Ensō makes              Ensō is fully open source, with our hardware and software
+no assumption about the data format itself, it can be repur-       implementations available at https://enso.cs.cmu.edu/.
+posed depending on the application and the offloads enabled
+on the NIC. For instance, if the NIC is only responsible for       2    Background and Motivation
+multiplexing/demultiplexing, it can use Ensō to deliver raw
+packets; if the NIC is also aware of application-level mes-        The way software (either the kernel or applications using
+sages, it can use Ensō to deliver entire messages and RPCs        a kernel-bypass API) and the NIC exchange data is defined
+to the application; and if the NIC implements a transport          by the interface that the NIC hardware exposes. Today,
+protocol, such as TCP, it can use Ensō to communicate with        most NICs expose a packetized NIC interface. This includes
+the application using bytestreams.                                 NICs from several companies including Amazon [2], Broad-
+   To provide a streaming abstraction, Ensō replaces ring         com [12], Intel [39], Marvell [56], and others. Indeed, prior
+buffers containing descriptors, used by the current NIC in-            2 Developing this software packet generator was a necessary first step
+terface, with a ring buffer containing data. The NIC and           in evaluating Ensō because no existing software packet generators could
+the software communicate by appending data to these ring           scale to the link rates we needed to stress test Ensō!
+
+
+
+
+1006    17th USENIX Symposium on Operating Systems Design and Implementation                                       USENIX Association
+    Pkt. 1        Pkt. Buf. 1     Pkt. 2       Pkt. Buf. 3                   transmitted (rather than received) a packet.
+                  Pkt. 3        Pkt. Buf. 2    Pkt. 4        Pkt. Buf. 4
+                                                                                One of the major benefits of dedicating buffers for each
+                                                                             packet is that multiplexing/demultiplexing can be done effi-
+                                              RX Descriptor Ring Buffer
+                                                                             ciently in software. If the software transmitting packets is the
+   HeadSW       TailNIC
+                                                                             kernel, this might mean associating each descriptor/packet
+Figure 1: Data structures used to receive packets in a packetized NIC        pair with an appropriate socket; if the software in use is a
+interface. Each packet is placed in a separate buffer that can be arranged   software switch [32, 67] this might mean steering the right
+arbitrarily in memory.
+                                                                             packet to an appropriate virtual machine. Either way, the
+work [68] found that of the 44 NIC drivers included in DPDK,                 cleverness of the packetized NIC interface in using dedicated
+40 use this interface. Due to its ubiquity, the packetized                   packet buffers shines here: rather than copying individual
+NIC interface has dictated the API provided by nearly all                    packets in the process of sorting through inbound packets,
+high-performance network libraries, including io_uring [15],                 the switching logic can deliver packet pointers to the appro-
+DPDK [19] and netmap [73]. In this section, we describe the                  priate endpoints. These packets can then be processed and
+packetized NIC interface and highlight some of the issues                    freed in arbitrary order.
+that it brings to high-performance applications.                                The usage model for a modern high-performance software
+                                                                             stack, however, looks very different. Instead of one software
+                                                                             entity (e.g., kernel, software switch) mediating access to the
+2.1     Packetized NIC Interface                                             NIC, there may be many threads or processes with direct NIC
+A core design choice in the packetized NIC interface is to                   access (i.e., kernel bypass). High-performance NIC ASICs
+place every packet in a dedicated packet buffer. The NIC and                 expose multiple hardware queues (as many as thousands [39])
+the software communicate by exchanging packet descriptors.                   so that each thread or process can transmit and receive data
+Descriptors hold metadata, including packet size, what pro-                  directly to the NIC without coordination between them. The
+cessing the NIC should perform (e.g., update the checksum                    NIC then takes on all of the responsibilities of demultiplexing,
+or segment the packet), a flag bit, and a pointer to a separate              using, e.g., RSS [82], Intel’s Flow Director [39], or (for a very
+packet buffer which holds the actual packet data. Most packet                rich switching model) Microsoft’s AccelNet [28]. In this
+processing software pre-allocate a fixed number of buffers                   setting, the multiplexing/demultiplexing capabilities of the
+for packets; new packets (either generated by an applica-                    packetized NIC interface offer no additional value.
+tion or incoming from the network) are assigned to the next
+available buffer in the pool, which may not reside in memory                 2.2    Issues with a Packetized Interface
+anywhere near the preceding or following packet. Because
+software does not know the size of incoming packets before-                  While many high-performance applications today gain little
+hand, buffers are often sized so that they can accommodate                   from a packetized interface, they still need to pay for the over-
+MTU-sized packets (e.g., 1536B in Linux and 2kB in DPDK).                    heads accompanying it. Shoehorning data communication
+   Figure 1 shows an example of a packetized NIC interface                   between the NIC and applications into fixed-sized chunks
+being used to receive four packets from a particular hardware                leads to inefficient use of CPU caches and PCIe bandwidth
+queue on the NIC. The NIC queue is associated with a set                     for small requests, as well as additional data copies due to
+of NIC registers that can be used to control a receive (RX)                  fragmentation for applications that rely on large messages
+descriptor ring buffer and a transmit (TX) descriptor ring                   or bytestreams.
+buffer. Before being able to receive packets, the software                      In this section, we conduct microbenchmarks that isolate
+informs the NIC of the addresses of multiple available buffers               these issues, and in §7, we also show the impact that these
+in its pool by enqueueing descriptors pointing to each one                   issues have on real applications.
+in the RX descriptor ring buffer. The NIC can then use DMA                   Chaotic Memory Access: We experiment with a simple
+to write the incoming packet data into the next available                    DPDK-based ping/pong program (a description of our testbed
+packet buffer and enqueue updated descriptors containing                     is in §7) which receives a packet, increments a byte in the
+metadata such as the packet size. Importantly, the NIC also                  packet payload, and re-transmits it. For this program, we
+sets a ‘flag’ bit in the descriptor to signal to the software that           observed maximum throughput of 40 Gbps using a 100 Gb
+packets have arrived for this buffer. Observing a notification               NIC (Intel E810) and a single 3.1 GHz CPU core. When we
+bit for the descriptor under the head pointer, the software                  conduct a top-down analysis [43], we see that the application
+can then increment the head pointer.                                         is backend-bound, primarily due to L1 and L2 cache misses.
+   A similar process takes place for transmission: the sending               Figure 2a shows around 6% miss ratio for the L1d and a 55%
+software assembles a set of descriptors for packet buffers that              miss ratio for the L2 cache. This high cache miss ratio is a
+are ready to be transmitted and copies the descriptors—but                   direct consequence of using per-packet buffers in the packe-
+not the packets themselves—into the TX ring buffer; the flag                 tized NIC interface. First, because packet buffers themselves
+bit in the descriptor is now used to signal that the NIC has                 are scattered in memory, reads and writes to packet data evade
+
+
+
+USENIX Association                                  17th USENIX Symposium on Operating Systems Design and Implementation                1007
+                        60                               80                                                                                    HeadSW
+
+
+
+
+                                        PCIe BW (Gbps)
+       Miss ratio (%)                                                                   HeadSW           1        HeadSW           2       batch              3
+                        40                               60
+                                                                      PCIe limit           RX Ensō Pipe A        M1 M2                      M1 M2
+                                                         40           Goodput           TailNIC                                TailNIC          TailNIC
+                        20
+                                                         20           Metadata
+                                                                                       HeadSW                    HeadSW                    HeadSW
+                        0                                 0
+                             L1d   L2                         RD WR                        RX Ensō Pipe B       M3       M4 M5            M3        M4 M5
+                                                                                       TailNIC                           TailNIC                   TailNIC
+(a) Miss ratio for L1d and L2 caches. (b) PCIe bandwidth utilization. Up
+We observe 55% miss ratio for the L2 to 39% of the read bandwidth is con-              RX Notification Buf.     AB                        AB
+cache.                                sumed with metadata.
+                                                                                         Figure 3: Steps to receive batches of messages in two Ensō Pipes.
+Figure 2: PCIe bandwidth and cache misses for an application forwarding
+small packets with a packetized NIC interface (E810).                              In summary: By pairing every packet with a separate de-
+any potential benefit from shared cache lines or prefetching.3                     scriptor, the packetized NIC interface was well designed for
+Applications like key-value stores [4, 52] or packet proces-                       a previous generation of high-throughput networked appli-
+sors [18] exhibit very high spatio-temporal locality in their                      cations which needed to implement multiplexing in software.
+data access: they are designed to run to completion (i.e., they                    However, for today’s high-performance applications, it in-
+continue working on a packet or batch until the work for that                      troduces unnecessary performance overheads.
+item is completed, leading to repeated accesses to the same
+data), and they operate over incoming packets or batches in
+the order in which they arrive (i.e., the current item being                       3      Ensō Overview
+processed serves as an excellent predictor of the next one).
+However, this structure is not realized in the memory layout                       Ensō is a new streaming interface for NIC-application com-
+of packetized buffers, and hence to any cache optimizations,                       munication. Ensō’s design has three primary goals: (1) flexi-
+reads and writes appear unpredictable. Second, because every                       bility, allowing it to be used for different classes of offloads
+packet is paired with a descriptor, the total amount of mem-                       operating at different network layers and with different data
+ory required to store all of the data required for I/O increases,                  sizes; (2) low software overhead, reducing the number of cy-
+exacerbating last-level cache contention simply because more                       cles that applications need to spend on communication; and
+data needs to be accessed. Indeed, prior work [55, 81] has re-                     (3) hardware simplicity, enabling practical implementations
+peatedly demonstrated that the size of the working set for                         on commodity NICs.
+packet processing applications often outgrows the amount                              Ensō is designed around the Ensō Pipe, a new buffer ab-
+of cache space dedicated to DDIO [35], negating the benefits                       straction that allows applications and the NIC to exchange
+of this hardware optimization to bring I/O data directly into                      arbitrary chunks of data as if reading and writing to an un-
+the cache. As we discuss in detail in §7.2.3, using a different                    bounded memory buffer. Different from the ring buffers
+NIC interface that facilitates sequential memory accesses                          employed by the packetized interface (which hold descrip-
+can drop the miss ratio from 6% to 0.2% for the L1d cache,                         tors to scattered packet buffers), an Ensō Pipe is implemented
+and from 55% to 9% for the L2 cache.                                               as a data ring buffer that contains the actual packet data.
+
+Metadata Bandwidth Overhead: We observe that the                                   High-level operation: In Figure 3 we show how an appli-
+packetized NIC interface requires the CPU and the NIC to                           cation, with two Ensō Pipes, receives messages. Initially, the
+exchange both descriptors and packet buffers. This leads to                        Ensō Pipes are empty, and the HeadSW and TailNIC point to
+the second problem with the packetized interface: up to 39%                        the same location in the buffer 1 . When the NIC receives
+of the CPU to NIC interconnect bandwidth is spent transferring                     messages, it uses DMA to enqueue them in contiguous mem-
+descriptors (Figure 2b). While NIC-CPU interconnect line                           ory owned by the Ensō Pipes 2 . In the figure, the NIC en-
+rates are typically higher than network line rates, the gap                        queues two messages in Ensō Pipe A’s memory, and three in
+between them is relatively narrow. This is particularly prob-                      Ensō Pipe B’s memory. The NIC informs the software about
+lematic for small transfers as the PCIe theoretical limit drops                    this by also enqueuing two notifications (one for each Ensō
+to only 85 Gbps with 64-byte transfers [62]. We also expect                        Pipe) in the notification buffer. The software uses these noti-
+this gap to remain small in the future as a state-of-the-art                       fications to advance TailNIC and process the messages. Once
+next generation server with a 400 Gbps Ethernet connection                         the messages have been processed, the software writes to a
+and 512 Gbps of PCIe 5.0 bandwidth would still bottleneck                          Memory-Mapped I/O (MMIO) register (advancing HeadSW )
+with 39% of bandwidth wasted on metadata. This observa-                            to notify the NIC—allowing the memory to be reused by later
+tion complements recent studies that also point to the PCIe                        messages 3 . Sending messages is symmetric, except for the
+as a source of congestion for transport protocols [1].                             last step: the NIC notifies the software that messages have
+                                                                                   been transmitted by overwriting the notification that the
+   3We note here that the aforementioned performance penalty arises in             CPU used to inform the NIC that a message was available to
+spite of the fact that DPDK performs mbuf-level software prefetching.              be transmitted.
+
+
+
+1008              17th USENIX Symposium on Operating Systems Design and Implementation                                                 USENIX Association
+Ensō Pipe’s flexibility: Although Figure 3 shows the steps        control when notifications are sent. These mechanisms are
+to send messages, because Ensō Pipes are opaque, they can be      naturally adaptive, i.e., they minimize the number of notifi-
+used to transmit arbitrary chunks of data. These can be raw        cations sent without limiting throughput, and can be imple-
+packets, messages composed of multiple MTU-sized packets,          mented without adding hardware complexity.
+or even an unbounded bytestream. The format of the data
+                                                                   Low hardware complexity and state: Because the design of
+is dictated by the application and the offloads running on
+                                                                   Ensō involves both hardware and software, we must be care-
+the NIC. Moreover, Ensō Pipes’ opaqueness means that they
+                                                                   ful to not pay for software simplicity with hardware com-
+can be mapped to any pinned memory within the applica-
+                                                                   plexity. Ensō favors coordination mechanisms that require
+tion’s memory space. Thus, by mapping both the RX and TX
+                                                                   little NIC state. We aim for a design that is simple and easily
+Ensō Pipes to the same region, network functions and other
+                                                                   parallelized. We present Ensō’s hardware design in §5.
+forwarding applications can avoid copying packets. In our
+evaluation (§7) we use this approach when implementing             Target applications: Ensō implements a streaming inter-
+Maglev and a Network Telemetry application.                        face that is optimized for cases where software processes
+                                                                   received data in order. Our evaluation (§7) shows that this
+Performance advantages of an Ensō Pipe: The fact that             covers a wide range of network-intensive applications.
+data can be placed back-to-back inside an Ensō Pipe ad-              One might expect that the resulting design is ill-suited for
+dresses both of the performance challenges we listed previ-        applications that need to multiplex and demultiplex packets
+ously: First, Ensō Pipes allow applications to read and write     (e.g., virtual switches like Open vSwitch [67] and BESS [32]),
+I/O data sequentially, thus avoiding chaotic memory accesses.      as such applications require additional copies with Ensō.4
+Second, as shown in Figure 3, inlining data in an Ensō Pipe       However, perhaps surprisingly, Ensō outperforms the pack-
+removes the need for per-packet descriptors, thus reducing         etized interface even when it requires such additional copies.
+the amount of metadata exchanged over the PCIe bus, and            As we show in §7.2.2, when comparing the performance of
+reducing cycles spent managing (i.e., allocating and freeing)      an application that uses Ensō and copies each packet, to a
+packet buffers.                                                    similar DPDK-based application that does not copy packets,
+Challenges: Although implementing a ring buffer for data           using a CAIDA trace [13] (average packet size of 462 B), we
+transfer is, on its own, a simple idea, coordinating the notifi-   find that Ensō’s throughput is still 28% higher than DPDK’s
+cations between the CPU and the NIC to update head and             (92.6 Gbps vs. 72.6 Gbps). We discuss how Ensō can be used
+tail pointers turns out to be challenging.                         depending on the applications and the functionality offered
+                                                                   by the NIC in §6.
+Efficient coordination: The packetized interface coordinates
+incoming and outgoing packets by ‘piggybacking’ notifica-
+tions in the descriptor queue itself. Each descriptor includes     4     Efficient Notifications
+a ‘flag bit’ that can be used to signal when the descriptor is
+valid. Software polls the next descriptor’s flag bit to check if   The key challenges in Ensō arise from efficiently coordinat-
+a new packet arrived. We cannot use the same strategy for          ing Ensō Pipes between the CPU and the NIC. In this section,
+Ensō Pipes as they do not assume a format for the data in         we describe how Ensō efficiently coordinates pipes using
+the buffer, and hence cannot embed control signals in it.          notifications (§4.1) and how it paces such notifications (§4.2).
+   In §4.1, we discuss how naïve approaches to notification
+can stress worst-case performance of MMIO and DMA. In              4.1     Efficient Ensō Pipe Coordination
+particular, concurrent accesses to the same memory address
+can create cache contention between the CPU and the NIC.           Recall from Figure 3 that the software and the NIC coordinate
+Ensō uses dedicated notification buffers to synchronize up-       access to RX Ensō Pipes using HeadSW and TailNIC and to TX
+dates to head and tail pointers; when combined with batching       Ensō Pipes using HeadNIC and TailSW . How should software
+and multiqueue processing, the notification buffer approach        and the NIC communicate pointer updates?
+reduces the threat of cache contention.                               In the descriptor ring buffers employed by the packetized
+                                                                   NIC interface, software communicates pointer updates to
+Notification pacing: Ensō Pipes are designed so that notifi-      the NIC using MMIO writes, and the NIC communicates
+cations for multiple packets can be combined, reducing the         pointer updates via inline signaling in the descriptor buffer
+amount of metadata transferred between the CPU and the             itself [25, 39], avoiding the overheads of MMIO reads. Be-
+NIC. However, it is still important to decide when to send         cause the descriptor’s format is defined by the NIC, the NIC
+notifications: when sent too frequently they waste PCIe
+                                                                      4 Note that this overhead only affects applications that multi-
+bandwidth and add software overheads, but if sent too in-
+                                                                   plex/demultiplex packets, and does not apply to software, e.g., TCP stacks,
+frequently the core might be idle waiting for notification,        that processes packet data but might need to reorder packets. This is because
+thus reducing throughput. Ensō includes two mechanisms,           reordering packet data (rather than whole packets) requires a memory copy
+reactive notifications and notification prefetching (§4.2), that   when using either interface.
+
+
+
+
+USENIX Association                          17th USENIX Symposium on Operating Systems Design and Implementation                         1009
+               HeadSW                                                            cation once it is done transmitting the corresponding batch.
+                   1        2             3                   RX Ensō Pipe       Completions flip a flag signal, so that software can check if
+             NotificationHeadSW                    TailNIC                       the following cache line corresponds to a completion or a
+  0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 RX Notification Buffer                           pending TX notification.
+     Cache line
+
+Figure 4: Notification buffer being used to notify the arrival of three chunks   4.1.2   Multiplexing and Scaling
+of data in an RX Ensō Pipe. Notifications contain the latest TailNIC for a
+given Ensō Pipe as well as a flag signal.
+                                                                                 Within a single thread: To let a single thread efficiently
+can dedicate a ‘flag signal’ in every descriptor to signal that                  access multiple Ensō Pipes, we associate multiple Ensō Pipes
+the descriptor is valid. Software can then poll the next de-                     with the same notification buffer. To accomplish this, notifi-
+scriptor until its flag becomes valid. This way, there is no                     cations include an Ensō Pipe ID alongside the TailNIC and the
+need for the NIC to explicitly tell software of pointer updates.                 flag signal that we discussed before. As a result, software can
+Unfortunately, we cannot use this approach for Ensō. While                      probe a single notification buffer to retrieve updates from
+Ensō Pipes can still use MMIO writes for pointer updates                        multiple Ensō Pipes. This avoids the known scalability issues
+from software, we cannot embed inline signaling in the Ensō                     from needing to poll multiple queues [59, 76].
+Pipe itself since we do not impose any structure on the data.
+   We considered several design options to communicate                           Among multiple threads: To let multiple threads send
+pointer updates. We focus on one illuminating rejected de-                       and receive data independently, Ensō supports multiple noti-
+sign here: sharing an address in main memory between the                         fication buffers. Each thread can use a dedicated notification
+NIC and software. With each Ensō Pipe, we might have                            buffer, avoiding costly synchronization primitives. When
+a dedicated address in memory where the NIC writes the                           setting up a new Ensō Pipe, software tells the NIC which
+latest TailNIC . The software can then poll this address to de-                  notification buffer is associated with it. Therefore, the NIC
+termine the latest value. Unfortunately, this approach leads                     knows to which notification buffer to send a notification.
+to contention because every time the NIC writes to memory,                       Among multiple applications: In addition to using inde-
+the cache entry on the CPU is invalidated. If software con-                      pendent notification buffers, Ensō ensures that applications
+tinues to poll the same cache line, the resulting contention                     only have access to their own subset of Ensō Pipes and noti-
+reduces throughput by orders of magnitude: we measured a                         fication buffers. Each queue’s MMIO pointer register pair is
+throughput below 5 Gbps when using small transfers with                          kept in its own dedicated page-aligned block of memory [22].
+this approach. We discuss other rejected approaches in Ap-                       This lets the kernel map the pointer registers at a per-queue
+pendix A.                                                                        granularity to the address space of the application that re-
+                                                                                 quested it.
+4.1.1    Notification Buffer
+                                                                                 4.1.3   Notifications: Contention and Overhead
+Ensō uses a notification buffer to communicate pointer up-
+dates. Although the structure of the notification buffer on                      Allowing multiple Ensō Pipes to share the same notification
+its own does not solve the cache contention challenge, when                      queue (§4.1.2), and having notifications arrive only for larger
+combined with batched notifications and when it is used to ag-                   batches of data (§4.2) naturally prevents contention by keep-
+gregate notification updates to/from multiple Ensō Pipes, this                  ing the NIC ‘ahead’ of the CPU in updating the notification
+approach prevents the CPU from busy waiting on the shared                        buffer, and also reduces the PCIe overhead of communicating
+cache line and hence avoids contention-induced slowdowns.                        these notifications. As the CPU reads in data for one Ensō
+   Figure 4 shows an RX Ensō Pipe with its corresponding                        Pipe, the NIC is writing new entries for subsequent Ensō
+notification buffer. It shows how a single notification indi-                    Pipes. Because the CPU is processing larger batches of data,
+cates the presence of multiple sequential chunks of data at                      it is busier for longer before it needs to check the notification
+the same time; we discuss how notifications are ‘batched’ or                     buffer. Hence, as line rates go up, the two are unlikely to be
+coalesced in §4.2. Notifications contain the latest TailNIC for                  accessing the same cache line simultaneously.
+a given RX Ensō Pipe as well as a flag signal that software can
+use to check if the next notification is ready to be consumed.                   4.2     Pacing Notifications
+As is done typically with descriptor ring buffers, software
+advances the NotificationHeadSW using an MMIO write after                        As mentioned above, Ensō batches notifications aiming to
+consuming a notification. Like an RX Ensō Pipe, a TX Ensō                      reduce metadata bandwidth consumption and to keep CPUs
+Pipe also uses a separate notification buffer to synchronize                     busy processing data, rather than waiting for notifications.
+pointer updates. But software enqueues new notifications                         Using the wrong batch size, however, is problematic: a sys-
+when it wants to transmit a chunk of data and the NIC over-                      tem that uses batch sizes that are too small would unneces-
+writes the transmission notification with a completion notifi-                   sarily transmit extra metadata, and a system that uses batch
+
+
+
+1010     17th USENIX Symposium on Operating Systems Design and Implementation                                              USENIX Association
+   func onPktArrival()           func onRxUpdate(HeadSW )                    is unlikely to be an issue for Internet-facing applications, it
+       if status = 0 then            if HeadSW = TailNIC then                might be an issue for some latency-sensitive applications [7].
+            notify (TailNIC )             𝑠𝑡𝑎𝑡𝑢𝑠 ← 0
+            𝑠𝑡𝑎𝑡𝑢𝑠 ← 1               else                                    Notification prefetching: To improve latency for latency-
+                                          notify (TailNIC )                  sensitive applications, Ensō also implements a notification
+Figure 5: Reactive notification mechanism for an Ensō Pipe. It only sends   prefetching mechanism. Notification prefetching allows soft-
+notifications when new data arrives and status = 0, or if software updates
+HeadSW and it is different from TailNIC .
+                                                                             ware to explicitly request a new notification to the NIC. Ap-
+                                                                             plications can use notification prefetching either explicitly,
+sizes that are too large might unnecessarily inflate latency.                by calling a function to prefetch notifications for a given
+Ideally, the NIC could keep track of how frequently software                 Ensō Pipe, or transparently, by compiling the Ensō library
+is consuming notifications and try to send a notification right              in low-latency mode. When compiled in low-latency mode,
+before software needs the next one, with all the data that                   the library always prefetches notifications for the next Ensō
+have arrived since the last software read. Ensō approximates                Pipe before returning data for the current one. We evaluate
+this ideal approach but without the impossibility of perfectly               the impact of using notification prefetching in §7.2.5.
+predicting when the next read is coming.
+   Instead of trying to predict when to send the next notifi-
+cation, Ensō lets software dictate the pace of notifications by             5     Ensō Implementation
+sending notifications reactively. It leverages the fact that the
+NIC is already aware of when the software is consuming data,                 Our Ensō implementation consists of three pieces: a
+as the NIC is notified whenever software updates HeadSW                      userspace library, a kernel module, and a NIC hardware
+through MMIO writes. Therefore, the NIC can send notifica-                   that implements Ensō. We implement the library and kernel
+tions in response to these updates. Specifically, we allow the               module on Linux in about 9k lines of C and C++17. Our
+actual NIC tail pointer (TailNIC ) to diverge temporarily from               hardware implementation uses about 10k lines of SystemVer-
+what is observed from software via the notification buffer.                  ilog, excluding tests and auto-generated IPs. Our hardware
+Ensō suppresses updates to TailNIC until the NIC sees an                    implementation targets an FPGA SmartNIC but the same
+update to HeadSW . Our implementation uses a single status                   design could also be implemented in an ASIC.
+bit for every Ensō Pipe, initialized to ‘0’, which indicates if
+the buffer has data.                                                         5.1    Software Implementation
+Operation: Figure 5 summarizes the reactive notification
+                                                                             Applications use a library call to request notification buffers
+mechanism. Whenever data arrive at an RX Ensō Pipe
+                                                                             and Ensō Pipes. Typically, applications will request a noti-
+(onPktArrival), we check the status bit, only sending a
+                                                                             fication buffer for each thread but may use multiple Ensō
+notification if status = 0 (indicating that the buffer is empty).
+                                                                             Pipes per thread, depending on their needs. The library
+We also potentially send notifications whenever software
+                                                                             sends requests for new Ensō Pipes and notification buffers to
+updates HeadSW (onRxUpdate). If the new HeadSW is the
+                                                                             the kernel, which checks permissions, allocates them on the
+same as TailNIC , it means that the buffer is now empty and
+                                                                             NIC, and then maps them into application space. Ensō Pipes
+we can reset the status back to ‘0’ without sending a new
+                                                                             are typically allocated in pairs of RX and TX Ensō Pipe but
+notification. Otherwise, it indicates that software is unaware
+                                                                             may also be allocated as unified RX/TX Ensō Pipes. Unified
+of some of the latest data in the buffer, which triggers a new
+                                                                             RX/TX Ensō Pipes map the RX and TX buffer to the same
+notification.
+                                                                             memory region, which is useful for applications that modify
+Discussion: Reactive notifications cause the notification                    data in place and send them back, e.g., network functions.
+rate to naturally adapt to the rate at which software is con-                In contrast, separate Ensō Pipes map the RX and TX buffers
+suming data, as well as how fast incoming data is arriving.                  to the different memory regions and are useful for typical
+When software is slow to consume data from a particular                      request-response applications.
+Ensō Pipe, bytes accumulate and the NIC sends fewer notifi-                    To ensure a consistent abstraction of unbounded Ensō
+cations for that Ensō Pipe. When software is fast to consume                Pipes we must also deal with corner cases that arise when
+data, it advances the HeadSW pointer more often, causing                     data wrap around the buffer limit. To prevent breaking re-
+the NIC to send frequent notifications.                                      ceived data that wrap around, we map the same Ensō Pipe’s
+   Reactive notifications ensure that every piece of data is                 physical address twice in the application’s virtual memory
+notified, but as we will see in §7.2.5, they can impose a small              address space. This means that, to the application, the buffer
+latency overhead. This overhead occurs if packet arrivals                    appears to be twice its actual size, with the second half always
+are known to the NIC but have not yet been communicated                      mirroring the first one. The application can then consume
+in the notification buffer. In this case, when HeadSW reaches                up to the full size of the buffer of data at once, regardless
+TailNIC , software has to wait for a PCIe RTT before it is                   of where in the buffer the current HeadSW is. To transmit
+notified of the waiting packets. While an extra PCIe RTT                     data that wrap around the buffer limit, the library checks if
+
+
+
+USENIX Association                                  17th USENIX Symposium on Operating Systems Design and Implementation               1011
+                                                                                                                                        MMIO/JTAG
+                  MMIO/JTAG             MMIO/JTAG
+                                                                                                  DMA Read Request
+                  RX Ensō Pipe                                                                                                         TX Notification
+                                            RX        Metadata/                                                                ...
+                   Manager 1                                                                                                           Buffer Manager
+
+
+
+
+                                                                    enignE AMD
+
+
+
+
+                                                                                     enignE AMD
+   Metadata                             Notification Notification                                 DMA Read                                               Pending
+                                                                                                                   Notification FIFO
+                                                                                                                                                         Data
+
+
+
+                     ...
+                                          Buffer                                                  Response                     ...      Configurator
+                  RX Ensō Pipe                                                                                                                           Request
+                                         Manager                                                                  Configuration FIFO
+                   Manager 16                                                                                       ...
+        Data                                              Data                                                                          Completion       Metadata
+                                  ...                                                             TX Completion         Data FIFO                         Data
+                                                                                                                                         Monitor
+                                         Data FIFO
+                                                                                                                  Figure 7: NIC TX Datapath.
+                   Figure 6: NIC RX Datapath.
+the transfer goes around the Ensō Pipe boundary and auto-                       DMA Engine: This module uses DMA to write data and
+matically partitions it into several transfers, each of which                    notifications to the correct address in host memory based on
+is smaller than the overall buffer size.                                         the metadata computed by the upstream modules.
+
+
+5.2      Hardware Implementation                                                 5.2.2              TX Datapath and Configuration Path
+
+We now describe key RX and TX hardware modules.                                  The TX datapath (Figure 7) is composed of:
+                                                                                 TX Notification Buffer Manager: This module keeps state
+5.2.1     RX Datapath                                                            for all TX notification buffers. When software enqueues a
+                                                                                 new TX notification and advances NotificationTailSW using
+Figure 6 illustrates the RX datapath. It receives as input data                  an MMIO write, the manager requests a DMA read to fetch
+and metadata, which includes the Ensō Pipe ID and the size                      the notification from memory. The read request is sent to
+of the corresponding data that is being enqueued. Metadata                       the DMA Engine, which enqueues the DMA read response
+is handled separately from the data, which allows for smaller                    to the Notification FIFO. The manager can then consume
+queues between modules. The RX datapath is composed of                           the notifications, allowing it to request DMA reads for the
+the following modules:                                                           actual data inside an Ensō Pipe. It also sends information
+RX Ensō Pipe Managers: The Ensō Pipe managers are                              about each data request to the Completion Monitor module.
+responsible for keeping Ensō Pipe state such as the buffer’s
+                                                                                 Completion Monitor: When the data requested by the
+physical address, HeadSW , TailNIC , notification buffer ID, and
+                                                                                 TX Notification Buffer Manager arrive, the DMA Engine
+notification status bit. When metadata arrive for Ensō Pipe 𝑖,
+                                                                                 enqueues them to the Data FIFO. The Completion Monitor
+the manager checks for sufficient space in 𝑖 and advances 𝑖’s
+                                                                                 consumes the data and keeps track of the number of bytes
+TailNIC . The manager also determines whether to trigger a
+                                                                                 pending in each request using information that it received
+notification according to the reactive notification strategy
+                                                                                 from the TX Notification Buffer Manager. When the request
+(§4.2). To trigger a notification, the manager includes the
+                                                                                 completes, the Completion Monitor sends a TX completion
+notification buffer ID and sets a bit in the metadata that is
+                                                                                 notification to the DMA Engine that writes it to host memory.
+sent to the Notification Buffer Manager.
+                                                                                 It can then output the data and the metadata, containing the
+   We use multiple Ensō Pipe Managers for two reasons. First,                   Ensō Pipe ID and size, to downstream modules on the NIC.
+it enables flow-level parallelism. Each manager requires two
+cycles to process each metadata, achieving a request rate of                     Configurator: Configuration notifications are enqueued
+125 Mpps at a 250 MHz clock. To achieve 100 Gbps line rate                       to the Configuration FIFO instead of the Notification FIFO.
+(148.8 Mpps) we thus need at least two managers. Second,                         These are consumed by the Configurator, which directs the
+multiple managers enable scaling to high Ensō Pipe counts.                      configuration to the appropriate module on the NIC. For
+We split the state for different Ensō Pipes among different                     instance, when the kernel sets a new Ensō Pipe, it inserts an
+managers, allowing the logic to be closer to the memory that                     entry in the NIC Flow Table to direct a set of packets to it.
+it needs to access. We configure the number of Ensō Pipe
+Managers at synthesis time with a default of 16, which allows
+                                                                                 6                Using Ensō
+the design to meet timing for up to 16k Ensō Pipes.
+RX Notification Buffer Manager: This module issues noti-                         Ensō provides a zero-copy streaming abstraction that the NIC
+fications when needed. It spends one cycle for every request                     and applications can use to exchange data. Thus far, we have
+and an extra cycle for those that require a notification. If we                  shown how this abstraction can be efficiently implemented.
+can suppress notifications for at least 20% of requests, we                      We now discuss how Ensō should be used.
+only need a single notification manager at a 250 MHz clock.                         How one uses Ensō depends on how features are split
+A single notification manager is also sufficient since we use                    between hardware and software. We consider three settings:
+fewer notification buffers than Ensō Pipes, e.g., one notifi-                   (1) Traditional NICs which implement simple offloads, such
+cation buffer per CPU core. Our implementation defaults to                       as checksum and RSS [82], and rely on software implemen-
+128 notification buffers but also meets timing with 1024.                        tation for the rest. These can use Ensō Pipes to deliver raw
+
+
+
+1012      17th USENIX Symposium on Operating Systems Design and Implementation                                                             USENIX Association
+packets to/from a network stack implemented in software.                                      150
+
+
+
+
+                                                                         Packet rate (Mpps)
+(2) NICs that implement transport offloads [10, 14, 77, 78]
+                                                                                              100
+in hardware. These can deliver application-level messages
+or reassembled bytestreams through the Ensō Pipes. And
+                                                                                              50
+finally, (3) NICs that implement application logic [41, 49],
+                                                                                                               Ensō          E810
+which can use Ensō Pipes to exchange application data. We                                     0
+elaborate on each of these settings below.                                                          12           4           8
+                                                                                                   Number of cores
+Traditional NICs: For traditional NICs that perform simple       Figure 8: Raw packet rate. Ensō is bottlenecked by Ethernet while the E810
+offloads such as checksum and segmentation, using Ensō is       does not scale beyond two cores. The dashed line represents the 100 Gb
+not significantly different than using a packetized interface.   Ethernet limit.
+In both cases, the network stack is implemented in software      DPDK to minimize software overheads. All our experiments
+and only needs to be changed to use Ensō Pipes. Ensō is        are run on a server with an Intel Core i9-9960X CPU [38]
+designed to support several Ensō Pipes, and for most appli-     with 16 cores running at 3.1 GHz base frequency, 22 MB of
+cations this change does not induce any additional software      LLC, and PCIe 3.0. We disable dynamic frequency scaling,
+overheads. Furthermore, high-performance packet process-         hyper-threading, power management features (C-states and
+ing applications that process packets in order, as is the case   P-states), and isolate CPU cores from the scheduler.
+for most network functions [68] and applications that use
+UDP, can consume and transmit raw packets through an             Packet generator: The packet generator machine is
+Ensō Pipe without copies.                                       equipped with an Intel Core i7-7820X CPU [37] with 8
+   However, applications such as virtual switches [32, 67],      cores running at 3.6 GHz base frequency, 11 MB of LLC, and
+that multiplex and demultiplex packets (but do not perform       PCIe 3.0. It includes another Stratix 10 MX FPGA connected
+reassembly or other functions that require re-ordering pack-     back to back to the E810 and the FPGA on the DUT machine.
+ets, where both interfaces require copies), need to perform         We found that existing high-performance packet genera-
+an additional copy when forwarding packets to their destina-     tors such as DPDK Pktgen [85] and Moongen [24] are unable
+tion. As we show in §7.2.2, Ensō’s performance advantages       to keep up with Ensō’s packet rate because their performance
+can outweigh the cost of copies even for such applications.      is limited by the packetized NIC interface. We thus imple-
+                                                                 ment EnsōGen, a packet generator based on Ensō. EnsōGen
+NICs with transport offload: NICs that implement                 generates packets from a pcap file, and can send and re-
+message-based transports (e.g., SCTP, Homa [60]) or              ceive arbitrary-sized packets at 100 Gbps line rate using a
+streaming-based transports (e.g., TCP) may also choose to use    single CPU core. We describe EnsōGen in more detail in
+Ensō Pipes to deliver messages or reassembled bytestreams       Appendix B. We use EnsōGen in all experiments except for
+directly to the application without copies.                      MICA, where we send requests from a MICA client (§7.3.3).
+NICs with application logic: NICs that implement                 Methodology: We measure zero-loss throughput as defined
+application-layer protocols or include part of the applica-      in RFC 2544 [11, 61] with a precision of 0.1 Gbps. We report
+tion logic may use Ensō Pipes to exchange application-level     median throughput and error bars for one standard deviation
+messages with applications. For instance, a NIC that is aware    from ten repetitions. We measure latency by implementing
+of both TCP and HTTP may deliver incoming HTTP requests          hardware timestamping on the FPGA, which achieves 5 ns
+back to back to a web server, effectively converting the ap-     precision for packet RTTs. EnsōGen keeps a histogram with
+plication to a run-to-completion model.                          the RTT of every received packet, which we use to com-
+                                                                 pute median and 99th percentile latencies. PCIe bandwidth
+7     Evaluation                                                 measurements use PCM [17] and we obtain other CPU coun-
+                                                                 ters using perf [65]. To evaluate MICA, we use the same
+We now evaluate our design decisions using microbench-           methodology as the original paper [52] for consistency.
+marks, and then use four real-world applications to show
+how Ensō improves end-to-end performance.                       7.2              Microbenchmarks
+                                                                 We start by using microbenchmarks to evaluate Ensō’s per-
+7.1    Setup and Methodology                                     formance and the design decisions we made.
+
+Device Under Test (DUT): We synthesize and run the Ensō
+                                                                 7.2.1                 Packet Rate
+NIC on an Intel Stratix 10 MX FPGA NIC [42] with 100 Gb
+Ethernet and a PCIe 3.0 x16 interface. Most of the NIC design    We start by measuring how fast Ensō can process packets.
+runs at 250 MHz. Our baseline uses an Intel E810 NIC [40]        We compare the performance of an Ensō-based echo server
+with 100 Gb Ethernet and a PCIe 4.0 x16 interface, and uses      to that of a DPDK-based echo server. On receiving a packet,
+
+
+
+USENIX Association                        17th USENIX Symposium on Operating Systems Design and Implementation                       1013
+                                                                                                   Ensō           Chaotic Ensō           E810
+                    100
+Throughput (Gbps)
+
+
+
+                                                                                Throughput        100.0 Gbps          38.0 Gbps          41.1 Gbps
+                    75                                                                 Rate       148.8 Mpps          56.5 Mpps          61.1 Mpps
+                                                                              L1d miss/total 22.8M/11,597M (0.2%) 557M/3,949M (14%) 1,357M/21,339M (6%)
+                    50                                                         L2 miss/total 2.1M/22.8M (9%)       382M/558M (68%) 747M/1,357M (55%)
+                                                                    Ensō     LLC miss/total 541/2.1M (0.03%)     348k/382M (0.09%) 9,086/747M (0.001%)
+                    25
+                                                                    E810
+                     0                                                       Table 1: Effect of chaotic memory accesses on throughput and cache misses.
+                             64     128
+                                    256       512       1024      1518
+                                                                             Results are the average of 10 runs, each lasting 10 s.
+                                 Packet size (bytes)
+    Figure 9: Throughput when forwarding packets between two queues. Ensō   It also puts into question the usefulness of a packetized in-
+    outperforms zero-copy E810 even when it needs to copy packets.           terface, as its overheads can be greater than those imposed
+    both versions increment a value in each packet’s payload and             by packet copies.
+    then send the packet back out through the same interface.                   Next, we use more detailed microbenchmarks that help ex-
+    We increment the payload value to ensure that all packets                plain where Ensō’s performance improvement comes from.
+    are brought into the processing core’s L1d cache. For the
+    Ensō echo server, we use an RX/TX Ensō Pipe, which lets it             7.2.3    Effect of Chaotic Memory Accesses on Cache
+    echo packets without copies.
+                                                                             We now show that placing messages sequentially in an Ensō
+       Figure 8 compares the packet rate for Ensō and DPDK for
+                                                                             Pipe is important for Ensō’s performance. As we discussed
+    different numbers of cores. Even with a single core, Ensō
+                                                                             previously, not using sequential buffers results in chaotic
+    is bottlenecked by Ethernet, achieving 148.8 Mpps. In con-
+                                                                             memory accesses, which reduces the effectiveness of hard-
+    trast, the E810 with DPDK achieves 59 Mpps with a single
+                                                                             ware prefetchers (e.g., streaming prefetcher [36]). To evalu-
+    core and does not scale beyond two cores, where it peaks at
+                                                                             ate this claim, we built a modified version of Ensō, which we
+    88 Mpps. Beyond two cores, the experiments with the E810
+                                                                             call Chaotic Ensō, that changes the gaps in memory between
+    are bottlenecked by PCIe bandwidth, which is insufficient for
+                                                                             subsequent messages. We compute the gap deterministically
+    transferring packet data and descriptor metadata (§7.2.4). As
+                                                                             based on the message’s current position in an Ensō Pipe,
+    a result, the number of packets dropped by the E810 NIC in-
+                                                                             ensuring that we add no additional software overhead when
+    creases as we increase the number of cores, and the zero-loss
+                                                                             using Chaotic Ensō.
+    throughput decreases beyond two cores.
+                                                                                We benchmarked Ensō, Chaotic Ensō, and the E810 NIC
+                                                                             using a program that receives and increments packets (but
+    7.2.2                 Packet Forwarding with Copies                      does not send them back). We measured zero-loss through-
+                                                                             put, and cache miss rates at this throughput.
+    As we discussed in §3, Ensō’s streaming interface targets                  We show the results in Table 1. Observe that Chaotic Ensō
+    applications that process received data in order. With Ensō,            achieves a lower throughput of 56.5 Mpps than even the E810.
+    applications that multiplex and demultiplex data, such as                The number of cache misses reveals why: despite processing
+    virtual switches [32, 67], need to copy packets to forward               fewer packets per second (and hence having fewer cache
+    them to their destination. However, as we will see next, Ensō           accesses), Chaotic Ensō has an order-of-magnitude (557 mil-
+    outperforms the E810 even in this scenario.                              lion vs. 22.7 million) more L1d cache misses than Ensō. This,
+       To quantify the overhead of multiplexing and demultiplex-             in turn, leads to an order of magnitude (558 million vs. 22.8
+    ing data, we implement a simple packet forwarding applica-               million) more accesses to L2 cache, thus increasing packet
+    tion that swaps MAC addresses and copies incoming packets                processing overheads. We also observe that the E810 has
+    to a different TX Ensō Pipe. We compare this application                more cache accesses than either Ensō or chaotic Ensō, this
+    against an equivalent zero-copy DPDK implementation. Fig-                is because it uses a descriptor per packet and thus requires
+    ure 9 shows the throughput when forwarding packets of                    the application to read more data. Finally, we observed that
+    different sizes using a single CPU core. Packet copies add               LLC misses were rare in all three configurations.
+    overhead to Ensō, which can no longer forward 64-byte pack-
+    ets at 100 Gbps (148.8 Mpps). However, Ensō’s throughput
+                                                                             7.2.4    PCIe Bandwidth
+    with 64-byte packets (91.7 Gbps) is still more than 2× that
+    achieved by the E810 with DPDK without copies (39.6 Gbps).               Next, we evaluate the importance of reducing packet meta-
+    For other packet sizes, Ensō achieves line rate. We also eval-          data by eliminating descriptors. We do so by measuring PCIe
+    uate the throughput for the same application when send-                  bandwidth when using the echo server described in §7.2.1
+    ing packets from a CAIDA trace [13]. For this trace Ensō’s              with 64-byte packets. In what follows, PCIe writes refer to
+    throughput is 92.6 Gbps, compared to 72.6 Gbps for the E810              DMA transfers from NIC to host memory, while PCIe reads
+    with DPDK without copies.                                                refer to DMA transfers from the host memory to the NIC.
+       This result came as a surprise to us as our goal with Ensō              Unlike other microbenchmarks, we do not limit ourselves
+    was never to target multiplexing/demultiplexing in software.             to zero-loss throughput for this experiment, and instead send
+
+
+
+    1014                  17th USENIX Symposium on Operating Systems Design and Implementation                                USENIX Association
+                                                                                                          50
+                        80
+PCIe bandwidth (Gbps)
+
+
+                                                                                                                                                                Reactive 99th pctl.
+                                                                                                          40
+
+
+
+
+                                                                                           Latency (µs)
+                                                                                                          30                                                    Reactive 50th pctl.
+                        60
+                                                                                                          20                                                    Per packet 99th pctl.
+                        40                                                                                10                                                    Per packet 50th pctl.
+
+                                         Ensō Goodput       Ensō RD         E810 RD
+                                                                                                           0
+                        20                                                                                     0        25        50      75         100
+                                         E810 Goodput        Ensō WR         E810 WR
+                                                                                                                         Offered load (Gbps)
+                         0
+                                  1  2                4               8                     Figure 11: RTT for different loads when using a notification per packet or
+                                      Number of cores                                       reactive notifications without notification prefetching.
+    Figure 10: PCIe bandwidth utilization for read (RD) and write (WR) trans-                             50
+                                                                                                                                                           Ensō (No pref.) 99th pctl.
+    actions. The bars represent the overall PCIe bandwidth utilization, while                             40
+
+
+
+
+                                                                                           Latency (µs)
+    the lines represent the goodput, i.e., the amount of PCIe bandwidth used to                           30                                               Ensō (No pref.) 50th pctl.
+    transmit packet data. Ensō uses little PCIe bandwidth for metadata, causing                          20                                               Ensō (Pref.) 99th pctl.
+    it to achieve a higher goodput while consuming less overall PCIe bandwidth.                           10                                               Ensō (Pref.) 50th pctl.
+    packets at line rate. This ensures that software overheads do                                          0                                               E810 99th pctl.
+                                                                                                               0       25       50     75      100
+    not limit observed PCIe bandwidth, since drops due to queu-                                                                                            E810 50th pctl.
+                                                                                                                       Offered load (Gbps)
+    ing do not reduce throughput. We measure PCIe bandwidth
+                                                                                            Figure 12: RTT for different loads for the E810 as well as Ensō with and
+    and the rate at which the packet generator receives packets.                            without notification prefetching.
+    We use this to calculate the fraction of PCIe bandwidth used
+                                                                                            the impact reactive notifications have on throughput and
+    for actual packet data (goodput).5
+                                                                                            latency, by comparing Ensō’s performance (reactive) to that
+       We report the results in Figure 10, where we show both
+                                                                                            of a variant of Ensō (per-packet) that sends a notification for
+    PCIe goodput and total PCIe bandwidth for read (RD) and
+                                                                                            each packet. We again reuse the echo server from previous
+    write (WR) directions. We draw four conclusions from it:
+                                                                                            microbenchmarks for this.
+      1. With one core, the E810 is CPU-bound, and the NIC
+                                                                                               Figure 11 shows the RTT (50th and 99th percentiles) as
+          drops incoming packets because of a lack of buffers in
+                                                                                            we increase load for both cases. While reactive notifications
+          host memory. This reduces goodput and PCIe band-
+                                                                                            can sustain up to 100 Gbps of offered load, a design using
+         width utilization.
+                                                                                            per-packet notifications can only sustain 50 Gbps. However,
+      2. Beyond two cores, the E810 becomes PCIe bound, and
+                                                                                            reactive notifications also add latency with increased load.
+          consumes up to 84.1 Gbps of PCIe read bandwidth. This
+                                                                                               We use notification prefetching to minimize latency un-
+          is close to 85 Gbps, the theoretical limit for PCIe Gen3
+                                                                                            der high loads.6 When using notification prefetching, the
+          x16 with 64-byte transfers [62].
+                                                                                            software explicitly sends the NIC a request for notifications
+      3. Even though the E810 has a lower goodput, it consumes
+                                                                                            pertaining to the next Ensō Pipe, while consuming data from
+          more PCIe bandwidth due to metadata. This overhead
+                                                                                            the current Ensō Pipe. This effectively doubles the number
+          accounts for up to 39% of the PCIe read bandwidth. In
+                                                                                            of notifications that the NIC sends to software at a high rate
+          contrast Ensō’s metadata overhead remains below 1.2%.
+                                                                                            but ensures that the software does not need to wait for a
+      4. Although barely noticeable in the plot, Ensō’s PCIe
+                                                                                            PCIe RTT before processing the next Ensō Pipe.
+         write bandwidth utilization increases as we increase the
+                                                                                               Figure 12 shows the RTT with an increasing load for Ensō
+          number of cores: going up from 76.4 Gbps (one core) to
+                                                                                            with and without notification prefetching and for an E810
+          77.2 Gbps (eight cores). This is because the NIC sends
+                                                                                            NIC with DPDK. We observe that notification prefetching sig-
+          reactive notifications more frequently when software
+                                                                                            nificantly reduces Ensō’s latency, and allows us to achieve la-
+          consumes packets faster.
+                                                                                            tency comparable to the E810, while still sustaining 100 Gbps.
+       While newer PCIe generations, including PCIe Gen 4,
+    have higher capacity and will no longer be a bottleneck for
+    100 Gbps traffic, they will continue to be a problem for NICs                           7.2.6                  Sensitivity Analysis
+    that have multiple 100 Gbps interfaces and for future 400 and                           Finally, we use microbenchmarks to evaluate Ensō’s sensi-
+    500 Gbps NICs. Even with PCIe Gen 5 and a 400 Gbps NIC,                                 tivity to different configuration parameters:
+    the ratio of PCIe to ethernet bandwidth remains the same as
+    in our setting with PCIe Gen 3.                                                         Impact of the number of Ensō Pipes: We measure the
+                                                                                            impact of increasing the number of Ensō Pipes by varying the
+                                                                                            number of active Ensō Pipes, and using a workload where
+    7.2.5                    Reactive Notifications and Latency
+                                                                                            each incoming packet goes to a different Ensō Pipe. We
+    As we discussed in §4.2, Ensō is able to reduce metadata                               partition Ensō Pipes evenly across all cores. Our results in
+    overhead by sending notifications reactively. We measure                                Figure 13 show that (a) we need at least two Ensō Pipes to
+                        5 The maximum goodput achievable with 64-byte packets and 100 Gb                  6 By default Ensō does not prefetch notifications. Latency-sensitive ap-
+
+    Ethernet is 76.19 Gbps, since Ethernet adds 20 bytes of overhead per packet.            plications may enable notification prefetching at compile time.
+
+
+
+
+    USENIX Association                                             17th USENIX Symposium on Operating Systems Design and Implementation                                         1015
+                      150                                                                                            Ensō (Cached)      E810 (Cached)
+Packet rate (Mpps)
+
+
+                                                                                                                     Ensō (SYN Flood)   E810 (SYN Flood)
+                      100                                                                                          150
+
+
+
+
+                                                                                              Packet rate (Mpps)
+                          50                                                                                       100
+                                                           1 core      4 cores
+                                                           2 cores     8 cores                                     50
+                          0
+                                 18  2   4
+                                       16 32 64 128 256 512 1024                                                    0
+                                  Number of Ensō Pipes                                                               2    1   4           8
+   Figure 13: Packet rate for different numbers of Ensō Pipes and core counts.                                    Number of cores
+   The dashed line represents the 100 Gb Ethernet limit.                          Figure 15: Packet rate for the Maglev load balancer under two types of
+              1 core                            2 cores                           workloads. The dashed line is the 100 Gb Ethernet limit.
+         100
+          75
+                                                                                  posed in the Maglev paper, caching recent flows in a flow
+      Throughput (Gbps)
+
+
+
+
+          50                                                                      table, as also suggested in the paper. The load balancer ul-
+          25                                                                      timately determines a backend server for every incoming
+            0                                                                     packet, rewriting the packet’s destination IP to that of the
+              4 cores                           8 cores
+         100                                                                      chosen backend server. To steer packets among different
+          75
+          50                                                                      cores, we use a hash of the 5-tuple (RSS) in both systems.
+          25                                                Ensō       E810      We evaluate our implementation using two extreme types
+            0                                                                     of workloads: one with only 16 flows, which means that
+                64 128 256 512 1024 1518 64 128 256 512 1024 1518
+                                      Packet size (bytes)                         packets always hit the flow cache; and another with a SYN
+    Figure 14: Sensitivity analysis with different numbers of cores and packet    flood, which means that packets always miss the flow cache.
+    sizes. Ensō is bottlenecked by 100 Gb Ethernet in all scenarios.             In both cases, we use small 64-byte packets as Maglev is mo-
+    achieve line rate, since this allows us to mask notification                  tivated by the need to load balance small requests [23, §3.2].
+    latency; and (b) that throughput drops when a core has more                   For Ensō, we use unified RX/TX Ensō Pipes to avoid copying
+    than 32 Ensō Pipes, or eight cores have more than 512. Note                  the packet when forwarding it back.
+    that this is a pessimal workload, and realistic workloads are                    Figure 15 shows the packet rate with both the E810 NIC us-
+    likely to perform better even with many queues [30].                          ing DPDK and Ensō as we scale the number of cores. With a
+                                                                                  single core and the cached workload, Ensō achieves a packet
+    Impact of packet sizes and cores: In Figure 14 we measure                     rate of 138 Mpps, approximately 6× the 23 Mpps achieved
+    the impact of varying packet size and number of cores, and                    by the E810. With the SYN flood workload, Ensō achieves
+    find that Ensō can always sustain full line rate, regardless of              79 Mpps, approximately 5× the 16 Mpps achieved by the
+    packet size and core count.                                                   E810.7 With four cores, Ensō becomes bottlenecked by Eth-
+                                                                                  ernet for both workloads; and with eight cores, the DPDK
+    7.3                        Application Benchmarks                             implementation becomes bottlenecked by PCIe (§7.2.4).
+
+   We now evaluate how Ensō impacts the performance of
+                                                                                  7.3.2    Network Telemetry
+   real applications. We ported four different applications to
+   use both DPDK and Ensō. These applications represent                          Sketching algorithms are popular primitives for many net-
+   three classes of network-intensive applications (raw packets,                  work telemetry tasks (e.g., heavy-hitter detection, flow count
+   message-based, and streaming) that we expect to be used                        estimation) because of their small memory footprint and the-
+   with Ensō: Google’s Maglev Load Balancer [23], a network-                     oretical accuracy guarantees. NitroSketch [54] is a sketching
+   telemetry application based on NitroSketch [54], MICA Key                      framework that enables software sketches to achieve high
+   Value Store [52], and a log monitor inspired by AWS Cloud-                     performance on commodity servers without sacrificing accu-
+   Watch Logs [6]. To enable a fair comparison, we use the same                   racy. To evaluate this class of applications, we implemented
+   processing logic for both DPDK and Ensō-based implemen-                       a Count-Min Sketch (CMS) using the NitroSketch framework
+   tations, changing only the wrapper code used to send and                       and Ensō. As in Maglev, we use unified RX/TX Ensō Pipes.
+   receive packets. Moreover, we only enable simple traditional                      We benchmarked our implementation using two work-
+   offloads on the NIC, e.g., RSS, Flow Director, and checksum,                   loads: 64B packets (emulating the stress-test performed
+   for both Ensō and DPDK. We expect Ensō to perform even                       in [54]), and a busy period sampled from the 2016 CAIDA
+   better with more offloads on the NIC (§6).                                     Equinix 10G dataset [13], with an average packet size of 462B.
+                                                                                      7We note that DPDK’s packet rate of 16 Mpps with a single core is in fact a
+    7.3.1                      Maglev Load Balancer                               good packet rate for DPDK. For instance, NetBricks’ Maglev implementation
+                                                                                  achieves 9.2 Mpps with a single core [64]. We attribute the improvement in
+   We implemented Google’s Maglev load balancer [23] as fol-                      our DPDK numbers to NetBricks’ unoptimized implementation and our use
+   lows. We replicate the consistent-hashing algorithm pro-                       of a newer CPU with better single-thread performance.
+
+
+
+
+    1016                       17th USENIX Symposium on Operating Systems Design and Implementation                                         USENIX Association
+                                                            80                                           80                                                100
+
+
+
+
+                                                                                                                                       Throughput (Gbps)
+                      50       Ensō                              Ensō                                        Ensō                                             Ensō
+
+
+
+
+                                                                                                                         Packet loss
+Request rate (Mops)
+
+
+
+
+                                                                            Packet loss
+                               E810                               E810                                         E810                                        75    E810
+                      40                                    60                                           60
+
+
+
+
+                                             Latency (µs)
+
+
+
+
+                                                                                          Latency (µs)
+                      30                                                                                                                                   50
+                                                            40                                           40
+                      20                                                                                                                                   25
+                                                            20                                           20                                                 0
+                      10
+
+
+
+
+                                                                                                                                                              ve he
+                                                                                                                                                                e ot
+                                                                                                                                                              myxim
+                                                                                                                                                              ngsql
+                                                                                                                                                           po pnx
+                                                                                                                                                           se tfam
+                                                                                                                                                              li ix
+                                                                                                                                                              sinux
+                                                                                                                                                                ssve
+                                                                                                                                                                   hd
+                      0                     0                                  0
+
+
+
+
+                                                                                                                                                           dopac
+                                                                                                                                                                 c
+
+
+                                                                                                                                                                 i
+
+
+
+                                                                                                                                                                 e
+                     2     1
+                           4      8           0 1 2 3 4 5 6 7                    0 5 10 15 20 25 30
+
+
+
+
+                                                                                                                                                              s
+                                                                                                                                                            a
+                 Number of cores                   Offered load (Mops)                Offered load (Mops)                 Target application log
+    Figure 16: MICA throughput with 8B Figure 17: Mean RTT for MICA as a Figure 18: Mean RTT for MICA as a Figure 19: Log monitor throughput
+    keys and values.                   function of offered load (1 core). function of offered load (4 cores). for different target applications.
+   With a single core, Ensō sustains a zero-loss throughput of                                     With 2 and 4 cores, we see throughput speedups of 33% and
+   81.5 Gbps (121 Mpps), approximately 3.5× that achieved by                                        23%, respectively. At 8 cores, the bottleneck moves to a dif-
+   the E810 (22.8 Gbps or 33.9 Mpps) on 64B packets. On the                                         ferent part of the system (i.e., memory). We report numbers
+   CAIDA trace, Ensō achieves 94.9 Gbps, a 21% improvement                                         for the ‘tiny’ configuration since it represents a significant
+   over the E810 (78.3 Gbps); the application remains compute-                                      fraction of requests found in real workloads [4, 57], while
+   bound in this setting, but Ensō shrinks the fraction of time                                    also being the most challenging workload for MICA. We also
+   spent performing network I/O, which improves performance.                                        tested other configurations with larger keys and values, ob-
+                                                                                                    taining up to 29% improvement for the ‘small’ workload (16B
+    7.3.3                  MICA Key-Value Store                                                     keys and 64B values) and up to 12% for the ‘large’ workload
+                                                                                                    (128B keys and 1024B values).
+   MICA [52] is a state-of-the-art key-value (KV) store which is                                       We also evaluate latency, plotting the average request
+   also a popular benchmark in the literature [34,46,47,51,69,79].                                  latency as a function of the offered load when using a server
+   Different from Maglev and the Network Telemetry applica-                                         with a single core (Figure 17) or four cores (Figure 18). For
+   tion, that operate on raw packets and forward them back with                                     both configurations, we find that Ensō outperforms the E810
+   modifications, MICA represents a typical message-based ap-                                       in terms of both throughput and latency. With a single core,
+   plication whose responses must be constructed separately                                         Ensō reduces latency by up to 8 µs (43% reduction) before the
+   from the incoming request. Also different from these ap-                                         queues start to build up and, with four cores, Ensō reduces
+   plications, latency is typically more critical for key-value                                     latency by up to 6 µs (36% reduction).
+   stores [7]. MICA also entails significantly more work per
+   packet (in terms of both compute and memory accesses) and                                         7.3.4    Log Monitor
+   is, therefore, less likely to become network-bound.
+      For the following experiments, we set the size for both                                       To understand Ensō’s effect on streaming applications, we
+   keys and values to 8B (corresponding to the ‘tiny’ configura-                                    implemented a log monitor. The log monitor is inspired by
+   tion in [52]). We report results for operations skewed 50%                                       AWS CloudWatch Logs [6], which lets users centralize logs
+   towards GET requests and with a uniform distribution of key                                      from different hosts and craft queries to look for specific
+   popularity, but these generalize to other configurations as                                      patterns and raise alarms. Like, AWS CloudWatch Logs In-
+   well. We use the same throughput metric as described in [52]                                     sights [5], the log monitor also supports Hyperscan [84] to
+   (tolerating <1% loss at the NIC), and the same methodology                                       search for multiple regular expressions. We use Hyperscan in
+   for measuring end-to-end latency (the client tags each re-                                       streaming mode for both Ensō and DPDK implementations.
+   quest with an 8B timestamp, then computes latency based                                          To feed the system, we use MTU-sized packets, carrying sys-
+   on the arrival time of the corresponding response).                                              tem logs extracted from long-running Linux hosts. We also
+      Figure 16 shows the steady-state throughput in millions                                       configured the log monitor to look for regular expressions
+   of operations per second (Mops) achieved by MICA for both                                        extracted from Fail2ban [45]. We run experiments target-
+   E810 with DPDK and Ensō for different numbers of cores.                                         ing each of the ten most popular applications supported by
+   With a single core, Ensō achieves 7.65 Mops, a 31% improve-                                     Fail2ban according to the Debian package statistics [16].
+   ment over the E810.8 While this might seem modest at first                                          Figure 19 shows the throughput we achieve when target-
+   (compared to the 6× speedup on Maglev), note that MICA is                                        ing each of the ten applications. Performance is dictated
+   significantly more compute- and memory-intensive than Ma-                                        primarily by the number and complexity of the regular ex-
+   glev. Thus, while DPDK adds considerable CPU overhead, it                                        pressions that are required by each target. Ensō’s throughput
+   corresponds to a smaller fraction of the overall compute time.                                   is higher across all targets but the gap is more noticeable for
+        8 For consistency, all the MICA experiments use the original, unmodified
+                                                                                                    those with simpler or fewer regular expressions, with almost
+    MICA client implemented with DPDK. We observe even better perfor-
+                                                                                                    double the throughput when targeting postfix, selinux,
+    mance when using a MICA client ported to Ensō (up to 47% improvement                           or sieve. The reasons for Ensō’s improvement in perfor-
+    in throughput).                                                                                 mance are twofold: First, Hyperscan performs better when
+
+
+
+    USENIX Association                                           17th USENIX Symposium on Operating Systems Design and Implementation                                    1017
+larger chunks of data are handed to it at once. With Ensō, we         NFV [69] stores packet payloads on NIC memory, sending
+can invoke Hyperscan with large chunks of contiguous logs              only the packet headers inlined inside descriptors, which is
+delivered from the NIC but with DPDK we need to invoke                 useful for network functions that only need to modify the
+Hyperscan for every DPDK mbuf. Second, as demonstrated                 header. This is orthogonal to Ensō’s interface changes and
+in §7.2.3, Ensō’s memory access patterns are sequential, mak-         could also be used in conjunction with it.
+ing better use of the CPU prefetcher.
+                                                                       Application-specific software optimizations: Some pro-
+                                                                       posals avoid part of the overheads of existing NICs with
+8    Related Work                                                      application-specific optimizations in software. TinyNF [68]
+                                                                       is a userspace driver optimized for network functions (NFs).
+                                                                       It relies on the fact that NFs typically retransmit the same
+Direct application access: While giving applications direct            packet after processing. It keeps the set of buffers in the RX
+access to the NIC has been a common theme of research for              and TX descriptor rings fixed, reducing buffer management
+more than three decades [8, 22, 26, 33, 50, 66, 73, 75, 80, 87, 88],   overheads. eRPC [46] is an RPC framework that employs
+most work accepts the NIC interface as a given and instead             many RPC-specific optimizations. For instance, it reduces
+look at how to optimize the software interface exposed to ap-          transmission overheads by ignoring completion notifications
+plications. A notable exception is Application Device Chan-            from the NIC, instead relying on RPC responses as a proxy for
+nels [22], which gives control of the NIC to the kernel while          completions. FaRM [21] is a distributed memory implemen-
+giving applications independent access to different queues.            tation. It uses one-sided RDMA to implement a message ring
+We take inspiration from it in the way that we allow multiple          buffer data structure that has some similarities to an Ensō
+applications to share the same NIC.                                    Pipe. However, different from an Ensō Pipe, FaRM’s message
+Alternative NIC interfaces: There are also proposals that              buffer is not opaque (enforcing a specific message scheme),
+try to address some of the performance and abstraction issues          must be exclusive to every sender, and lacks a separate noti-
+that we highlighted for the packetized interface.                      fication queue (requiring the receiver to fill the buffer with
+   In terms of performance, Nvidia MLX 5 NICs [20] provide a           zeros and to probe every buffer for new messages).
+feature named Multi-Packet Receive Queue (MPRQ) that can
+potentially reduce PCIe RD bandwidth utilization with meta-            9   Conclusion
+data by allowing software to post multiple packet buffers
+at once. However, this is not enough to completely avoid               Ensō provides a new streaming abstraction for communica-
+PCIe bottlenecks as the NIC still needs to notify the arrival          tion between software and NICs. It is better suited to modern
+of every packet, consuming PCIe WR bandwidth. Another                  NICs with offloads and improves throughput by up to 6×
+proposed change to the NIC interface is Batched RxList [70].           by being more cache- and prefetch-friendly and by reducing
+This design aggregates multiple packets in the same buffer             the amount of metadata transferred over the IO bus. While
+as a way to allow descriptor ring buffers to be shared more            this paper focused on using Ensō for NIC-to-software com-
+efficiently by multiple threads, which in turn could help them         munication, we believe that a similar approach might also
+avoid the leaky DMA problem [81].                                      apply to other I/O devices and accelerators, and we hope to
+   In terms of abstraction, U-Net [83] and, more recently,             explore this in future work.
+NICA [27] allow the NIC to exchange application-level mes-
+sages directly. U-Net proposes a communication abstraction
+that resembles part of what is now libibverbs (RDMA) [53]              Acknowledgments
+and NICA uses a similar mechanism named “custom rings.”
+                                                                       We thank our shepherd, Jon Crowcroft, and the anonymous
+However, similar to the packetized interface, both U-Net
+                                                                       OSDI ’23 reviewers for their great comments. We thank Fran-
+and NICA use descriptors and scattered buffers and, as such,
+                                                                       cisco Pereira and Adithya Abraham Philip for their comments
+inherit its performance limitations.
+                                                                       on this and earlier drafts of this paper, and Ilias Marinos for
+Application-specific hardware optimizations: Prior                     the discussions and feedback regarding applications. We also
+work has optimized the NIC for specific applications.                  thank the people from Intel and VMware that gave us feed-
+FlexNIC [49] quantifies the benefits that custom NIC inter-            back throughout this work, including Roger Chien, David
+faces could have to different applications. NIQ [29] imple-            Ott, Ben Pfaff, Yipeng Wang, and Gerd Zellweger.
+ments a mechanism to reduce latency for minimum-sized                     This work was supported in part by Intel and VMware
+packets by using MMIO writes to transmit these packets.                through the Intel/VMware Crossroads 3D-FPGA Academic
+It also favors MMIO reads over DMA writes for notifying                Research Center, by a Google Faculty Research Award, and
+incoming packets. NIQ’s reliance on MMIO means that it                 by ERDF through the COMPETE 2020 program as part of
+is mostly useful for applications that are willing to vastly           the project AIDA (POCI-01-0247-FEDER-045907). Nirav Atre
+sacrifice throughput and CPU cycles to improve latency. nm-            was supported by a CyLab Presidential Fellowship.
+
+
+
+1018    17th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+References                                                          Gregory R. Ganger. The CacheLib caching engine: De-
+                                                                    sign and experiences at scale. In 14th USENIX Sympo-
+ [1] Saksham Agarwal, Rachit Agarwal, Behnam Montaz-                sium on Operating Systems Design and Implementation,
+     eri, Masoud Moshref, Khaled Elmeleegy, Luigi Rizzo,            OSDI ’20, pages 753–768, November 2020. 1
+     Marc Asher de Kruijf, Gautam Kumar, Sylvia Rat-
+     nasamy, David Culler, and Amin Vahdat. Understand-        [10] Junehyuk Boo, Yujin Chung, Eunjin Baek, Seongmin
+     ing host interconnect congestion. In Proceedings of            Na, Changsu Kim, and Jangwoo Kim. F4T: A fast
+     the 21st ACM Workshop on Hot Topics in Networks, Hot-          and flexible FPGA-based full-stack TCP acceleration
+     Nets ’22, pages 198–204, New York, NY, USA, 2022. 2.2          framework. In Proceedings of the 50th Annual Interna-
+                                                                    tional Symposium on Computer Architecture, ISCA ’23,
+ [2] Amazon. DPDK driver for elastic network adapter                Orlando, FL, USA, 2023. 6
+     (ENA). https://github.com/amzn/amzn-drivers/
+     tree/master/userspace/dpdk, 2022. 2                       [11] S. Bradner and J. McQuaid. Benchmarking methodol-
+                                                                    ogy for network interconnect devices. RFC 2544, March
+ [3] Mina Tahmasbi Arashloo, Alexey Lavrov, Manya                   1999. 7.1
+     Ghobadi, Jennifer Rexford, David Walker, and David
+     Wentzlaff. Enabling programmable transport protocols      [12] Broadcom. BNXT poll mode driver. https://doc.
+     in high-speed NICs. In 17th USENIX Symposium on Net-           dpdk.org/guides/nics/bnxt.html, 2022. 2
+     worked Systems Design and Implementation, NSDI ’20,
+     pages 93–109, Santa Clara, CA, February 2020. 1           [13] CAIDA. Anonymized internet traces 2016. https://
+                                                                    catalog.caida.org/dataset/passive_2016_pcap.
+ [4] Berk Atikoglu, Yuehai Xu, Eitan Frachtenberg, Song             3, 7.2.2, 7.3.2
+     Jiang, and Mike Paleczny. Workload analysis of a large-
+     scale key-value store. In Proceedings of the 12th ACM     [14] Chelsio Communications.   Terminator 5 ASIC,
+     SIGMETRICS/PERFORMANCE Joint International Con-                2021. https://www.chelsio.com/terminator-5-
+     ference on Measurement and Modeling of Computer Sys-           asic/. 1, 6
+     tems, SIGMETRICS ’12, pages 53–64, New York, NY,
+                                                               [15] Jonathan Corbet. Ringing in a new asynchronous I/O
+     USA, 2012. 1, 2.2, 7.3.3
+                                                                    API, 2019. https://lwn.net/Articles/776703/. 2
+ [5] AWS.          CloudWatch Logs Insights query              [16] Debian. Debian popularity contest: Statistics by
+     syntax, 2022.          https://docs.aws.amazon.                source packages (sum) sorted by fields, 2022. https:
+     com/AmazonCloudWatch/latest/logs/CWL_                          //popcon.debian.org/source/by_inst. 7.3.4
+     QuerySyntax.html. 7.3.4
+                                                               [17] Roman Dementiev et al. Processor Counter Monitor
+ [6] AWS.           What is Amazon CloudWatch                       (PCM), 2022. https://github.com/opcm/pcm. 7.1
+     Logs?, 2022.         https://docs.aws.amazon.
+     com/AmazonCloudWatch/latest/logs/                         [18] Mihai Dobrescu, Norbert Egi, Katerina Argyraki,
+     WhatIsCloudWatchLogs.html. 1, 7.3, 7.3.4                       Byung-Gon Chun, Kevin Fall, Gianluca Iannaccone,
+                                                                    Allan Knies, Maziar Manesh, and Sylvia Ratnasamy.
+ [7] Luiz Barroso, Mike Marty, David Patterson, and                 RouteBricks: Exploiting parallelism to scale software
+     Parthasarathy Ranganathan. Attack of the killer mi-            routers. In Proceedings of the ACM SIGOPS 22nd Sympo-
+     croseconds. Communications of the ACM, 60(4):48–54,            sium on Operating Systems Principles, SOSP ’09, pages
+     March 2017. 4.2, 7.3.3                                         15–28, New York, NY, USA, 2009. 2.2
+ [8] Adam Belay, George Prekas, Ana Klimovic, Samuel           [19] DPDK. Data Plane Development Kit, 2022. https:
+     Grossman, Christos Kozyrakis, and Edouard Bugnion.             //dpdk.org. 1, 2
+     IX: A protected dataplane operating system for high
+     throughput and low latency. In 11th USENIX Sympo-         [20] DPDK. NVIDIA MLX5 ethernet driver, 2022. https:
+     sium on Operating Systems Design and Implementation,           //doc.dpdk.org/guides/nics/mlx5.html. 1, 8
+     OSDI ’14, pages 49–65, Broomfield, CO, October 2014.
+     8                                                         [21] Aleksandar Dragojević, Dushyanth Narayanan, Miguel
+                                                                    Castro, and Orion Hodson. FaRM: Fast remote mem-
+ [9] Benjamin Berg, Daniel S. Berger, Sara McAllister, Isaac        ory. In 11th USENIX Symposium on Networked Systems
+     Grosof, Sathya Gunasekar, Jimmy Lu, Michael Uhlar,             Design and Implementation, NSDI ’14, pages 401–414,
+     Jim Carrig, Nathan Beckmann, Mor Harchol-Balter, and           Seattle, WA, April 2014. 8
+
+
+
+USENIX Association                       17th USENIX Symposium on Operating Systems Design and Implementation      1019
+[22] Peter Druschel, Larry L. Peterson, and Bruce S. Davie.    [29] Mario Flajslik and Mendel Rosenblum. Network inter-
+     Experiences with a high-speed network adaptor: A soft-         face design for low latency request-response protocols.
+     ware perspective. In Proceedings of the Conference on          In 2013 USENIX Annual Technical Conference, ATC ’13,
+     Communications Architectures, Protocols and Applica-           pages 333–346, San Jose, CA, June 2013. 8
+     tions, SIGCOMM ’94, pages 2–13, New York, NY, USA,
+     1994. 1, 4.1.2, 8                                         [30] Hamid Ghasemirahni, Tom Barbette, Georgios P. Kat-
+                                                                    sikas, Alireza Farshin, Amir Roozbeh, Massimo Girondi,
+[23] Daniel E. Eisenbud, Cheng Yi, Carlo Contavalli, Cody           Marco Chiesa, Gerald Q. Maguire Jr., and Dejan Kostić.
+     Smith, Roman Kononov, Eric Mann-Hielscher, Ardas               Packet order matters! Improving application perfor-
+     Cilingiroglu, Bin Cheyney, Wentao Shang, and Jin-              mance by deliberately delaying packets. In 19th USENIX
+     nah Dylan Hosein. Maglev: A fast and reliable soft-            Symposium on Networked Systems Design and Imple-
+     ware network load balancer. In 13th USENIX Sympo-              mentation, NSDI ’22, pages 807–827, Renton, WA, April
+     sium on Networked Systems Design and Implementation,           2022. 7.2.6
+     NSDI ’16, pages 523–535, Santa Clara, CA, March 2016.
+     1, 7.3, 7.3.1                                             [31] Sanjay Ghemawat, Howard Gobioff, and Shun-Tak Le-
+                                                                    ung. The Google file system. In Proceedings of the
+[24] Paul Emmerich, Sebastian Gallenmüller, Daniel Raumer,          Nineteenth ACM Symposium on Operating Systems Prin-
+     Florian Wohlfart, and Georg Carle. MoonGen: A script-          ciples, SOSP ’03, pages 29–43, New York, NY, USA, 2003.
+     able high-speed packet generator. In Proceedings of the        1
+     2015 Internet Measurement Conference, IMC ’15, pages
+     275–287, New York, NY, USA, 2015. 7.1, B                  [32] Sangjin Han, Keon Jang, Aurojit Panda, Shoumik Palkar,
+                                                                    Dongsu Han, and Sylvia Ratnasamy. SoftNIC: A soft-
+[25] Paul Emmerich, Maximilian Pudelko, Simon Bauer, Ste-           ware NIC to augment hardware. Technical Report
+     fan Huber, Thomas Zwickl, and Georg Carle. User                UCB/EECS-2015-155, EECS Department, University of
+     space network drivers. In 2019 ACM/IEEE Symposium              California, Berkeley, May 2015. 2.1, 3, 6, 7.2.2
+     on Architectures for Networking and Communications
+     Systems, ANCS ’19, pages 1–12, Cambridge, UK, 2019.       [33] Toke Høiland-Jørgensen, Jesper Dangaard Brouer,
+     IEEE. 4.1, A                                                   Daniel Borkmann, John Fastabend, Tom Herbert, David
+                                                                    Ahern, and David Miller. The EXpress data path: Fast
+[26] D. R. Engler, M. F. Kaashoek, and J. O’Toole. Exoker-          programmable packet processing in the operating sys-
+     nel: An operating system architecture for application-         tem kernel. In Proceedings of the 14th International
+     level resource management. In Proceedings of the Fif-          Conference on Emerging Networking EXperiments and
+     teenth ACM Symposium on Operating Systems Principles,          Technologies, CoNEXT ’18, pages 54–66, New York, NY,
+     SOSP ’95, pages 251–266, New York, NY, USA, 1995. 8            USA, 2018. 8
+
+[27] Haggai Eran, Lior Zeno, Maroun Tork, Gabi Malka, and      [34] Stephen Ibanez, Alex Mallery, Serhat Arslan, Theo
+     Mark Silberstein. NICA: An infrastructure for inline           Jepsen, Muhammad Shahbaz, Changhoon Kim, and
+     acceleration of network applications. In 2019 USENIX           Nick McKeown. The nanoPU: A nanosecond network
+     Annual Technical Conference, ATC ’19, pages 345–362,           stack for datacenters. In 15th USENIX Symposium on
+     Renton, WA, July 2019. 1, 8                                    Operating Systems Design and Implementation, OSDI ’21,
+                                                                    pages 239–256, July 2021. 7.3.3
+[28] Daniel Firestone, Andrew Putnam, Sambhrama Mund-
+     kur, Derek Chiou, Alireza Dabagh, Mike Andrewartha,       [35] Intel. Intel data direct I/O technology (Intel DDIO): A
+     Hari Angepat, Vivek Bhanu, Adrian Caulfield, Eric              primer. Technical report, Intel, February 2012. 2.2
+     Chung, Harish Kumar Chandrappa, Somesh Chaturmo-
+     hta, Matt Humphrey, Jack Lavier, Norman Lam, Fengfen      [36] Intel. Intel 64 and IA-32 architectures optimization
+     Liu, Kalin Ovtcharov, Jitu Padhye, Gautham Popuri,             reference manual.      Technical Report 248966-045,
+     Shachar Raindel, Tejas Sapre, Mark Shaw, Gabriel Silva,        Intel, 2022. https://www.intel.com/content/www/
+     Madhan Sivakumar, Nisheeth Srivastava, Anshuman                us/en/developer/articles/technical/intel-
+     Verma, Qasim Zuhair, Deepak Bansal, Doug Burger,               sdm.html. 7.2.3
+     Kushagra Vaid, David A. Maltz, and Albert Greenberg.
+     Azure accelerated networking: SmartNICs in the pub-       [37] Intel. Intel Core i7-7820X X-series Processor, 2022.
+     lic cloud. In 15th USENIX Symposium on Networked               https://ark.intel.com/content/www/us/en/ark/
+     Systems Design and Implementation, NSDI ’18, pages             products/123767/intel-core-i77820x-xseries-
+     51–66, Renton, WA, April 2018. 2.1                             processor-11m-cache-up-to-4-30-ghz.html. 7.1
+
+
+
+1020   17th USENIX Symposium on Operating Systems Design and Implementation                           USENIX Association
+[38] Intel. Intel Core i9-9960X X-series Processor, 2022.        [48] Svilen Kanev, Juan Pablo Darago, Kim Hazelwood,
+     https://ark.intel.com/content/www/us/en/ark/                     Parthasarathy Ranganathan, Tipp Moseley, Gu-Yeon
+     products/189123/intel-core-i99960x-xseries-                      Wei, and David Brooks. Profiling a warehouse-scale
+     processor-22m-cache-up-to-4-50-ghz.html. 7.1                     computer. In Proceedings of the 42nd Annual Interna-
+                                                                      tional Symposium on Computer Architecture, ISCA ’15,
+[39] Intel. Intel Ethernet Controller E810. Technical Report          pages 158–169, New York, NY, USA, 2015. 1
+     613875-006, Intel, March 2022. 1, 2, 2.1, 4.1, A, B
+                                                                 [49] Antoine Kaufmann, Simon Peter, Naveen Kr. Sharma,
+                                                                      Thomas Anderson, and Arvind Krishnamurthy. High
+[40] Intel. Intel Ethernet Network Adapter E810-CQDA2,
+                                                                      performance packet processing with FlexNIC. In Pro-
+     2022.        https://ark.intel.com/content/www/
+                                                                      ceedings of the Twenty-First International Conference on
+     us/en/ark/products/210969/intel-ethernet-
+                                                                      Architectural Support for Programming Languages and
+     network-adapter-e8102cqda2.html. 7.1
+                                                                      Operating Systems, ASPLOS ’16, pages 67–81, New York,
+                                                                      NY, USA, 2016. 6, 8
+[41] Intel.   Intel infrastructure processing unit (Intel
+     IPU) platform (codename: Oak Springs Canyon),               [50] Antoine Kaufmann, Tim Stamler, Simon Peter,
+     2022. https://www.intel.com/content/www/us/                      Naveen Kr. Sharma, Arvind Krishnamurthy, and
+     en/products/platforms/details/oak-springs-                       Thomas Anderson. TAS: TCP acceleration as an OS
+     canyon.html. 6                                                   service. In Proceedings of the Fourteenth EuroSys Con-
+                                                                      ference 2019, EuroSys ’19, New York, NY, USA, 2019.
+[42] Intel.   Intel Stratix 10 MX 2100 FPGA, 2022.                    8
+     https://ark.intel.com/content/www/us/en/ark/
+     products/210297/intel-stratix-10-mx-2100-                   [51] Nikita Lazarev, Shaojie Xiang, Neil Adit, Zhiru Zhang,
+     fpga.html. 7.1, B                                                and Christina Delimitrou. Dagger: Efficient and fast
+                                                                      RPCs in cloud microservices with near-Memory recon-
+[43] Intel.     Top-down microarchitecture analysis                   figurable NICs. In Proceedings of the 26th ACM Interna-
+     method.       https://www.intel.com/content/                     tional Conference on Architectural Support for Program-
+     www/us/en/develop/documentation/vtune-                           ming Languages and Operating Systems, ASPLOS ’21,
+     cookbook/top/methodologies/top-down-                             pages 36–51, New York, NY, USA, 2021. 7.3.3
+     microarchitecture-analysis-method.html,                     [52] Hyeontaek Lim, Dongsu Han, David G. Andersen, and
+     2022. 2.2                                                        Michael Kaminsky. MICA: A holistic approach to fast
+                                                                      in-memory key-value storage. In 11th USENIX Sympo-
+[44] Jaeyoung Jang, Sung Jun Jung, Sunmin Jeong, Jun Heo,             sium on Networked Systems Design and Implementation,
+     Hoon Shin, Tae Jun Ham, and Jae W. Lee. A specialized            NSDI ’14, pages 429–444, Seattle, WA, April 2014. 1,
+     architecture for object serialization with applications          2.2, 7.1, 7.3, 7.3.3
+     to big data analytics. In Proceedings of the ACM/IEEE
+     47th Annual International Symposium on Computer Ar-         [53] Linux RDMA. RDMA core userspace libraries and
+     chitecture, ISCA ’20, pages 322–334, Virtual Event, 2020.        daemons, 2022. https://github.com/linux-rdma/
+     IEEE Press. 1                                                    rdma-core. 8
+                                                                 [54] Zaoxing Liu, Ran Ben-Basat, Gil Einziger, Yaron Kass-
+[45] Cyril Jaquier et al. Fail2ban, 2022.      https://www.
+                                                                      ner, Vladimir Braverman, Roy Friedman, and Vyas
+     fail2ban.org/. 7.3.4
+                                                                      Sekar. NitroSketch: Robust and general sketch-based
+                                                                      monitoring in software switches. In Proceedings of the
+[46] Anuj Kalia, Michael Kaminsky, and David Andersen.
+                                                                      ACM Special Interest Group on Data Communication,
+     Datacenter RPCs can be general and fast. In 16th
+                                                                      SIGCOMM ’19, pages 334–350, New York, NY, USA,
+     USENIX Symposium on Networked Systems Design and
+                                                                      2019. 1, 7.3, 7.3.2
+     Implementation, NSDI ’19, pages 1–16, Boston, MA,
+     February 2019. 7.3.3, 8                                     [55] Antonis Manousis, Rahul Anand Sharma, Vyas Sekar,
+                                                                      and Justine Sherry. Contention-aware performance
+[47] Anuj Kalia, Michael Kaminsky, and David G. Andersen.             prediction for virtualized network functions. In Pro-
+     FaSST: Fast, scalable and simple distributed transac-            ceedings of the Annual Conference of the ACM Special
+     tions with two-sided (RDMA) datagram RPCs. In 12th               Interest Group on Data Communication on the Applica-
+     USENIX Symposium on Operating Systems Design and                 tions, Technologies, Architectures, and Protocols for Com-
+     Implementation, OSDI ’16, pages 185–201, Savannah,               puter Communication, SIGCOMM ’20, pages 270–282,
+     GA, November 2016. 7.3.3                                         New York, NY, USA, 2020. 2.2
+
+
+
+USENIX Association                        17th USENIX Symposium on Operating Systems Design and Implementation            1021
+[56] Marvell. DPDK marvell. https://github.com/                   [65] Perf. perf: Linux profiling with performance counters,
+     MarvellEmbeddedProcessors/dpdk-marvell, 2022.                     2022. https://perf.wiki.kernel.org. 7.1
+     2
+                                                                  [66] Simon Peter, Jialin Li, Irene Zhang, Dan R. K. Ports,
+[57] Sara McAllister, Benjamin Berg, Julian Tutuncu-Macias,            Doug Woos, Arvind Krishnamurthy, Thomas Anderson,
+     Juncheng Yang, Sathya Gunasekar, Jimmy Lu, Daniel S.              and Timothy Roscoe. Arrakis: The operating system
+     Berger, Nathan Beckmann, and Gregory R. Ganger.                   is the control plane. In 11th USENIX Symposium on
+     Kangaroo: Caching billions of tiny objects on flash.              Operating Systems Design and Implementation, OSDI ’14,
+     In Proceedings of the ACM SIGOPS 28th Symposium on                pages 1–16, Broomfield, CO, October 2014. 8
+     Operating Systems Principles, SOSP ’21, pages 243–262,
+     New York, NY, USA, 2021. 1, 7.3.3                            [67] Ben Pfaff, Justin Pettit, Teemu Koponen, Ethan Jackson,
+                                                                       Andy Zhou, Jarno Rajahalme, Jesse Gross, Alex Wang,
+[58] Rui Miao, Lingjun Zhu, Shu Ma, Kun Qian, Shujun                   Joe Stringer, Pravin Shelar, Keith Amidon, and Mar-
+     Zhuang, Bo Li, Shuguang Cheng, Jiaqi Gao, Yan Zhuang,             tin Casado. The design and implementation of Open
+     Pengcheng Zhang, Rong Liu, Chao Shi, Binzhang Fu, Ji-             vSwitch. In 12th USENIX Symposium on Networked
+     aji Zhu, Jiesheng Wu, Dennis Cai, and Hongqiang Harry             Systems Design and Implementation, NSDI ’15, pages
+     Liu. From luna to solar: The evolutions of the compute-           117–130, Oakland, CA, May 2015. 2.1, 3, 6, 7.2.2
+     to-storage networks in Alibaba Cloud. In Proceedings
+     of the ACM SIGCOMM 2022 Conference, SIGCOMM ’22,             [68] Solal Pirelli and George Candea. A simpler and faster
+     pages 753–766, New York, NY, USA, 2022. 1                         NIC driver model for network functions. In 14th
+                                                                       USENIX Symposium on Operating Systems Design and
+[59] Amirhossein Mirhosseini, Hossein Golestani, and                   Implementation, OSDI ’20, pages 225–241, November
+     Thomas F. Wenisch. HyperPlane: A scalable low-                    2020. 2, 6, 8
+     latency notification accelerator for software data planes.
+     In 2020 53rd Annual IEEE/ACM International Symposium         [69] Boris Pismenny, Liran Liss, Adam Morrison, and Dan
+     on Microarchitecture, MICRO ’20, pages 852–867, 2020.             Tsafrir. The benefits of general-purpose on-NIC mem-
+     4.1.2                                                             ory. In Proceedings of the 27th ACM International Con-
+                                                                       ference on Architectural Support for Programming Lan-
+[60] Behnam Montazeri, Yilong Li, Mohammad Alizadeh,
+                                                                       guages and Operating Systems, ASPLOS ’22, New York,
+     and John Ousterhout. Homa: A receiver-driven low-
+                                                                       NY, USA, 2022. 7.3.3, 8
+     latency transport protocol using network priorities. In
+     Proceedings of the 2018 Conference of the ACM Special        [70] Boris Pismenny, Adam Morrison, and Dan Tsafrir.
+     Interest Group on Data Communication, SIGCOMM ’18,                ShRing: Networking with shared receive rings. In
+     pages 221–235, New York, NY, USA, 2018. 6                         17th USENIX Symposium on Operating Systems Design
+[61] Al Morton. RFC Errata, Erratum ID 412, RFC 2544,                  and Implementation, OSDI ’23, Boston, MA, July 2023.
+     November 2006.     https://www.rfc-editor.org/                    8
+     errata/eid422. 7.1
+                                                                  [71] Arash Pourhabibi, Siddharth Gupta, Hussein Kassir,
+[62] Rolf Neugebauer, Gianni Antichi, José Fernando Zazo,              Mark Sutherland, Zilu Tian, Mario Paulo Drumond,
+     Yury Audzevich, Sergio López-Buedo, and Andrew W.                 Babak Falsafi, and Christoph Koch. Optimus prime:
+     Moore. Understanding PCIe performance for end host                Accelerating data transformation in servers. In Pro-
+     networking. In Proceedings of the 2018 Conference of              ceedings of the Twenty-Fifth International Conference on
+     the ACM Special Interest Group on Data Communication,             Architectural Support for Programming Languages and
+     SIGCOMM ’18, pages 327–341, New York, NY, USA,                    Operating Systems, ASPLOS ’20, pages 1203–1216, New
+     2018. 2.2, 2                                                      York, NY, USA, 2020. 1
+
+[63] Nvidia.       NVIDIA BlueField-3 DPU, 2022.                  [72] Deepti Raghavan, Philip Levis, Matei Zaharia, and Irene
+     https://www.nvidia.com/content/dam/en-zz/                         Zhang. Breakfast of champions: Towards zero-copy
+     Solutions/Data-Center/documents/datasheet-                        serialization with NIC scatter-gather. In Proceedings
+     nvidia-bluefield-3-dpu.pdf. B                                     of the Workshop on Hot Topics in Operating Systems,
+                                                                       HotOS ’21, pages 199–205, New York, NY, USA, 2021. 1
+[64] Aurojit Panda, Sangjin Han, Keon Jang, Melvin Walls,
+     Sylvia Ratnasamy, and Scott Shenker. NetBricks: Tak-         [73] Luigi Rizzo. netmap: A novel framework for fast
+     ing the V out of NFV. In 12th USENIX Symposium on                 packet I/O. In 2012 USENIX Annual Technical Con-
+     Operating Systems Design and Implementation, OSDI ’16,            ference, ATC ’12, pages 101–112, Boston, MA, 2012. 2,
+     pages 203–216, Savannah, GA, November 2016. 7                     8
+
+
+
+1022   17th USENIX Symposium on Operating Systems Design and Implementation                              USENIX Association
+[74] Hugo Sadok, Miguel Elias M. Campista, and Luís Hen-            Systems Design and Implementation, NSDI ’18, pages
+     rique M. K. Costa. A case for spraying packets in              283–297, Renton, WA, April 2018. 2.2, 8
+     software middleboxes. In Proceedings of the 17th ACM
+     Workshop on Hot Topics in Networks, HotNets ’18, pages    [82] Amy Viviano. Introduction to receive side scaling, 2022.
+     127–133, New York, NY, USA, 2018. B                            https://docs.microsoft.com/en-us/windows-
+                                                                    hardware/drivers/network/introduction-to-
+[75] Hugo Sadok, Zhipeng Zhao, Valerie Choung, Nirav                receive-side-scaling. 2.1, 6
+     Atre, Daniel S. Berger, James C. Hoe, Aurojit Panda,
+     and Justine Sherry. We need kernel interposition over     [83] Thorsten von Eicken, Anindya Basu, Vineet Buch, and
+     the network dataplane. In Proceedings of the Workshop          Werner Vogels. U-Net: A user-level network interface
+     on Hot Topics in Operating Systems, HotOS ’21, pages           for parallel and distributed computing. In Proceedings
+     152–158, New York, NY, USA, 2021. 8                            of the Fifteenth ACM Symposium on Operating Systems
+                                                                    Principles, SOSP ’95, pages 40–53, New York, NY, USA,
+[76] Alireza Sanaee, Farbod Shahinfar, Gianni Antichi, and          1995. 8
+     Brent E. Stephens. Backdraft: A lossless virtual switch
+     that prevents the slow receiver problem. In 19th USENIX   [84] Xiang Wang, Yang Hong, Harry Chang, KyoungSoo
+     Symposium on Networked Systems Design and Implemen-            Park, Geoff Langdale, Jiayu Hu, and Heqing Zhu. Hy-
+     tation, NSDI ’22, pages 1375–1392, Renton, WA, April           perscan: A fast multi-pattern regex matcher for mod-
+     2022. 4.1.2                                                    ern CPUs. In 16th USENIX Symposium on Networked
+                                                                    Systems Design and Implementation, NSDI ’19, pages
+[77] Rajath Shashidhara, Tim Stamler, Antoine Kaufmann,             631–648, Boston, MA, February 2019. 7.3.4
+     and Simon Peter. FlexTOE: Flexible TCP offload
+     with fine-grained parallelism. In 19th USENIX Sympo-      [85] Keith Wiles et al. The Pktgen application, 2022. https:
+     sium on Networked Systems Design and Implementation,           //pktgen-dpdk.readthedocs.io/. 7.1
+     NSDI ’22, pages 87–102, Renton, WA, April 2022. 1, 6
+                                                               [86] Adam Wolnikowski, Stephen Ibanez, Jonathan Stone,
+[78] Arjun Singhvi, Aditya Akella, Dan Gibson, Thomas F.            Changhoon Kim, Rajit Manohar, and Robert Soulé. Zeri-
+     Wenisch, Monica Wong-Chan, Sean Clark, Milo M. K.              alizer: Towards zero-copy serialization. In Proceedings
+     Martin, Moray McLaren, Prashant Chandra, Rob                   of the Workshop on Hot Topics in Operating Systems,
+     Cauble, Hassan M. G. Wassel, Behnam Montazeri,                 HotOS ’21, pages 206–212, New York, NY, USA, 2021. 1
+     Simon L. Sabato, Joel Scherpelz, and Amin Vahdat.
+                                                               [87] Kenichi Yasukata, Michio Honda, Douglas Santry, and
+     1RMA: Re-envisioning remote memory access for multi-
+                                                                    Lars Eggert. StackMap: Low-latency networking with
+     tenant datacenters. In Proceedings of the Annual Con-
+                                                                    the OS stack and dedicated NICs. In 2016 USENIX
+     ference of the ACM Special Interest Group on Data Com-
+                                                                    Annual Technical Conference, ATC ’16, pages 43–56,
+     munication on the Applications, Technologies, Architec-
+                                                                    Denver, CO, June 2016. 8
+     tures, and Protocols for Computer Communication, SIG-
+     COMM ’20, pages 708–721, New York, NY, USA, 2020.         [88] Irene Zhang, Amanda Raybuck, Pratyush Patel, Kirk
+     6                                                              Olynyk, Jacob Nelson, Omar S. Navarro Leija, Ash-
+                                                                    lie Martinez, Jing Liu, Anna Kornfeld Simpson, Sujay
+[79] Mark Sutherland, Siddharth Gupta, Babak Falsafi, Viren-
+                                                                    Jayakar, Pedro Henrique Penna, Max Demoulin, Piali
+     dra Marathe, Dionisios Pnevmatikatos, and Alexandres
+                                                                    Choudhury, and Anirudh Badam. The demikernel data-
+     Daglis. The NeBuLa RPC-optimized architecture. In
+                                                                    path OS architecture for microsecond-scale datacenter
+     Proceedings of the ACM/IEEE 47th Annual International
+                                                                    systems. In Proceedings of the ACM SIGOPS 28th Sympo-
+     Symposium on Computer Architecture, ISCA ’20, pages
+                                                                    sium on Operating Systems Principles, SOSP ’21, pages
+     199–212, Virtual Event, 2020. IEEE Press. 7.3.3
+                                                                    195–211, New York, NY, USA, 2021. 1, 8
+[80] Chandramohan A. Thekkath, Thu D. Nguyen, Evelyn
+     Moy, and Edward D. Lazowska. Implementing network         [89] Xiantao Zhang, Xiao Zheng, Zhi Wang, Hang Yang,
+     protocols at user level. In Conference Proceedings on          Yibin Shen, and Xin Long. High-density multi-tenant
+     Communications Architectures, Protocols and Applica-           bare-metal cloud. In Proceedings of the Twenty-Fifth
+     tions, SIGCOMM ’93, pages 64–73, New York, NY, USA,            International Conference on Architectural Support for
+     1993. 8                                                        Programming Languages and Operating Systems, AS-
+                                                                    PLOS ’20, pages 483–495, New York, NY, USA, 2020.
+[81] Amin Tootoonchian, Aurojit Panda, Chang Lan, Melvin            1
+     Walls, Katerina Argyraki, Sylvia Ratnasamy, and Scott
+     Shenker. ResQ: Enabling SLOs in network function vir-
+     tualization. In 15th USENIX Symposium on Networked
+
+
+
+USENIX Association                       17th USENIX Symposium on Operating Systems Design and Implementation         1023
+Appendix A          Rejected Designs for Pointer                    match the cookie. Unfortunately, filling the buffer with cook-
+                    Updates                                         ies whenever the data is consumed imposes considerable
+                                                                    overhead. For this reason, this design worked well for small
+Unfortunately, the simplest alternatives for communicating          data transfers but poorly when using large chunks of data.
+pointer updates from the NIC to software perform poorly.            This design also prevents software from detecting unaligned
+We considered three potential alternative designs to let the        writes.
+NIC inform pointer updates to software. While these designs
+might seem to suit our needs at first, we ultimately discarded      Appendix B         EnsōGen Packet Generator
+them since they perform poorly due to architectural details
+of PCIe or the CPU:                                                 EnsōGen is a software packet generator built on top of the
+MMIO synchronization: The simplest design would be for              Ensō NIC interface that achieves 100 Gbps with a single core
+the NIC to update the pointer values to its internal memory         and arbitrary packet sizes. Here we briefly describe how it
+and make software periodically issue an MMIO read to fetch          operates and how we ensure that it is correct.
+the latest value. Unfortunately, software-issued MMIO reads         Operation: At startup EnsōGen reads a user-supplied pcap
+cannot be served from the cache, causing the CPU core to            file and allocates enough Ensō Pipes to be able to fit all its
+stall until the read request is sent and the response is received   packets. At run time, EnsōGen simply needs to round-robing
+(two PCIe transfers). Additionally, PCIe serializes MMIO            among the pre-allocated Ensō Pipes enqueueing a single no-
+reads, further reducing performance.                                tification in order to transmit the entire 2 MB buffer con-
+Shared memory synchronization: A second simple al-                  tent. This makes it trivial for EnsōGen to saturate the link
+ternative would be to dedicate an address in host memory            with very little CPU overhead. Since transmission is cheap,
+to hold the pointer value. The NIC can issue a DMA write            EnsōGen spends most of its CPU cycles receiving packets. It
+whenever it needs to update the pointer value. Software             parses every incoming packet to track the number of bytes
+can then periodically poll the same address to figure out if        and packets received.
+the NIC advanced the pointer. The issue with this design            Simple offloads: We implemented hardware support
+is that it makes the software and the NIC contend for the           for timestamping and rate limiting, which helps EnsōGen
+same cache line, which requires a slow ownership transfer           achieve cycle-accurate precision while saving CPU cy-
+whenever the NIC or the CPU access the cache line. To verify        cles. These features are also commonly offered in existing
+this, we implemented this design and obtained a throughput          NICs [39, 63] and are leveraged by some software packet
+of less than 5 Gbps when enqueueing 64-byte packets using           generators [24]. When hardware timestamping is enabled,
+the same setup as described in §7.                                  EnsōGen keeps a histogram in host memory with the RTT
+Inline synchronization: The last discarded design is moti-          of every received packet with 5 ns granularity (the same
+vated by traditional NIC descriptor ring buffers which con-         precision as the hardware timestamper, which operates at
+tain constant-sized descriptors with metadata in a format           200 MHz). To spread the load equally among the RX Ensō
+defined by the NIC. These designs designate a bit of the            Pipes regardless of the workload, EnsōGen also configures
+descriptor as a “flag bit” [25, 39]. Initially, all the descrip-    the hardware to direct packets to pipes in a round-robin
+tor slots in the buffer have their flag bit zeroed. Whenever        fashion [74].
+the NIC DMA writes a new descriptor to host memory, it              Correctness: We verified EnsōGen’s performance and rate-
+overwrites the old ‘0’ flag with a ‘1’ flag. To figure out if       limiting capabilities using another in-house packet generator
+a new descriptor is ready to be consumed, software simply           fully implemented on an FPGA, as well as using software
+needs to check if the next slot’s flag is set. After consuming      counters, to ensure that the rate limited throughput always
+a descriptor, software sets the flag back to ‘0.’ Because many      matches the specification.
+descriptors are likely to be present in the buffer, this reduces
+the chance that software and the NIC will contend for the
+same cache line.
+   Since Ensō Pipes are opaque, implementing the same strat-
+egy used in the descriptor ring buffer is impossible. Even
+if we zeroed the entire buffer after the data is consumed,
+we do not know what data to expect in the buffer—the next
+incoming data might also be zero. Therefore we tested an
+alternative design: we picked a 128-bit random cookie, to
+make the chance of collision with incoming data negligible
+and placed it at the beginning of every cache line of the Ensō
+Pipe. Software now only needs to check if the next 128 bits
+
+
+
+1024    17th USENIX Symposium on Operating Systems Design and Implementation                                 USENIX Association
+Artifact Appendix                                                 tions that we evaluate in §7.3. Here we briefly describe the
+                                                                  main files and directories:
+Abstract                                                          experiment.py: Script to automatically run the experi-
+The paper artifact is composed of Ensō’s hardware and soft-      ments to verify the main claims in the paper.
+ware implementations, the applications used in the evalua-
+                                                                  paper_plots.py: Script to produce all the plots in the paper.
+tion, the EnsōGen packet generator, as well as the code to
+automatically run most of the experiments. We also include        setup.sh: Script to automatically setup the experiment
+documentation describing how to set up the environment,           environment.
+compile the code, synthesize the hardware, and use Ensō
+                                                                  maglev/: Maglev Load Balancer used in §7.3.1.
+for other purposes—including a detailed description of the
+software API.                                                     nitrosketch/: Network telemetry application based on
+                                                                  NitroSketch used in §7.3.2.
+Scope                                                             mica2/: MICA Key-Value store used in §7.3.3.
+The artifact has two main goals: The first is to allow the        log_monitor/: Log monitor application used in §7.3.4.
+main claims in the paper to be validated. The second is to
+allow others to build upon Ensō for their own projects.
+   We include code to automatically reproduce Figures 8, 11,      Hosting
+12, 13, 14, and 15. We also include the source code for all the
+applications that we evaluate in §7.3 and for the EnsōGen        Both repositories are hosted on GitHub and archived using
+packet generator.                                                 Zenodo with a permanent DOI. The documentation con-
+                                                                  tained in the Ensō Repository is also automatically deployed
+Contents                                                          using GitHub actions for easy access.
+
+The artifact is split between two git repositories.
+                                                                  Ensō Repository
+Ensō Repository                                                    • Repository: https://github.com/crossroadsfpga/enso
+This repository includes Ensō’s source code as well as doc-        • Commit: 093dca77836fbe10409af7f0ec3b28232fc25f44
+umentation and example applications. It is structured as            • Zenodo Archive: https://zenodo.org/record/7860872
+follows:                                                            • DOI: https://doi.org/10.5281/zenodo.7860872
+hardware/: Source code for the hardware component and
+scripts to automatically generate all the required IPs.           Ensō Evaluation Repository
+software/: Source code for the software component,
+                                                                    • Repository: https://github.com/crossroadsfpga/enso_eval
+which includes both the library and the kernel module.
+                                                                    • Commit: 1a100cb38577930b9124fc6fefced3f0a6da7da4
+It also includes example applications and EnsōGen under
+                                                                    • Zenodo Archive: https://zenodo.org/record/7860936
+software/examples.
+                                                                    • DOI: https://doi.org/10.5281/zenodo.7860936
+frontend/: Frontend to programmatically load and config-
+ure the hardware from Python as well as a command line
+interface based on this frontend.                                 Ensō Documentation
+docs/: Documentation detailing how to set up the system,            • Link: https://enso.cs.cmu.edu
+compile the software and the hardware, and how to use
+Ensō’s primitives (RX Pipes, TX Pipes, and RX/TX Pipes)
+from an application.                                              Requirements
+                                                                  Running Ensō requires a host equipped with an Intel
+Ensō Evaluation Repository
+                                                                  Stratix 10 MX FPGA [42] and an x86-64 CPU. The software
+This repository includes code to automatically run experi-        component also assumes that the host is running Linux. §7
+ments to verify the main claims in the paper and the applica-     details the exact environment we used in our experiments.
+
+
+
+
+USENIX Association                         17th USENIX Symposium on Operating Systems Design and Implementation          1025
+

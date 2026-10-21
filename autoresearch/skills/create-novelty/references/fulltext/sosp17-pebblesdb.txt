@@ -1,0 +1,1034 @@
+               PebblesDB: Building Key-Value Stores using
+                Fragmented Log-Structured Merge Trees
+                             Pandian Raju                                                         Rohan Kadekodi
+                     University of Texas at Austin                                            University of Texas at Austin
+
+                       Vijay Chidambaram                                                            Ittai Abraham
+    University of Texas at Austin and VMware Research                                               VMware Research
+ABSTRACT
+Key-value stores such as LevelDB and RocksDB offer excel-
+lent write throughput, but suffer high write amplification.
+The write amplification problem is due to the Log-Structured
+Merge Trees data structure that underlies these key-value
+stores. To remedy this problem, this paper presents a novel
+data structure that is inspired by Skip Lists, termed Frag-
+                                                                                  Figure 1: Write Amplification. The figure shows the
+mented Log-Structured Merge Trees (FLSM). FLSM intro-
+                                                                                  total write IO (in GB) for different key-value stores
+duces the notion of guards to organize logs, and avoids
+                                                                                  when 500 million key-value pairs (totaling 45 GB) are
+rewriting data in the same level. We build PebblesDB, a high-
+                                                                                  inserted or updated. The write amplification is indi-
+performance key-value store, by modifying HyperLevelDB
+                                                                                  cated in parenthesis.
+to use the FLSM data structure. We evaluate PebblesDB us-
+ing micro-benchmarks and show that for write-intensive                            ACM Reference Format:
+workloads, PebblesDB reduces write amplification by 2.4-3×                        Pandian Raju, Rohan Kadekodi, Vijay Chidambaram, and Ittai Abra-
+compared to RocksDB, while increasing write throughput by                         ham. 2017. PebblesDB: Building Key-Value Stores using Fragmented
+6.7×. We modify two widely-used NoSQL stores, MongoDB                             Log-Structured Merge Trees. In Proceedings of ACM Symposium
+and HyperDex, to use PebblesDB as their underlying storage                        on Operating Systems Principles (SOSP’17). ACM, New York, NY,
+                                                                                  USA, Article 4, 18 pages. https://doi.org/10.1145/3132747.
+engine. Evaluating these applications using the YCSB bench-
+                                                                                  3132765
+mark shows that throughput is increased by 18-105% when
+using PebblesDB (compared to their default storage engines)
+while write IO is decreased by 35-55%.                                            1   INTRODUCTION
+                                                                                  Key-value stores have become a fundamental part of the
+CCS CONCEPTS                                                                      infrastructure for modern systems. Much like how file sys-
+• Information systems → Key-value stores; Record and                              tems are an integral part of operating systems, distributed
+block layout;                                                                     systems today depend on key-value stores for storage. For
+                                                                                  example, key-value stores are used to store state in graph
+                                                                                  databases [21, 31], task queues [5, 54], stream processing
+KEYWORDS
+                                                                                  engines [7, 50], application data caching [35, 43], event track-
+key-value stores, log-structured merge trees, write-optimized                     ing systems [46], NoSQL stores [18, 40], and distributed
+data structures                                                                   databases [30]. Improving the performance of key-value
+                                                                                  stores has the potential to impact a large number of widely-
+Permission to make digital or hard copies of all or part of this work for
+                                                                                  used data intensive services.
+personal or classroom use is granted without fee provided that copies are not
+made or distributed for profit or commercial advantage and that copies bear          Great progress has been made in improving different as-
+this notice and the full citation on the first page. Copyrights for components    pects of key-value stores such as memory efficiency [9, 17,
+of this work owned by others than ACM must be honored. Abstracting with           34, 42, 58] and energy efficiency [6]. One fundamental prob-
+credit is permitted. To copy otherwise, or republish, to post on servers or to    lem that remains is the high write amplification of key-value
+redistribute to lists, requires prior specific permission and/or a fee. Request
+                                                                                  stores for write-intensive workloads. Write amplification is
+permissions from permissions@acm.org.
+SOSP’17, Oct 28-31, Shanghai, China
+                                                                                  the ratio of total write IO performed by the store to the total
+© 2017 Association for Computing Machinery.                                       user data. High write amplification increases the load on stor-
+ACM ISBN 978-1-4503-5085-3/17/10. . . $15.00                                      age devices such as SSDs, which have limited write cycles be-
+https://doi.org/10.1145/3132747.3132765                                           fore the bit error rate becomes unacceptable [3, 26, 39]. With
+SOSP’17, Oct 28-31, Shanghai, China                                                                                  P. Raju et al.
+
+the increasing size of user data sets (e.g,. Pinterest’s stateful   excellent performance on both read-dominated and write-
+systems process tens of petabytes of data every day [46]),          dominated workloads.
+high write amplification results in frequent device wear out           PebblesDb outperforms mature, carefully engineered key-
+and high storage costs [41]. Write amplification also reduces       value stores such as RocksDB and LevelDB on several work-
+write throughput: in the RocksDB [20] key-value store, it           loads (§5) . On the db_bench micro-benchmarks, PebblesDb
+results in write throughput being reduced to 10% of read            obtains 6.7× the write throughput of RocksDB and 27% higher
+throughput [53]. Thus, reducing write amplification will            read throughput, while doing 2.4-3× less write IO. When the
+both lower storage costs and increase write throughput.             NoSQL store MongoDB [40] is configured to use PebblesDb
+   Figure 1 shows the high write amplification (ratio of total      instead of RocksDB as its storage engine, MongoDB obtains
+IO to total user data written) that occurs in several widely-       the same overall performance on the YCSB benchmark [16]
+used key-value stores when 500 million key-value pairs              while doing 37% less IO (§5).
+are inserted or updated in random order. Techniques from               While the FLSM data structure is useful in many scenar-
+prior research tackling write amplification have not been           ios, it is not without its limitations. On a fully compacted
+widely adopted since they either require specialized hard-          key-value store, PebblesDb incurs a 30% overhead for small
+ware [38, 55] or sacrifice other aspects such as search (range      range queries. While the overhead drops to 11% for large
+query) performance [57]. Conventional wisdom is that reduc-         range queries, the FLSM data structure is not the best fit
+ing write amplification requires sacrificing either write or        for workloads which involve a lot of range queries after an
+read throughput [34]. In today’s low-latency, write-intensive       initial burst of writes. Note that PebblesDb does not incur an
+environments [27], users are not willing to sacrifice either.       overhead if the range queries are interspersed with writes.
+   Key-value stores such as LevelDB [25] and RocksDB are               In summary, the paper makes the following contributions:
+built on top of the log-structured merge trees [44] (LSM) data            • The design of the novel Fragmented Log-Structured
+structure, and their high write amplification can be traced                 Merge Trees data structure, which combines ideas from
+back to the data structure itself (§2). LSM stores maintain                 skip lists and log-structured merge trees (§3).
+data in sorted order on storage, enabling efficient querying
+of data. However, when new data is inserted into an LSM-                  • The design and implementation of PebblesDb, a key-
+store, existing data is rewritten to maintain the sorted order,             value store built using fragmented log-structured merge
+resulting in large amounts of write IO.                                     trees and several important optimizations (§4). We
+   This paper presents a novel data structure, the Fragmented               have made PebblesDb publicly available at https:
+Log-Structured Merge Trees (FLSM), which combines ideas                     //github.com/utsaslab/pebblesdb.
+from the Skip List [47, 48] and Log-Structured Merge trees                • Experimental results demonstrating that PebblesDb
+data structures along with a novel compaction algorithm.                    dominates LSM-based stores such as RocksDB in many
+FLSM strikes at the root of write amplification by drastically              workloads, showing that it is possible to achieve low
+reducing (and in many cases, eliminating) data rewrites, in-                write amplification, high write throughput, and high
+stead fragmenting data into smaller chunks that are orga-                   read throughput simultaneously (§5).
+nized using guards on storage (§3). Guards allow FLSM to
+find keys efficiently. Write operations on LSM stores are of-       2     BACKGROUND
+ten stalled or blocked while data is compacted (rewritten           This section provides some background on key-values stores
+for better read performance); by drastically reducing write         and log-structured merge trees. It first describes common
+IO, FLSM makes compaction significantly faster, thereby in-         operations on key-values stores (§2.1) and discusses why
+creasing write throughput.                                          log-structured merge trees are used to implement key-value
+   Building a high-performance key-value store on top of            stores in write-intensive environments (§2.2). It shows that
+the FLSM data structure is not without challenges; the de-          the log-structured merge tree data structure fundamentally
+sign of FLSM trades read performance for write throughput.          leads to large write amplification.
+This paper presents PebblesDb, a modification of the Hyper-
+LevelDB [29] key-value store that achieves the trifecta of low
+                                                                    2.1     Key-Value Store Operations
+write amplification, high write throughput, and high read
+throughput. PebblesDb employs a collection of techniques            Get. The get(key) operation returns the latest value asso-
+such as parallel seeks, aggressive seek-based compaction, and       ciated with key.
+sstable-level bloom filters to reduce the overheads inherent
+to the FLSM data structure (§4). Although many of the tech-         Put. The put(key, value) operation stores the mapping
+niques PebblesDb employs are well-known, together with              from key to value in the store. If key was already present
+the FLSM data structure, they allow PebblesDb to achieve            in the store, its associated value is updated.
+PebblesDB: Building Key-Value Stores using Fragmented Log-Structured Merge Trees SOSP’17, Oct 28-31, Shanghai, China
+
+Iterators. Some key-value stores such as LevelDB provide            Each key has a sequence number that indicates its version.
+an iterator over the entire key-value store. it.seek(key)           Finding the key at each level requires reading and searching
+positions the iterator it at the smallest key ≥ key. The            exactly one sstable.
+it.next() call moves it to the next key in sequence. The               The seek() and next() operations require positioning
+it.value() call returns the value associated with the key           an iterator over the entire key-value store. This is imple-
+at the current iterator position. Most key-value stores allow       mented using multiple iterators (one per level); each iterator
+the user to provide a function for ordering keys.                   is first positioned inside the appropriate sstable in each level,
+                                                                    and the iterator results are merged. The seek() operation
+Range Query. The range_query(key1, key2) operation                  requires finding the appropriate sstables on each level, and
+returns all key-value pairs falling within the given range.         positioning the sstable iterators. The results of the sstable
+Range queries are often implemented by doing a seek() to            iterators are merged (by identifying the smallest key) to po-
+key1 and doing next() calls until the iterator passes key2.         sition the key-value store iterator. The next() operation
+                                                                    simply advances the correct sstable iterator, merges the iter-
+2.2     Log-Structured Merge Trees                                  ators again, and re-positions the key-value store iterator.
+Embedded databases such as KyotoCabinet [32] and Berke-                The put() operation writes the key-value pair, along
+leyDB [45] are typically implemented using B+ Trees [14].           with a monotonically increasing sequence number, to an
+However, B+ Trees are a poor fit for write-intensive work-          in-memory skip list [48] called the memtable. When the
+loads since updating the tree requires multiple random writes       memtable reaches a certain size, it is written to storage as
+(10-100× slower than sequential writes). Inserting 100 million      a sstable at Level 0. When each level contains a threshold
+key-value pairs into KyotoCabinet writes 829 GB to storage          number of files, it is compacted into the next level. Assume
+(61× write amplification). Due to the low write throughput          Level 0 contains {2, 3} and {10, 12} sstables. If Level 1 contains
+and high write amplification of B+ Trees, developers turned         {1,4} and {9, 13} sstables, then during compaction, Level 1
+to other data structures for write-intensive workloads.             sstables are rewritten as {1, 2, 3, 4} and {9, 10, 12, 13}, merging
+   The log-structured merge trees (LSM) data structure [44]         the sstables from Level 0 and Level 1. Compacting sstables
+takes advantage of high sequential bandwidth by only writ-          reduces the total number of sstables in the key-value store
+ing sequentially to storage. Writes are batched together in         and pushes colder data into higher levels. The lower levels
+memory and written to storage as a sequential log (termed           are usually cached in memory, thus leading to faster reads
+an sstable). Each sstable contains a sorted sequence of keys.       of recent data.
+   Sstables on storage are organized as hierarchy of levels.           Updating or deleting keys in LSM-based stores does not
+Each level contains multiple sstables, and has a maximum            update the key in place, since all write IO is sequential. In-
+size for its sstables. In a 5-level LSM, Level 0 is the lowest      stead, the key is inserted once again into the database with
+level and Level 5 is the highest level. The amount of data (and     a higher sequence number; a delete key is inserted again
+the number of sstables) in each level increases as the levels       with a special flag (often called a tombstone flag). Due to the
+get higher. The last level in an LSM may contain hundreds           higher sequence number, the latest version of the flag will
+of gigabytes. Application data usually flows into the lower         be returned by the store to the user.
+levels and is then compacted into the higher levels. The lower
+levels are usually cached in memory.                                Write Amplification: Root Cause. Figure 2 illustrates com-
+   LSM maintains the following invariant at each level: all         paction in a LSM key-value store. The key-value store con-
+sstables contain disjoint sets of keys. For example, a level        tains two sstables in Level 1 initially. Let us assume that
+might contain three sstables: {1..6}1 , {8..12}, and {100..105}.    Level 0 is configured to hold only one sstable at a time; when
+Each key will be present in exactly one sstable on a given          this limit is reached, compaction is triggered. At time t 1 , one
+level. As a result, locating a key requires only two binary         sstable is added, and a compaction is triggered is at t 2 . Sim-
+searches: one binary search on the starting keys of sstables        ilarly, sstables are added at t 3 and t 5 and compactions are
+(maintained separately) to locate the correct sstable and an-       triggered at t 4 and t 6 . When compacting a sstable, all sstables
+other binary search inside the sstable to find the key. If the      in the next level whose key ranges intersect with the sstable
+search fails, the key is not present in that level.                 being compacted are rewritten. In this example, since the key
+                                                                    ranges of all Level 0 sstables intersect with key ranges of all
+LSM Operations. The get() operation returns the latest              Level 1 sstables, the Level 1 sstables are rewritten every time
+value of the key. Since the most recent data will be in lower       a Level 0 sstable is compacted. In this worst-case example,
+levels, the key-value store searches for the key level by level,    Level 1 sstables are rewritten three times while compacting
+starting from Level 0; if it finds the key, it returns the value.   a single upper level. Thus, the high write amplification of
+1 Let {x..y} indicate a sstable with keys ranging from x to y
+SOSP’17, Oct 28-31, Shanghai, China                                                                                                  P. Raju et al.
+
+                             Level 0    10 210                                    levels. FLSM achieves this using a novel storage layout and
+          Time: t1
+                             Level 1    1 100         200 400                     organizing data using guards (§3.1). This section describes
+    New sstable in Level 0
+                                                                                  how guards are selected (§3.2), how guards are inserted and
+          Time: t2           Level 0
+                                                                                  deleted (§3.3), how FLSM operations are performed (§3.4),
+      After compacting       Level 1    1 10 100            200 210 400
+     Level 0 into Level 1                                                         how FLSM can be tuned for different performance/write-IO
+          Time: t3                                                                trade-offs (§3.5), and its limitations (§3.6).
+                             Level 0    20 220
+        New sstable
+         in Level 0          Level 1    1 10 100            200 210 400
+                                                                                  3.1      Guards
+          Time: t4           Level 0
+      After compacting
+                                                                                  In the classical LSM, each level contains sstables with dis-
+                             Level 1    1 10 20 100             200 210 220 400
+     Level 0 into Level 1                                                         joint key ranges (i.e., each key will be present in exactly one
+          Time: t5           Level 0    30 330
+                                                                                  sstable). The chief insight in this work is that maintaining
+        New sstable                                                               this invariant is the root cause of write amplification, as it
+         in Level 0          Level 1    1 10 20 100             200 210 220 400
+                                                                                  forces data to be rewritten in the same level. The FLSM data
+          Time: t6           Level 0                                              structure discards this invariant: each level can contain mul-
+      After compacting
+     Level 0 into Level 1    Level 1   1 10 20 30 100       200 210 220 330 400   tiple sstables with overlapping key ranges, so that a key may
+                                                                                  be present in multiple sstables. To quickly find keys in each
+Figure 2: LSM Compaction. The figure shows sstables                               level, FLSM organizes the sstables into guards (inspired from
+being inserted and compacted over time in a LSM.                                  the Skip-List data structure [47, 48]).
+                                                                                      Each level contains multiple guards. Guards divide the
+LSM key-value stores can be traced to multiple rewrites                           key space (for that level) into disjoint units. Each guard G i
+of sstables during compaction.                                                    has an associated key Ki , chosen from among keys inserted
+                                                                                  into the FLSM. Each level in the FLSM contains more guards
+The Challenge. A naive way to reduce write amplification                          than the level above it; the guards get progressively more
+in LSM is to simply not merge sstables during compaction                          fine-grained as the data gets pushed deeper and deeper into
+but add new sstables to each level [19, 22]. However, read                        the FLSM. As in a skip-list, if a key is a guard at a given level
+and range query performance will drop significantly due                           i, it will be a guard for all levels > i.
+to two reasons. First, without merge, the key-value store                             Each guard has a set of associated sstables. Each sstable is
+will end up containing large number of sstables. Second, as                       sorted. If guard G i is associated with key Ki and guard G i+1
+multiple sstables can now contain the same key and can have                       with Ki+1 , an sstable with keys in the range [Ki , Ki+1 ) will
+overlapping key ranges in the same level, read operations                         be attached to G i . Sstables with keys smaller than the first
+will have to examine multiple sstables (since binary search                       guard are stored in a special sentinel guard in each level. The
+to find the sstable is not possible), leading to large overhead.                  last guard G n in the level stores all sstables with keys ≥ Kn .
+                                                                                  Guards within a level never have overlapping key ranges.
+3      FRAGMENTED LOG-STRUCTURED                                                  Thus, to find a key in a given level, only one guard will have
+       MERGE TREES                                                                to be examined.
+The challenge is to achieve three goals simultaneously: low                           In FLSM compaction, the sstables of a given guard are
+write amplification, high write throughput, and good read                         (merge) sorted and then fragmented (partitioned), so that
+performance. This section presents our novel data struc-                          each child guard receives a new sstable that fits into the key
+ture, Fragmented Log-structured Merge Trees (FLSM), and                           range of that child guard in the next level.
+describes how it tackles this challenge.                                          Example. Figure 3 shows the state of the FLSM data struc-
+   FLSM can be seen as a blend of an LSM data structure                           ture after a few put() operations. We make several observa-
+with a Skip List along with a novel compaction algorithm                          tions based on the figure:
+that overall reduces write amplification and increases write
+throughput. The fundamental problem with log-structured                                 • A put() results in keys being added to the in-memory
+merge trees is that sstables are typically re-written multiple                            memtable (not shown). Eventually, the memtable be-
+times as new data is compacted into them. FLSM counters                                   comes full, and is written as an sstable to Level 0. Level
+this by fragmenting sstables into smaller units. Instead of                               0 does not have guards, and collects together recently
+rewriting the sstable, FLSM’s compaction simply appends                                   written sstables.
+a new sstable fragment to the next level. Doing so ensures                              • The number of guards increases as the level number
+that data is written exactly once in most levels; a different                             increases. The number of guards in each level does not
+compaction algorithm is used for the the last few highest                                 necessarily increase exponentially.
+PebblesDB: Building Key-Value Stores using Fragmented Log-Structured Merge Trees SOSP’17, Oct 28-31, Shanghai, China
+
+ Level 0 (no guards)                                                       level. For example, in Figure 3, key 5 is chosen as a guard for
+   1 50 26 800         104 203 1024
+                                                                           Level 1; therefore it is also a guard for levels 2 and 3.
+                                                                              FLSM selects guards out of inserted keys for simplicity;
+ Level 1    Guard: 5                                                       FLSM does not require that guards correspond to keys present
+                                                                           in the key-value store.
+    3            10 400 3000          200
+
+ Sentinel
+                                                                           Other schemes for selecting guards. The advantage of
+                                                                           the current method for selecting guards is that it is simple,
+ Level 2    Guard: 5                            Guard: 375
+                                                                           cheap to compute, and fairly distributes guards over inserted
+                                                 525 2750                  keys. However, it does not take into account the amount of IO
+ Level 3    Guard: 5               Guard: 100   Guard: 375   Guard: 1023   that will result from partitioning sstables during compaction
+    2            5 35 40       7      101 125    380 400      1050
+                                                                           (this section will describe how compaction works shortly).
+                                                                           FLSM could potentially select new guards for each level at
+                                                                           compaction time such that sstable partitions are minimized;
+Figure 3: FLSM Layout on Storage. The figure illus-                        however, this could introduce skew. We leave exploring al-
+trates FLSM’s guards across different levels. Each box                     ternative selection schemes for future work.
+with dotted outline is an sstable, and the numbers rep-
+resent keys.                                                               3.3    Inserting and Deleting Guards
+                                                                           Guards are not inserted into FLSM synchronously when
+                                                                           they are selected. Inserting a guard may require splitting
+      • Each level has a sentinel guard that is responsible for            an sstable or moving an sstable. If a guard is inserted on
+        sstables with keys < than the first guard. In Figure 3,            multiple levels, work is generated on all those levels. For this
+        sstables with keys < 5 are attached to the sentinel                reason, guards are inserted asynchronously into FLSM.
+        guard.                                                                When guards are selected, they are added to an in-memory
+      • Data inside an FLSM level is partially sorted: guards do           set termed the uncommitted guards. Sstables are not parti-
+        not have overlapping key ranges, but the sstables at-              tioned on storage based on (as of yet) uncommitted guards; as
+        tached to each guard can have overlapping key ranges.              a result, FLSM reads are performed as if these guards did not
+                                                                           exist. At the next compaction cycle, sstables are partitioned
+3.2     Selecting Guards                                                   and compacted based on both old guards and uncommitted
+FLSM performance is significantly impacted by how guards                   guards; any sstable that needs to be split due to an uncom-
+are selected. In the worst case, if one guard contains all ssta-           mitted guard is compacted to the next level. At the end of
+bles, reading and searching such a large guard (and all its                compaction, the uncommitted guards are persisted on stor-
+constituent sstables) would cause an un-acceptable increase                age and added to the full set of guards. Future reads will be
+in latency for reads and range queries. For this reason, guards            performed based on the full set of guards.
+are not selected statically; guards are selected probabilisti-                We note that in many of the workloads that were tested,
+cally from inserted keys, preventing skew.                                 guard deletion was not required. A guard could become
+                                                                           empty if all its keys are deleted, but empty guards do not
+Guard Probability. When a key is inserted into FLSM, guard                 cause noticeable performance degradation as get() and
+probability determines if it becomes a guard. Guard probabil-              range query operations skip over empty guards. Neverthe-
+ity gp(key,i) is the probability that key becomes a guard                  less, deleting guards is useful in two scenarios: when the
+at level i. For example, if the guard probability is 1/10, one             guard is empty or when data in the level is spread unevenly
+in every 10 inserted keys will be randomly selected to be a                among guards. In the second case, consolidating data among
+guard. The guard probability is designed to be lowest at Level             fewer guards can improve performance.
+1 (which has the fewest guards), and it increases with the                    Guard deletion is also performed asynchronously similar
+level number (as higher levels have more guards). Selecting                to guard insertion. Deleted guards are added to an in-memory
+guards in this manner distributes guards across the inserted               set. At the next compaction cycle, sstables are re-arranged
+keys in a smooth fashion that is likely to prevent skew.                   to account for the deleted guards. Deleting a guard G at
+   Much like skip lists, if a key K is selected as a guard in              level i is done lazily at compaction time. During compaction,
+level i, it becomes a guard for all higher levels i + 1, i + 2 etc.        guard G is deleted and sstables belonging to guard G will be
+The guards in level i + 1 are a strict superset of the guards in           partitioned and appended to either the neighboring guards
+level i. Choosing guards in this manner allows the interval                in the same level i or child guards in level i + 1. Compaction
+between each guard to be successively refined in each deeper               from level i to i + 1 proceeds as normal (since G is still a
+SOSP’17, Oct 28-31, Shanghai, China                                                                                      P. Raju et al.
+
+guard in level i + 1). At the end of compaction, FLSM persists       guard; deleting a guard will involve a significant amount of
+metadata indicating G has been deleted at level i. If required,      compaction work. Thus, empty guards are possible.
+the guard is deleted in other levels in a similar manner. Note
+that if a guard is deleted at level i, it should be deleted at all   Compaction. When a guard accumulates a threshold num-
+levels < i; FLSM can choose whether to delete the guard at           ber of sstables, it is compacted into the next level. The sstables
+higher levels > i.                                                   in the guard are first (merge) sorted and then partitioned into
+                                                                     new sstables based on the guards of the next level; the new
+                                                                     sstables are then attached to the correct guards. For example,
+3.4    FLSM Operations                                               assume a guard at Level 1 contains keys {1, 20, 45, 101, 245}.
+                                                                     If the next level has guards 1, 40, and 200, the sstable will be
+Get Operations. A get() operation first checks the in-               partitioned into three sstables containing {1, 20}, {45, 101},
+memory memtable. If the key is not found, the search contin-         and {245} and attached to guards 1, 40, and 200 respectively.
+ues level by level, starting with level 0. During the search, if         Note that in most cases, FLSM compaction does not rewrite
+the key is found, it is returned immediately; this is safe since     sstables. This is the main insight behind how FLSM reduces
+updated keys will be in lower levels that are searched first.        write amplification. New sstables are simply added to the
+To check if a key is present in a given level, binary search         correct guard in the next level. There are two exceptions to
+is used to find the single guard that could contain the key.         the no-rewrite rule. First, at the highest level (e.g,. Level 5) of
+Once the guard is located, its sstables are searched for the         FLSM, the sstables have to be rewritten during compaction;
+key. Thus, in the worst case, a get() requires reading one           there is no higher level for the sstables to be partitioned and
+guard from each level, and all the sstables of each guard.           attached to. Second, for the second-highest level (e.g,. Level
+                                                                     4), FLSM will rewrite an sstable into the same level if the
+Range Queries. Range queries require collecting all the              alternative is to merge into a large sstable in the highest
+keys in the given range. FLSM first identifies the guards at         level (since we cannot attach new sstables in the last level
+each level that intersect with the given range. Inside each          if the guard is full). The exact heuristic is rewrite in second-
+guard, there may be multiple sstables that intersect with the        highest-level if merge causes 25× more IO.
+given range; a binary search is performed on each sstable                FLSM compaction is trivially parallelizable because com-
+to identify the smallest key overall in the range. Identifying       pacting a guard only involves its descendants in the next
+the next smallest key in the range is similar to the merge           level; the way guards are chosen in FLSM guarantees that
+procedure in merge sort; however, a full sort does not need          compacting one guard never interferes with compacting an-
+to be performed. When the end of range query interval is             other guard in the same level. For example, in Figure 3 if
+reached, the operation is complete, and the result is returned       guard 375 in Level 2 is split into guards 375 and 1023 in Level
+to the user. Key-value stores such as LevelDB provide related        3, only these three guards are affected. Compacting guard
+operations such as seek() and next(); a seek(key) posi-              5 (if it had data) will not affect the on-going compaction of
+tions an iterator at the smallest key larger than or equal to        guard 375 in any way. Thus, the compaction process can be
+key, while next() advances the iterator. In LSM stores, the          carried out in parallel for different guard files at the same
+database iterator is implemented via merging level iterators;        time. Parallel IO from compaction can be efficiently han-
+in FLSM, the level iterators are themselves implemented by           dled by devices such as flash SSDs that offer high random
+merging iterators on the sstables inside the guard of interest.      write throughput with multiple flash channels. Such parallel
+Put Operations. A put() operation adds data to an in-                compaction can reduce the total time taken to compact sig-
+memory memtable. When the memtable gets full, it is written          nificantly. A compacted key-value store has lower latency
+as a sorted sstable to Level 0. When each level reaches a cer-       for reads; since parallel compaction gets the store to this
+tain size, it is compacted into the next level. In contrast to       state faster, it also increases read throughput.
+compaction in LSM stores, FLSM avoids sstable rewrites in
+most cases by partitioning sstables and attaching them to
+                                                                     3.5    Tuning FLSM
+guards in the next level.
+                                                                     FLSM performance for reads and range queries depends
+Key Updates and Deletions. Similar to LSM, updating or               upon a single parameter: the number of sstables inside each
+deleting a key involves inserting the key into the store with        guard. If guards contain a large number of sstables, read and
+an updated sequence number or a deletion flag respectively.          range query latencies become high. Therefore, FLSM provide
+Reads and range queries will ignore keys with deletion flags.        users a knob to tune behavior, max_sstables_per_guard,
+If the insertion of a key resulted in a guard being formed, the      which caps the maximum number of sstables present in-
+deletion of the key does not result in deletion of the related       side each guard in FLSM. When any guard accumulates
+PebblesDB: Building Key-Value Stores using Fragmented Log-Structured Merge Trees SOSP’17, Oct 28-31, Shanghai, China
+
+max_sstables_per_guard number of sstables, the guard is              will have at most O (B) data items [1, 12, 24]. Naively, search-
+compacted into the next level.                                       ing for an item would require finding the right guard at each
+   Tuning max_sstables_per_guard allows the user to trade-           level (via binary search), and then searching inside all sstables
+off more write IO (due to more compaction) for lower read            inside the guard. Since the last level has the most guards (B H ),
+and range query latencies. Interestingly, if this parameter          binary search cost would be dominated by the cost for the
+is set to one, FLSM behaves like LSM and obtains similar             last level: O (log2 B H ) = O (H log2 B) = O (logB n ∗ log2 B) =
+read and write performance. Thus, FLSM can be viewed as a            O (log2 n). Since there are O (H ) = O (loдB n) levels to search,
+generalization of the LSM data structure.                            this yields a total cost of O (log2 n logB n) in-memory opera-
+                                                                     tions for finding the right guards at each level.
+3.6    Limitations                                                      However, in FLSM, the guards and bloom filters are all
+The FLSM data structure significantly reduces write ampli-           stored in memory. FLSM performs O (log2 n logB n) in-memory
+fication and has faster compaction (as compaction in FLSM            operations during the binary search for the right guard in
+requires lower read and write IO). By virtue of faster com-          each level. Then, for each of the H = logB n guards found,
+paction, write throughput increases as well. However, the            FLSM does a bloom filter query on each of the O (B) ssta-
+FLSM data structure is not without limitations.                      bles associated with the guard, with each query costing
+   Since get() and range query operations need to examine            O (log(1/ϵ )) in memory operations. In the DAM model all
+all sstables within a guard, the latency of these operations         this in-memory work has no cost.
+is increased in comparison to LSM. Section 4 describes how              Finally, on average, the bloom filter will indicate only
+this limitation can be overcome; using a combination of well-        1 + o(1) sstables to be read (with high probability). Reading
+known techniques can reduce or eliminate the overheads in-           these sstables will cost 1 +o(1) in the DAM model. Therefore,
+troduced by the FLSM data structure, resulting in a key-value        the total read cost of a get operation (assuming sufficient
+store that achieves the trifecta of low write amplification,         memory to store guards and bloom filters) is just O (1) in the
+high write throughput, and high read throughput.                     DAM model.
+                                                                        FLSM cannot leverage bloom filters for range queries. The
+                                                                     binary search per level is still done in memory. For each level,
+3.7    Asymptotic Analysis
+                                                                     the binary search outputs one guard and FLSM needs to read
+This section provides an analysis of FLSM operations using           all the O (B) associated sstables. So the total cost for a range
+a theoretical model.                                                 query returning k elements is O (B logB n + k/B).
+Model. We use the standard Disk Access Model (DAM) [2]
+and assume that each read/write operation can access a block         4     BUILDING PEBBLESDB OVER FLSM
+of size B in one unit cost. To simplify the model, we will           This section presents the design and implementation of Peb-
+assume a total of n data items are stored.                           blesDb, a high-performance key-value store built using frag-
+                                                                     mented log-structured merge trees. This section describes
+FLSM Analysis. Consider a FLSM where the guard prob-
+                                                                     how PebblesDb offsets FLSM overheads for reads (§4.1) and
+ability is 1/B (so the number of guards in level i + 1 is in
+                                                                     range queries (§4.2), different PebblesDb operations (§4.3),
+expectation B times more than the number of guards in level
+                                                                     how PebblesDb recovers from crashes (§4.4), its implemen-
+i). Since the expected fan-out of FLSM is B, with high prob-
+                                                                     tation (§4.5), and its limitations (§4.6).
+ability, an FLSM with n data items will have H = logB n
+levels. It is easy to see that each data item is written just
+once per level (it is appended once and never re-written to
+                                                                     4.1    Improving Read Performance
+the same level), resulting in a write cost of O (H ) = O (logB n).   Overhead Cause. A get() operation in FLSM causes all
+Since in the DAM model, FLSM writes a block of B items at            the sstables of one guard in each level to be examined. In
+unit cost, the total amortized cost of any put operation is          contrast, in log-structured merge trees, exactly one sstable
+O (H /B) = O ((logB n)/B) over its entire compaction lifetime.       per level needs to be examined. Thus, read operations incur
+However, FLSM compaction in the last level does re-write             extra overhead in FLSM-based key-value stores.
+data. Since this last level re-write will occur with high prob-
+ability O (B) times then the final total amortized cost of any       Sstable Bloom Filters. A Bloom filter is a space-efficient
+put operation is O ((B + logB n)/B).                                 probabilistic data structure used to test whether an element is
+    The guards in FLSM induce a degree B Skip List. A detailed       present in a given set in constant time [13]. A bloom filter can
+theoretical analysis of the B-Skip List data structure shows         produce false positives, but not false negatives. PebblesDb
+that with high probability each guard will have O (B) children,      attaches a bloom filter to each sstable to efficiently detect
+each guard will have at most O (B) sstables, and each sstable        if a given key could be present in the sstable. The sstable
+SOSP’17, Oct 28-31, Shanghai, China                                                                                    P. Raju et al.
+
+bloom filters allow PebblesDb to avoid reading unnecessary            4.3 PebblesDb Operations
+sstables off storage and greatly reduces the read overhead            This section briefly describes how various operations are
+due to the FLSM data structure.                                       implemented in PebblesDb, and how they differ from doing
+   RocksDB also employs sstable-level bloom filters. Many             the same operations on the FLSM data structure. The put()
+key-value stores (including RocksDB and LevelDB) employ               operation in PebblesDb is handled similar to puts in FLSM.
+bloom filters for each block of the sstable. If sstable-level
+bloom filters are used, block-level filters are not required.         Get. PebblesDb handles get() operations by locating the ap-
+                                                                      propriate guard in each level (via binary search) and search-
+                                                                      ing the sstables within the guard. PebblesDb get() differs
+                                                                      from FLSM get() in the use of sstable-level bloom filters to
+4.2    Improving Range Query Performance                              avoid reading unnecessary sstables off storage.
+
+Overhead Cause. Similar to get() operations, range queries            Range Query. PebblesDb handles range queries by locating
+(implemented using seek() and next() calls) also require              the appropriate guard in each level and placing the iterator at
+examining all the sstables of a guard for FLSM. Since LSM             the right position for each sstable in the guard by performing
+stores examine only one sstable per level, FLSM stores have           binary searches on the sstables. PebblesDb optimizes this by
+significant overhead for range queries.                               reading and searching sstables in parallel, and aggressively
+                                                                      compacting the levels if a threshold number of consecutive
+Seek-Based Compaction. Similar to LevelDB, PebblesDb                  seek() requests are received.
+implements compaction triggered by a threshold number of
+consecutive seek() operations (default: 10). Multiple ssta-           Deleting Keys. PebblesDb deletes a key by inserting the
+bles inside a guard are merged and written to the guards in           key into the store with a flag marking it as deleted. The
+the next level. The goal is to decrease the average number of         sequence number of inserted key identifies it as the most
+sstables within a guard. PebblesDb also aggressively com-             recent version of the key, instructing PebblesDb to discard
+pacts levels: if the size of level i is within a certain threshold    the previous versions of the key for read and range query
+ratio (default: 25%) of level i +1, level i is compacted into level   operations. Note that bloom filters are created over sstables;
+i + 1. Such aggressive compaction reduces the number of               since sstables are never updated in place, existing bloom
+active levels that need to be searched for a seek(). Although         filters do not need to be modified during key deletions. Keys
+such compaction increases write IO, PebblesDb still does              marked for deletion are garbage collected during compaction.
+significantly lower amount of IO overall (§5).
+                                                                      4.4    Crash Recovery
+Parallel Seeks. A unique optimization employed by Peb-
+                                                                      By only appending data, and never over-writing any data
+blesDb is using multiple threads to search sstables in parallel
+                                                                      in place, PebblesDb builds on the same foundation as LSM
+for a seek(). Each thread reads one sstable off storage and
+                                                                      to provide strong crash-consistency guarantees. PebblesDb
+performs a binary search on it. The results of the binary
+                                                                      builds on the LevelDB codebase, and LevelDB already pro-
+searches are then merged and the iterator is positioned cor-
+                                                                      vides a well-tested crash-recovery mechanism for both data
+rectly for the seek() operation. Due to this optimization,
+                                                                      (the sstables) and the metadata (the MANIFEST file). Peb-
+even if a guard contains multiple sstables, FLSM seek() la-
+                                                                      blesDb simply adds more metadata (guard information) to
+tency incurs only a small overhead compared to LSM seek()
+                                                                      be persisted in the MANIFEST file. PebblesDb sstables use
+latency.
+                                                                      the same format as LevelDB sstables. Crash-recovery tests
+   Parallel seeks must not be carelessly used: if the sstables
+                                                                      (testing recovered data after crashing at randomly picked
+being examined are cached, the overhead of using multiple
+                                                                      points) confirm that PebblesDb recovers inserted data and
+threads is higher than the benefit obtained from doing par-
+                                                                      associated guard-related metadata correctly after crashes.
+allel seeks. Given that there is no way to know whether a
+given sstable has been cached or not (since the operating
+system may drop a cached sstable under memory pressure),              4.5    Implementation
+PebblesDb employs a simple heuristic: parallel seeks are              PebblesDb is implemented as a variant of the LevelDB family
+used only in the last level of the key-value store. The rea-          of key-value stores. PebblesDb was built by modifying Hy-
+son to choose this heuristic is that the last level contains          perLevelDB [29], a variant of LevelDB that was engineered
+the largest amount of data; furthermore, the data in the last         to have improved parallelism and better write throughput
+level is not recent, and therefore not likely to be cached. This      during compaction. We briefly examined the RocksDB code
+simple heuristic seems to work well in practice.                      base, but found that the HyperLevelDB code base was smaller,
+                                                                      better documented (as it derives from LevelDB), and easier
+PebblesDB: Building Key-Value Stores using Fragmented Log-Structured Merge Trees SOSP’17, Oct 28-31, Shanghai, China
+
+to understand. Thus, HyperLevelDB was chosen as the base          Multi-threaded Compaction. Similar to RocksDB, Peb-
+for PebblesDb.                                                    blesDb uses multiple threads for background compaction.
+   We added/modified 9100 LOC in C++ to HyperLevelDB.             Each thread picks one level and compacts it into the next
+Most of the changes involved introducing guards in Hyper-         level. Picking which level to compact is based on the amount
+LevelDB and modifying compaction. Since guards are built on       of data in each level. When a level is compacted, only guards
+top of sstables, PebblesDb was able to take advantage of the      containing more than a threshold number of sstables are com-
+mature, well-tested code that handled sstables. PebblesDb         pacted. We have not implemented guard-based parallel com-
+is API-compatible with HyperLevelDB since all changes are         paction in PebblesDb yet; even without parallel compaction,
+internal to the key-value store.                                  compaction in PebblesDb is much faster than compaction
+                                                                  in LSM-based stores such as RocksDB (§5.2).
+Selecting Guards. Similar to skip lists, PebblesDb picks
+guards randomly out of the inserted keys. When a key is
+inserted, a random number is selected to decide if the key is     4.6    Limitations
+a guard. However, obtaining a random number for every key         This section describes three situations where a traditional
+insertion is computationally expensive; instead, PebblesDb        LSM-based store may be a better choice over PebblesDb.
+hashes every incoming key, and the last few bits of the hash         First, if the workload data will fit entirely in memory,
+determine if the key will be a guard (and at which level).        PebblesDb has higher read and range query latency than
+   The computationally cheap MurmurHash [8] algorithm is          LSM-based stores. In such a scenario, read or range query
+used to hash each inserted key. A configurable parameter          requests will not involve storage IO and the computational
+top_level_bits determines how many consecutive Least              overhead of locating the correct guard and processing ssta-
+Significant Bits (LSBs) in the bit representation of the hashed   bles inside a guard will contribute to higher latency. Given
+key should be set for the key to be selected as a guard key       the increasing amount of data being generated and pro-
+in Level 1. Another parameter bit_decrement determines            cessed every day [49], most datasets will not fit in mem-
+the number of bits by which the constraint (number of LSBs        ory. For the rare cases where the data size is small, setting
+to be set) is relaxed going each level higher. For example, if    max_sstables_per_guard to one configures PebblesDb to
+top_level_bits is set to 17, and bit_decrement is set to          behave similar to HyperLevelDB, reducing the latency over-
+2, then a guard key in level 1 should have 17 consecutive         head for reads and range queries.
+LSBs set in its hash value, a guard key in level 2 should            Second, for workloads where data with sequential keys
+have 15 consecutive LSBs set in its hash value and so on.         is being inserted into the key-value store, PebblesDb has
+The top_level_bits and bit_decrement parameters need              higher write IO than LSM-based key value stores. If data
+to be determined empirically; based on our experience, a          is inserted sequentially, sstables don’t overlap with each
+value of two seems reasonable for bit_decrement, but the          other. LSM-based stores handle this case efficiently by simply
+top_level_bits may need to be increased from our default          moving an sstable from one level to the next by modifying
+of 27 if the users expect more than 100 million keys to be        only the metadata (and without performing write IO); in
+inserted into PebblesDb. Over-estimating the number of            the case of PebblesDb, the sstable may be partitioned when
+keys in the store is harmless (leads to many empty guards);       moving to the next level, leading to write IO. We believe that
+under-estimating could lead to skewed guards.                     real-world workloads that insert data sequentially are rare
+Implementing Guards. Each guard stores metadata about             since most workloads are multi-threaded; in such rare cases,
+the number of sstables it has, the largest and smallest key       we advocate the use of LSM-based stores such as RocksDB.
+present across the sstables, and the list of sstables. Each          Third, if the workload involves an initial burst of writes fol-
+sstable is represented by a unique 64-bit integer. Guards are     lowed by a large number of small range queries, PebblesDb
+persisted to storage along with metadata about the sstables       may not be the best fit. For such range queries over a com-
+in the key-value store. Guards are recovered after a crash        pacted key-value store, PebblesDb experiences a significant
+from the MANIFEST log and the asynchronous write-ahead            overhead (30%) compared to LSM-based stores. However,
+logs. Recovery of guard data is woven into the key-value          the overhead drops as the range queries get bigger and en-
+store recovery of keys and sstable information. We have not       tirely disappears if the range queries are interspersed with
+implemented guard deletion in PebblesDb yet since extra           insertions or updates (as in YCSB Workload E).
+guards did not cause significant performance degradation
+for reads in our experiments and the cost of persisting empty     5     EVALUATION
+guards is relatively insignificant. We plan to implement guard
+                                                                  This section evaluates the performance of PebblesDb by
+deletion in the near future.
+                                                                  answering the following questions:
+SOSP’17, Oct 28-31, Shanghai, China                                                                                  P. Raju et al.
+
+      • What is the write amplification of PebblesDb? (§5.2)                                  PebblesDB HyperLevelDB
+        What is the performance of various PebblesDb key-
+                                                                            Average                 17.23          13.33
+        value store operations? (§5.2) What are the strengths               Median                   5.29          16.59
+        and weaknesses of PebblesDb?                                        90th percentile         51.06          16.60
+      • How does PebblesDb perform on workloads resem-                      95th percentile         68.31          16.60
+        bling access patterns in various applications? (§5.3)
+                                                                   Table 1: SSTable Size. The table shows the distribu-
+      • How do NoSQL applications perform when they use            tion of sstable size (in MB) for PebblesDB and Hyper-
+        PebblesDb as their storage engine? (§5.4)                  LevelDB when 50 million key-value pairs totaling 33
+      • How much memory and CPU does PebblesDb con-                GB were inserted.
+        sume? (§5.5)
+
+
+5.1     Experimental Setup                                         5.2    Micro-benchmarks
+Our experiments are run on a Dell Precision Tower 7810 with        This section evaluates PebblesDb performance using differ-
+an Intel Xeon 2.8 GHz processor, 16 GB RAM, and running            ent single-threaded and multi-threaded micro-benchmarks
+Ubuntu 16.04 LTS with the Linux 4.4 kernel. The ext4 file          and in various conditions. The single-threaded benchmarks
+system is run on top of a software RAID0 array used over           help us understand the performance of different PebblesDb
+two high-performance Intel 750 SSDs (each 1.2 TB).                 operations. The multi-threaded benchmark evaluates how
+   All workloads use datasets 3× larger than the main mem-         PebblesDb performs in the more realistic setting of multiple
+ory on test machine. All reported numbers are the mean of          readers and writers. PebblesDb is evaluated in different con-
+at least five runs. The standard deviation in all cases was less   ditions such as when the dataset fits in memory, with small
+than 5% of the mean. PebblesDb performance is compared             key-value pairs, with an aged file system and key-value store,
+with widely-used key-value stores LevelDB, RocksDB and             and finally under extremely low memory conditions.
+HyperLevelDB. To simplify results, compression is turned
+off in all stores. We have verified that compression does not      Write Amplification. We measure write amplification for
+change any of our performance results; it simply leads to a        workloads that insert or update keys in random order (key:16
+smaller dataset. HyperLevelDB does not employ bloom fil-           bytes, value:128 bytes). Figure 4 (a) presents the results. Peb-
+ters for sstables; to make a fair comparison (and to show our      blesDb write IO (in GB) is shown over the bars. PebblesDb
+results do not derive just from sstable bloom filters), this op-   consistently writes the least amount of IO, and the difference
+timization is added to HyperLevelDB: all numbers presented         in write amplification between PebblesDb and other stores
+for HyperLevelDB are with bloom filters for sstables.              goes up as the number of keys increases. For 500M keys,
+                                                                   PebblesDb lowers write amplification by 2.5× compared to
+Key-Value Store Configurations. The key-value stores               RocksDB and HyperLevelDB and 1.6× compared to LevelDB.
+being evaluated have three parameters that affect perfor-
+mance: memtable-size, level0-slowdown, level0-stop.                Single-threaded Workloads. We use db_bench (a suite of
+Note that Level 0 can have sstables with overlapping ranges;       micro-benchmarks that comes bundled with LevelDB) [33] to
+new sstables are simply appended to Level 0 (otherwise             evaluate PebblesDb performance on various operations: 50M
+adding an sstable to Level 0 would trigger compaction, affect-     sequential writes, 50M random writes, 10M random reads
+ing write throughput). However, letting Level 0 grow without       and 10M random seeks. Reads and seeks were performed on
+bounds will reduce read and range query throughput. The            the previously (randomly) inserted 50M keys. Each key was
+memtable-size parameter controls how big the memtable              16 bytes and the value was 1024 bytes. The results, presented
+can grow before being written to storage. The other two            in Figure 4 (b), show both the strengths and weaknesses of
+parameters are used to slow down or stop writes to Level 0.        PebblesDb.
+  HyperLevelDB and RocksDB have different default val-             Random Writes and Reads. PebblesDb outperforms all
+ues for these parameters. HyperLevelDB uses 4 MB memta-            other key-value stores in random writes due to the under-
+bles with level0-slowdown of 8 and level0-stop of 12.              lying FLSM data structure. PebblesDb throughput is 2.7×
+RocksDB uses 64 MB memtables with level0-slowdown of               that of HyperLevelDB, the closest competitor. PebblesDb
+20 and level0-stop of 24. When comparing PebblesDb                 compaction finishes 2.5× faster than HyperLevelDB com-
+with these systems, the default HyperLevelDB parameters            paction. Random reads perform better in PebblesDb due to
+are used. Certain experiments also report performance under        the larger sstables of PebblesDb (as shown in Table 1). The
+RocksDB parameters.                                                index blocks of all PebblesDb sstables are cached, whereas
+PebblesDB: Building Key-Value Stores using Fragmented Log-Structured Merge Trees SOSP’17, Oct 28-31, Shanghai, China
+
+
+
+
+Figure 4: Micro-benchmarks. The figure compares the throughput of several key-value stores on various micro-
+benchmarks. Values are shown relative to HyperLevelDB, and the absolute value (in KOps/s or GB) of the baseline
+is shown above the bar. For (a), lower is better. In all other graphs, higher is better. PebblesDb excels in random
+writes, achieving 2.7× better throughput, while performing 2.5× lower IO.
+
+there are cache misses for the index blocks of the many Hy-       resulting in random writes; for example, in the YCSB work-
+perLevelDB sstables. With larger caches for index blocks,         load suite which reflects real-world access patterns, none of
+PebblesDb read performance is similar to HyperLevelDB.            the workloads insert keys sequentially [16].
+Sequential Writes. PebblesDb obtains 3× less throughput           Range Queries. A range query is comprised of an seek()
+than HyperLevelDB on the sequential write workload; this          operation followed by a number of next() operations. Range-
+is because sequential workloads result in disjoint sstables       query performance depends mainly on two factors: the num-
+naturally (e.g,. first 100 keys go to the first sstable, second   ber of levels in the key-value store on storage, and the num-
+100 keys go to the second sstable, etc.), LSM-based stores        ber of next() operations. Figure 4 (b) shows key-value store
+can just move the sstable from one level to another without       performance for range queries comprising of only seek() op-
+doing any IO. On the other hand, PebblesDb always has to          erations, performed after allowing the key-value store time
+partition sstables based on guards (and therefore perform         to perform compaction. As such, it represents a worst case for
+write IO) when moving sstables from one level to the next. As     PebblesDB: the expensive seek() operation is not amortized
+a result, PebblesDb performs poorly when keys are inserted        by successive next() operations, and other key-value stores
+sequentially. Many real-world workloads are multi-threaded,       compact more aggressively than PebblesDB, since they do
+SOSP’17, Oct 28-31, Shanghai, China                                                                              P. Raju et al.
+
+                    PebblesDB HyperLevelDB LevelDB RocksDB          We ran another experiment to measure update through-
+                                                                 put. We inserted 50M keys (value: 1024 bytes) into the store,
+Insert 50M values       56.18         40.00    22.42     14.12
+Update Round 1          47.85         24.55    12.29      7.60
+                                                                 and then updated all keys twice. The results are presented in
+Update Round 2          42.55         19.76    11.99      7.36   Table 2. We find that as the database becomes larger, inser-
+                                                                 tion throughput drops since insertions are stalled by com-
+Table 2: Update Throughput. The table shows the                  pactions and compactions involve more data in larger stores.
+throughput in KOps/s for inserting and updating 50M              While the other key-value stores drop to 50% of the initial
+key-value pairs in different key-value stores.                   write throughput, PebblesDB drops to only 75% of original
+                                                                 throughput; we attribute this difference to the compaction
+not seek to minimize write IO. In this worst-case scenario,      used by the different key-value stores. The update through-
+PebblesDB has a 30% overhead compared to HyperLevelDB,           put of PebblesDB is 2.15× that of HyperLevelDB, the closest
+due to the fact that a seek() in PebblesDb requires reading      competitor.
+multiple sstables from storage in each level. We note that in    Space Amplification. The storage space used by PebblesDb
+real-world workloads such as YCSB, there are many next()         is not significantly higher compared to LSM-based stores.
+operations following a seek() operation.                         LSM-based stores only reclaim space if the key has been
+    Next, we measure range query performance in a slightly       updated or deleted. For a workload with only insertions of
+different setting. We insert 50M key-value pairs (key: 16        unique keys, the space used by RocksDB and PebblesDB will
+bytes, value: 1 KB), and immediately perform 10M range           be identical. For workloads with updates and deletions, Peb-
+queries (each range query involves 50 next() operations). In     blesDB will have a slight overhead due to delay in merging.
+this more realistic scenario, we find that PebblesDb overhead    We inserted 50M unique key-value pairs. The storage-space
+(as compared to HyperLevelDB) reduces to 15% from the            consumption of RocksDB, LevelDB, and PebblesDb were
+previous 30%. If we increase range query size to 1000, the       within 2% of each other (52 GB). We performed another ex-
+overhead reduces to 11%.                                         periment where we inserted 5M unique keys, and updated
+    Unfortunately, even with many next() operations, Peb-        each key 10 times (total 50M writes). Since the keys aren’t
+blesDb range-query performance will be lower than that of        compacted yet, PebblesDb consumes 7.9 GB while RocksDB
+LSM key-value stores. This is because PebblesDb pays both        consumes 7.1 GB. LevelDB consumed 7.8 GB of storage space.
+an IO cost (reads more sstables) and a CPU cost (searches
+through more sstables in memory, merges more iterators)          Multi-threaded Reads and Writes. We use four threads
+for range queries. While the overhead will drop when the         to perform 10M read and 10M write operations (each) on the
+number of next() operations increase (as described above),       evaluated key-value stores. The reads are performed on the
+it is difficult to eliminate both IO cost and CPU cost.          store after the write workload finishes. We use the default
+    To summarize range-query performance, PebblesDb has          RocksDB configuration (64 MB memtable, large Level 0).
+significant overhead (30%) for range queries when the key-       Figure 4 (c) presents the results. PebblesDb performs the
+value store has been fully compacted. This overhead derives      best on both workloads, obtaining 3.3× the write throughput
+both from the fact that PebblesDb has to examine more            of RocksDB (1.7× over baseline).
+sstables for a seek() operation, and that PebblesDb does
+                                                                 Concurrent Reads and Writes. In this experiment, two
+not compact as aggressively as other key-value stores as it
+                                                                 threads perform 10M reads each, while two other threads
+seeks to minimize write IO. The overhead is reduced for large
+                                                                 perform 10M writes each. Figure 4 (c) reports the combined
+range queries, and when range queries are interspersed with
+                                                                 throughput of reads and writes (mixed). PebblesDb outper-
+writes (such as in YCSB workload E).
+                                                                 forms the other stores. The lower write amplification leads to
+Deletes and Updates. Deletes and Updates are handled sim-        higher write throughput. Since compaction in PebblesDb is
+ilar to writes in LSM-based key-value stores. Updates do not     faster than the other stores, PebblesDb reaches a compacted
+check for the previous value of the key, so updates and new      state earlier with larger (and fewer) sstables, resulting in
+writes are handled identically. Deletes are simply writes with   lower read latency and higher read throughput. Note that
+a zero-sized value and a special flag. We ran an experiment      PebblesDb outperforms HyperLevelDB even when Hyper-
+where we inserted 200M key-value pairs (key: 16 bytes, value:    LevelDB uses sstable-level bloom filters, thus demonstrating
+128 bytes) into the database and deleted all inserted keys. We   the gains are due to the underlying FLSM data structure.
+measure the deletion throughput. The results are presented
+                                                                 Small Workloads on Cached Datasets. We run an exper-
+in Figure 4 (b) and follow a pattern similar to writes: Peb-
+                                                                 iment to determine the performance of PebblesDb on data
+blesDb outperforms the other key-value stores due to its
+faster compaction.
+PebblesDB: Building Key-Value Stores using Fragmented Log-Structured Merge Trees SOSP’17, Oct 28-31, Shanghai, China
+
+sets that are likely to be fully cached. We insert 1M ran-         Workload Description                    Represents
+dom key-value pairs (key:16 bytes, value: 1KB) into Hyper-
+                                                                   Load A     100% writes                  Insert data for workloads
+LevelDB and PebblesDb. The total dataset size is 1 GB, so                                                  A–D and F
+it is comfortably cached by the test machine (RAM: 16 GB).         A          50% reads, 50% writes        Session recording recent
+We do 1M random reads and seeks. Figure 4 (d) presents the                                                 actions
+results. Even for small datasets, PebblesDb gets better write      B          95% reads, 5% writes         Browsing and tagging
+throughput than HyperLevelDB due to the FLSM data struc-                                                   photo album
+ture. Due to extra CPU overhead of guards, there is a small        C          100% reads                   Caches
+7% overhead on reads and 47% overhead on seeks. When Peb-          D          95% reads (latest values),   News feed or status feed
+blesDb is configured to run with max_sstables_per_guard                       5% writes
+(§3.5) set to one so that it behaves more like an LSM store        Load E     100% writes                  Insert data for Workload
+(PebblesDB-1), PebblesDb achieves 11% higher read through-                                                 E
+put and the seek overhead drops to 13%.                            E          95% Range queries, 5%        Threaded conversation
+                                                                              writes
+Performance for Small Sized Key-Value Pairs. We in-                F          50% reads, 50% Read-         Database workload
+sert 300M key-value pairs into the database (key: 16 bytes,                   modify-writes
+value: 128 bytes). As shown in Figure 4 (e), PebblesDb ob-         Table 3: YCSB Workloads. The table describes the six
+tains higher write throughput and equivalent read and seek         workloads in the YCSB suite. Workloads A–D and F are
+throughputs (similar to results with large keys).                  preceded by Load A, while E is preceded by Load E.
+Impact of Empty Guards. We run an experiment to mea-
+sure the performance impact of empty guards. We insert
+                                                                   on writes (although the throughput speedup reduces to 2×
+20M key-value pairs (with keys from 0 to 20M, value size:
+                                                                   from 2.7×). Similarly, PebblesDB outperforms HyperLevelDB
+512B, dataset size: 10 GB), perform 10M read operations on
+                                                                   by 8% (down from 20% on a fresh file system) on reads, and
+the data, and delete all keys. We then repeat this, but with
+                                                                   incurs a 40% penalty on range queries (as compared to 30%
+keys from 20M to 40M. We do twenty iterations of this ex-
+                                                                   on a fresh file system) compared to HyperLevelDB.
+periment. Since we are always reading the currently inserted
+keys, empty guards due to old deleted keys will accumulate         Performance Under Low Memory. We evaluate the per-
+(there are 9000 empty guards at the beginning of the last iter-    formance of PebblesDb when the total available memory
+ation). Throughout the experiment, read throughput varied          is a small percentage of the dataset size. We insert 100M
+between 70 and 90 KOps/s. Read throughput did not reduce           key-value pairs (key:16 bytes, value: 1K) for a total dataset
+with more empty guards.                                            size of 65 GB. We restrict the RAM on our machine using the
+                                                                   mem kernel boot parameter to 4 GB. Thus, the total available
+Impact of File-System and Key-Value Store Aging. Re-
+                                                                   DRAM is only 6% of the total dataset size (in our previous
+cent work has shown that file-system aging has a significant
+                                                                   experiments, it was 30%). We evaluate the performance of
+impact on performance [15]. To assess the impact of file-
+                                                                   PebblesDb under these conditions using micro-benchmarks.
+system and key-value store aging on PebblesDB, we run the
+                                                                   The results are presented in Figure 4 (g). All key-values
+following experiment. File-system Aging: We create a new
+                                                                   stores evaluated use a 64 MB memtable and a large Level
+file system on a 1.1 TB SSD, then use sequential key-value
+                                                                   0. We find that PebblesDb still outperforms the other key-
+pair insertion to fill up the file system. We then delete all
+                                                                   value stores at random writes, although the margin (with
+data in the file system, and fill the file system using the same
+                                                                   respect to HyperLevelDB) reduces to 64%. PebblesDb out-
+process again until 130 GB of free space (11% of the file-
+                                                                   performs HyperLevelDB on random reads by 63%. On the
+system size) is left. Key-Value Store Aging: We then age the
+                                                                   range query micro-benchmark, PebblesDb experiences a
+key-value store under evaluation by using four threads to
+                                                                   40% penalty compared to HyperLevelDB. Thus, PebblesDb
+each insert 50M key-value pairs, delete 20M key-value pairs,
+                                                                   still achieves good performance in reads and writes when
+and update 20M key-value pairs in random order. Once both
+                                                                   memory is scarce, although range queries experience more
+file-system and key-value store aging is done, we then run
+                                                                   performance degradation.
+micro-benchmarks for writes, reads, and seeks (all in random
+order). The results are presented in Figure 4 (f). We find that    Impact of Different Optimizations. We describe how the
+the absolute performance numbers drop: 18% for reads and           different optimizations described in the paper affect Peb-
+16% for range queries (mainly because there is more data           blesDb performance. If PebblesDb doesn’t use any opti-
+in the key-value store from the aging). As with a fresh file       mizations for range queries, range query throughput drops
+system, PebblesDB outperforms the other key-value stores           by 66% (48 GB dataset). The overhead drops to 48% if parallel
+SOSP’17, Oct 28-31, Shanghai, China                                                                              P. Raju et al.
+
+                                                                   For the range-query-dominated Workload E, PebblesDb
+                                                                surprisingly has performance close (6% overhead) to the
+                                                                other key-value stores. When we analyzed this, we found
+                                                                that the small amount of writes in the workload (Workload E
+                                                                has 5% writes) prevent any key-value store from full compact-
+                                                                ing; as a result, every key-value store has to examine multiple
+                                                                levels, which reduces the performance impact of the extra
+                                                                sstables examined by PebblesDb. When the YCSB work-
+                                                                load is modified to contain only range queries, PebblesDb
+                                                                throughput is 18% lower than HyperLevelDB as expected.
+                                                                Each range query in this workload does N next() operations
+                                                                (N picked randomly from 1 to 100), and the next() opera-
+Figure 5: YCSB Performance. The figure shows the
+                                                                tions also contribute in reducing range-query overhead.
+throughput (bigger is better except for Total-IO bars)
+                                                                   In Workload F, all writes are read-modify-writes: the work-
+of different key-value stores on the YCSB Benchmark
+                                                                load does a get() before every put() operation. As a result,
+suite run with four threads. PebblesDb gets higher
+                                                                the full write throughput of PebblesDb is not utilized, result-
+throughput than RocksDB on almost all workloads,
+                                                                ing in performance similar to that of other key-value stores.
+while performing 2× lower IO than RocksDB.
+                                                                We see similar read-modify-write behavior in applications
+seeks are used, and only 7% if only seek-based compaction       such as HyperDex and MongoDB.
+is used. Using sstable-level bloom filters improves read per-
+formance by 63% (53 GB dataset).                                5.4    NoSQL Applications
+5.3   Yahoo Cloud Serving Benchmark                             We evaluate the performance of two real-world applications,
+                                                                the HyperDex and MongoDB NoSQL stores, when they use
+The industry standard in evaluating key-value stores is the     PebblesDb as the underlying storage engine. We use the Java
+Yahoo Cloud Serving Benchmark [16]. The suite has six work-     clients provided by HyperDex and MongoDB for running the
+loads (described in Table 3), each representing a different     YCSB benchmark, with both the server and client running
+real-world scenario. We modify db_bench [33] to run the         on the same machine (no network involved).
+YCSB benchmark with 4 threads (one per core) and using de-
+fault RocksDB parameters (64MB memtable and large Level         HyperDex. HyperDex is a high-performance NoSQL store
+0). We run RocksDB with 4 background compaction threads         that uses HyperLevelDB as it storage engine by default [18].
+to further boost its performance. Load-A and Load-E do 50M      We evaluate the performance impact of using PebblesDb as
+operations each, all other workloads do 10M operations each.    the storage engine by running the YCSB benchmark with
+Figure 5 presents the results: PebblesDb outperforms both       4 threads. Load-A inserts 20M values, Load-E inserts 30M
+RocksDB and HyperLevelDB on write workloads, while ob-          values, A–D and F perform 10M operations each, and E per-
+taining nearly equal performance on all other workloads.        forms 250K operations (lower number of ops as HyperDex
+Overall, PebblesDb writes 50% less IO than RocksDB.             range-query latency is very high). We use the same setup
+   On write-dominated workloads like Load A and Load E,         used by HyperDex developers to benchmark their system
+PebblesDb achieves 1.5–2× better throughput due to the          using YCSB [28]. Both HyperLevelDB and PebblesDb are
+faster writes offered by the underlying FLSM data structure.    configured with the default HyperDex parameters (16 MB
+   For the read-only Workload C, PebblesDb read perfor-         memtable size).
+mance is better than other key-value stores due to the larger      Figure 6 (a) presents the results. In every workload, us-
+sstables of PebblesDb. The key-value stores cache a lim-        ing PebblesDb improves HyperDex throughput, with the
+ited number of sstable index blocks (default: 1000): since      highest gain of 59% coming when inserting 30M key-value
+PebblesDb has fewer, larger files, most of its sstable-index-   pairs in the Load-E workload. HyperDex adds significant
+blocks are cached. The cache misses for the other key-value     latency to operations done by YCSB. For example, the aver-
+stores result in reduced read performance. When we increase     age latency to insert a key in HyperDex is 151 µs, of which
+the number of index blocks cached, PebblesDb read perfor-       PebblesDb accounts for only 22.3 µs (14.7%). Furthermore,
+mance becomes similar to the other key-value stores. Note       HyperDex checks whether a key already exists before insert-
+that the larger sstables of PebblesDb result from compaction:   ing, turning every put() operation in the Load workloads
+in workloads such as B and D, the constant stream of writes     into a get() and a put(). This behavior of HyperDex re-
+adds new sstables that are not compacted; as a result, Peb-     duces the performance gain from PebblesDb, because Peb-
+blesDb throughput is similar to the other key-value stores.     blesDb can handle much higher rate of insertions. Despite
+PebblesDB: Building Key-Value Stores using Fragmented Log-Structured Merge Trees SOSP’17, Oct 28-31, Shanghai, China
+
+
+
+
+                   (a) HyperDex Throughput                                        (b) MongoDB Throughput
+Figure 6: Application Throughput. The figure shows the YCSB throughput (bigger is better except last bar) of
+the HyperDex document store and MongoDB NoSQL store when using different key-value stores as the storage
+engine. The throughput is shown relative to the default storage option (HyperLevelDB for HyperDex, WiredTiger
+for MongoDB). The raw throughput in KOps/s or total IO in GB of the default option is shown above the bars.
+
+this, PebblesDb increases HyperDex throughput while si-                Workload        HyperLevelDB RocksDB PebblesDb
+multaneously reducing write IO.
+                                                                       Writes (100M)            159       896          434
+  When we increase the value size from the YCSB default of
+                                                                       Reads (10M)              154        36          500
+1 KB to 16 KB, the speedup HyperDex achieves from using                Seeks (10M)              111        34          430
+PebblesDb drastically increases: the geometric mean of the
+speedup is 105% (not shown). As the value size increases,        Table 4: Memory Consumption. The table shows the
+more IO is required for all operations, making the extra         memory consumed (in MB) by key-value stores for dif-
+CPU overhead of PebblesDb negligent, and highlighting the        ferent workloads.
+benefits of the FLSM data structure.
+                                                                 throughput. Note that PebblesDb still writes 40% lesser IO
+MongoDB. We configure MongoDB [40], a widely-used                then RocksDB, providing lower write amplification.
+NoSQL store, to use PebblesDb as the storage engine. Mon-
+goDB can natively run with either the Wired Tiger key-value      Summary. PebblesDb does not increase performance on
+store (default) or RocksDB. We evaluate all three options        HyperDex and MongoDB as significantly as in the YCSB
+using the YCSB Benchmark suite. All three stores are con-        macro-benchmark. This is both due to PebblesDb latency
+figured to use 8 MB cache and a 16 MB memtable. Since            being a small part of overall application latency, and due to
+Wired Tiger is not a LSM-based store (it uses checkpoints        application behavior such as doing a read before every write.
++ journaling), it does not use memtables; instead, it collects   If the application is optimized for PebblesDb, we believe
+entries in a log in memory. We configure the max size of         the performance gains would be more significant. Despite
+this log to be 16 MB. Figure 6 (b) presents the results. We      this, PebblesDb reduces write amplification, providing either
+find that both RocksDB and PebblesDb significantly out-          equal (MongoDB) or better performance (HyperDex).
+perform Wired Tiger on all workloads, demonstrating why
+LSM-based stores are so popular. While RocksDB performs          5.5     Memory and CPU Consumption
+40% more IO than Wired Tiger, PebblesDb writes 4% lesser
+IO than Wired Tiger.                                             Memory Consumption. We measure memory used during
+   We investigated why PebblesDb write throughput is not         the insertion of 100M keys (key size: 16 bytes, value size: 1024
+2× higher than RocksDB as in the YCSB benchmark. As in           bytes, total: 106 GB) followed by 10M reads and range queries.
+HyperDex, MongoDB itself adds a lot of latency to each           The results are shown in Table 4. PebblesDb consumes about
+write (PebblesDb write constitutes only 28% of latency of        300 MB more than HyperLevelDB. PebblesDb uses 150 MB
+MongoDB write) and provides requests to PebblesDb at a           for storing sstable bloom filters, and 150 MB for temporary
+much lower rate than PebblesDb can handle. The slower            storage for constructing the bloom filters.
+request rate allows RocksDB’s compaction to keep up with         CPU Cost. We measured the median CPU usage during
+the inserted data; thus, PebblesDb’s faster compaction is        the insertion of 30M keys, followed by reads of 10M keys.
+not utilized, and the two key-value stores have similar write    The median CPU usage of PebblesDb is 170.95%, while the
+SOSP’17, Oct 28-31, Shanghai, China                                                                                 P. Raju et al.
+
+median for the other key-value stores ranged from 98.3–            and range query performance [22]. PebblesDb employs ad-
+110%. The increased CPU usage is due to the PebblesDb              ditional techniques over FLSM to balance reducing write
+compaction thread doing more aggressive compaction.                amplification with reasonable range query performance.
+                                                                      TRIAD [10] uses a combination of different techniques
+Bloom Filter Construction Cost. Bloom filters are calcu-           such as separating hot and cold keys, using commit logs as
+lated over all the keys present in an sstable. The overhead        sstables, and delaying compaction to reduce write IO and
+of calculating the bloom filter is incurred only the first time    improve performance. The TRIAD techniques are orthogonal
+the sstable is accessed. The time taken to calculate depends       to our work and can be incorporated into PebblesDb.
+on the size of sstable. We observed the rate of calculation to
+be 1.2 s per GB of sstable. For 3200 sstables totaling 52 GB,      Improving Key-Value store Performance. Both academia
+bloom filter calculation took 62 seconds.                          and industry have worked on improving the performance
+                                                                   of key-value stores based on log-structured merge trees.
+                                                                   PebblesDb borrows optimizations such as sstable bloom
+6   RELATED WORK                                                   filters and multi-threaded compaction from RocksDB. Hyper-
+The work in this paper builds on extensive prior work in           LevelDB [29] introduces fine-grained locking and a new com-
+building and optimizing key-value stores. The key contribu-        paction algorithm that increases write throughput. bLSM [51]
+tion relative to prior work is the FLSM data structure and         introduces a new merge scheduler to minimize write latency
+demonstrating that a high performance key-value store that         and maintain write throughput, and uses bloom filters to
+drastically reduces write amplification can be built on top        improve performance. VT-Tree [52] avoids unnecessary data
+of FLSM. This section briefly describe prior work and places       copying for data that is already sorted using an extra level of
+the work in this paper in context.                                 indirection. WiscKey [37] improves performance by not stor-
+                                                                   ing the values in the LSM structure. LOCS [56] improves LSM
+Reducing Write Amplification. Various data structures              compaction using the internal parallelism of open-channel
+have been proposed for implementing key-value stores. Frac-        SSDs. cLSM [23] introduces a new algorithm for increasing
+tal Index trees [11] (see TokuDB [36]) were suggested to           concurrency in LSM-based stores. We have a different focus
+reduce the high IO cost associated with traditional B-Trees.       from these work: rather than making LSM-based stores bet-
+While FLSM and Fractal index trees share the same goal of          ter, we introduce a better data structure, FLSM, and demon-
+reducing write IO costs, Fractal index trees do not achieve        strate that it can be used to build high performance key-value
+high write throughput by taking advantage of large sequen-         stores. Many of the techniques in prior work can be readily
+tial writes, and do not employ in-memory indexes such as           adapted for FLSM and PebblesDb.
+bloom filters to improve performance like PebblesDb.
+   NVMKV [38] uses a hashing-based design to reduce write          7   CONCLUSION
+amplification and deliver close to raw-flash performance.          This paper presents PebblesDb, a high-performance key-
+NVMKV is tightly coupled to the SSD’s Flash Translation            value store that achieves low write amplification, high write
+Layer (FTL) and cannot function without using FTL features         throughput, and high read throughput simultaneously. Peb-
+such as atomic multi-block write. Similarly, researchers have      blesDb outperforms widely-used stores such as RocksDB on
+proposed building key-value stores based on vector inter-          several workloads. PebblesDb is built on top of a novel data
+faces (that are not currently available) [55]. In contrast, Peb-   structure, Fragmented Log-Structured Merge Trees, that com-
+blesDb is device-agnostic and reduces write amplification          bines ideas from skip lists and log-structured merge trees.
+on both commodity hard drives and SSDs. We should note             PebblesDb is publicly available at https://github.com/
+that we have not tested PebblesDb on hard-drives yet; we           utsaslab/pebblesdb. Since it shares the same API as Lev-
+believe the write behavior will be similar, although range         elDB, we hope this will aid in adoption by applications.
+query performance may be affected.
+   The HB+-trie data structure is used in ForestDB [4] to          ACKNOWLEDGMENTS
+efficiently index long keys and reduce space overhead of
+                                                                   We would like to thank our shepherd, Frans Kaashoek, the
+internal nodes. FLSM and HB+trie target different goals re-
+                                                                   anonymous reviewers, and members of the LASR group and
+sulting in different design decisions; FLSM is designed to
+                                                                   the Systems and Storage Lab for their feedback and guid-
+reduce write amplification, not space amplification.
+                                                                   ance. This work was supported by generous donations from
+   The LSM-trie [57] data structure uses tries to organize
+                                                                   VMware and Facebook. Any opinions, findings, and conclu-
+keys, thereby reducing write amplification; however, it does
+                                                                   sions, or recommendations expressed herein are those of
+not support range queries. Similarly, RocksDB’s universal
+                                                                   the authors and do not necessarily reflect the views of other
+compaction reduces write amplification by sacrificing read
+                                                                   institutions.
+PebblesDB: Building Key-Value Stores using Fragmented Log-Structured Merge Trees SOSP’17, Oct 28-31, Shanghai, China
+
+REFERENCES                                                                       [18] Robert Escriva, Bernard Wong, and Emin Gün Sirer. 2012. HyperDex:
+ [1] Ittai Abraham, James Aspnes, and Jian Yuan. 2005. Skip B-trees. In Pro-          a distributed, searchable key-value store. In Proceedings of the ACM
+     ceedings of the 9th International Conference on Principles of Distributed        SIGCOMM 2012 Conference. 25–36.
+     Systems (OPODIS 2005). 366–380.                                             [19] Facebook. 2017. FIFO compaction style. https://github.com/
+ [2] Alok Aggarwal, Jeffrey Vitter, et al. 1988. The input/output complexity          facebook/rocksdb/wiki/FIFO-compaction-style. (2017).
+     of sorting and related problems. Commun. ACM 31, 9 (1988), 1116–            [20] Facebook. 2017. RocksDB | A persistent key-value store. http://
+     1127.                                                                            rocksdb.org. (2017).
+ [3] Nitin Agrawal, Vijayan Prabhakaran, Ted Wobber, John D. Davis,              [21] Facebook. 2017. RocksDB Users. https://github.com/facebook/
+     Mark S. Manasse, and Rina Panigrahy. 2008. Design Tradeoffs for                  rocksdb/blob/master/USERS.md. (2017).
+     SSD Performance. In Proceedings of the 2008 USENIX Annual Technical         [22] Facebook. 2017. Universal Compaction. https://github.com/
+     Conference. 57–70.                                                               facebook/rocksdb/wiki/Universal-Compaction. (2017).
+ [4] Jung-Sang Ahn, Chiyoung Seo, Ravi Mayuram, Rahim Yaseen, Jin-Soo            [23] Guy Golan-Gueta, Edward Bortnikov, Eshcar Hillel, and Idit Keidar.
+     Kim, and Seungryoul Maeng. 2016. ForestDB: A Fast Key-Value Storage              2015. Scaling Concurrent Log-structured Data Stores. In Proceedings
+     System for Variable-Length String Keys. IEEE Trans. Comput. 65, 3                of the Tenth European Conference on Computer Systems (Eurosys 15).
+     (2016), 902–915.                                                                 ACM, 32.
+ [5] Reed Allman. 2014. Rock Solid Queues @ Iron.io. https://www.                [24] Daniel Golovin. 2010. The B-Skip-List: A Simpler Uniquely Repre-
+     youtube.com/watch?v=HTjt6oj-RL4. (2014).                                         sented Alternative to B-Trees. CoRR abs/1005.0662 (2010).
+ [6] David G. Andersen, Jason Franklin, Michael Kaminsky, Amar Phan-             [25] Google. 2017. LevelDB. https://github.com/google/leveldb.
+     ishayee, Lawrence Tan, and Vijay Vasudevan. 2009. FAWN: A Fast                   (2017).
+     Array Of Wimpy Nodes. In Poceedings of the ACM SIGOPS 22nd Sym-             [26] Laura M. Grupp, Adrian M. Caulfield, Joel Coburn, Steven Swanson,
+     posium On Operating Systems Principles (SOSP 09). ACM, 1–14.                     Eitan Yaakobi, Paul H. Siegel, and Jack K. Wolf. 2009. Characteriz-
+ [7] Apache. 2017. Search Results Apache Flink: Scalable Stream and Batch             ing Flash Memory: Anomalies, Observations, and Applications. In
+     Data Processing. https://flink.apache.org. (2017).                               Proceedings of 42nd Annual IEEE/ACM International Symposium on
+ [8] Austin Appleby. 2016. SMHasher test suite for MurmurHash family of               Microarchitecture (MICRO-42). IEEE, 24–33.
+     hash functions. https://github.com/aappleby/smhasher. (2016).               [27] James Hamilton. 2009. The Cost of Latency. http://perspectives.
+ [9] Anirudh Badam, KyoungSoo Park, Vivek S. Pai, and Larry L Peterson.               mvdirona.com/2009/10/the-cost-of-latency/. (2009).
+     2009. HashCache: Cache Storage for the Next Billion. In Proceed-            [28] HyperDex. 2016. HyperDex Benchmark Setup. http://hyperdex.
+     ings of the 6th USENIX Symposium on Network Systems Design and                   org/performance/setup/. (2016).
+     Implementation (NSDI 09). 123–136.                                          [29] HyperDex. 2017. HyperLevelDB Performance Benchmarks. http:
+[10] Oana Balmau, Diego Didona, Rachid Guerraoui, Willy Zwaenepoel,                   //hyperdex.org/performance/leveldb/. (2017).
+     Huapeng Yuan, Aashray Arora, Karan Gupta, and Pavan Konka. 2017.            [30] Cockroach Labs. 2017. CockroachDB. https://github.com/
+     TRIAD: Creating Synergies Between Memory, Disk and Log in Log                    cockroachdb/cockroach. (2017).
+     Structured Key-Value Stores. In Proceedings of the 2017 USENIX Annual       [31] Dgraph labs. 2017. Dgraph: Graph database for production environ-
+     Technical Conference (USENIX ATC 17). Santa Clara, CA, 363–375.                  ment. https://dgraph.io. (2017).
+[11] Michael A. Bender, Martin Farach-Colton, Jeremy T. Fineman,                 [32] FAL Labs. 2011. Kyoto Cabinet: a straightforward implementation of
+     Yonatan R. Fogel, Bradley C. Kuszmaul, and Jelani Nelson. 2007. Cache-           DBM. http://fallabs.com/kyotocabinet/. (2011).
+     Oblivious Streaming B-trees. In Proceedings of the 19th Annual ACM          [33] LevelDB. 2016. LevelDB db_bench benchmark. https://github.
+     Symposium on Parallel Algorithms and Architectures. ACM, 81–92.                  com/google/leveldb/blob/master/db/db_bench.cc. (2016).
+[12] Michael A. Bender, Martín Farach-Colton, Rob Johnson, Simon Mauras,         [34] Hyeontaek Lim, Bin Fan, David G. Andersen, and Michael Kaminsky.
+     Tyler Mayer, Cynthia A. Phillips, and Helen Xu. 2017. Write-Optimized            2011. SILT: A memory-efficient, high-performance key-value store. In
+     Skip Lists. In Proceedings of the 36th ACM Symposium on Principles of            Proceedings of the Twenty-Third ACM Symposium on Operating Systems
+     Database Systems (PODS ’17). ACM, New York, NY, USA, 69–78.                      Principles (SOSP 11). ACM, 1–13.
+[13] Burton H. Bloom. 1970. Space/time trade-offs in hash coding with            [35] LinkedIn. 2016. FollowFeed: LinkedIn’s Feed Made Faster and Smarter.
+     allowable errors. Commun. ACM 13, 7 (1970), 422–426.                             http://bit.ly/2onMQwN. (2016).
+[14] Douglas Comer. 1979. Ubiquitous B-tree. ACM Computing Surveys               [36] Percona LLC. 2017. Percona TokuDB. https://www.percona.com/
+     (CSUR) 11, 2 (1979), 121–137.                                                    software/mysql-database/percona-tokudb. (2017).
+[15] Alexander Conway, Ainesh Bakshi, Yizheng Jiao, William Jannen, Yang         [37] Lanyue Lu, Thanumalayan Sankaranarayana Pillai, Andrea C. Arpaci-
+     Zhan, Jun Yuan, Michael A. Bender, Rob Johnson, Bradley C. Kuszmaul,             Dusseau, and Remzi H. Arpaci-Dusseau. 2016. WiscKey: Separating
+     Donald E. Porter, Jun Yuan, and Martin Farach-Colton. 2017. File                 Keys from Values in SSD-conscious Storage. In Proceedings of the 14th
+     Systems Fated for Senescence? Nonsense, Says Science!. In Proceedings            USENIX Conference on File and Storage Technologies (FAST 16). 133–148.
+     of the 15th USENIX Conference on File and Storage Technologies (FAST        [38] Leonardo Marmol, Swaminathan Sundararaman, Nisha Talagala, and
+     17). 45–58.                                                                      Raju Rangaswami. 2015. NVMKV: a Scalable, Lightweight, FTL-aware
+[16] Brian F. Cooper, Adam Silberstein, Erwin Tam, Raghu Ramakrishnan,                Key-Value Store. In 2015 USENIX Annual Technical Conference (USENIX
+     and Russell Sears. 2010. Benchmarking Cloud Serving Systems with                 ATC 15). 207–219.
+     YCSB. In Proceedings of the 1st ACM Symposium on Cloud Computing            [39] Neal Mielke, Todd Marquart, Ning Wu, Jeff Kessenich, Hanmant Belgal,
+     (SOCC 10). ACM, 143–154.                                                         Eric Schares, Falgun Trivedi, Evan Goodness, and Leland R. Nevill.
+[17] Biplob Debnath, Sudipta Sengupta, and Jin Li. 2011. SkimpyStash: RAM             2008. Bit Error Rate in NAND Flash Memories. In Proceedings of the
+     Space Skimpy Key-Value Store on Flash-Based Storage. In Proceedings              IEEE International Reliability Physics Symposium, (IRPS 08). IEEE, 9–19.
+     of the 2011 ACM SIGMOD International Conference on Management of            [40] MongoDB. 2017. MongoDB. https://www.mongodb.com. (2017).
+     Data. ACM, 25–36.                                                           [41] Dushyanth Narayanan, Eno Thereska, Austin Donnelly, Sameh El-
+                                                                                      nikety, and Antony Rowstron. 2009. Migrating server storage to SSDs:
+                                                                                      analysis of tradeoffs. In Proceedings of the 4th ACM European conference
+SOSP’17, Oct 28-31, Shanghai, China                                            P. Raju et al.
+
+     on Computer Systems (Eurosys 09). ACM, 145–158.
+[42] Suman Nath and Aman Kansal. 2007. FlashDB: Dynamic Self-tuning
+     Database for NAND flash. In Proceedings of the 6th International Con-
+     ference on Information Processing in Sensor Networks. ACM, 410–419.
+[43] Netflix. 2016.              Application Data Caching using
+     SSDs.                    http://techblog.netflix.com/2016/05/
+     application-data-caching-using-ssds.html. (May 2016).
+[44] Patrick O’Neil, Edward Cheng, Dieter Gawlick, and Elizabeth O’Neil.
+     1996. The log-structured merge-tree (LSM-tree). Acta Informatica 33,
+     4 (1996), 351–385.
+[45] Oracle. 2017. Oracle Berkeley DB. http://www.oracle.com/
+     technetwork/database/database-technologies/berkeleydb/
+     overview/index.html. (2017).
+[46] Pinterest. 2016. Open-sourcing Rocksplicator, a real-time RocksDB
+     data replicator. http://bit.ly/2pv5nZZ. (2016).
+[47] William Pugh. 1989. Skip lists: A probabilistic alternative to balanced
+     trees. Algorithms and Data Structures (1989), 437–449.
+[48] William Pugh. 1990. A Skip List Cookbook. Technical Report CS-TR-
+     2286.1. University of Maryland.
+[49] Parthasarathy Ranganathan. 2011. From Microprocessors to Nanos-
+     tores: Rethinking Data-Centric Systems. Computer 44, 1 (2011), 39–48.
+[50] Apache Samza. 2017. State Management. http://samza.apache.
+     org/learn/documentation/0.8/container/state-management.
+     html. (2017).
+[51] Russell Sears and Raghu Ramakrishnan. 2012. bLSM: a General Purpose
+     Log Structured Merge Tree. In Proceedings of the 2012 ACM SIGMOD
+     International Conference on Management of Data. ACM, 217–228.
+[52] Pradeep J. Shetty, Richard P. Spillane, Ravikant R. Malpani, Binesh
+     Andrews, Justin Seyster, and Erez Zadok. 2013. Building Workload-
+     Independent Storage with VT-trees. In Proceedings of the 11th USENIX
+     Conference on File and Storage Technologies (FAST 13). 17–30.
+[53] RocksDB Issue Tracker. 2014. Strategies to Reduce Write Amplification
+     19. https://github.com/facebook/rocksdb/issues/19. (2014).
+[54] Uber. 2016. Cherami: Uber Engineering’s Durable and Scalable Queue
+     in Go. https://eng.uber.com/cherami/. (2016).
+[55] Vijay Vasudevan, Michael Kaminsky, and David G. Andersen. 2012.
+     Using Vector Interfaces To Deliver Millions Of IOPS From A Networked
+     Key-Value Storage Server. In Proceedings of the Third ACM Symposium
+     on Cloud Computing (SOCC 12). ACM, 8.
+[56] Peng Wang, Guangyu Sun, Song Jiang, Jian Ouyang, Shiding Lin, Chen
+     Zhang, and Jason Cong. 2014. An Efficient Design And Implementa-
+     tion Of LSM-Tree Based Key-Value Store On Open-Channel SSD. In
+     Proceedings of the Ninth European Conference on Computer Systems
+     (Eurosys 14). ACM, 16.
+[57] Xingbo Wu, Yuehai Xu, Zili Shao, and Song Jiang. 2015. LSM-trie: An
+     LSM-Tree-Based Ultra-Large Key-Value Store for Small Data Items. In
+     Proceedings of the 2015 USENIX Annual Technical Conference (USENIX
+     ATC 15). 71–82.
+[58] Demetrios Zeinalipour-Yazti, Song Lin, Vana Kalogeraki, Dimitrios
+     Gunopulos, and Walid A. Najjar. 2005. MicroHash: An Efficient Index
+     Structure for Flash-Based Sensor Devices. In Proceedings of the 4th
+     USENIX Conference on File and Storage Technologies (FAST ’05).
+

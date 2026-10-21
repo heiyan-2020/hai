@@ -1,0 +1,946 @@
+ A Generic Communication Scheduler for Distributed
+             DNN Training Acceleration
+                   Yanghua Peng∗† , Yibo Zhu† , Yangrui Chen∗ , Yixin Bao∗ , Bairen Yi† , Chang Lan†
+                                          Chuan Wu∗ , Chuanxiong Guo†
+      {yhpeng, yrchen, yxbao, cwu}@cs.hku.hk∗ , {zhuyibo, yibairen.byron, lanchang, guochuanxiong}@bytedance.com†
+                                    The University of Hong Kong∗ , ByteDance Inc.†
+
+Abstract                                                                          Natural Language Processing, etc. Training DNNs, however,
+We present ByteScheduler, a generic communication sched-                          are time-consuming tasks, mainly due to large volumes of
+uler for distributed DNN training acceleration. ByteSched-                        data and growing DNN model sizes. The most common way
+uler is based on our principled analysis that partitioning and                    to scale out and accelerate DNN training is data parallelism
+rearranging the tensor transmissions can result in optimal                        (§2). Unfortunately, its performance is often far from linear
+results in theory and good performance in real-world even                         speed-up, due mainly to the communication overhead. As
+with scheduling overhead. To make ByteScheduler work gen-                         a large online service provider, in many of our internal and
+erally for various DNN training frameworks, we introduce                          publicly available training workloads, communication often
+a unified abstraction and a Dependency Proxy mechanism                            consumes a significant portion of total training time. This is
+to enable communication scheduling without breaking the                           also echoed by recent literature [9, 18, 39].
+original dependencies in framework engines. We further in-                           Consequently, many different communication accelera-
+troduce a Bayesian Optimization approach to auto-tune ten-                        tion approaches have been proposed and integrated into pop-
+sor partition size and other parameters for different training                    ular frameworks, including TensorFlow [6], PyTorch [28],
+models under various networking conditions. ByteScheduler                         MXNet [12], with drastically different implementations. For
+now supports TensorFlow, PyTorch, and MXNet without                               example, one can use RDMA to replace TCP, while the RDMA
+modifying their source code, and works well with both Pa-                         implementations are quite different among frameworks. Or,
+rameter Server (PS) and all-reduce architectures for gradient                     one can use ring-based all-reduce, either from one of several
+synchronization, using either TCP or RDMA. Our experi-                            different MPI implementations or NCCL [4] by NVIDIA, to
+ments show that ByteScheduler accelerates training with all                       replace Parameter Servers (PS). Nevertheless, they share the
+experimented system configurations and DNN models, by                             same goal – speeding up each individual message.
+up to 196% (or 2.96× of original speed).                                             Recently, a new direction to accelerate distributed DNN
+                                                                                  training, i.e., communication scheduling, has been explored [18,
+CCS Concepts • Computer systems organization →                                    21]. The idea is to change the transmission order of differ-
+Distributed architectures; Neural networks.                                       ent DNN layers, in order to better hide the communication
+Keywords ML frameworks, communication scheduling                                  overhead and achieve training speed improvement with-
+                                                                                  out affecting computation results. For example, Jayarajan
+1     Introduction                                                                et al. [21] empirically show that a speed-up of 25% − 66%
+Deep Neural Networks (DNNs) have been extensively used                            can be achieved with a certain framework (MXNet with PS
+for a wide range of applications, such as Computer Vision,                        and 1Gbps to 10Gbps TCP network). Independently, we got
+                                                                                  a similar observation with our own initial implementation
+The work of Yanghua Peng, Yangrui Chen and Chuan Wu was supported
+                                                                                  and deployment. We will further explain the details in §2.2.
+in part by a ByteDance Research Collaboration Project. Yanghua Peng is
+also supported by SOSP 2019 Student Scholarship from the ACM Special                 In this paper, we will show that priority-based commu-
+Interest Group in Operating Systems.                                              nication scheduling, combined with tensor partitioning, is
+                                                                                  not only the theoretically optimal strategy (§4) assuming no
+Permission to make digital or hard copies of all or part of this work for         system overhead, but also generic. It can accelerate most, if
+personal or classroom use is granted without fee provided that copies are not     not all, popular frameworks, both PS (synchronous or asyn-
+made or distributed for profit or commercial advantage and that copies bear
+this notice and the full citation on the first page. Copyrights for components
+                                                                                  chronous) and all-reduce gradient synchronization, different
+of this work owned by others than ACM must be honored. Abstracting with           network transports (RDMA or TCP), and any combinations
+credit is permitted. To copy otherwise, or republish, to post on servers or to    of them. This could have allowed the whole community/in-
+redistribute to lists, requires prior specific permission and/or a fee. Request   dustry to use the expensive GPU cycles more efficiently!
+permissions from permissions@acm.org.                                             Meanwhile, with a unified scheduling module across dif-
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+                                                                                  ferent frameworks, future developers and researchers can
+© 2019 Association for Computing Machinery.
+ACM ISBN 978-1-4503-6873-5/19/10. . . $15.00
+                                                                                  experiment with their ideas much easier in a wide range of
+https://doi.org/10.1145/3341301.3359642                                           settings and achieve a larger impact.
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                            Y. Peng, Y. Zhu, Y. Chen, Y. Bao, B. Yi, C. Lan, C. Wu, C. Guo
+
+
+   Unfortunately, the existing designs [18, 21] are far from             We summarize our contributions as follows:
+this vision because of two main reasons.                                 ▷ We design a generic tensor scheduling framework, ByteSched-
+   First, as mentioned above, there are many different com-           uler, that separates tensor scheduling and partitioning from
+binations of frameworks and network stacks. However, ex-              various training frameworks, gradient update architectures,
+isting communication scheduler designs are just for one:              and network protocols, without modifying their implementa-
+P3 [21] modified several layers in MXNet framework and its            tions. Our design works for TensorFlow and PyTorch which
+PS implementation, and TicTac [18] modified TensorFlow                introduce global barriers between successive iterations.
+and its PS implementation totally differently from P3. To use            ▷ Our analysis shows that ByteScheduler’s scheduling al-
+them in another framework with different communication                gorithm is optimal when there is no system overhead. The
+methods, e.g., all-reduce, one may have to re-do everything.          insight is that assigning higher priority to the layers near
+   In contrast, we design a generic communication schedul-            the DNN input maximizes the overlap with forward compu-
+ing layer that presents a framework-agnostic and commu-               tation of the next iteration. With given system overhead, the
+nication method-agnostic abstraction, benefiting a broader            performance gap from the optimum is bounded.
+audience. Building such a generic scheduling layer, however,             ▷ We identify key system parameters, i.e., partition size and
+is non-trivial. For example, different frameworks decide the          credit size, and design Bayesian Optimization-based auto-
+order of both computation and communication by them-                  tuning. It makes ByteScheduler adapt to various training
+selves. We must have a generic way to schedule the order of           models and system configurations.
+communication, while complying with the framework en-                    We have open-sourced our implementation, including the
+gines, without heavy modifications in the respective engines          core scheduler and plugins for different frameworks [2]. We
+(otherwise it cannot be generic). Also, some frameworks               hope to continue evolving it with the community, since
+introduce global barriers that prevent communication sched-           many future directions can be investigated. Examples in-
+uling (e.g., TensorFlow, PyTorch). Thus, in addition to the           clude variable tensor partition sizes, supporting dynamic
+unified scheduling abstraction, we propose two designs, De-           models, cross-job co-scheduling, etc. ByteScheduler decou-
+pendency Proxy and layer-wise out-of-engine dependencies, to          ples communication scheduling from the computation frame-
+address the above challenges, respectively.                           works, so that it can be made framework-agnostic and op-
+   Second, existing work does not adapt well to a wide range          timized separately. We believe that ByteScheduler, being
+of system setups. Different communication methods have                open-sourced and widely generic, can significantly facilitate
+their own implications on system parameters, such as tensor           future research and development in related directions.
+partition sizes. For PS architecture, it is better to slice tensors
+into smaller pieces, so that push and pull can better utilize
+                                                                      2     Background and Motivation
+bi-directional network bandwidth. However, for all-reduce,
+each partition incurs a synchronization cost among all work-          2.1   DNN Training and Data Parallelism
+ers, so small partition sizes may lead to performance penalty.        In deep learning, a DNN model is trained by iterating a large
+Moreover, different DNNs, bandwidths, and even the number             dataset many times (or “epochs”), to minimize a loss function.
+of workers also affect the optimal system parameters.                 Forward and backward propagation. Within each epoch,
+   To address these issues, we present the analysis of how            the dataset is partitioned into mini-batches. In each iteration,
+different system setups may impact the final performance              one mini-batch travels through the DNN model layer-by-
+and system parameter choices, and propose an auto-tuning              layer and generates a loss. This process is called forward
+algorithm based on Bayesian Optimization. It automatically            propagation (FP). After FP, the gradients are calculated from
+searches for the best system parameters, like tensor partition        the last layer to the first layer, and this process is called back-
+sizes and maximum sender credits. The auto-tuning helps               ward propagation (BP). The gradients are then used to update
+the core scheduling algorithm adapt to different models,              model parameters based on some optimization algorithm,
+communication architectures and hardware configurations.              e.g., Stochastic Gradient Descent (SGD). Then, the training
+   We evaluate our design with MXNet, TensorFlow, and Py-             moves on to the next mini-batch, starting from FP again.
+Torch, with PS or all-reduce gradient synchronization, using          Data parallelism. Due to the complexity of DNN mod-
+RDMA or TCP transports with different physical bandwidths.            els and large datasets, the training is often not able to be
+Popular CNN and RNN models are tested. The results are                finished within a short time, e.g., it takes 115 minutes to
+promising – the performance improvement is up to 196%,                finish training ResNet50 [19] on a DGX-1 machine with 8
+for all different combinations of frameworks/networks/mod-            V100 GPUs [3]. Data parallelism is a popular strategy for
+els. In addition, with the auto-tuning for different run-time         scaling DNN training across many devices. It partitions the
+environments, our design outperforms P3 [21] (in its only             dataset onto multiple compute devices (“workers”), where
+scenario, MXNet with PS TCP) by 28% to 43%. All these re-             each worker shares the same model parameters. Gradients
+quire zero or little code change to the framework engines,            from all workers are then aggregated before applied to up-
+and no more than 5-line change to the user code.                      date model parameters. Network communication is involved
+A Generic Communication Scheduler for Distributed DNN Training Acceleration               SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+                                                                          push 1 both require upload bandwidth, push 1 gets executed
+                                                                          before push 0 ; similarly, pull 1 could be executed before pull 0 .
+                                                                             However, this is sub-optimal. Because f 0 must be executed
+                                                                          before f 1 , it is better to finish pull 0 as soon as possible. In
+                                                                          the case that pull 1 takes a long time and blocks pull 0 , FIFO
+                                                                          strategy delays pull 0 , and hence delays the start time of f 0
+Figure 1. Layer-wise computation and communication in dis-                and the whole iteration process.
+tributed DNN training, e.g., MXNet PS.                                       Communication scheduling [18, 21] is a good solution to
+                                                                          this problem. In the example above, we can prioritize pushi
+                                                                          over push j if i < j, and do the same for pull operations. Then
+                                                                          the forward propagation of the next iteration can start earlier,
+                                                                          and potentially speed up the training.
+                                                                          Tensor partitioning. In DNNs, each layer includes one or
+                                                                          multiple tensors (e.g., the “pushed” gradients and “pulled”
+                                                                          parameters). Communication scheduling is commonly car-
+                                                                          ried out for such tensors, while tensors in the same layer can
+Figure 2. A contrived example showing performance gain with a             have the same scheduling priority (i.e., push tensors have
+better scheduling strategy (than FIFO) and tensor partitioning.
+                                                                          the same priority and the same for all pull tensors) and are
+                                                                          scheduled sequentially on the respective resource (e.g., up-
+in this process, usually using the parameter server architec-
+                                                                          load and download bandwidth). The tensor sizes can vary
+ture [15, 24] or collective routines (e.g., all-reduce) [32].
+                                                                          significantly (e.g., the smallest tensor is 256B and the largest
+Parameter Server. A parameter server (PS) is a logically
+                                                                          tensor is over 400MB for VGG16 model [33]). A very large
+separate device that stores global parameters and provides a
+                                                                          tensor, once en-queued in the communication stack, would
+key-value interface to workers. Typically, data parallelism
+                                                                          block other tensors even if they have higher priorities. Thus,
+with PS has the following steps: (a) each worker computes
+                                                                          a more efficient scheduling strategy is to partition the ten-
+the gradients using its local data partition and sends them
+                                                                          sors before en-queuing, and allow higher-priority tensors to
+to PS (push); (b) PS sums the gradients across workers and
+                                                                          jump ahead of the queue once they arrive.
+updates its parameters (update); (c) Workers synchronize
+                                                                             Tensor partitioning also improves bandwidth utilization
+parameters with PS (pull). A PS architecture enables better
+                                                                          of bi-directional network in PS architecture. Without parti-
+fault tolerance and more flexible parameter synchronization.
+                                                                          tioning, the pull flow of a large tensor can start only after
+All-reduce. All-reduce is a collective operation that reduces
+                                                                          the push flow of the whole tensor is done. Given that the
+the target arrays with a specified binary operator (e.g., sum,
+                                                                          network today is usually duplex, this implies 50% bandwidth
+max) in all processes to a single array and broadcasts the
+                                                                          waste. Finally, partitioning tensors can mitigate load imbal-
+result to all processes. In DNN training, all-reduce computes
+                                                                          ance in PS architecture, especially when one or a few tensors
+the sum of gradients across workers, and then each worker
+                                                                          are very large and dominate the total model size.
+updates its parameters accordingly locally.
+                                                                          Potential benefits. To demonstrate the potential bene-
+2.2 Communication Scheduling                                              fits of communication scheduling (with tensor partitioning),
+Computation-communication dependency DAG. In dis-                         we show a simple and contrived illustrative example (Fig-
+tributed DNN training, computation and communication of                   ure 2). The DNN has three layers of different sizes, with
+tensors form a dependency DAG (Directed Acyclic Graph).                   FP and BP consuming different time. Compared with the
+In the DAG, the forward and backward propagation is or can                default FIFO transmission scheduling, the better schedule
+be linearized as a chain of computation across layers (e.g., by           can lead to 44.4% training speed-up. Jayarajan et al. [21]
+grouping or coalescing multiple operators or tensors [36]).               have implemented similar scheduling strategies on MXNet
+Let fi , bi , pushi and pulli be the FP, BP, push and pull of layer       PS and shown an up-to-66% training speed improvement
+i, respectively. Figure 1 shows the layer-wise dependencies               with 10Gbps (or less) TCP networks, than FIFO.
+of MXNet with PS architecture between two iterations: fi
+depends on fi−1 and pulli , pulli depends on pushi , pushi de-
+pends on bi , and bi depends on bi+1 . To finish DNN training             2.3   The Opportunities and Challenges
+is to finish such a DAG (spanning all iterations).                        We believe that communication scheduling is valuable to
+Scheduling the order of communication. By default, ML                     general DNN training, not just MXNet with PS and TCP. We
+framework engines execute communication operations in                     explain the rationale and challenges below.
+a FIFO order, because the underlying communication stack,                 Opportunity 1: one unified scheduler for all. Though
+either PS or all-reduce, TCP or RDMA, is inherently based                 there are several different ML frameworks and DNN models,
+on FIFO queues. This is shown in Figure 1: since push 0 and               the most popular training jobs have similar DAG structures
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                                                      Y. Peng, Y. Zhu, Y. Chen, Y. Bao, B. Yi, C. Lan, C. Wu, C. Guo
+
+
+                                                                                                                 in a FIFO manner. A generic scheduler must be able to work
+                                                                                                                 with both types of engines, manipulating the transmission
+                                                                                                                 order without breaking the properties of the original engines.
+                                                                                                                    In addition, existing engines are not designed with com-
+                                                                                                                 munication scheduling in mind. Therefore, some engines,
+                                                                                                                 like TensorFlow and PyTorch, introduce a global barrier be-
+Figure 3. Distributed DNN training with an inter-iteration barrier.                                              tween iterations, as Figure 3 shows. This would make any
+TensorFlow with PS is shown. PyTorch also has this barrier.                                                      scheduling of push/pull (or all-reduce) ineffective.
+                           1e3                                                     1e3
+                                                                                                                 Challenge 2: adapt to different run-time environments.
+                                                                            0.90
+Speed (images/sec)
+
+
+
+
+                                                       Speed (images/sec)
+                     2.5                                                                                         In the real-world, scheduling and tensor partitioning have
+                     2.0                                                    0.75                                 networking-related overhead. For example, there is certain
+                     1.5                                                    0.60                      1 Gbps     overhead for sending a tensor regardless of the size of the
+                                                                                                      10 Gbps
+                     1.0                                                    0.45                                 tensor. Consequently, tensor partitioning has a performance
+                                             1 Gbps
+                     0.5                     10 Gbps                        0.30                                 penalty, especially if the partition size is too small. In Fig-
+                            200        400       600                                200         400        600   ure 4(a), we show the training speed with different partition
+                               Partition Size (KB)                                        Credit Size (KB)       sizes, with FIFO transmission scheduling. We see that the
+                     (a) Different partition sizes                           (b) Different credit sizes          partition size affects training speed, especially in networks
+                                                                                                                 with larger bandwidth. P3 [21] uses a default partition size
+Figure 4. Training VGG16 using MXNet (PS, TCP) with FIFO
+                                                                                                                 of 160KB (the leftmost points in Figure 4(a)). Such a partition
+communication scheduling at different network bandwidth levels.
+                                                                                                                 size is far from optimal in a 10Gbps network when FIFO
+as shown in Figure 1. Most DNN models have layered struc-                                                        scheduling is used, though P3’s scheduling out-weighs the
+tures, and computation takes place one layer after another.                                                      non-optimality of partition size and delivers positive gains
+Even though the training frameworks have different features,                                                     in the end. The same goes for credit size (Figure 4(b)), which
+they essentially run the same DAG for the same model, just                                                       is defined by us (§4.2) for filling the sending buffer in the
+with different ways (e.g., APIs) of implementing the DAG.                                                        network stack. P3 essentially uses a credit size equal to the
+   In addition, different communication methods also fit in                                                      partition size, which is again not the best.
+this DAG model – the network transport (TCP or RDMA)                                                                The question is, what are the sweet spots for these pa-
+does not change the DAG, and an all-reduce architecture                                                          rameters? They are likely to vary with many factors. For
+simply replaces a push and a pull in the DAG by the all-                                                         example, in Figure 4, we show that the impact of overhead
+reduce operation. Intuitively, the same scheduling algorithm                                                     is very different in 1Gbps and 10Gbps networks. In practice,
+should also apply.                                                                                               the physical network bandwidth can range from 1Gbps to
+   We envision a generic scheduler that can accelerate the                                                       200Gbps, and users use either PS or all-reduce as gradient
+execution of DAG by changing the order of communication                                                          synchronization method, and TCP or RDMA as the trans-
+operations, no matter which frameworks, which commu-                                                             port. Furthermore, we find that various DNN models have
+nication patterns and which network transports. Also, for                                                        different optimal partition/credit size values because they
+the best generality and easier adoption, we seek minimal-                                                        have different model structures and sizes. We will further
+to-none modification to existing framework engines and                                                           show its analytical complexity in §4.1.
+communication libraries.                                                                                            A generic scheduling framework must be able to adapt to
+Opportunity 2: one unified analytical foundation for                                                             all these different run-time environments.
+scheduling algorithms. Once we realize the unified sched-
+uler, we essentially decouple the algorithm design from the
+                                                                                                                 3     Design
+framework-related implementation details. This gives us the                                                      3.1   Architecture
+opportunity to formulate the scheduling problem across all                                                       To make ByteScheduler generic, the key question is –
+system setups. In contrast, previous work was deeply cou-                                                        Which layer should ByteScheduler be implemented in?
+pled with specific framework implementations, and only                                                           From the closest to user to the lowest level, ML frameworks
+focused on empirical results. In this paper, we show that our                                                    and communication stacks include: 1) user code that declares
+scheduling algorithm is not only empirically effective, but                                                      DNN models, 2) framework frontend with high-level API
+also theoretically guaranteed even with system overhead.                                                         (e.g., Python frontend), 3) framework engine (which decides
+   However, the opportunities come with challenges.                                                              how to execute the DAG), 4) message-level communication
+Challenge 1: be generic to different frameworks. Al-                                                             library, and 5) TCP or RDMA stack. To be generic, we can
+though the DAGs are similar in the end, how the frameworks                                                       not modify user code and framework engines heavily. Im-
+build such DAGs and execute them is very different. Engines                                                      plementing the scheduler in message-level communication
+that support declarative mode decide the execution order                                                         library is a good choice if in a clean slate. Unfortunately, in
+based on DAG dependencies, while imperative engines run                                                          reality, the communication libraries are quite diverse (e.g.,
+A Generic Communication Scheduler for Distributed DNN Training Acceleration              SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+                                                                          functionality of Core, and our observation on the most popu-
+                                                                          lar frameworks (TensorFlow, PyTorch, MXNet) and commu-
+                                                                          nication methods, we conclude that the following CommTask
+                                                                          interfaces are sufficient and implementable in the plugins.
+                                                                          CommTask.partition(size): Core calls this interface to
+                                                                          partition a CommTask into one or multiple SubCommTasks
+                                                                          with tensors no larger than size, which invokes a callback in
+                                                                          the plugin as tensor partitioning is framework-dependent.
+                                                                          Core then schedules those partitioned CommTasks. This
+                                                                          incurs low overhead because all popular frameworks provide
+                                                                          zero-copy APIs for partitioning the underlying tensor.
+                                                                          CommTask.notify_ready(): Most ML frameworks are asyn-
+                                                                          chronous – when a communication operation is posted to
+Figure 5. ByteScheduler architecture in the communication stack.
+The dark grey part is added by ByteScheduler.
+                                                                          the engine, possibly the tensor has not been computed or
+                                                                          ready to be sent. We let the engine use this interface to notify
+lots of RPC and MPI implementations), with their own thread               Core about a tensor being ready, so that Core can actually
+management modules. It would be almost impossible to have                 begin scheduling it. We will explain how we achieve this
+a single piece of code work across all of them. Under the                 generically and without modifying the engines in §3.3.
+TCP or RDMA stack, like socket and verbs, we will lose                    CommTask.start(): Core calls this interface to let engines
+application-level information, such as message priorities.                and the underlying communication stacks send the tensor. It
+   Therefore, this leaves us the final choice – implement                 has to be implemented per framework and communication
+ByteScheduler at the high-level API implementation layer                  method combination. Fortunately, the differences are very
+in the framework. Fortunately, this layer is usually imple-               small – simply calling the built-in communication primitives
+mented in flexible languages (i.e., Python) that support class            (e.g., ring all-reduce, push or pull) in the framework.
+inheritance and runtime monkey patch [38]. Since this layer               CommTask.notify_finish(): Once the communication of
+is mainly for translating users’ DNN declaration into asyn-               a tensor (all-reduce, push or pull) has been finished, the
+chronous operations, it often has a simple threading model                framework engine must notify Core about this, so that Core
+(e.g., single-threaded), indicating an easier implementation.             can continue scheduling more Tasks. More details are in §3.3.
+   As shown in Figure 5, we design ByteScheduler to be                       We believe that one can implement most, if not all, com-
+just before the API layer posting communication opera-                    mon scheduling algorithms with these interfaces. Using these
+tions to the engine. For each framework, we design a shim                 interfaces, we implement our scheduling algorithm in Core
+layer, called plugin, that wraps the original operation into a            (Algorithm 1 in §4). All the above interfaces must be imple-
+unified “communication task” abstraction (§3.2). Then, the                mented in the plugins per framework, and start() is also per
+Core, schedules the task using our (or any) algorithm. Con-               communication methods. The users can enable plugins with
+sequently, the same piece of scheduling code would work                   no more than 2 lines of codes (LoC), as shown in §5.
+across frameworks and communication methods. The de-
+tailed interaction between these modules is explained in the
+following subsections.                                                    3.3   Interaction with Framework Engines
+3.2 Unified Abstraction for Communication Tasks                           Next, we explain our generic approach that works with dif-
+ByteScheduler Core is designed to be framework-agnostic                   ferent engines to schedule the order of CommTasks.
+and communication method-agnostic. It accepts a unified                      The frameworks have their own execution engines that
+abstraction for communication, called CommTask (a com-                    run the computation and communication operations. Declar-
+munication task associated with one tensor, e.g., all-reduce),            ative engines, e.g., TensorFlow and MXNet, build dependency
+as input from the plugins. Except the trivial init() and shut-            graphs, while imperative engines like PyTorch, run opera-
+down() interfaces, the Core exposes a single interface to the             tions in a FIFO manner. Either way, the Core should not
+plugins, i.e., Core.enqueue(CommTask).                                    schedule a CommTask before the engine allows, and should
+   Each time a communication tensor arrives, the plugin                   be able to delay a CommTask while keeping original depen-
+wraps it as a CommTask and assigns priority before enqueu-                dencies. We propose a new primitive to address this problem.
+ing it. For declarative engines (e.g., TensorFlow), it uses topo-         Dependency Proxy (or Proxy). A Proxy is an operation
+logical sort to obtain the priority. For imperative engines, it           created by ByteScheduler. It can be posted into the frame-
+assigns a monotonic increasing ID to each (gradient) tensor               work engines, and claim dependencies from/to other opera-
+based on the order they are created (same as the BP order).               tions. Declarative engines all provide direct APIs to define
+   Once getting a CommTask, Core partitions it into Sub-                  such dependencies since this is the fundamental feature of
+CommTasks and decides when to send each. Based on the                     such engines. In the case of imperative engines, Proxy can
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                               Y. Peng, Y. Zhu, Y. Chen, Y. Bao, B. Yi, C. Lan, C. Wu, C. Guo
+
+
+
+
+Figure 6. Interaction between Core and framework engines with-
+out global barrier, e.g., MXNet. Only one DNN layer is shown (as-       Figure 7. Interaction between Core and framework engines when
+sume one tensor in the layer). Operations in squares are added by       a global barrier exists, e.g., TensorFlow. The thick dashed arrow
+ByteScheduler. The solid arrows are direct function calls, while the    means dependencies enforced by ByteScheduler, not by engines.
+dashed arrows mean dependencies.
+
+be simply posted immediately before or after an operation,
+e.g., with “hooks” in PyTorch.
+   If a communication operation must happen after a compu-
+tation operation in the original order, e.g., the computation
+operation generates the gradients to be sent, we will post
+a Proxy to the engine. It claims to depend on the finish of       Figure 8. The new DAG with layer-wise out-of-engine dependen-
+the computation operation, and also to be precedent to the        cies (assume one layer has one tensor). Dashed arrows indicate the
+communication operation, as shown in Figure 6.                    original dependencies removed by ByteScheduler.
+   Proxy does only two things. First, once it is started by the
+engine, it will trigger the corresponding CommTask.notify_ready() Layer-wise out-of-engine dependencies. To facilitate
+via a callback, because the start of Proxy means the original     scheduling, we make the global barrier not wait for the ac-
+precedent operations of the communication operation have          tual completion of communication operations. We replace
+been finished. Second, it will not finish until Core tells it     the actual communication operation by an asynchronous
+to end via CommTask.start(). Because it is one precedence         operation, as Figure 7 shows. The asynchronous operation
+of the communication operation, it effectively delays the         will  start the actual communication in the background, and
+communication operation until being scheduled by Core.            returns    immediately to let the global barrier pass. In other
+   Proxy has very low overhead – before Proxy ends, it is         words,   the  actual communication operations are run outside
+blocked by a lock and yields the CPU resources (in the case       the  engine    and computation graph, by Core, even after the
+of imperative engines), or simply “finishes” without calling      barrier.  At  the  end of each actual communication operation,
+the on_complete() callback provided by the engine (in the         we   add  a  callback to notify Core about completion.2
+case of declarative engines). Core will call CommTask.start(),       Only moving the actual communication out of the DAG
+which includes the engine’s on_complete().                        may    cause incorrectness. Because neither TensorFlow nor
+   For MXNet, we post another type of Proxy right after           PyTorch     engines can track cross-iteration dependencies, the
+the communication operation and claim dependency on it.           FP  in the  next iteration may start before the actual communi-
+This Proxy only generates completion signal using Comm-           cation   finishes.  Hence we add another type of Proxy before
+Task.notify_finish() once it is started by the engine. For Ten-   the  FP  of each   DNN   layer, and let the Proxy block until Core
+sorFlow and PyTorch, we have to generate the completion           gets  CommTask.notify_finish().       Thus, the dependencies are
+signal a bit differently – see the next subsection.               enforced    by  ByteScheduler   instead  of by the engines. Figure 8
+3.4 Crossing the Global Barrier                                   summarizes       the design.
+As explained in §2.3, some frameworks (e.g., TensorFlow and
+PyTorch) introduce a global barrier between two consecutive
+                                                                        4    Scheduling in the Wild
+iterations. This makes scheduling largely ineffective – the             Next, we first present the analysis of our core scheduling
+global barrier waits for all communication operations to                algorithm (Algorithm 1). We show that it is the optimal sched-
+finish before moving on to the next iteration, so changing              uling in an ideal scenario (i.e., no system overhead), and it
+the order of communication does not matter. We cannot                   is within a certain bound to the ideal case in practice. Then,
+simply take the global barrier away, because it would require           we explain our auto-tuning mechanism to reduce the gap be-
+significant change on the framework and the user code.1                 tween real-world performance and the theoretical optimum.
+
+1 The most common way to program in TensorFlow and PyTorch is to wait   2 Fortunately, even if the operation is run outside the main engine, Tensor-
+
+for each iteration’s finishing in a while-loop.                         Flow and PyTorch still allow us to add an on_complete() callback.
+A Generic Communication Scheduler for Distributed DNN Training Acceleration               SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+4.1   The Analysis of ByteScheduler Algorithm                             partition overhead (about 300us in our testbed). With the over-
+The following theorem shows that in the ideal case with                   head, the scheduling problem is much more complicated.
+assumptions, the optimal scheduling strategy turns out to                    It causes three kinds of extra delay, comparing its time for
+be priority queuing. The priorities of tensors are determined             one training iteration with the infinitely-small partition case:
+by the order of the layers in the DNN model. Detailed proof               1) In PS architecture, the pull flow will start later because a
+of the theorem can be found in the appendix [1].                          partition must be pushed before being pulled. The partition
+Theorem 1. The following priority queuing scheduler:                      size determines this delay. 2) Sending each partition will need
+   • in a PS architecture, prioritize pulli over pullk , and pushi        longer time due to overhead. 3) Preemption cannot happen
+over pushk , ∀i < k                                                       at any time but only when a partition transmission is done.
+   • in an all-reduce architecture, prioritize allreducei over            Therefore, partition size affects the preemption granularity.
+allreducek , ∀i < k                                                          Fortunately, for the first kind of delay, we find that the
+is the optimal solution for minimizing the time for each train-           gap to the ideal case is bounded by the transmission time
+ing iteration, if the following conditions are met:                       of one partition, since the start of all push/pull flows and
+   1. (Sequential GPU computation operations) The subgraph                preemption need to wait for the ongoing partition to be
+of DAG containing only fi and bi is a chain (i.e., no parallel            transmitted first. The smaller the partition is, the closer it
+layers in the DNN).                                                       is to the ideal case. For the second kind of delay – system
+   2. (Optimal GPU scheduling) Whenever the dependencies of               slowdown directly caused by partition overhead, we consider
+fi or bi are satisfied, GPU will run the computation operation            the worst case that the bottleneck during one iteration is the
+without preemption. This is the optimal GPU scheduler because             communication time. The extra delay is bounded by O(nθ )
+the GPU computation operations are in a chain.                            where θ is a constant partition overhead, and n is the number
+   3. (Tensor partition) Tensors in each DNN layer are par-               of partitions in all layers in the DNN.
+titioned, such that flow preemption can happen; with PS, if                  Summing up the gaps in the above two delays, we obtain
+the push flow in a layer is only partially done before being              that the extra delay due to finite partition size and partition
+preempted, the done part can be pulled.                                   overhead, as compared to the ideal case in Theorem 1, is at
+                                                                                 ÍN −1 si                     δ
+   4. (Infinitely small partition) Suppose the partition size is δ        most i=0     (⌊ δ ⌋θ ) + θ + 2 bandwidth  for PS, where si is the
+and δ → 0.                                                                size of pushi , δ is the partition size and N is the number of
+                                                                                                     ÍN −1 allr educei            δ
+   5. (Flow preemption) Higher priority push/pull or all-reduce           layers in the DNN, and i=0       (⌊    δ     ⌋θ ) + bandwidth  for
+can preempt lower priority push/pull or all-reduce immediately            all-reduce, where allreducei is the size for one all-reduce op-
+without extra overhead.                                                   eration. This delay for one iteration is a function of partition
+   With infinitely small partition, the push flow and pull flow           size δ , composed by an increasing function and a decreasing
+can start at the same time to increase pipelining in PS ar-               function, and has a trend to decrease first and increase later.
+chitecture. Minimizing the time for one training iteration                Due to the rounding operator, this function is not smooth
+is equivalent to maximizing the overlap between communi-                  nor differentiable everywhere, and it is hard to find the near-
+cation and computation. Priority queuing can lead to more                 optimal partition size using classical optimization methods.
+potential overlap between forward computation and com-                    We will explain how to tune the best partition size in §4.3.
+munication than other policies. The optimality of Theorem 1                  For the last kind of delay related to preemption granularity,
+can be proved by induction on the number of layers.                       it is influenced even more by another system parameter,
+   In the all-reduce architecture, all workers form a topology            credit size, as explained below.
+(usually a ring). Each tensor is partitioned (or segmented, in
+MPI terms) and reduced by walking the ring from different                 4.2   Credit-based Preemption
+starting points. This is the same as the PS case with small               To realize preemption, a naïve approach is stop-and-wait: the
+partition and without preemption overhead.                                sender keeps only one tensor unacknowledged and sends the
+   Assumptions 1 and 2 are typically true for existing ML                 next tensor after receiving the acknowledgement. Existing
+frameworks and DNN models, especially those models con-                   schedulers like [21] adopted this approach. However, depend-
+sisting of layers where one stacks on another. Unfortunately,             ing on runtime environment, sending tensors one-by-one
+assumptions 4 and 5 do not hold in practice – the preemption              may not fully utilize network bandwidth (§2.3).
+in scheduling cannot be as ideal as assumed, and partitions                  Our solution is credit-based preemption. It works like a
+cannot be infinitely small due to system overhead (see §2.3).             sliding window and the credit is the window size. Multiple
+Analysis with partition size and overhead. Below, we                      tensors (instead of one tensor) in the window can be sent
+consider non-infinitely-small partition sizes. In addition to             concurrently (to the underlying FIFO network transmission
+the network transmission time t = size/bandwidth, real-                   queue). This improves network utilization due to filling the
+world systems usually spend extra time on handling a mes-                 sending buffer in the network stack. However, preemption
+sage, like the RPC serialization and ACK time, or synchro-                may happen less timely. Suppose while tensor 1 is being
+nization time for all-reduce. We refer to this extra time as              transmitted, tensors 2, 3 and 4 arrive sequentially (priorities
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                                Y. Peng, Y. Zhu, Y. Chen, Y. Bao, B. Yi, C. Lan, C. Wu, C. Guo
+
+
+Algorithm 1 The scheduling algorithm in Core                                                             1e3
+
+
+
+
+                                                                              Speed (images/sec)
+                                                                                                   2.4                           Objective Function
+Input:                                                                                                                           95% Confidence Interval
+     commtasks ← a set of unready SubCommTasks                                                     2.3
+     queue ← priority queue of SubCommTasks
+                                                                                                   2.2
+     credit ← credit size for credit-based preemption                                                               Prediction
+     unit ← partition size that is used to partition a CommTask                                    2.1              Samples
+  1: /* Partition a CommTask in Core*/
+                                                                                                          0         100          200           300
+  2: procedure Partition(task)                                                                                            Credit (MB)
+  3:     subtasks = task.partition(unit)                                Figure 9. Bayesian Optimization example: 7 samples; tuning credit
+  4:     commtasks.add(subtasks)                                        size of VGG16 in MXNet (all-reduce)
+  5: /* Enqueue a ready SubCommTask based on priority*/
+                                                                        Unfortunately, formally modeling and solving this problem
+  6: procedure Ready(priority, subtask)
+                                                                        is hard, since we can not explicitly express training speed as
+  7:     queue.put(priority, subtask)
+  8:     commtasks.remove(subtask)                                      a function of two knobs. We leave the two knobs undecided
+                                                                        until runtime, and resort to runtime searching.
+  9: /* Return credits when a SubCommTask is finished*/
+ 10: procedure Finish(subtask)
+                                                                           To search the best credit size and partition size, one simple
+ 11:     credit = credit + subtask.tensor.size                          way is to use grid search, i.e., enumerate all possible com-
+ 12: /* Schedule SubCommTasks in the priority queue */                  binations of credit size and partition size. But the cost of
+ 13: procedure Schedule                                                 enumeration is too high and is infeasible for the continuous
+ 14:     while True do                                                  solution space. Some simple heuristic algorithm like SGD
+ 15:         priority, subtask = queue.get()                            with momentum [30] may work when the training speed
+ 16:         if credit > subtask.tensor.size then                       has a trend of unimodality, but we can not get the accurate
+ 17:             credit = credit - subtask.tensor.size                  gradient of the curve as it is non-parametric. The derivatives
+ 18:             subtask.start()                                        approximated by slope are “noisy” due to runtime jitters, and
+ 19:         else
+                                                                        SGD is easy to be stuck in a local optimum.
+ 20:             wait until a subtask is finished and returns credits
+                                                                           We experimented with a few algorithms (see §6), and fi-
+                                                                        nalize on using Bayesian Optimization (BO) to tune credit
+p1 < p2 < p3 < p4 ). Using the existing approach, the trans-            and partition size together. BO does not have any limitation
+mission order will be 1->4->3->2 due to stop-and-wait. Using            of the function format. The function of partition size and
+our solution with a sliding window of size 2, the order will            credit size can be treated as non-parametric. In addition, it
+be 1->2->4->3. Once tensor 2 arrives, it will be sent to the            tries to minimize the number of trials to find a near-optimal
+underlying FIFO queue though tensor 1 is still being trans-             solution, which reduces the tuning cost. BO is also known
+mitted, to improve network utilization; later when tensor               to be noise-resilient since it quantitatively evaluates the un-
+3 and 4 arrive, they can not preempt tensor 2 as the first              certainty region of the performance curve [8].
+approach, because tensor 2 has been delivered to the under-                We aim to optimize the training speed D(δ, c) and the de-
+lying queue before their arrival. A larger credit size leads to         cision variables are partition size δ and credit size c. The
+better bandwidth utilization but with less timely preemption.           objective function D(·) is unknown beforehand, but its val-
+We leave it as a system parameter to balance the trade-off              ues can be observed through profiling. At each given (δ, c),
+and will explain how to tune its best value in §4.3.                    the objective function value follows a distribution and we
+   Algorithm 1 shows the preemptive scheduling algorithm                use Gaussian as it is widely accepted as a good surrogate
+in ByteScheduler Core. In one iteration, each communication             model for BO [8]. A 95% confidence interval is associated
+operation is wrapped as a CommTask and partitioned into                 with D(δ, c), which describes the region that D(δ, c) most
+SubCommTasks (line 3). As the BP goes, the SubCommTasks                 likely resides in. With one more trial, the confidence interval
+become ready one by one and are enqueued into a priority                is updated with the new observation according to the poste-
+queue (line 7). A scheduling thread runs the SCHEDULE pro-              rior distribution. With more trials, the confidence interval
+cedure (line 13) and polls the queue constantly. Whenever               decreases and the estimate of D(·) becomes more accurate.
+the credit is enough for the highest priority SubCommTask                  To minimize the number of trials, BO selects the next
+(line 16), ByteScheduler pops the SubCommTask from the                  configuration (δ, c) by maximizing an acquisition function,
+queue and starts transmission (line 18). The credit is de-              which is also updated with the confidence interval. We use
+creased by the tensor size (line 17), and increased when the            the most common acquisition function, Expected Improve-
+tensor’s transmission is completed (line 11).                           ment [11], which picks (δ, c) to maximize the expected speed
+                                                                        improvement over the current best candidate. A BO hyper-
+4.3   Auto-Tuning Partition Size and Credits                            parameter EI balances the exploitation and the exploration
+Credit size and partition size are two knobs that decide the            of the searching process (we use the default value 0.1 in the
+trade-off between optimal scheduling and system overhead.               experiments). In this way, BO can quickly learn the objective
+A Generic Communication Scheduler for Distributed DNN Training Acceleration              SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+function and only suggest (δ, c) in the areas that most likely            the implementation of MXNet all-reduce plugin, we wrap
+contain the optimal solution. For illustration, Figure 9 shows            Horovod DistributedOptimizer in our ScheduledOptimizer.
+BO’s search process for credit size for training VGG16. Each              TensorFlow plugin. The plugin is implemented for TensorFlow≥
+sample is a pair (credit, speed).                                         1.13 and PS architecture. It is an opt-in TensorFlow graph
+                                                                          optimization module, using the TensorFlow Grappler frame-
+5    Implementation Details                                               work [5]. Grappler supports altering run-time behavior of
+ByteScheduler is implemented using C++11 and Python. The                  graph execution, such as instrumenting OpKernel implemen-
+Core is a common Python library for all ML frameworks. For                tation, adding and removing data or control dependencies
+each framework, a plugin is required for PS architecture or               of graph nodes. The TensorFlow plugin goes through the
+all-reduce architecture. The plugins are usually a mixture of             data-flow graph before its execution, and adds Dependency
+C++ and Python code. The current implementation has 4279                  Proxies to schedule the timing of worker sending gradients
+LoC in total, with Core as the largest part (1503 LoC).                   and parameter server sending model parameters. The invoca-
+ByteScheduler Core. The Core runs a single main thread,                   tion of gradient updates is moved out of graph, i.e., the global
+handling events like Core.enqueue(CommTask), and all Comm-                barrier is removed, as discussed in Sec. 3.4. Among all three
+Task APIs. The key data structure is a priority queue of                  frameworks, only TensorFlow requires 13-line code change
+CommTasks, and the main algorithm is described in Algo-                   in its engine, which delays the clean-up of communication
+rithm 1. Auto-tuning algorithms are also implemented.                     channels when we cross the global barrier.
+   Every worker runs an instance of Core. However, only                   Auto-tuning support. Each worker needs to adjust par-
+one worker’s (with ID 0) Core runs as a master, which runs                tition size and credit size during BO tuning. For training
+auto-tuning algorithms to decide the partition size and credit            DNNs in PS architecture, adjusting the partition size requires
+size and broadcasts them to other workers. Also, to avoid                 re-partitioning the parameters and can cause errors due to
+deadlocks in all-reduce, only the master Core determines the              tensor shape mismatch. Hence, each time when the partition
+order of sending tensors and broadcasting to other workers,               size is changed, we checkpoint and restart the training (e.g.,
+so that all workers can perform the same all-reduce operation             by adding a batch_end_callback hook). For all-reduce, we
+simultaneously. For PS that supports asynchronous push and                can change the values of the two knobs dynamically without
+pull, all Cores schedule the order independently.                         stopping training.
+MXNet plugin. We implement plugins for both PS and                        Usage. Users need to add 2 lines of code in their Python≥ 2.7
+all-reduce architectures for MXNet≥ 1.4. The PS plugin is                 program to enable ByteScheduler. Take MXNet PS architec-
+based on MXNet’s native communication abstraction, i.e.,                  ture as an example, a user needs to wrap MXNet KVStore
+KVStore. We wrap calls of KVStore APIs (e.g., init, push,                 using our ScheduledKVS, shown as follows.
+pull) as CommTasks and post them to ByteScheduler Core                    # After user created an MXNet KVStore object kvs
+for scheduling. We will evaluate ByteScheduler performance                from bytescheduler.mxnet.kvstore import ScheduledKVS
+on both TCP and RDMA for MXNet PS, shown in Sec. 6. So                    kvs = ScheduledKVS(kvs)
+far, ps-lite, the underlying PS library of MXNet, only sup-               # Continue using kvs without any further modification
+ports TCP communication between workers and parameter                        ByteScheduler may cause confusion for users due to cross-
+servers. Internally, we added RDMA support to ps-lite. It is              ing the global barrier. From our experience, the impact is
+out of the scope of this paper, so we omit the details.                   little since the main metrics (e.g., loss and accuracy) are cal-
+   For all-reduce, we develop the plugin based on Horovod,                culated during forward pass and hence are not affected.
+which wraps MXNet optimizer with Horovod DistributedOp-
+timizer [32]. We further wrap Horovod DistributedOptimizer
+in our ScheduledOptimizer for MXNet, so that all-reduce op-               6     Evaluation
+erators are scheduled before executed by Horovod.                         6.1   Methodology
+PyTorch plugin. We implement PyTorch plugin for only all-                 Testbed setup. Our testbed has 16 physical machines, each
+reduce architecture because PyTorch does not support PS. In               with 64 CPU cores, 256GB memory, 8 Tesla V100 GPUs with-
+order to support layer-wise out-of-engine dependencies, we                out NVLinks, and 100Gbps bandwidth between any two
+add hooks (via register_hook function provided by PyTorch)                servers using Mellanox CX-5 single-port NICs.
+to backward propagation so that all-reduce operators will be              Benchmarks. We choose 2 CNN models, VGG16 and ResNet50,
+called after each gradient tensor is ready; we also add hooks             and 1 RNN model, Transformer, as our benchmark models.
+to forward propagation (via register_forward_pre_hook func-               We have run ByteScheduler in 8 different setups: MXNet PS,
+tion in PyTorch) so that forward computation of each layer                MXNet NCCL, TensorFlow PS, and PyTorch NCCL, each with
+will not start until the all-reduce of this layer is completed.           TCP or RDMA, respectively. ByteScehduler accelerates train-
+   We again leverage Horovod, which supports all-reduce                   ing in all setups. Due to space limit, we only show results in
+communication for PyTorch≥ 0.4 by wrapping PyTorch op-                    5 setups: MXNet PS TCP, MXNet PS RDMA, TensorFlow PS
+timizer with Horovod DistributedOptimizer [32]. Similar to                TCP, MXNet NCCL RDMA, and PyTorch NCCL TCP.
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                                                                                                       Y. Peng, Y. Zhu, Y. Chen, Y. Bao, B. Yi, C. Lan, C. Wu, C. Guo
+
+                         1e3                                                         1e3                                                     1e3                                                    1e4                                                    1e4
+Speed (images/sec)
+
+
+
+
+                                                          Speed (images/sec)
+
+
+
+
+                                                                                                                  Speed (images/sec)
+
+
+
+
+                                                                                                                                                                         Speed (images/sec)
+
+
+
+
+                                                                                                                                                                                                                                Speed (images/sec)
+                     4                                                         6.0                                                     2.4
+                                 Baseline                                                  Baseline                                                Baseline                                   0.8         Baseline                                   0.8         Baseline
+                     3           ByteScheduler                                             ByteScheduler                                           ByteScheduler                                          ByteScheduler                                          ByteScheduler
+                                                                               4.5                                                     1.8                                                    0.6                                                    0.6
+                                 Linear Scaling                                            Linear Scaling                                          Linear Scaling                                         Linear Scaling                                         Linear Scaling
+                     2           P3                                            3.0                                                     1.2                                                    0.4                                                    0.4
+                     1                                                         1.5                                                     0.6                                                    0.2                                                    0.2
+                     0                                                         0.0                                                     0.0                                                    0.0                                                    0.0
+                            8        16     32       64                                8     16     32       64                                8     16     32      64                                8     16     32      64                                8     16     32      64
+                                     # of GPUs                                               # of GPUs                                               # of GPUs                                              # of GPUs                                              # of GPUs
+
+
+  (a) MXNet, PS, TCP     (b) MXNet, PS, RDMA      (c) TensorFlow, PS, TCP (d) MXNet, NCCL, RDMA (e) PyTorch, NCCL, TCP
+       (80%-94%)               (97%-125%)                (170%-196%)               (14%-20%)                 (7%-13%)
+Figure 10. Training VGG16 model. The numbers in parentheses are ByteScheduler speedup percentages as compared with the baseline.
+                           1e4                                                       1e4                                                     1e4                                                    1e4                                                    1e4
+Speed (images/sec)
+
+
+
+
+                                                          Speed (images/sec)
+
+
+
+
+                                                                                                                  Speed (images/sec)
+
+
+
+
+                                                                                                                                                                         Speed (images/sec)
+
+
+
+
+                                                                                                                                                                                                                                Speed (images/sec)
+                                                                                                                                                                                              1.6
+                     1.2            Baseline                                   1.2         Baseline                                    0.8         Baseline                                               Baseline                                               Baseline
+                                    ByteScheduler                                          ByteScheduler                                           ByteScheduler                              1.2         ByteScheduler                              1.2         ByteScheduler
+                     0.9            Linear Scaling                             0.9         Linear Scaling
+                                                                                                                                       0.6         Linear Scaling                                         Linear Scaling                                         Linear Scaling
+                                    P3                                                                                                                                                        0.8                                                    0.8
+                     0.6                                                       0.6                                                     0.4
+
+                     0.3                                                       0.3                                                     0.2                                                    0.4                                                    0.4
+
+                     0.0                                                       0.0                                                     0.0                                                    0.0                                                    0.0
+                                8     16     32      64                                8     16     32       64                                8     16     32      64                                8     16     32      64                                8     16     32      64
+                                      # of GPUs                                              # of GPUs                                               # of GPUs                                              # of GPUs                                              # of GPUs
+
+
+                     (a) MXNet, PS, TCP                             (b) MXNet, PS, RDMA                           (c) TensorFlow, PS, TCP (d) MXNet, NCCL, RDMA (e) PyTorch, NCCL, TCP
+                          (32%-62%)                                       (6%-16%)                                        (70%-89%)              (1%-7%)               (11%-15%)
+                                                                                                             Figure 11. Training ResNet50 model.
+                           1e5                                                       1e5                                                     1e5                                                    1e5                                                    1e5
+Speed (tokens/sec)
+
+
+
+
+                                                          Speed (tokens/sec)
+
+
+
+
+                                                                                                                  Speed (tokens/sec)
+
+
+
+
+                                                                                                                                                                         Speed (tokens/sec)
+
+
+
+
+                                                                                                                                                                                                                                Speed (tokens/sec)
+                                                                               1.6                                                     0.8
+                     1.2            Baseline                                               Baseline                                                Baseline                                               Baseline                                               Baseline
+                                    ByteScheduler                                          ByteScheduler                                           ByteScheduler                              2.4         ByteScheduler                              2.4         ByteScheduler
+                                                                               1.2                                                     0.6
+                     0.9            Linear Scaling                                         Linear Scaling                                          Linear Scaling                                         Linear Scaling                                         Linear Scaling
+                                    P3                                         0.8                                                                                                            1.6                                                    1.6
+                     0.6                                                                                                               0.4
+
+                     0.3                                                       0.4                                                     0.2                                                    0.8                                                    0.8
+
+                     0.0                                                       0.0                                                     0.0                                                    0.0                                                    0.0
+                                8     16     32      64                                8     16     32       64                                8     16     32      64                                8     16     32      64                                8     16     32      64
+                                      # of GPUs                                              # of GPUs                                               # of GPUs                                              # of GPUs                                              # of GPUs
+
+
+                     (a) MXNet, PS, TCP                             (b) MXNet, PS, RDMA                           (c) TensorFlow, PS, TCP (d) MXNet, NCCL, RDMA (e) PyTorch, NCCL, TCP
+                          (18%-72%)                                       (34%-171%)                                     (31%-102%)                (6%-14%)            (11%-18%)
+                                                                                                            Figure 12. Training Transformer model.
+   For PS architecture, workers and parameter servers are                                                                                                    Comparison with P3. We compare ByteScheduler with
+on different machines, the number of workers is equal to the                                                                                                 P3, which only works in the MXNet PS TCP case. We use the
+number of parameter servers, and each worker has 8 GPUs.                                                                                                     source code available on Github and the default partition con-
+Only the results of synchronous training is shown as we                                                                                                      figuration of P3. We tested other partition sizes and obtained
+find the training speedup of asynchronous mode is similar.                                                                                                   no better results. From Figure 10 (a), 11 (a) and 12 (a), we
+For all-reduce, each worker process has 1 GPU. The batch                                                                                                     see that ByteScheduler outperforms P3 by 28% − 43% across
+sizes of VGG16, ResNet50, and Transformer are 32, 32, 512                                                                                                    the 3 benchmark models. The main reason is that P3 cannot
+samples per GPU by default.                                                                                                                                  utilize the bandwidth fully due to its stop-and-wait tensor
+Baselines. We use the vanilla ML frameworks as baselines.                                                                                                    transmission and system overhead as shown in §2.3. We did
+We also present the linear scalability, which is used as an                                                                                                  not compare with TicTac [18] as it is not fully open-sourced.
+optimal case in many works [21, 32, 39]. It is calculated by the                                                                                             TCP vs. RDMA. From (a) and (b) in Figure 10, 11, 12, we
+training speed on 1 machine (with a vanilla ML framework)                                                                                                    see that the speedup varies largely case by case. In general,
+multiplied by the number of machines. We use training speed                                                                                                  ByteScheduler has larger benefits with RDMA. We suspect
+(samples/sec) as the performance metric. All the reported                                                                                                    that this is because the overhead due to small partition is
+speed numbers are averaged over 500 training iterations after                                                                                                lower with RDMA than with TCP, based on its more efficient
+a warm-up of 10 iterations.                                                                                                                                  network stack. The outlier is ResNet50 with PS RDMA: the
+                                                                                                                                                             baseline is already close to linear scaling, so there is not
+                                                                                                                                                             much room for ByteScheduler to improve.
+6.2                         Speedup in Different Setups                                                                                                      PS vs. all-reduce. In most cases, ByteScheduler has larger
+Figure 10, 11 and 12 show the training speeds of baseline,                                                                                                   speedup in PS architecture than in all-reduce. Take VGG16
+ByteScheduler, and linear scaling when running the 3-model                                                                                                   training on 16 GPUs as an example. ByteScheduler achieves
+5-case benchmarks under 100Gbps network bandwidth with                                                                                                       124.9% and 19% improvement for MXNet PS RDMA and
+the number of GPUs ranging from 8 to 64. Since each ma-                                                                                                      MXNet NCCL RDMA, respectively. The reason is that: for
+chine has 8 GPUs, the number of machines is calculated by                                                                                                    PS, removing the global barrier and partitioning the tensors
+dividing the number of GPUs by 8.
+A Generic Communication Scheduler for Distributed DNN Training Acceleration                                                                   SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+                           1e3                                                          1e3
+  Speed (images/sec)
+
+
+
+
+                                                             Speed (images/sec)
+                                                                                  6.0                                          45       BO          Random                            BO         Random
+                       4              Baseline                                                 Baseline
+                                                                                                                                        SGD         Grid                      200     SGD        Grid
+
+
+
+
+                                                                                                                 # of Trials
+
+
+
+
+                                                                                                                                                                # of Trials
+                                      Fixed Scheduler                                          Fixed Scheduler
+                                                                                  4.5                                                                                         150
+                       3              Tuned Scheduler                                          Tuned Scheduler                 30
+                       2                                                          3.0                                                                                         100
+                                                                                                                               15
+                       1                                                          1.5                                                                                          50
+
+                       0                                                          0.0                                           0                                               0
+                              1         10  25    40 100                                  1     10 25 40 100                          VGG-16   Transformer                          VGG-16   Transformer
+                                      Bandwidth (Gbps)                                        Bandwidth (Gbps)                              Models                                        Models
+
+                       (a) VGG16, PS (79%-132%)                                 (b) VGG16, NCCL (3%-16%)                            (a) MXNet PS RDMA                         (b) MXNet NCCL RDMA
+                             1e4                                                        1e4                      Figure 14. Search costs of different auto-tuning algorithms. Error
+  Speed (images/sec)
+
+
+
+
+                                                             Speed (images/sec)
+                                       Baseline                                   1.2          Baseline          bars show standard deviation.
+                       0.8
+                                       Fixed Scheduler                                         Fixed Scheduler
+                                                                                  0.9
+                       0.6             Tuned Scheduler                                         Tuned Scheduler                 Table 1. Best partition size (MB) and credit size (MB)
+                       0.4                                                        0.6
+                                                                                                                                (partition, credit)       VGG16                ResNet50     Transformer
+                       0.2                                                        0.3
+                                                                                                                                MXNet PS RDMA             (6, 21)                (3, 17)       (5, 29)
+                       0.0                                                        0.0                                          MXNet NCCL RDMA           (88, 171)              (56, 64)      (56, 103)
+                                  1     10 25 40 100                                      1     10 25 40 100
+                                      Bandwidth (Gbps)                                        Bandwidth (Gbps)
+                                                                                                                 (i.e., 1Gbps, 10Gbps, 25Gbps, 40Gbps, and 100Gbps). In this
+                       (c) ResNet50, PS (10%-64%)                    (d) ResNet50, NCCL (1%-13%)                 experiment, we use 4 machines with 32 GPUs in total to run
+                             1e5                                                        1e5
+                     1.2                                                                                         the workers. We set the available bandwidth by limiting the
+Speed (tokens/sec)
+
+
+
+
+                                                           Speed (tokens/sec)
+
+
+
+
+                                       Baseline                                 2.0            Baseline
+                                       Fixed Scheduler                                         Fixed Scheduler   speed of Mellanox NIC card using the mlnx_qos command.
+                     0.9                                                        1.5
+                                       Tuned Scheduler                                         Tuned Scheduler   We measure the training speed of the benchmarks in cases
+                     0.6                                                        1.0                              of MXNet PS RDMA and MXNet NCCL RDMA. Figure 13
+                     0.3                                                        0.5                              shows the training speeds of baseline and ByteScheduler
+                     0.0                                                        0.0                              with auto-tuning (“Tuned Scheduler” bars).
+                                  1     10 25 40 100                                      1     10 25 40 100
+                                      Bandwidth (Gbps)                                        Bandwidth (Gbps)       From Figure 13, we observe that: (1) ByteScheduler with
+                                                                                                                 auto-tuning consistently speeds up the training of VGG16
+     (e) Transformer, PS (67%-70%) (f) Transformer, NCCL (7%-15%)
+                                                                                                                 and Transformer in all bandwidth settings. The improve-
+Figure 13. Speed comparison by training models with MXNet PS                                                     ment is larger with PS, which is also consistent with pre-
+RDMA and MXNet NCCL RDMA under different bandwidths.                                                             vious figures. (2) The improvement for ResNet50 is high
+create better pipelining of push and pull and hence the com-                                                     when the bandwidth is less than 25Gbps (e.g., 64.4% speedup
+munication time is also reduced significantly. For all-reduce                                                    with PS under 10Gbps bandwidth) but decreases as the band-
+training with NCCL RDMA, ByteScheduler is very close to                                                          width increases (e.g., 9.6% speedup with PS under 100Gbps
+linear scaling; occasionally, it even outperforms linear scal-                                                   bandwidth). This is because ResNet50 is more computation-
+ing (based on vanilla MXNet), because ByteScheduler also                                                         intensive and has less parameters than the other two models.
+benefits the communication between GPUs inside a machine.
+Different DNN models. We see ByteScheduler has larger                                                            6.3                Auto-tuning’s Contribution and Overhead
+speedup for VGG16 and Transformer than ResNet50. The low                                                         Figure 13 also shows the training speed when disabling auto-
+gain of ResNet50 is expected, since training it with 100Gbps                                                     tuning (i.e., the “Fixed Scheduler” bars). Specifically, we fix
+RDMA is not communication-bound, i.e., the ratio of com-                                                         the partition and credit sizes to be values given by our auto-
+munication to computation is low. We also test other models.                                                     tuning algorithm under 1Gbps bandwidth, and use them un-
+For example, using 32 GPUs in MXNet PS RDMA setting,                                                             der all bandwidth settings. We find that auto-tuning achieves
+speedups for AlexNet [23] and VGG19 [33] are 96% and 60%,                                                        higher speed than without it in all cases. Auto-tuning is also
+respectively. We omit other numbers due to space limit.                                                          necessary as in some cases, without auto-tuning, ByteSched-
+PS load balancing. In some cases, ByteScheduler achieves                                                         uler even performs worse than baseline.
+significantly higher improvement than what we expect, e.g.,                                                         In addition, we show the best partition size and credit size
+171% speed-up when training Transformer using 2 workers                                                          of the 3 models using 32 GPUs for training under 100Gbps
+(16 GPUs) in MXNet PS RDMA. In such cases, we find that                                                          bandwidth in Table 1. We see that: (1) The best configura-
+the PS are severely imbalanced in baseline (due to the imbal-                                                    tions are different. (2) NCCL requires much larger partition
+ance in tensor sizes and the naïve tensor-to-PS assignment                                                       size and credit size than PS, mainly due to the larger synchro-
+like round-robin by default) and smaller partitions used in                                                      nization costs of all-reduce primitive. (3) The best partition
+ByteScheduler actually balance the PS load very well.                                                            and credit sizes also differ between different models. For ex-
+Working with different network bandwidths. We ex-                                                                ample, ResNet50 is computation-heavy, so achieving timely
+amine how much improvement ByteScheduler can achieve                                                             preemption is more important than paying less partition
+compared with the baseline under typical bandwidth settings                                                      overhead. VGG16 is the opposite.
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                        Y. Peng, Y. Zhu, Y. Chen, Y. Bao, B. Yi, C. Lan, C. Wu, C. Guo
+
+
+Search cost. To compare with BO used in our auto-tuning al-        Though they are probably the three most popular frame-
+gorithms, we choose 3 classic alternatives, i.e., random search,   works, there are many other alternatives, like Caffe [22],
+grid search and SGD with momentum [30]. Random search              CNTK [31] and Spark [27, 35]. We believe that we can apply
+tests points randomly picked. Grid search splits each dimen-       ByteScheduler to them in similar ways, since the ByteSched-
+sion by interval in search space and tests grid points one by      uler design is quite generic. We leave this as future work.
+one. For SGD with momentum [30], we randomly choose
+an initial point and restart the algorithm in case that it is      8   Related work
+stuck in a local optimum. We test different hyper-parameters
+and show the results achieved with the best parameters. For        Speed up communication in DNN training. Existing ap-
+each algorithm, we stop searching when it reaches the opti-        proaches include: (1) speeding up individual messages by
+mal configuration (as identified by grid search). We compare       using RDMA [25] or NCCL [4]; (2) compressing data trans-
+the search cost (i.e., number of searches) of algorithms for       mission such as gradient quantization [9, 37] and sparse
+VGG16 and Transformer in PS and NCCL.                              parameter synchronization [7]; (3) optimizing communica-
+   Figure 14 shows that: (1) on average Bayesian Optimiza-         tion approach, e.g., Stale Synchronous Parallel [20] for PS
+tion can reach optimal configuration with much less cost           and different all-reduce algorithms [10, 14]; (4) minimizing
+than other algorithms, e.g., it incurs 28% − 51% less number       network flow completion time by using flow control [26] or
+of trials than momentum and hence mitigates the restarting         Coflow scheduling [13]. These work mainly focus on acceler-
+overhead (see §5) in PS architecture. (2) BO is much more sta-     ating a single communication operation, and are orthogonal
+ble than random search and SGD with momentum (smaller              and complementary to ByteScheduler.
+standard deviation), as it selects next point based on expected    Overlap communication with computation. Most DNN
+improvement. So users can expect more stable performance           frameworks, e.g., TensorFlow, PyTorch, MXNet and Posei-
+in the tuning phase.                                               don [39], support overlapping communication with back-
+   BO tuning runs in parallel with model training. For Horovod     ward propagation. On top of this, P3 [21] further attempts to
+NCCL, it does not add extra overhead. For PS architecture          overlap communication with forward propagation by layer
+like TensorFlow PS, the restarting overhead varies among           partitioning and scheduling on MXNet PS architecture. Tic-
+models, e.g., 5 seconds for VGG16 and 9 seconds for ResNet50       Tac [18] proposes a similar idea but shows a much smaller
+in each restart. Since BO typically runs within 10 trials (Fig-    training speedup (less than 20%) based on TensorFlow PS
+ure 14), the overhead is small compared to the entire training.    TCP. We suspect that it is due to the global barrier (§2.3).
+                                                                      P3 and TicTac are probably the closest related work to
+                                                                   ByteScheduler. However, ByteScheduler is generic across
+7    Discussion and Future Directions                              multiple DNN frameworks, provides analysis on the schedul-
+Dynamic partition size and credit size. We use auto-               ing algorithm, overcomes their shortcomings like not adapt-
+tuning to search for the best parameters, i.e., partition size     ing to system overhead and suffering from a global barrier,
+and credit size, at the beginning of training, and assume          and achieves much higher speedup.
+their values stay constant throughout the training. We may         Parameter tuning with BO. BO is also used in searching
+further allow dynamic partition size and credit size over the      the best cloud configuration for big data analytics [8], tuning
+training course, by consistently searching for the best values     the learning parameters of machine learning algorithm [34],
+using newly profiled results. Also, we may use different           and online parameter tuning of databases [16]. ByteSched-
+partition and credit sizes for different layers in the DNN.        uler is parallel to them, as it searches the optimal scheduling
+Both improvements may incur significantly more search              parameters to accelerate distributed DNN training.
+costs. We leave efficient search algorithms as open problems.
+Co-scheduling in a shared cluster. For simplicity, our
+scheduling algorithm omits the consideration of possible           9   Conclusion
+shared resources between training jobs: (a) shared worker          ByteScheduler is a generic communication scheduler for dis-
+resources (e.g., CPUs and NICs); (b) shared network with           tributed DNN training acceleration. Our implementation sup-
+congestion; (c) shared PS resources (e.g., GPU/CPU). How-          ports multiple ML frameworks including MXNet, PyTorch,
+ever, in the multi-tenancy cloud setting, resource sharing is      and TensorFlow, with both PS and all-reduce for gradient
+common. The performance impact is not negligible when              synchronization, and using either TCP or RDMA. ByteSched-
+the shared resource is the bottleneck. A potential solution        uler achieves up to 196% end-to-end speedup. The key design
+is to cooperatively schedule the communication within the          points include a unified abstraction for communication oper-
+shared cluster, and possibly integrate it with DNN cluster         ations, Dependency Proxy, and system parameter auto-tuning.
+job scheduler [17, 29] or Coflow scheduler [13].                   We have open-sourced our implementation and expect that
+ByteScheduler for other ML frameworks. Our current                 the community will add support to more existing and future
+implementation supports TensorFlow, PyTorch and MXNet.             frameworks.
+A Generic Communication Scheduler for Distributed DNN Training Acceleration                       SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada
+
+
+References                                                                      [19] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. 2016. Deep
+ [1] 2019.     ByteScheduler Appendix.        https://www.dropbox.com/s/             Residual Learning for Image Recognition. In Proceedings of IEEE Con-
+     smoq6xd6pr7av81/bytescheduler_appendix.pdf?dl=0.                                ference on Computer Vision and Pattern Recognition (CVPR).
+ [2] 2019. ByteScheduler Source Code. https://github.com/bytedance/             [20] Qirong Ho, James Cipar, Henggang Cui, Seunghak Lee, Jin Kyu Kim,
+     byteps.                                                                         Phillip B Gibbons, Garth A Gibson, Greg Ganger, and Eric P Xing.
+ [3] 2019. MLPerf Training v0.6 Results. https://mlperf.org/training-results-        2013. More Effective Distributed ML via a Stale Synchronous Parallel
+     0-6/.                                                                           Parameter Server. In Proceedings of Advances in Neural Information
+ [4] 2019. NVIDIA Collective Communications Library (NCCL). https:                   Processing Systems (NIPS).
+     //developer.nvidia.com/nccl.                                               [21] Anand Jayarajan, Jinliang Wei, Garth Gibson, Alexandra Fedorova, and
+ [5] 2019. TensorFlow Grapper. https://github.com/tensorflow/tensorflow/             Gennady Pekhimenko. 2019. Priority-Based Parameter Propagation
+     tree/master/tensorflow/core/grappler.                                           for Distributed DNN Training. In Proceedings of Systems and Machine
+ [6] Martín Abadi, Paul Barham, Jianmin Chen, Zhifeng Chen, Andy Davis,              Learning (SysML).
+     Jeffrey Dean, Matthieu Devin, Sanjay Ghemawat, Geoffrey Irving,            [22] Yangqing Jia, Evan Shelhamer, Jeff Donahue, Sergey Karayev, Jonathan
+     Michael Isard, et al. 2016. TensorFlow: A System for Large-Scale                Long, Ross Girshick, Sergio Guadarrama, and Trevor Darrell. 2014.
+     Machine Learning. In Proceedings of USENIX Symposium on Operating               Caffe: Convolutional Architecture for Fast Feature Embedding. In
+     Systems Design and Implementation (OSDI).                                       Proceedings of the 22nd ACM International Conference on Multimedia.
+ [7] Alham Fikri Aji and Kenneth Heafield. 2017. Sparse Communication           [23] Alex Krizhevsky, Ilya Sutskever, and Geoffrey E Hinton. 2012. Ima-
+     for Distributed Gradient Descent. arXiv preprint arXiv:1704.05021               geNet Classification with Deep Convolutional Neural Networks. In Pro-
+     (2017).                                                                         ceedings of Advances in Neural Information Processing Systems (NIPS).
+ [8] Omid Alipourfard, Hongqiang Harry Liu, Jianshu Chen, Shivaram              [24] Mu Li, David G Andersen, Jun Woo Park, Alexander J Smola, Amr
+     Venkataraman, Minlan Yu, and Ming Zhang. 2017. Cherrypick: Adap-                Ahmed, Vanja Josifovski, James Long, Eugene J Shekita, and Bor-Yiing
+     tively Unearthing the Best Cloud Configurations for Big Data Analytics.         Su. 2014. Scaling Distributed Machine Learning with the Parameter
+     In Proceedings of USENIX Symposium on Networked Systems Design                  Server. In Proceedings of USENIX Symposium on Operating Systems
+     and Implementation (NSDI).                                                      Design and Implementation (OSDI).
+ [9] Dan Alistarh, Demjan Grubic, Jerry Li, Ryota Tomioka, and Milan            [25] Jiuxing Liu, Jiesheng Wu, and Dhabaleswar K Panda. 2004. High
+     Vojnovic. 2017. QSGD: Communication-Efficient SGD via Gradient                  Performance RDMA-based MPI Implementation over InfiniBand. In-
+     Quantization and Encoding. In Proceedings of Advances in Neural In-             ternational Journal of Parallel Programming (2004).
+     formation Processing Systems (NIPS).                                       [26] Luo Mai, Chuntao Hong, and Paolo Costa. 2015. Optimizing Net-
+[10] Ammar Ahmad Awan, Ching-Hsiang Chu, Hari Subramoni, and Dha-                    work Performance in Distributed Machine Learning. In Proceedings of
+     baleswar K Panda. 2018. Optimized Broadcast for Deep Learning                   USENIX Workshop on Hot Topics in Cloud Computing (HotCloud).
+     Workloads on Dense-GPU Infiniband Clusters: MPI or NCCL?. In Pro-          [27] Xiangrui Meng, Joseph Bradley, Burak Yavuz, Evan Sparks, Shivaram
+     ceedings of the 25th European MPI Users’ Group Meeting.                         Venkataraman, Davies Liu, Jeremy Freeman, DB Tsai, Manish Amde,
+[11] Eric Brochu, Vlad M Cora, and Nando De Freitas. 2010. A Tutorial on             Sean Owen, et al. 2016. Mllib: Machine Learning in Apache Spark.
+     Bayesian Optimization of Expensive Cost Functions, with Application             Journal of Machine Learning Research (2016).
+     to Active User Modeling and Hierarchical Reinforcement Learning.           [28] Adam Paszke, Sam Gross, Soumith Chintala, Gregory Chanan, Edward
+     arXiv preprint arXiv:1012.2599 (2010).                                          Yang, Zachary DeVito, Zeming Lin, Alban Desmaison, Luca Antiga, and
+[12] Tianqi Chen, Mu Li, Yutian Li, Min Lin, Naiyan Wang, Minjie Wang,               Adam Lerer. 2017. Automatic Differentiation in PyTorch. In Proceedings
+     Tianjun Xiao, Bing Xu, Chiyuan Zhang, and Zheng Zhang. 2016.                    of NIPS Autodiff Workshop.
+     MXNet: A Flexible and Efficient Machine Learning Library for Het-          [29] Yanghua Peng, Yixin Bao, Yangrui Chen, Chuan Wu, and Chuanxiong
+     erogeneous Distributed Systems. In Proceedings of NIPS Workshop on              Guo. 2018. Optimus: An Efficient Dynamic Resource Scheduler for
+     Machine Learning Systems.                                                       Deep Learning Clusters. In Proceedings of the 13th ACM European
+[13] Mosharaf Chowdhury, Yuan Zhong, and Ion Stoica. 2014. Efficient                 Conference on Computer Systems (EuroSys).
+     Coflow Scheduling with Varys. In Proceedings of ACM Special Interest       [30] Sebastian Ruder. 2016. An Overview of Gradient Descent Optimization
+     Group on Data Communication (SIGCOMM).                                          Algorithms. arXiv preprint arXiv:1609.04747 (2016).
+[14] Jeff Daily, Abhinav Vishnu, Charles Siegel, Thomas Warfel, and Vinay       [31] Frank Seide and Amit Agarwal. 2016. CNTK: Microsoft’s Open-Source
+     Amatya. 2018. GossipGraD: Scalable Deep Learning using Gossip                   Deep-Learning Toolkit. In Proceedings of ACM International Conference
+     Communication based Asynchronous Gradient Descent. arXiv preprint               on Knowledge Discovery and Data Mining (KDD).
+     arXiv:1803.05880 (2018).                                                   [32] Alexander Sergeev and Mike Del Balso. 2018. Horovod: Fast and
+[15] Jeffrey Dean, Greg Corrado, Rajat Monga, Kai Chen, Matthieu Devin,              Easy Distributed Deep Learning in TensorFlow. arXiv preprint
+     Mark Mao, Andrew Senior, Paul Tucker, Ke Yang, Quoc V Le, et al. 2012.          arXiv:1802.05799 (2018).
+     Large Scale Distributed Deep Networks. In Proceedings of Advances in       [33] Karen Simonyan and Andrew Zisserman. 2014. Very Deep Convolu-
+     Neural Information Processing Systems (NIPS).                                   tional Networks for Large-Scale Image Recognition. arXiv preprint
+[16] Songyun Duan, Vamsidhar Thummala, and Shivnath Babu. 2009. Tun-                 arXiv:1409.1556 (2014).
+     ing Database Configuration Parameters with iTuned. In Proceedings of       [34] Jasper Snoek, Hugo Larochelle, and Ryan P Adams. 2012. Practical
+     Very Large Data Bases (VLDB) Endowment.                                         Bayesian Optimization of Machine Learning Algorithms. In Proceedings
+[17] Juncheng Gu, Mosharaf Chowdhury, Kang G Shin, Yibo Zhu, Myeong-                 of Advances in Neural Information Processing Systems (NIPS).
+     jae Jeon, Junjie Qian, Hongqiang Liu, and Chuanxiong Guo. 2019.            [35] Evan R Sparks, Ameet Talwalkar, Virginia Smith, Jey Kottalam, Xing-
+     Tiresias: A GPU Cluster Manager for Distributed Deep Learning. In               hao Pan, Joseph Gonzalez, Michael J Franklin, Michael I Jordan, and
+     Proceedings of USENIX Symposium on Networked Systems Design and                 Tim Kraska. 2013. MLI: An API for Distributed Machine Learning. In
+     Implementation (NSDI).                                                          Proceedings of IEEE International Conference on Data Mining (ICDM).
+[18] Sayed Hadi Hashemi, Sangeetha Abdu Jyothi, and Roy H Campbell.             [36] Minjie Wang, Chien-chin Huang, and Jinyang Li. 2019. Supporting
+     2019. TicTac: Accelerating Distributed Deep Learning with Commu-                Very Large Models Using Automatic Dataflow Graph Partitioning. In
+     nication Scheduling. In Proceedings of Systems and Machine Learning             Proceedings of the 14th ACM European Conference on Computer Systems
+     (SysML).                                                                        (EuroSys).
+SOSP ’19, October 27–30, 2019, Huntsville, ON, Canada                                  Y. Peng, Y. Zhu, Y. Chen, Y. Bao, B. Yi, C. Lan, C. Wu, C. Guo
+
+
+[37] Wei Wen, Cong Xu, Feng Yan, Chunpeng Wu, Yandan Wang, Yiran           [39] Hao Zhang, Zeyu Zheng, Shizhen Xu, Wei Dai, Qirong Ho, Xiaodan
+     Chen, and Hai Li. 2017. Terngrad: Ternary Gradients to Reduce Com-         Liang, Zhiting Hu, Jinliang Wei, Pengtao Xie, and Eric P Xing. 2017.
+     munication in Distributed Deep Learning. In Proceedings of Advances        Poseidon: An Efficient Communication Architecture for Distributed
+     in Neural Information Processing Systems (NIPS).                           Deep Learning on GPU Clusters. In Proceedings of USENIX Annual
+[38] Wikipedia. 2019. Monkey Patch. https://en.wikipedia.org/wiki/              Technical Conference (USENIX ATC).
+     Monkey_patch.
+

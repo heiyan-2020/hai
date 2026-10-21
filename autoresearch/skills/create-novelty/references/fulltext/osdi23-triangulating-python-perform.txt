@@ -1,0 +1,1176 @@
+Triangulating Python Performance Issues
+               with Scalene
+  Emery D. Berger, Sam Stern, and Juan Altmayer Pizzorno,
+            University of Massachusetts Amherst
+   https://www.usenix.org/conference/osdi23/presentation/berger
+
+
+
+
+ This paper is included in the Proceedings of the
+ 17th USENIX Symposium on Operating Systems
+          Design and Implementation.
+             July 10–12, 2023 • Boston, MA, USA
+                        978-1-939133-34-2
+
+
+                              Open access to the Proceedings of the
+                              17th USENIX Symposium on Operating
+                               Systems Design and Implementation
+                                        is sponsored by
+                    Triangulating Python Performance Issues with S CALENE
+                   Emery D. Berger                                                   Sam Stern
+    College of Information and Computer Sciences                  College of Information and Computer Sciences
+         University of Massachusetts Amherst                           University of Massachusetts Amherst
+                emery@cs.umass.edu                                            jstern@cs.umass.edu
+
+                                                Juan Altmayer Pizzorno
+                                    College of Information and Computer Sciences
+                                         University of Massachusetts Amherst
+                                             jpizzorno@cs.umass.edu
+                         Abstract                                 more memory than their native counterparts. For example, the
+                                                                  integer 1 consumes 4 bytes in C, but 28 bytes in Python; "a"
+This paper proposes the S CALENE Python profiler. S CALENE        consumes 2 bytes in C, but 50 bytes in Python. This increased
+precisely and simultaneously profiles CPU, memory, and GPU        space demand is primarily due to metadata that Python main-
+usage, all with low overhead. S CALENE’s CPU and memory           tains for every object, including reference counts and dynamic
+profilers help Python programmers direct their optimization       type information. Python is a garbage collected language; be-
+efforts by distinguishing between inefficient Python and effi-    cause garbage collection delays memory reclamation, it can
+cient native execution time and memory usage. S CALENE’s          further increase the amount of memory consumed compared
+memory profiler employs a novel sampling algorithm that lets      to native code [14].
+it operate with low overhead yet high precision. It also incor-      Because of these costs, one of the most effective ways for
+porates a novel algorithm that automatically pinpoints mem-       Python programmers to optimize their code is to identify
+ory leaks within Python or across the Python/native boundary.     performance-critical and/or memory-intensive code that uses
+S CALENE tracks a new metric called copy volume, which            pure Python, and replace it with native libraries. Python’s
+highlights costly copying operations that can occur when          ecosystem includes numerous high-performance packages
+Python silently converts between native and Python data rep-      with native implementations, which are arguably the key en-
+resentations, or between CPU and GPU. Since its introduc-         abler of its adoption and popularity. These libraries include
+tion, S CALENE has been widely adopted, with over 675,000         the NumPy numeric library [25], the machine learning li-
+downloads to date. We present experience reports from devel-      braries SciKit-Learn [29] and TensorFlow [2, 3], among many
+opers who used S CALENE to achieve significant performance        others. By writing code that makes effective use of these pack-
+improvements and memory savings.                                  ages, Python programmers sidestep Python’s space and time
+                                                                  costs, and at the same time take full advantage of hardware
+1   Introduction                                                  resources like multiple cores, vector instructions, and GPUs.
+                                                                     Unfortunately, past Python profilers—which can be viewed
+Python is now firmly established as one of the most popu-         as ports of traditional profilers for native code—fall short. We
+lar programming languages, with first place rankings from         believe Python programmers need a profiler designed from
+TIOBE [42] and IEEE Spectrum [6], second place on the Red-        the ground up to meet the specific challenges of developing
+monk Rankings [24], and fourth place in the 2022 Stack Over-      high performance Python applications.
+flow Developer Survey [38]. Large-scale industrial users of          This paper proposes S CALENE, a profiler that comprises a
+Python include Dropbox [4], Facebook [18], Instagram [15],        suite of profiling innovations designed specifically for Python.
+Netflix [22], Spotify [47], and YouTube [44].                     Unlike all past Python profilers, S CALENE simultaneously
+   At the same time, Python is (in)famously slow. The stan-       profiles CPU, memory usage, and GPU usage. It provides
+dard Python implementation, known as CPython, is a stack-         fine-grained information targeted specifically at the problems
+based bytecode interpreter written in C [48]. Pure Python         of optimizing Python code. In particular, S CALENE teases
+code typically runs 1–2 orders of magnitude slower than na-       apart time and memory consumption that stem from Python
+tive code. As an extreme example, the Python implementation       vs. native code, revealing where programmers can optimize
+of matrix-matrix multiplication takes more than 60, 000× as       by switching to native code. S CALENE reports a new metric,
+long as the native BLAS version.                                  copy volume, that helps identify costly (and often inadvertent)
+   Python’s performance costs are nearly matched by its high      copying across the Python/native divide, or copying between
+memory overhead. Python data types consume dramatically           CPU and GPU. Its memory profiler accurately tracks memory
+
+
+
+USENIX Association                            17th USENIX Symposium on Operating Systems Design and Implementation            51
+                                Lines or Unmodified             Multi-   Python vs. System Profiles    Python vs.         Memory     Copy Detects
+Profiler            Slowdown                        Threads                                                         GPU
+                                Functions  Code               processing  C Time     Time Memory       C Memory            Trends   Volume Leaks
+                                                               CPU-only profilers
+pprofile (stat.)         1.0×     lines      ✓        ✓          -            -       -        -           -         -       -        -      -
+py-spy                   1.0×     lines      ✓        ✓         ✓             -       -        -           -         -       -        -      -
+pyinstrument             1.7×   functions    ✓        -          -            -       -        -           -         -       -        -      -
+cProfile                 1.7×   functions    ✓        -          -            -       -        -           -         -       -        -      -
+yappi wallclock          3.2×   functions    ✓        ✓          -            -       -        -           -         -       -        -      -
+yappi CPU                3.6×   functions    ✓        ✓          -            -       -        -           -         -       -        -      -
+line_profiler            2.2×     lines      -        -          -            -       -        -           -         -       -        -      -
+Profile                 15.1×   functions    ✓        -          -            -       -        -           -         -       -        -      -
+pprofile (det.)         36.8×     lines      ✓        ✓          -            -       -        -           -         -       -        -      -
+                                                              memory-only profilers
+fil                      2.7×     lines       -        -         -            -       -    peak only       -         -       -        -      -
+memory_profiler        ≥37.1×     lines       -        -         -            -       -      RSS           -         -       -        -      -
+memray                   4.0×     lines       -       ✓          -            -       -    peak only      ✓          -       -        -      -
+                                                              CPU+memory profilers
+Austin (CPU+mem)         1.0×     lines      ✓        ✓         ✓             -       -      RSS           -         -       -        -      -
+Scalene (CPU+GPU)        1.0×     both       ✓        ✓          ✓           ✓        ✓        -           -        ✓        -        -      -
+Scalene (all)            1.3×     both       ✓        ✓          ✓           ✓        ✓       ✓           ✓         ✓       ✓         ✓      ✓
+
+
+
+Figure 1: S CALENE vs. past Python profilers. S CALENE provides vastly more information than past Python profilers, with more accurate
+memory profiling (§6.3) and with low overhead (§6.4, §6.5). Most past profilers (§8.5) exclusively profile either CPU time or memory;
+S CALENE simultaneously profiles CPU, GPU, and (optionally) memory, and comprises a suite of unique features backed by novel algorithms.
+
+
+consumption over time, and automatically identifies memory                  teasing apart time spent running in the Python interpreter from
+leaks, whether within Python or in native code. Its GPU pro-                native code execution and system time (§2). We then describe
+filer tracks GPU utilization and memory consumption, letting                S CALENE’s memory profiling component (§3), including its
+it identify when native libraries are not being used to their best          threshold-based sampling approach that reduces overhead
+advantage. At the same time, S CALENE imposes low overhead                  while ensuring accuracy, its memory leak detection algorithm,
+(median: 0% for CPU+GPU, 32% for CPU+GPU+memory).                           and how it tracks copy volume. We then explain how S CA -
+S CALENE’s design addresses the substantial differences be-                 LENE profiles GPU utilization and memory consumption (§4).
+tween Python and past environments such as JVMs, including                  Finally, we present technical details underpinning S CALENE’s
+the widespread use of native libraries, the resulting reduced               user interface (§5). We then present our evaluation (§6) and
+usage of garbage collection, and its popularity for machine                 a number of case studies of user experiences with S CALENE
+learning applications that make GPUs a first-class concern.                 (§7); we conclude with a discussion of related work (§8).
+    Since its introduction, S CALENE has become a popular tool
+among Python developers, with over 600,000 downloads to
+                                                                            2    CPU Profiling
+date. We report on case studies supplied by external users of
+S CALENE, including professional Python open source devel-                  S CALENE’s CPU profiler employs sampling, but unlike past
+opers and industrial users, highlighting how S CALENE helped                profilers, it leverages an apparent limitation of how Python
+them diagnose and then remedy their performance problems,                   delivers signals to extract more granular information.
+leading to improvements ranging from 45% to 125×.                              Sampling profilers like S CALENE work by periodically
+    This paper makes the following contributions: it pro-                   interrupting program execution and examining the current
+poses S CALENE, a profiler specifically tailored to Python;                 program counter. Given a sufficiently large number of sam-
+it presents several novel algorithms, including its algorithm               ples, the number of samples each program counter receives
+for attributing time consumption to Python or native code;                  is proportional to the amount of time that the program was
+its sampling-based memory profiling that is both accurate                   executing. Sampling can be triggered by the passage of real
+and low overhead; and its automatic memory leak detector,                   (wall-clock) time, which accounts for CPU time as well as
+which identifies leaks with low overhead. It also introduces                time spent waiting for I/O or other events, or virtual time (the
+and demonstrates the value of a new metric, copy volume, that               time the application was scheduled for execution), which only
+surfaces hidden costs due to copying.                                       accounts for CPU time.
+    The next sections explain S CALENE’s implementation and                    However, in Python, using sampling to drive profiling leads
+algorithms. We first outline how S CALENE efficiently per-                  to erroneous profiles. Like other scripting languages such
+forms line-level CPU profiling, focusing on its approach to                 as Perl and Ruby, Python only delivers signals to the main
+
+
+
+52    17th USENIX Symposium on Operating Systems Design and Implementation                                                 USENIX Association
+Figure 2: An example profile from S CALENE’s web UI, sorted in descending order by GPU utilization. The top graphs provide a summary
+for the entire program, with more detailed data reported for each active line (and, not shown, for each function). CPU time is in blue, with
+different shades reflecting time taken in Python code, native code, or system/GPU time (§2). Average and peak memory consumption is in
+green, with different shades distinguishing memory consumed by Python objects vs. native ones (§3); the memory timeline depicts memory
+consumption over time (§5). Copy volume is in yellow (§3.5), as well as GPU utilization and GPU memory consumption (§4). Hovering over
+bars provides detailed statistics in hovertips.
+
+          q     q     q    ...
+                                                                         2.1    Accurate Python-Native Code Profiling
+                    pure Python execu on                                 S CALENE’s CPU profiler turns these limitations of Python
+                                                                         signals to its advantage, inferring whether a line spent its time
+                                                                         executing Python or native code (e.g., C). It leverages the
+                Python + na ve execu on
+                                                                         following insight: any delay in signal delivery corresponds
+          q                                                              to time spent executing outside the interpreter. That is, if
+                                 T                                       S CALENE’s signal handler received the signal immediately
+                                                                         (that is, in the requested timing interval), then all that time
+                 Python: q           na ve: T-q                          must have been spent in the interpreter. If it was delayed, it
+Figure 3: Overview of S CALENE’s inference of Python vs. native          must be due to running code outside the interpreter, which is
+execution. Sampling profilers depend on regular timer interrupts,        the only cause of delays (at least, in virtual time).
+but Python defers all signals when running native code, leading              Figure 3 depicts how S CALENE handles signals and at-
+to the appearance of no time spent executing that code. S CALENE
+                                                                         tributes time to either Python or native code. S CALENE
+leverages this apparent limitation to accurately attribute time spent
+                                                                         tracks time between interrupts recording the current vir-
+executing Python and native code (§2.1) in the main thread; it uses a
+different algorithm for code running in threads (§2.2).                  tual time whenever it receives a CPU timer interrupt (using
+                                                                         time.process_time()). When it receives the next interrupt,
+                                                                         it computes T , the elapsed virtual time, and compares it to the
+                                                                         timing interval q (for quantum).
+thread [31]. Also like those languages, Python defers signal                 S CALENE uses these values to attribute time spent to
+delivery until the virtual machine (i.e., the interpreter loop)          Python or native code. Whenever S CALENE receives a signal,
+regains control, and only checks for pending signals after               S CALENE walks the Python stack until it reaches code being
+specific opcodes such as jumps.                                          profiled (that is, outside of libraries or the Python interpreter
+   The result is that, during the entire time that Python spends         itself), and attributes time to the identified line of code. S CA -
+executing external library calls, no timer signals are delivered.        LENE maintains two counters for every line of code being
+The effect can be that the profiler will reflect no time spent           profiled: one for Python, and one for native code. Each time
+executing native code, no matter how long it actually took. In           a line is interrupted by a signal, S CALENE increments the
+addition,
+ ti       because only maintithreads are interrupted,
+                                             ti         sampling
+                                                       ti                Python counter by q, the timing interval, and it increments
+profilers can fail to account for any time spent in child threads.       the native counter by T − q, the delay.
+
+
+
+USENIX Association                                17th USENIX Symposium on Operating Systems Design and Implementation                   53
+2.2 Accurate Python-Native Profiling of
+    Threads
+
+
+
+
+                                                                      footprint
+                                                                                         100M
+
+                                                                                                                                           ...
+                                                                                  ...                                            90M
+The approach described above attributes execution time for                                             rate-based samples
+Python vs. native code in the main thread, but it does not                                             threshold-based samples
+
+attribute execution time at all for subthreads, which, as de-
+                                                                                                            me
+scribed above, never receive signals. To correctly attribute
+time for code running in subthreads, S CALENE applies an al-
+gorithm leveraging a combination of Python features: monkey
+patching, thread enumeration, stack inspection, and bytecode          Figure 4: Threshold-Based vs. Rate-Based Sampling. S CALENE
+                                                                      employs a novel sampling scheme that only triggers when memory
+disassembly.
+                                                                      use grows or declines beyond a set threshold, letting it capture all
+   Monkey patching refers to the redefinition of functions            significant changes in footprint (beyond a given granularity, here
+at runtime. S CALENE uses monkey patching to ensure that              10MB) with low overhead. (§3.2).
+signals are always received by the main thread, even when
+the main thread is blocking (e.g., waiting to join with              ti
+
+child threads). S CALENE replaces blocking functions like
+threading.join with variants that always use timeouts. It             3           Memory and Copy Volume Profiling
+sets these timeouts to Python’s own thread quantum, obtained
+via sys.getswitchinterval(). Replacing these calls forces             Almost all past profilers either report CPU time or memory
+the main thread to yield regularly and allow signal delivery.         consumption; S CALENE reports both, at a line granularity. It is
+                                                                      vital that S CALENE track memory both inside Python and out,
+  In addition, to attribute execution times correctly, S CA -
+                                                                      as external libraries are often responsible for a considerable
+LENE maintains a status flag for every thread, all initially
+                                                                      fraction of memory consumption.
+executing. In each of the calls it intercepts, before S CALENE
+issues the blocking call, it sets the calling thread’s status as
+sleeping. Once that thread returns (either after successfully
+acquiring the desired resource or after a timeout), S CALENE          3.1               Intercepting Allocation Calls
+resets the status of the calling thread to executing. S CALENE
+only attributes time to currently executing threads.                  S CALENE intercepts all system allocator calls (malloc, free,
+   Now, when the main thread receives a signal, S CALENE              etc.) as well as Python internal memory allocator by insert-
+invokes threading.enumerate() to collect a list of all run-           ing its own “shim” memory allocator, using Python’s built-in
+ning threads. It then obtains the Python stack frame from each        memory hooks. This two-fold approach lets S CALENE dis-
+thread using Python’s sys._current_frames() method. As                tinguish between native memory allocated by libraries and
+above, S CALENE walks the stack to find the appropriate line          Python memory allocated in the interpreter.
+of code to attribute execution time.                                     The shim allocator extends and uses code from the Heap
+                                                                      Layers memory allocator infrastructure [5]; S CALENE injects
+   Finally, S CALENE uses bytecode disassembly (via the dis
+                                                                      it via library interposition before Python begins executing
+module) to distinguish between time spent in Python vs. na-
+                                                                      using LD_PRELOAD on Linux and DYLD_INSERT_LIBRARIES
+tive code. Whenever Python invokes an external function,
+                                                                      on Mac OS X. To interpose on Python’s internal mem-
+it does so using a bytecode whose textual representation is
+                                                                      ory allocator, S CALENE uses Python’s custom allocator API
+either CALL_FUNCTION, CALL_METHOD, or, as of Python 3.11,
+                                                                      (PyMem_SetAllocator).
+CALL. S CALENE builds a map of all such bytecodes at startup.
+                                                                         Each shim allocator function handles calls by sampling for
+    S CALENE checks the stack of each running thread to see           inclusion in the profiling statistics (§3.2) and then passing
+if the currently executing bytecode is a call instruction. S CA -     these to the original (Python or system) allocator. A complica-
+LENE uses this information to infer if the thread is currently
+                                                                      tion arises from the fact that the Python allocators themselves
+executing Python or native code.                                      may handle allocation requests by calling into the system
+   If a thread is running Python code, it is likely to spend          allocator. To avoid counting Python allocations also as native
+almost no time in a bytecode before executing another Python          allocations, S CALENE sets a flag, stored in thread-specific
+bytecode. By contrast, if if it is running native code, it will be    data, indicating it is within a memory allocator. When a shim
+“stuck” on the CALL bytecode for the duration of native execu-        allocator function is called with this flag set, it skips over
+tion. Leveraging this fact lets S CALENE accurately attribute         the profiling, just forwarding to the original allocator. This
+execution time: if it finds that a stack is executing CALL, S CA -    approach both avoids double counting and simplifies writing
+LENE assigns time elapsed to the native counter; otherwise, it        profiling code, as it can allocate memory normally without
+assigns time elapsed to the Python counter.                           causing infinite recursion.
+
+
+
+54   17th USENIX Symposium on Operating Systems Design and Implementation                                                   USENIX Association
+3.2    Threshold-Based Sampling                                      3.3    Collecting and Processing Samples
+                                                                     When a memory sample is taken, S CALENE temporarily en-
+                                                                     ables tracing using Python’s PyEval_SetTrace. Tracing re-
+The standard approach to sampling memory profilers, as ex-
+                                                                     mains active only until it detects execution has moved on
+emplified by several non-Python memory profilers in Android,
+                                                                     from that line. This approach lets S CALENE properly account
+Chrome, Go, and Google’s tcmalloc [40] and in Java TLAB
+                                                                     for average memory consumption per line.
+based sampling [1], use a rate-based sampling approach. This
+sampler triggers samples at a rate proportional to the number           Each entry in S CALENE’s sampling file includes informa-
+of bytes allocated or freed. In effect, each byte allocated or       tion about allocations or frees, the fraction of Python (vs.
+freed corresponds to a Bernoulli trial with a given probability      native) allocations in the total sample, as well as an attribu-
+p of sampling; e.g., if p = 1/T, then (in expectation) there         tion to a line of Python source code.
+will be one sample per T bytes. In practice, for efficiency,            S CALENE attributes each sample to Python source code at
+these samplers initialize counters to random numbers drawn           the time the sample is taken. It does so by obtaining the cur-
+from a Poisson process or a geometric distribution with the          rent thread’s call stack from the interpreter and skipping over
+same parameter. Each allocation and free then decrements             frames until one within profiled source code is found. This
+this counter by the number of bytes allocated and freed, and         attribution needs to happen whenever a sample is taken, so it
+triggers a sample when the counter drops below 0.                    is implemented as a C++ extension module, using read-only
+                                                                     accesses to Python structures. S CALENE loads this module
+   By contrast, the S CALENE sampler introduces threshold-           upon startup, which in turn uses a symbol exported by the
+based sampling. The allocator maintains a count of all mem-          shim library to complete the linkage, making itself available
+ory allocations and frees, in bytes. Once the absolute dif-          to the shim.
+ference between allocations and frees crosses a threshold               A background thread in S CALENE’s Python code reads
+(|A − F| >= T ), S CALENE triggers a sample, correspond-             from the sampling file and updates the profiling statistics.
+ing to appending an entry to a sampling file and resets the          S CALENE also tracks the current memory footprint, which it
+counters. Figure 4 illustrates this operation. The sampling          uses both to report maximum memory consumption and mem-
+threshold T is currently set to a prime number slightly above        ory trends. S CALENE records a timestamp and the current
+10MB; S CALENE uses a prime number to reduce the risk of             footprint at each threshold crossing, which S CALENE uses to
+stride behavior interfering with sampling.                           generate memory trend visualizations (§5).
+
+   Threshold-based sampling has several advantages over rate-
+based sampling. Unlike rate-based sampling, which is trig-           3.4    Memory Leak Detection
+gered by all allocation activity (even when it has almost no
+                                                                     Like other garbage-collected languages, Python can suffer
+effect on footprint), threshold-based sampling is only trig-
+                                                                     from memory leaks when references to objects are acciden-
+gered by significant memory use growth or decline. Table 2
+                                                                     tally retained so that the garbage collector cannot reclaim
+shows the dramatic reduction in the number of samples, as
+                                                                     them. As in other garbage collected languages, identifying
+high as 676× (median: 18×) fewer. This reduced number of
+                                                                     leaks in Python programs is generally a slow, manual process.
+samples translates directly to lower runtime overhead.
+                                                                        In Python, the standard approach to identifying leaks is to
+   At the same time, threshold-based sampling deterministi-          first activate tracemalloc, which records the size, allocation
+cally triggers a new sample whenever a significant change in         site, and stack frame for each allocated object. The program-
+footprint occurs. This approach improves repeatability over          mer then inserts calls at the appropriate place to produce a
+rate-based sampling (which is probabilistic) and avoids the          series of heap snapshots, and then manually inspects snapshot
+risk of missing these changes.                                       diffs to identify growing objects. This approach is laborious
+                                                                     and depends on a post hoc analysis of the heap. It also can be
+    Crucially, threshold-based sampling avoids two sources of        quite slow. In our tests, just activating tracemalloc can slow
+bias inherent to rate-based sampling. Rate-based sampling            Python applications down by 4×.
+can overstate the importance of allocations that do not con-            S CALENE incorporates a novel sampling-based memory
+tribute to an increased footprint since it does not take memory      leak detection algorithm that is both simple and efficient. The
+reclamation or footprint into account. It also biases the attribu-   algorithm piggybacks on threshold-based sampling (§3.2).
+tion of memory consumption to lines of code running Python           Whenever the sampler triggers because of memory growth,
+code that exercises the allocator, rather than code responsible      S CALENE checks if this growth has reached a new maximum
+for footprint changes. By constrast, threshold-based sampling        footprint. If so, S CALENE records the sampled allocation.
+filters out the vast number of short-lived objects that are cre-     Every call to free then checks to see whether this object
+ated by the Python interpreter itself, and only triggers based       is ever reclaimed. This checking is cheap—a single pointer
+on events that change footprint.                                     comparison—and highly predictable (almost always false).
+
+
+
+USENIX Association                              17th USENIX Symposium on Operating Systems Design and Implementation            55
+Leak Score: At the next crossing of a maximum, S CALENE              4   GPU Profiling
+updates a leak score for the sampled object. The leak score
+tracks the historic likelihood of reclamation of the sampled
+object, and consists of a pair of (frees, mallocs). S CALENE         S CALENE performs both line-granularity GPU utilization and
+first increments the mallocs field when it starts tracking an        memory profiling on systems equipped with NVIDIA GPUs.
+object, and then increments the frees field only if it reclaimed     This feature helps Python programmers identify whether they
+the allocated object. It then resumes tracking with a newly          are efficiently making use of their GPUs.
+sampled object.                                                        S CALENE piggybacks GPU sampling on top of its CPU
+   Intuitively, leak scores capture the likelihood that an alloca-   sampler. Every time S CALENE obtains a CPU sample, it also
+tion site is leaking. A site with a high number of mallocs and       collects the total currently used GPU memory and utilization,
+no frees is a plausible leak. By contrast, a site with a match-      which it associates with the currently executing line of code.
+ing number of mallocs and frees is probably not a leak. The          Whenever possible, S CALENE employs per-process ID ac-
+more observations we make, the higher the likelihood that we         counting, which increases accuracy in a shared GPU setting.
+are observing or ruling out a leak.                                     At startup, S CALENE checks to see if per-process ID ac-
+   S CALENE uses Laplace’s Rule of Succession to compute             counting has been enabled on the attached NVIDIA GPU. If
+the likelihood of a success or failure in the next Bernoulli         not, S CALENE offers to enable it, a process that requires that
+trial, given a history of successes and failures [50]. Here,         the user invoke S CALENE once with super-user privileges.
+successes correspond to reclamations (frees) and failures are
+non-reclamations (mallocs - frees). According to the Rule
+of Succession, S CALENE computes the leak probability as
+1.0 − (frees + 1)/(mallocs − frees + 2).
+                                                                     5   GUI Design and Implementation
+
+                                                                     S CALENE’s primary user interface is web-based, though it
+Leak Report Filtering and Prioritization: To provide                 also offers a non-interactive rich text-based CLI. In the UI,
+maximal assistance to Python developers, S CALENE filters            S CALENE not only reports net memory consumption per line,
+and augments leak information. First, to limit the number of         but also reports memory usage over time, both for the program
+leak reports, S CALENE only reports leaks whose likelihood           as a whole and for each individual line. Figure 2 presents
+exceeds a 95% threshold, and only when the slope of over-            several examples. The x-axis corresponds to execution time,
+all memory growth is at least 1%. Second, S CALENE lets              and the y-axis corresponds to the footprint of the program, as
+developers prioritize leaks by associating each leak with an         seen by that line of code.
+estimated leak rate: the average amount of memory allocated
+at a given line divided by time elapsed.                                Because it can be expensive to visualize graphs with large
+                                                                     numbers of points, S CALENE limits the number of points
+                                                                     it outputs in its JSON payload and HTML output. Prior to
+                                                                     generating the profile output, S CALENE applies the Ramer-
+3.5    Copy Volume                                                   Douglas-Peucker (RDP) algorithm [9, 32] to each line’s mem-
+                                                                     ory footprint log (if any). The RDP algorithm aims to reduce
+S CALENE uses sampling to collect information about copy             the total number of points while preserving the overall shape
+volume (megabytes per second of copying) by line. This met-          of the curve. The RDP algorithm depends on a parameter
+ric, which S CALENE introduces, helps identify costly (and           ε, a distance parameter below which RDP merges adjacent
+often inadvertent) copying across the Python/native divide, or       points; S CALENE sets ε to a value that approximately reduces
+copying between CPU and GPU.                                         the total number of points to a manageable size (100 points).
+   The S CALENE shim library used for memory allocation              Sometimes this process fails to reduce the number of points
+also interposes on memcpy, which is invoked both for general         sufficiently. To guarantee that the number of points is always
+copying (including to and from the GPU, and copying across           bounded, after applying RDP, S CALENE randomly downsam-
+the Python/native boundary). As with memory allocations,             ples all memory logs to exactly 100 points.
+S CALENE writes an entry to a sampling file once a threshold           To further ensure the scalability of the user interface, S CA -
+number of bytes has been copied. However, unlike memory              LENE only reports lines of code that are responsible for at
+sampling, copy volume sampling employs classical rate-based          least 1% of execution time (CPU or GPU) or at least 1% of
+sampling: since copy volume only ever increases, threshold-          total memory consumption, along with the preceding and fol-
+based sampling and rate-based sampling would effectively             lowing line. This approach guarantees that a S CALENE profile
+be equivalent. The current memcpy sampling rate is set at a          never contains more than 300 lines. In practice, profiles are
+multiple of the allocation sampling rate.                            generally skewed and resulting profilers are often far smaller.
+
+
+
+56    17th USENIX Symposium on Operating Systems Design and Implementation                                     USENIX Association
+6     Evaluation                                                                                                  Accuracy: Time spent vs. time reported
+Our evaluation answers the following questions: How does                                                   100
+
+S CALENE’s CPU profiling accuracy compare to other CPU
+
+
+
+
+                                                                         percentage reported by profiler
+profilers? (§6.2) How does S CALENE’s memory profiling ac-                                                  80
+curacy compare to other memory profilers? (§6.3) How does                                                                                                     profile
+S CALENE’s CPU profiling overhead compare to other CPU                                                      60                                                yappi CPU
+                                                                                                                                                              yappi wallclock
+profilers? (§6.4) How does S CALENE’s memory profiling                                                                                                        pprofile (det.)
+overhead compare to other memory profilers? (§6.5)                                                          40                                                cProfile
+                                                                                                                                                              pyinstrument
+                                                                                                                                                              line_profiler
+                                                                                                                                                              pprofile (stat.)
+6.1    Experimental Setup                                                                                   20                                                Austin
+                                                                                                                                                              py-spy
+Our prototype of S CALENE consists of roughly 3,500 lines of                                                                                                  Scalene
+                                                                                                             0
+Python 3 code and 1,700 lines of C++-17 code; its user inter-                                                     5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80 85 90 95
+face comprises 800 lines of JavaScript, excluding white space                                                                         actual percentage
+and comments as measured by cloc [8]. This prototype runs            Figure 5: CPU Profiling Accuracy: S CALENE is among the most
+on Linux, Microsoft Windows, and Mac OS X, for Python                accurate CPU profilers. This graph measures the accuracy of profile
+versions 3.8 and higher; we report Linux results here. We use        reports vs. the actual time spent in functions; the ideal is shown by
+the latest version of S CALENE, released 12/08/2022.                 the diagonal line (the amount the profiler reports is exactly the time
+                                                                     spent). Some profilers are highly inaccurate (§6.2).
+   We perform all experiments on an 8-core 4674 MHz AMD
+Ryzen 7, equipped with 32GB of RAM and an NVIDIA
+GeForce RTX 2070 GPU, running Linux 5.13.0-35-generic.                        Memory accounting, Scalene vs. RSS-based proxies
+All C/C++ code is compiled with g++ version 9, and we use                                                  600
+CPython version 3.10.9 (release date 12/06/2022) For over-
+head numbers, we report the interquartile mean of 10 runs.                                                 500
+                                                                      Reported allocation size (MB)
+
+
+
+
+                                                                                                           400
+6.2    CPU Profiling Accuracy
+                                                                                                           300
+Here, we explore a specific threat to the accuracy of Python
+CPU profilers. We show that some profilers suffer from a                                                                                                      Scalene
+                                                                                                           200                                                Austin
+probe effect that distorts the time spent by applications. Specif-                                                                                            Pympler
+ically, we observe that Python profilers that rely on Python’s                                             100                                                memory_profiler
+tracing facility exhibit a bias caused by tracing triggering both                                                                                             Memray
+                                                                                                                                                              Fil
+on function calls and lines of code, dilating the apparent time                                              0
+spent in function calls. We call this phenomenon function                                                          0         20          40        60          80           100
+                                                                                                                                  Percent of array accessed
+bias; we show that sampling-based profilers like S CALENE
+                                                                     Figure 6: Memory Profiling Accuracy: S CALENE produces more
+do not suffer from this bias.
+                                                                     accurate memory profiles than resident set size (RSS) based
+   We wrote a microbenchmark to measure this bias. It ex-            profilers. Varying the amount of memory accessed causes RSS-
+ecutes a varying number of iterations of two semantically            based profilers to significantly under-report, and sometimes over-
+identical functions: one invokes another function inside its         report, the true amount of allocated memory. Interposition-based
+loop, while the other inlines the same logic. We vary the            profilers are far more accurate (§6.3).
+amount of time spent in one function versus the other, and
+compare the profiler results to the ground truth, as measured
+with high resolution timers.                                         6.3                                         Memory Profiling Accuracy
+   Figure 5 presents the results of this experiment. The x-axis
+is the amount of time measured while running the variant             We next compare the accuracy of memory profilers with a
+with a function call (the ground truth), while the y-axis is         simple test designed to explore the effect of using resident set
+the amount of time reported by each profiler. The ideal is           size (RSS) instead of direct memory tracking. We expect to
+a diagonal running from the origin. The trace-based profil-          see a difference between the two, since RSS corresponds to
+ers exhibit a high degree of inaccuracy, showing significant         the use of memory rather than the allocation of objects. Our
+function bias. In the worst case, one such profiler reports a        test first allocates a single 512MB array, and then accesses a
+function takes 80% of execution time while in fact it only           varying amount of the array (from 0% to 100%).
+consumes 25%. We conclude that such profilers may be too                Figure 6 presents the result, confirming our hypothesis.
+potentially misleading to be of practical value for developers.      Both memory_profiler and Austin rely on RSS as a proxy
+
+
+
+USENIX Association                              17th USENIX Symposium on Operating Systems Design and Implementation                                                              57
+ Benchmark                      Repetitions    Time                  Benchmark                     Rate    Threshold    Ratio
+ async_tree_ionone                       22    11.9s                 async_tree_ionone              556           215     3×
+ async_tree_ioio                          9    12.0s                 async_tree_ioio                524           187     3×
+ async_tree_iocpu_io_mixed               14    12.3s                 async_tree_iocpu_io_mixed      719           167     4×
+ async_tree_iomemoization                16    10.6s                 async_tree_iomemoization       375           167     2×
+ docutils                                 5    12.5s                 docutils                        20             5     4×
+ fannkuch                                 3    12.1s                 fannkuch                       426             5    85×
+ mdp                                      5    13.4s                 mdp                            316             6    53×
+ pprint                                   7    12.8s                 pprint                        7976            23   347×
+ raytrace                                25    11.1s                 raytrace                       215             7    31×
+ sympy                                   25    11.3s                 sympy                         6757            10   676×
+Table 1: Benchmark suite: We conduct our evaluation using            Median:                                             18×
+the top ten most time consuming benchmarks from the standard        Table 2: Threshold vs. Rate-Based Sampling: S CALENE’s
+pyperformance benchmark suite. For each, we extend their running    threshold-based sampling tracks footprint with as many as 676×
+time by running them in a loop enough times to exceed 10 seconds.   fewer samples than conventional rate-based sampling (median:
+                                                                    18×).
+
+
+for memory consumption. But RSS is a measure of the phys-
+ical memory currently in use, and depends on a number of            required by some profilers; we also add code to ignore the
+other factors such as memory access patterns and the memory         decorators when they are not used. Finally, we add a call to
+needs of other processes. The figure clearly shows that this        system.exit(-1) to force py-spy to generate output. Fig-
+proxy can be wildly inaccurate, leading to under-reporting          ure 7 provides the results of running the profilers across all
+and even over-reporting the size of the allocated object. The       these benchmarks.
+other profilers directly measure allocation, and produce much
+more accurate results. Both S CALENE and Fil report within
+1% of the actual size of the allocated object (512MB), while        Summary: In general, S CALENE imposes low to modest
+Memray is within 6%.                                                overhead (median: 2% for CPU+GPU, and 30% for full func-
+                                                                    tionality), placing it among the profilers with the lowest over-
+                                                                    head.
+Drawbacks of peak-only profiling: Both Fil and Memray
+only report live objects at the point of peak memory allocation
+by a program. This information can be useful, but it can both       6.5    Memory Profiling Overhead
+exaggerate the potential for reducing memory and obscure
+other sources of memory consumption. Consider a program             Next, we evaluate the overhead of memory profilers
+that allocates and discards a 4GB object, and then allocates        (memory_profiler, Fil, Memray and Austin), and compare
+a 4GB + 8 byte object. A report that only contains informa-         them to S CALENE. We use the same benchmarks as we used
+tion at the point of peak allocation will reveal the second         for measuring runtime overhead for CPU profilers.
+object but not the first. That profile will suggest an enormous        Figure 8 shows the results. Because it can slow down ex-
+opportunity to save memory, but eliminating the second ob-          ecution by at least 150×, we omit memory_profiler from
+ject entirely would have almost no effect on peak memory            the graph. S CALENE’s performance is competitive with the
+consumption. Unlike peak profilers, S CALENE provides in-           other profilers; while Austin is faster, as Section 6.3 shows,
+formation about all significant memory allocation over time,        it provides inaccurate estimates of memory consumption.
+giving programmers a global view of memory consumption.
+                                                                    Log file growth: Some memory profilers feature a surpris-
+Summary: S CALENE’s memory profiling is highly accu-                ing other source of overhead. Two of the memory profilers,
+rate, while capturing memory consumption over time.                 Memray and Austin, produce detailed (and copious) logs of
+                                                                    memory activity that may limit their usefulness for profiling
+                                                                    long-lived applications.
+6.4    CPU Profiling Overhead
+                                                                       Memray deterministically logs information including all
+In our evaluation, we use the ten longest-running bench-            allocations, all updates to the Python stack, and context
+marks from pyperformance, the standard suite for evaluating         switches, which it later post-processes for reporting. Austin
+Python performance (Figure 1). We modify these benchmarks           similarly generates logs meant to be consumed by an exter-
+to run in a loop so that they execute for at least 10 seconds       nal tool. These files can grow rapidly: in our tests, Memray’s
+on our experimental platform. We also modify the bench-             output file grows by roughly 3MB/second, while Austin’s
+marks slightly by adding @profile decorators, as these are          grows by 2MB/second.
+
+
+
+58    17th USENIX Symposium on Operating Systems Design and Implementation                                   USENIX Association
+                                                                               CPU profiling: Execution time overhead
+Overhead (multiple of Python runtime)
+
+
+
+                                        6
+
+                                        4
+
+                                        2
+
+                                        0
+
+
+
+
+                                                                                                                                          ce
+
+
+
+                                                                                                                                                   y
+                                             p
+
+
+                                                           _io
+
+
+
+
+                                                                                                                 kh
+
+
+
+                                                                                                                             t
+
+
+
+
+                                                                                                                                                               tils
+
+
+
+                                                                                                                                                                           N
+                                                                          )
+
+
+                                                                                          )
+
+
+                                                                                                      )
+
+
+
+
+                                                                                                                           rin
+                                                                       (io
+
+
+                                                                                      (ci
+
+
+                                                                                                   (m
+
+
+
+
+                                                                                                                                                 mp
+                                            md
+
+
+
+
+                                                                                                                                                                       DIA
+                                                                                                                                      tra
+                                                                                                             nu
+                                                          e
+
+
+
+
+                                                                                                                                                          cu
+                                                                                                                          pp
+                                                                                 _io
+                                                                      _io
+
+
+
+
+                                                                                                  _io
+                                                      tre
+
+
+
+
+                                                                                                                                                sy
+                                                                                                                                    ray
+                                                                                                           fan
+
+
+
+
+                                                                                                                                                                      ME
+                                                                                                                                                          do
+                                                                                   e
+                                                    c_
+
+
+
+                                                                      e
+
+
+
+
+                                                                                                  e
+                                                                               tre
+                                                                  tre
+
+
+
+
+                                                                                              tre
+                                                  yn
+
+
+
+
+                                                                            c_
+                                                                 c_
+
+
+
+
+                                                                                             c_
+                                                 as
+
+
+
+
+                                                                            yn
+                                                              yn
+
+
+
+
+                                                                                         yn
+                                                                          as
+                                                           as
+
+
+
+
+                                                                                       as
+
+
+
+                                            pprofile_det              yappi_wall                  cProfile                pprofile_stat          austin_cpu             Scalene_cpu_gpu
+                                            profile                   line_profiler               pyinstrument            py_spy                 Scalene_cpu            Scalene_full
+                                            yappi_cpu
+
+Figure 7: CPU profiling: S CALENE has modest overhead. Despite collecting far more detailed information, S CALENE is competitive with
+the best-of-breed CPU profilers in terms of overhead (§6.4). The graph truncates the slowest profilers; see Table 3 for full data.
+
+                                                            mdp        a_t_i          (io)        (ci)       (m)      fannkuch      pprint     raytrace    sympy      docutils   Median
+                py_spy                                 0.99×           1.03×      1.02×         1.01×      1.02×        1.01×        1.03×       1.00×     1.02×        1.00×     1.02×
+                cProfile                               1.55×           1.71×      1.57×         1.62×      1.80×        1.35×        2.63×       1.98×     2.11×        1.74×     1.73×
+                yappi_wall                             2.16×           3.30×     33.25×         3.89×      5.34×        1.82×        3.77×       2.85×     3.04×        2.67×     3.17×
+                yappi_cpu                              3.38×           3.52×      3.33×         3.14×      3.72×        2.69×        7.07×       4.97×     5.14×        4.05×     3.62×
+                pprofile_stat                          1.01×           1.03×      1.02×         1.02×      1.04×        1.01×        1.01×       0.98×     1.04×        1.00×     1.02×
+                pprofile_det                          37.80×          35.06×     29.30×        28.09×     35.85×       65.19×      103.73×      56.23×    55.68×       34.78×    36.83×
+                line_profiler                          2.48×           2.18×      2.25×         2.01×      2.27×        8.92×        1.01×      11.59×     1.86×        1.67×     2.21×
+                profile                               14.30×          14.53×     13.54×        12.48×     15.71×       10.41×       55.68×      20.87×    26.17×       15.66×     15.1×
+                pyinstrument                           1.40×           1.89×      1.81×         1.74×      1.89×        1.34×        1.96×       1.64×     1.65×        1.54×     1.69×
+                austin_cpu                             1.00×           1.01×      1.00×         0.99×      1.02×        1.00×        1.01×       0.99×     1.02×        0.99×     1.00×
+                austin_full                            0.98×           1.01×      0.99×         1.00×      1.01×        1.01×        1.01×       1.00×     1.00×        0.99×     1.00×
+                memray                                 2.43×           4.34×      3.21×         4.80×      3.85×        2.92×        5.36×       3.21×     4.12×        4.11×     3.98×
+                fil                                    1.75×           3.05×      2.76×         2.73×      2.91×        1.85×        2.88×       2.15×     2.58×        2.68×     2.71×
+                memory_profiler                       > 150×          37.90×     28.42×        36.32×     41.90×       > 150×        1.01×      > 150×    18.95×        9.19×    37.11×
+                Scalene_cpu                            1.02×           1.05×      1.01×         1.02×      1.04×        1.05×        1.02×       1.00×     1.03×        1.01×     1.02×
+                Scalene_cpu_gpu                        1.03×           1.05×      1.02×         1.02×      1.05×        1.02×        1.03×       1.01×     1.03×        1.01×     1.02×
+                Scalene_full                           1.09×           1.33×      1.76×         1.30×      1.28×        1.36×        4.03×       1.12×     1.31×        1.49×     1.32×
+Table 3: Detailed profiling overhead (CPU and memory). All numbers are relative to the Python baseline (no profiling); a_t_i refers to the
+async_tree_io benchmark.
+
+
+  By contrast, S CALENE only records samples when memory                                                              7    Case Studies
+consumption grows or shrinks by a large amount (§3.2), lead-
+ing to vastly smaller logs. For example, when running the mdp                                                         This section includes reports on real-world experience by
+benchmark, Austin’s log file consumes 27MB and Memray’s                                                               external developers using S CALENE to identify and resolve
+log file consumes almost 100MB, while S CALENE’s log file                                                             performance issues. For each, we identify the features of S CA -
+consumes just 32K.                                                                                                    LENE that were instrumental in enabling these optimizations.
+
+
+                                                                                                                      Rich: A user reported severe slowness when printing large
+                                                                                                                      tables to the developer of Rich [20], an immensely popu-
+Summary: Among the accurate memory profilers, S CA -                                                                  lar Python library for formatting text in the terminal (down-
+LENE operates with the lowest overhead (median: 1.32× vs.                                                             loaded over 130 million times, with 41K stars on GitHub).
+3.98× (memray) and 2.71× (Fil), while capturing memory                                                                When Rich’s developer profiled it using S CALENE, he identi-
+usage over time and producing small log files.                                                                        fied two lines occupying a disproportional amount of run-
+
+
+
+USENIX Association                                                                           17th USENIX Symposium on Operating Systems Design and Implementation                     59
+                                              Memory profiling: Execution time overhead                      Pandas – concat and groupby queries: An instructor
+                                                                                                             had their students use S CALENE in a tutorial designed to
+                                        7                                                  austin_full       teach higher performance Pandas. The instructor found
+                                                                                           memory_profiler
+                                                                                           memray            that S CALENE revealed significant issues in both per-
+Overhead (multiple of Python runtime)
+
+
+
+
+                                        6                                                  fil               formance and space consumption when using Pandas.
+                                                                                           Scalene_full
+                                                                                                             First, S CALENE revealed that calling concat on Pandas
+                                        5                                                                    dataframes was using more memory than anticipated.
+                                                                                                             S CALENE’s copy volume reporting revealed that the
+                                        4
+                                                                                                             problem was that concat copies all the data by default
+                                        3
+                                                                                                             (https://pandas.pydata.org/pandas-docs/stable/
+                                                                                                             reference/api/pandas.concat.html#pandas.concat),
+                                        2                                                                    effectively doubling memory usage when managing large
+                                                                                                             dataframes. Second, S CALENE confirmed that exces-
+                                        1                                                                    sive RAM usage in some groupby operations is due to
+                                                                                                             copying of the groups; this bug has been reported to
+                                        0                                                                    the Pandas developers (https://github.com/pandas-
+                                                                                                             dev/pandas/issues/37139). Restructuring the groupby
+                                                                                            ce
+
+                                                                                             y
+                                             p
+                                                    _io
+
+
+
+
+                                                                                             h
+
+                                                                                              t
+
+
+
+
+                                                                                          tils
+
+                                                                                             N
+                                                             )
+
+                                                                      )
+
+                                                                            )
+
+
+
+                                                                                          rin
+                                                           (io
+
+                                                                  (ci
+
+                                                                          (m
+
+
+
+
+                                                                                         mp
+                                            md
+
+
+
+
+                                                                                   k
+
+
+
+
+                                                                                        DIA
+                                                                                        tra
+                                                                                nu
+                                                 ee
+
+
+
+
+                                                                                       cu
+                                                                                       pp
+                                                                 _io
+                                                        _io
+
+
+
+                                                                        _io
+
+
+
+
+                                                                                      sy
+                                                                                    ray
+                                                                              fan
+
+
+
+
+                                                                                    ME
+                                               _tr
+
+
+
+
+                                                                                    do
+
+
+
+                                                                                                             operation reduced memory consumption by a further
+                                                              ee
+                                                      ee
+
+
+
+                                                                       ee
+                                                c
+
+
+
+                                                           _tr
+                                             yn
+
+                                                    _tr
+
+
+
+                                                                   _tr
+                                            as
+
+
+
+                                                             c
+                                                    c
+
+
+
+                                                                    c
+
+
+
+
+                                                                                                             1.6GB (43%). [Features: Fine-grained CPU and memory
+                                                          yn
+                                                 yn
+
+
+
+                                                                 yn
+                                                        as
+                                                 as
+
+
+
+                                                                 as
+
+
+
+
+                                                                                                             profiling, copy volume.]
+Figure 8: Memory profiling overhead: S CALENE has competitive
+runtime overhead. Despite collecting far more detailed information,
+S CALENE is faster than the accurate memory profilers (§6.5).                                                NumPy vectorization: A graduate student was using
+                                                                                                             NumPy to implement classification with gradient descent and
+                                                                                                             was seeing extremely low performance. S CALENE showed
+                                                                                                             that 99% of the time was being spent in Python (rather than
+time. S CALENE indicated that a call to isinstance was                                                       native code), indicating that his code was not vectorized. In
+taking an unexpectedly large amount of time–though each                                                      other words, the code was not expressed in a way that allowed
+call takes very little time, the developer reported that it was                                              NumPy to efficiently compute vector operations (using native
+being called 80,000 times. Rich’s developer replaced these                                                   code). Guided by S CALENE’s feedback, the graduate student
+calls with a lower-cost function, hasattr. In our bench-                                                     gradually improved the performance from 80 iterations per
+marks, isinstance (when marked as a runtime protocol                                                         minute to 10,000 per minute, a 125× improvement. [Feature:
+via @typing.runtime_checkable) can run over 20× slower                                                       Fine-grained native vs. Python CPU profiling.]
+than hasattr. The developer also indicated that an unneces-
+sary copy was being performed once every cell. Optimizing
+these calls led to a reported 45% improvement in runtime                                                     Semantic Scholar: Semantic Scholar reports that they have
+when rendering a large table. [Features: Fine-grained CPU                                                    been using S CALENE as part of their tool suite for operational-
+profiling, copy volume.]                                                                                     izing their machine learning models. Recently, they found that
+                                                                                                             a model was cost-prohibitive and put an entire product direc-
+                                                                                                             tion in jeopardy. They generated a set of test data and ran
+                                                                                                             their models with S CALENE. S CALENE’s output was able to
+Pandas – Chained Indexing: A developer was seeing
+                                                                                                             pinpoint the issues and help them validate that their changes
+suboptimal performance in their code using Pandas [41].
+                                                                                                             were having an impact. While iteratively using S CALENE
+S CALENE identified that a list comprehension performing
+                                                                                                             while applying optimizations, they were ultimately able to
+nested indexes into a Pandas dataframe was taking an unex-
+                                                                                                             reduce costs by 92%. Additionally, S CALENE allowed Seman-
+pectedly large amount of time and resulting in a significant
+                                                                                                             tic Scholar’s developers to quickly determine what fraction of
+amount of copy volume. The developer noted that the first
+                                                                                                             their runtime would benefit from hardware acceleration and
+level of indexing was repeatedly using a string that was loop
+                                                                                                             what CPU-bound code they needed to optimize in order to
+invariant; the way this was being done in Pandas caused it to
+                                                                                                             achieve their goals. [Features: Simultaneous, fine-grained
+perform copies rather than using views, a problem known as
+                                                                                                             CPU, memory, and GPU profiling.]
+chained indexing (https://pandas.pydata.org/pandas-
+docs/stable/user_guide/indexing.html#returning-
+a-view-versus-a-copy). After manually hoisting this                                                          Summary: In nearly all of the cases described above, S CA -
+outer indexing operation, the developer obtained an 18×                                                      LENE was either invaluable or provided additional help that
+speedup. [Features: Copy volume and fine-grained CPU                                                         narrowed down performance issues, by leveraging unique or
+profiling.]                                                                                                  novel features of S CALENE: separation of native from Python
+
+
+
+60                                          17th USENIX Symposium on Operating Systems Design and Implementation                                      USENIX Association
+time, copy volume, GPU profiling, and its ability to simul-        mation at a line granularity. pprofile_det imposes a median
+taneously measure memory and CPU usage. Though other               overhead of 36.8×, while line_profiler’s median overhead
+tools can separately identify high RAM usage or slow code,         is 2.2×.
+past tools would either misattribute the location of usage due
+to the use of resident set size as a metric (unlike S CALENE’s
+accurate memory profiling approach) or not be able to si-          8.2    Sampling-based CPU profilers
+multaneously measure memory usage and CPU usage. The               Sampling-based profilers are more efficient and often
+insights generated by S CALENE were actionable, yielding           more accurate than the deterministic profilers. These in-
+substantial improvements in execution time and space, and          clude pprofile_stat, py-spy [10], and pyinstrument [33].
+reducing cost.                                                     Their overhead is between 1× and 1.7×, comparable to S CA -
+                                                                   LENE . Because it fails to cope with Python’s deferred signal
+8     Related Work                                                 delivery, pprofile_stat incorrectly ascribes zero runtime
+                                                                   to execution of native code or code in child threads (§2).
+There is an extensive history of profilers; we focus our atten-       Compared to past CPU-only profilers, S CALENE is nearly
+tion here on profilers that specifically support Python. The       as fast or faster, more accurate, and provides more detailed
+Python ecosystem contains many Python profilers, most of           CPU-related information, breaking down time spent into
+which have not been discussed in the academic literature.          Python, native, and system time.
+This section describes the most prominent profilers; Figure 1
+provides a tabular overview.
+   We first survey CPU-only profilers. We divide them into         8.3    Memory profilers
+two categories: deterministic (tracing-based) (§8.1) and           memory_profiler is a deterministic memory profiler that
+sampling-based (§8.2). We then discuss memory profilers            uses Python’s trace facility to trigger it after every line of
+(§8.3), ML-specific profilers (§8.4), other Python profilers       execution [36]. By default, it measures the RSS after each
+(§8.5), and general profilers with Python support (§8.6), and      line executes and records the change from the previous line.
+touch on more distantly related profilers for other languages      memory_profiler also does not support Python applications
+(§8.7).                                                            using threads or multiprocessing.
+                                                                      Fil measures the peak allocation of the profiled program
+8.1    Deterministic CPU profilers                                 by interposing on system allocator functions and forcing
+                                                                   Python to use the system allocator (instead of Python’s
+Python provides built-in tracing support (sys.settrace) that       Pymalloc) [45]. Fil records a full stack trace whenever the
+several profilers build upon. The tracing facility, when acti-     current memory footprint exceeds a previous maximum. On
+vated, triggers a callback in response to a variety of events,     exit, it produces a flamegraph [13] of call stacks responsible
+including function calls and execution of each line of code.       for memory allocation at the point of maximum memory con-
+This deterministic, instrumentation-based approach leads to        sumption. The Fil website reports that it supports threads (“In
+significant inaccuracies due to its probe effect, as Section 6.2   general, Fil will track allocations in threads correctly.” [46]).
+shows. Because of the overhead of tracing, they are also the       However, in our tests, Fil (version 2022.6.0) fails to ascribe
+slowest profilers.                                                 any memory allocations to threads. Fil also does not currently
+                                                                   support multiprocessing.
+Function-granularity: Python includes two built-                      Memray is a recently released (April 2022), Linux-only
+in function-granularity profilers, profile [35] and                memory profiler that deterministically tracks allocations and
+cProfile [34]. The primary difference between these two            other profiler events [37]. Memray interposes upon the C allo-
+profilers is that cProfile’s callback function is implemented      cation functions and optionally on the pymem functions, letting
+in C, making it much faster (1.7× slowdown vs. 15.1×)              it distinguish native from Python allocations.
+and somewhat more accurate than profile. Another                      The only previous CPU+memory profiler we are aware
+profiler, yappi, operates in two modes, wall clock time            of besides S CALENE is Austin [43]. Austin reduces perfor-
+(sample-based) and CPU time (deterministic); it is among the       mance overhead by profiling with a separate process.
+most inaccurate of CPU profilers, with slowdowns ranging
+from 1.8× to 33.3×.
+                                                                   8.4    Profilers for Machine Learning Libraries
+Line-granularity: pprofile [30] comes in two flavors:              Two widely used machine learning libraries, TensorFlow and
+a deterministic and a “statistical” (sampling-based) profiler.     PyTorch [28], include their own profilers [11, 19]. Both pro-
+Both flavors correctly work for multithreaded Python pro-          filers are targeted at identifying performance issues specific
+grams, unlike line_profiler [17]. All of these report infor-       to deep learning training and inference. For example, the
+
+
+
+USENIX Association                            17th USENIX Symposium on Operating Systems Design and Implementation              61
+PyTorch profiler can attribute runtime to individual opera-         for the Go language that can report both CPU and memory [7].
+tors (running inside PyTorch’s native code). NVIDIA’s Deep          Both profilers use rate-based memory sampling (§3.2).
+Learning profiler (DLprof) [23] provides similar functionality
+for either PyTorch or TensorFlow. Unlike S CALENE, these
+                                                                    9   Conclusion
+profilers are specific to machine learning workloads and are
+not suitable for profiling arbitrary Python code. These pro-        This paper presents S CALENE, a novel Python profiler. S CA -
+filers are complementary to S CALENE, which aims to be a            LENE delivers more actionable information than past profilers,
+general-purpose profiler. They also lack many of S CALENE’s         all with high accuracy and low overhead. Its suite of novel
+features.                                                           algorithms enables S CALENE’s holistic reporting of Python
+                                                                    execution. S CALENE has been released as open source at
+8.5    Other Python Profilers                                       https://github.com/plasma-umass/scalene.
+
+PieProf aims to identify and surface specific types of inef-        Acknowledgements
+ficient interactions between Python and native code [39].
+PieProf leverages data gathered from on-chip performance            We thank S CALENE’s users for their feature requests, ques-
+monitoring units and debug registers combined with data from        tions, and bug reports, which have helped shape and guide
+libunwind and the Python interpreter to identify redundant          this research. We are most grateful to users who contributed
+loads and stores initiated by user-controlled code. It surfaces     pull requests or worked with us to resolve compatibility is-
+pairs of redundant loads and stores for the developer to poten-     sues, including Raphael Cohen, James Garity, Ryan Grout,
+tially optimize. PieProf is not publicly available, so it was not   Friday James, and Marguerite Leang. We thank the users who
+possible to empirically compare it to S CALENE.                     contributed their experiences, reported here as case studies:
+                                                                    Will McGugan, Ian Oszvald, Donald Pinckney, Nicolas van
+                                                                    Kempen, and Chris Wilhelm. Finally, we thank our shepherd,
+8.6    Profilers with Python Support
+                                                                    Phil Levis, and the reviewers of this paper, whose feedback
+Several non-Python specific conventional profilers offer lim-       helped improve not only the paper but also S CALENE itself.
+ited support for Python. Intel’s VTune profiler [49] can at-           This material is based upon work supported by the National
+tribute its metrics to Python lines, with a number of caveats,      Science Foundation under Grant No. 1954830.
+including “if your application has very low stack depth, which
+includes called functions and imported modules, the VTune           References
+Profiler does not collect Python data.” [16]. VTune does not
+directly distinguish between time spent in Python code and           [1] Improved JFR allocation profiling in JDK 16. https:
+time spent in native code and does not track Python memory               //withent.blogspot.com/2021/01/improved-jfr-
+allocations. Google Cloud Profiler [12] only profiles Python             allocation-profiling-in.html, Jan. 2021.
+execution time, but neither distinguishes between Python and
+native time nor does it perform memory profiling for Python.         [2] M. Abadi, A. Agarwal, P. Barham, E. Brevdo, Z. Chen,
+Both lack most of S CALENE’s other features.                             C. Citro, G. S. Corrado, A. Davis, J. Dean, M. Devin,
+   Python 3.12, the current development version of Python,               S. Ghemawat, I. Goodfellow, A. Harp, G. Irving, M. Is-
+recently (November 2022) added support for use with the                  ard, Y. Jia, R. Jozefowicz, L. Kaiser, M. Kudlur, J. Leven-
+perf profiler on Linux platforms by reporting function names             berg, D. Mané, R. Monga, S. Moore, D. Murray, C. Olah,
+in traces [26]. Using perf in this mode only measures perfor-            M. Schuster, J. Shlens, B. Steiner, I. Sutskever, K. Tal-
+mance counters or execution time. Unlike S CALENE, perf                  war, P. Tucker, V. Vanhoucke, V. Vasudevan, F. Viégas,
+does not measure memory allocation, or attribute runtime                 O. Vinyals, P. Warden, M. Wattenberg, M. Wicke, Y. Yu,
+(Python or native) to individual lines of Python code.                   and X. Zheng. TensorFlow: Large-scale machine learn-
+                                                                         ing on heterogeneous systems, 2015. Software available
+                                                                         from tensorflow.org.
+8.7    Non-Python Profilers
+                                                                     [3] M. Abadi, P. Barham, J. Chen, Z. Chen, A. Davis,
+AsyncProfiler is a Java profiler that, like S CALENE, profiles           J. Dean, M. Devin, S. Ghemawat, G. Irving, M. Isard,
+both CPU and memory [27]. AsyncProfiler is a sampling                    M. Kudlur, J. Levenberg, R. Monga, S. Moore, D. G.
+profiler that avoids the safepoint bias problem [21]. Since              Murray, B. Steiner, P. Tucker, V. Vasudevan, P. Warden,
+Python does not have safepoints (all garbage collection hap-             M. Wicke, Y. Yu, and X. Zheng. TensorFlow: a sys-
+pens while the global interpreter lock is held), Python profilers        tem for Large-Scale machine learning. In 12th USENIX
+cannot suffer from this bias. Instead, as we show, they can              Symposium on Operating Systems Design and Imple-
+suffer from function bias (§6.2). Similarly, pprof is a profiler         mentation (OSDI 16), pages 265–283, 2016.
+
+
+
+62    17th USENIX Symposium on Operating Systems Design and Implementation                                   USENIX Association
+ [4] M. Belanger and D. Deville. How we rolled out             [17] R. Kern.   line_profiler: Line-by-line profiling
+     one of the largest Python 3 migrations ever - Drop-            for Python. https://github.com/pyutils/line_
+     box.    https://dropbox.tech/application/how-                  profiler.
+     we-rolled-out-one-of-the-largest-python-3-
+     migrations-ever, Sept. 2018.                              [18] R. Komorn. Python in production engineering. https:
+                                                                    //engineering.fb.com/production-engineering/
+ [5] E. D. Berger, B. G. Zorn, and K. S. McKinley. Compos-          python-in-production-engineering/, May 2016.
+     ing high-performance memory allocators. In M. Burke
+     and M. L. Soffa, editors, Proceedings of the 2001 ACM     [19] M. Lukiyanov, G. Hua, G. Chauhan, and G. Dankel.
+     SIGPLAN Conference on Programming Language De-                 Introducing PyTorch Profiler - the new and improved
+     sign and Implementation (PLDI), Snowbird, Utah, USA,           performance tool.     https://pytorch.org/blog/
+     June 20-22, 2001, pages 114–124. ACM, 2001.                    introducing-pytorch-profiler-the-new-and-
+                                                                    improved-performance-tool/.
+ [6] S. Cass.    Top programming languages 2022.
+     https://spectrum.ieee.org/top-programming-                [20] W. McGugan. Rich is a Python library for rich text and
+     languages-2022, Aug. 2022.                                     beautiful formatting in the terminal. https://github.
+ [7] R. Cox and S. Ma. Profiling go programs. https:                com/Textualize/rich.
+     //go.dev/blog/pprof, May 2013.
+                                                               [21] T. Mytkowicz, A. Diwan, M. Hauswirth, and P. F.
+ [8] A. Danial. cloc: v1.94.        https://github.com/             Sweeney. Evaluating the accuracy of Java profilers.
+     AlDanial/cloc, July 2022.                                      In B. G. Zorn and A. Aiken, editors, Proceedings of
+                                                                    the 2010 ACM SIGPLAN Conference on Program-
+ [9] D. H. Douglas and T. K. Peucker. Algorithms for the            ming Language Design and Implementation, PLDI 2010,
+     reduction of the number of points required to represent        Toronto, Ontario, Canada, June 5-10, 2010, pages 187–
+     a digitized line or its caricature. Cartographica: the         197. ACM, 2010.
+     international journal for geographic information and
+     geovisualization, 10(2):112–122, 1973.                    [22] Netflix Technology Blog.      Python at Netflix.
+                                                                    https://netflixtechblog.com/python-at-
+[10] B. Frederickson. py-spy: Sampling profiler for Python
+                                                                    netflix-bba45dae649e, Apr. 2019.
+     programs. https://github.com/benfred/py-spy.
+[11] Google Corporation. Optimize TensorFlow performance       [23] NVIDIA Corporation. NVIDIA Deep Learning Pro-
+     using the Profiler. https://www.tensorflow.org/                filer. https://docs.nvidia.com/deeplearning/
+     guide/profiler.                                                frameworks/dlprof-user-guide/.
+
+[12] Google LLC. Google Cloud: Profiling Python applica-       [24] S. O’Grady. The RedMonk Programming Language
+     tions. https://cloud.google.com/profiler/docs/                 Rankings: June 2022.    https://redmonk.com/
+     profiling-python, 2022.                                        sogrady/2022/10/20/language-rankings-6-22/,
+                                                                    Oct. 2022.
+[13] B. Gregg.     The flame graph.       Commun. ACM,
+     59(6):48–57, June 2016.                                   [25] T. E. Oliphant. Guide to NumPy. https://web.mit.
+[14] M. Hertz and E. D. Berger. Quantifying the performance         edu/dvp/Public/numpybook.pdf, 2006.
+     of garbage collection vs. explicit memory management.
+                                                               [26] Pablo Galindo. Python support for the Linux perf
+     In OOPSLA ’05: Proceedings of the 20th Annual ACM
+                                                                    profiler. "https://docs.python.org/3.12/howto/
+     SIGPLAN Conference on Object-Oriented programming,
+                                                                    perf_profiling.html, 2022.
+     Systems, Languages, and Applications, pages 313–326,
+     New York, NY, USA, 2005. ACM Press.                       [27] A. Pangin. async-profiler. https://github.com/
+[15] Instagram Engineering.  Python - Instagram En-                 jvm-profiling-tools/async-profiler.
+     gineering. https://instagram-engineering.com/
+     tagged/python, 2019.                                      [28] A. Paszke, S. Gross, F. Massa, A. Lerer, J. Bradbury,
+                                                                    G. Chanan, T. Killeen, Z. Lin, N. Gimelshein, L. Antiga,
+[16] Intel Corporation.    Intel VTune Profiler User                A. Desmaison, A. Köpf, E. Yang, Z. DeVito, M. Raison,
+     Guide.          https://www.intel.com/content/                 A. Tejani, S. Chilamkurthy, B. Steiner, L. Fang, J. Bai,
+     www/us/en/develop/documentation/vtune-                         and S. Chintala. PyTorch: An imperative style, high-
+     help/top/analyze-performance/code-profiling-                   performance deep learning library. Advances in Neural
+     scenarios/python-code-analysis.html, 2022.                     Information Processing Systems, 32, 2019.
+
+
+
+USENIX Association                          17th USENIX Symposium on Operating Systems Design and Implementation         63
+[29] F. Pedregosa, G. Varoquaux, A. Gramfort, V. Michel,         [43] G. N. Tornetta. austin: A frame stack sampler for
+     B. Thirion, O. Grisel, M. Blondel, P. Prettenhofer,              cpython. https://github.com/P403n1x87/austin.
+     R. Weiss, V. Dubourg, J. Vanderplas, A. Passos, and
+     D. Cournapeau. Scikit-learn: Machine learning in            [44] D. Trotter. Grumpy: Go running Python! https:
+     Python. Journal of Machine Learning Research,                    //opensource.googleblog.com/2017/01/grumpy-
+     12:2825–2830, 2011.                                              go-running-python.html, Jan. 2017.
+
+[30] V. Pelletier. pprofile: Line-granularity, thread-aware      [45] I. Turner-Trauring.   Fil profiler.       https://
+     deterministic and statistic pure-Python profiler. https:         pythonspeed.com/fil/.
+     //github.com/vpelletier/pprofile.                           [46] I. Turner-Trauring. Threading in NumPy (BLAS), Zarr,
+[31] Python Software Foundation. Signals and threads.                 numexpr.      https://pythonspeed.com/fil/docs/
+     https://docs.python.org/3/library/signal.                        threading.html.
+     html#signals-and-threads.                                   [47] G. van der Meer. How we use Python at Spo-
+[32] U. Ramer. An iterative procedure for the polygonal               tify. https://labs.spotify.com/2013/03/20/how-
+     approximation of plane curves. Computer graphics and             we-use-python-at-spotify/, Mar. 2013.
+     image processing, 1(3):244–256, 1972.                       [48] Wikipedia contributors. Cpython — Wikipedia, the free
+[33] J. Rickerby.      pyinstrument: Call stack pro-                  encyclopedia. https://en.wikipedia.org/w/index.
+     filer for Python.  https://github.com/joerick/                   php?title=CPython&oldid=1095361531, 2022. [On-
+     pyinstrument.                                                    line; accessed 4-July-2022].
+
+[34] B. Rosen and T. Czotter.   The Python Profil-               [49] Wikipedia contributors. VTune — Wikipedia, The
+     ers (cProfile). https://docs.python.org/3.8/                     Free Encyclopedia. https://en.wikipedia.org/w/
+     library/profile.html.                                            index.php?title=VTune&oldid=1107229725, 2022.
+                                                                      [Online; accessed 13-December-2022].
+[35] J. Roskind. The Python Profilers (profile). https:
+     //docs.python.org/3.8/library/profile.html.                 [50] S. L. Zabell. The rule of succession.    Erkenntnis,
+                                                                      31(2):283–321, 1989.
+[36] S. Saffron. memory_profiler. https://github.com/
+     SamSaffron/memory_profiler.
+[37] P. G. Salgado. Memray. https://bloomberg.github.
+     io/memray/.
+[38] Stack Overflow. Stack Overflow Developer Survey 2022.
+     https://survey.stackoverflow.co/2022/#most-
+     popular-technologies-language, May 2022.
+[39] J. Tan, Y. Chen, Z. Liu, B. Ren, S. L. Song, X. Shen,
+     and X. Liu. Toward efficient interactions between
+     Python and native libraries. In D. Spinellis, G. Gousios,
+     M. Chechik, and M. D. Penta, editors, ESEC/FSE ’21:
+     29th ACM Joint European Software Engineering Con-
+     ference and Symposium on the Foundations of Software
+     Engineering, Athens, Greece, August 23-28, 2021, pages
+     1117–1128. ACM, 2021.
+[40] TCMalloc Team.    How sampling in TCMalloc
+     works.   https://github.com/google/tcmalloc/
+     blob/master/docs/sampling.md, 2022.
+[41] The Pandas development team. pandas-dev/pandas: Pan-
+     das. https://github.com/pandas-dev/pandas, July
+     2022. [Online; accessed 4-July-2022].
+[42] TIOBE Software BV. TIOBE Index for December 2022.
+     https://www.tiobe.com/tiobe-index/, Dec. 2022.
+
+
+
+64   17th USENIX Symposium on Operating Systems Design and Implementation                             USENIX Association
+

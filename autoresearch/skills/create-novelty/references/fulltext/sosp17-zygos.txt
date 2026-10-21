@@ -1,0 +1,1241 @@
+                     ZygOS: Achieving Low Tail Latency for
+                      Microsecond-scale Networked Tasks
+              George Prekas*                                        Marios Kogias*                                 Edouard Bugnion
+                EPFL, Switzerland                                    EPFL, Switzerland                               EPFL, Switzerland
+ABSTRACT                                                                                Tasks. In Proceedings of SOSP ’17. ACM, New York, NY, USA,
+This paper focuses on the efficient scheduling on multicore                             17 pages. https://doi.org/10.1145/3132747.3132780
+systems of very fine-grain networked tasks, which are the
+typical building block of online data-intensive applications.
+The explicit goal is to deliver high throughput (millions of
+remote procedure calls per second) for tail latency service-                            1   INTRODUCTION
+level objectives that are a small multiple of the task size.                            To meet service-level objectives (SLO), web-scale online data-
+   We present Z YG OS, a system optimized for µs-scale, in-                             intensive applications such as search, e-commerce, and social
+memory computing on multicore servers. It implements a                                  applications rely on the scale-out architectures of modern,
+work-conserving scheduler within a specialized operating                                warehouse-scale datacenters [2]. In such deployments, a sin-
+system designed for high request rates and a large num-                                 gle application can comprise of hundreds of software compo-
+ber of network connections. Z YG OS uses a combination                                  nents, deployed on thousands of servers organized in multiple
+of shared-memory data structures, multi-queue NICs, and                                 tiers and interconnected by commodity Ethernet switches.
+inter-processor interrupts to rebalance work across cores.                              Such applications must support high concurrent connection
+   For an aggressive service-level objective expressed at the                           counts and operate with user-facing SLO, often defined in
+99t h percentile, Z YG OS achieves 75% of the maximum pos-                              terms of tail latency to meet business objectives [1, 12, 47].
+sible load determined by a theoretical, zero-overhead model                             To meet these objectives, most such applications distribute
+(centralized queueing with FCFS) for 10µs tasks, and 88%                                all critical data (e.g., the social graph) in the memory of hun-
+for 25µs tasks.                                                                         dreds of data services, such as memory-resident transactional
+   We evaluate Z YG OS with a networked version of Silo, a                              databases [20, 62, 65, 67, 68], NoSQL databases [44, 55], key-
+state-of-the-art in-memory transactional database, running                              value stores [15, 39, 43, 74], or specialized graph stores [6].
+TPC-C. For a service-level objective of 1000µs latency at the                              These in-memory data services typically service requests
+99t h percentile, Z YG OS can deliver a 1.63× speedup over                              from hundreds of application servers (high fan-in). Because
+Linux (because of its dataplane architecture) and a 1.26×                               each user request often involves hundreds of data services
+speedup over IX, a state-of-the-art dataplane (because of its                           (high fan-out) and must wait for the laggard for completion,
+work-conserving scheduler).                                                             the SLO of the data services must consider the long tail of
+                                                                                        the latency distributions of requests [12]. Individual task sizes
+KEYWORDS                                                                                often require only a handful of µs of user-level execution
+Tail latency, Microsecond-scale computing                                               each. These services would therefore ideally execute at the
+ACM Reference Format:                                                                   highest throughput, efficiently use all system resources (CPU,
+George Prekas, Marios Kogias, and Edouard Bugnion. 2017. Zy-                            NIC, and memory), and deliver a tail-latency SLO that is only
+gOS: Achieving Low Tail Latency for Microsecond-scale Networked                         a small multiple of the typical task service time [3].
+* co-equal first author.
+                                                                                           This hunt for the killer microseconds [3] requires researchers
+                                                                                        to revisit assumptions across the network and compute stacks,
+Permission to make digital or hard copies of all or part of this work for               whose policies and implementations play a significant role in
+personal or classroom use is granted without fee provided that copies are not           exacerbating the problem [34].
+made or distributed for profit or commercial advantage and that copies bear
+                                                                                           Our work focuses on the efficient scheduling on multi-
+this notice and the full citation on the first page. Copyrights for components
+of this work owned by others than ACM must be honored. Abstracting with                 core systems of these very fine-grain in-memory services.
+credit is permitted. To copy otherwise, or republish, to post on servers or to          The theoretical answer is well understood: (a) single-queue,
+redistribute to lists, requires prior specific permission and/or a fee. Request         multiple-processor models deliver lower tail latency than par-
+permissions from permissions@acm.org.                                                   allel single-queue, single-processor models and (b) FCFS
+SOSP ’17, October 28, 2017, Shanghai, China                                             delivers the best tail latency for low-dispersion tasks while
+© 2017 Association for Computing Machinery.
+                                                                                        processor sharing delivers superior results in high dispersion
+ACM ISBN 978-1-4503-5085-3/17/10. . . $15.00
+https://doi.org/10.1145/3132747.3132780                                                 service time distributions [70].
+
+
+
+
+                                                                                  325
+SOSP ’17, October 28, 2017, Shanghai, China                                                   G.Prekas, M.Kogias and E.Bugnion
+
+   The systems answer is, unfortunately, a lot less obvious,                (2) The implementation of Z YG OS, which includes an idle
+in particular when considering high request rates consist-               loop logic designed to aggressively identify task stealing op-
+ing of short messages and small processing times. In such                portunities throughout the operating system and down to the
+situations, the state-of-the-art uses multi-queue NICs (e.g.,            NIC hardware queues. Our implementation leverages hard-
+RSS [57]) to scale the networking stack across the multiple              ware virtualization and the Dune framework [4] and handles
+cores of the system. Current designs force users to choose be-           IPIs in an exit-less manner similar to ELI [22].
+tween conventional operating systems (i.e., typically Linux),               (3) A methodology using microbenchmarks with synthetic
+and more specialized kernel-bypass approaches. The for-                  service times to identify system overheads as a function of
+mer can efficiently schedule the resources of a multi-core               task size and distribution. This methodology allows us to
+server and prioritize latency-sensitive tasks [8] but suffers            identify both design limitations and implementation over-
+from high overheads for µs-scale tasks. The latter improves              heads. We apply this approach to Linux for event-driven
+throughput substantially (by up to 6× for key-value stores [5])          execution models (using both partitioned and floating con-
+through sweeping simplifications such as separation of control           nections among threads), IX and Z YG OS and show that all
+from the dataplane execution, polling, run-to-completion, and            converge as the task granularity increases, but at noticeably
+synchronization-free, flow-consistent mapping of requests to             different rates, to distinct, well-understood models. For an
+cores [5, 26, 27, 39, 42, 51].                                           SLO of 10× the mean service time at the 99th percentile, Z Y-
+   These sweeping simplifications lead to two related forms              G OS achieves 75% of the maximum possible theoretical load
+of inefficiencies: (a) the dataplane is not a work conserving            for 10µs tasks, and 88% of the equivalent load for 25µs tasks
+scheduler, i.e., a core may be idle while there are pending re-          (§6.1).
+quests; and (b) the dataplane suffers from head-of-line block-              (4) We compare Z YG OS to IX, a state-of-the-art data-
+ing, i.e., a request may be blocked until the previous tasks             plane with strict run-to-completion that partitions flows onto
+complete execution. While these limitations might be accept-             cores [5]. While Z YG OS’s scheduler introduces some neces-
+able to workloads with near-deterministic task execution time            sary buffering, communication and synchronization (which
+and relatively loose SLO (e.g., some widely-studied mem-                 are measurable for extremely small tasks), it eliminates head-
+cached workloads [1, 43] with an SLO at > 100× the mean                  of-line blocking and clearly outperforms IX for tasks ≥10µs
+service time [5]), such assumptions break down when consid-              (§6.1). IX does outperform Z YG OS for workloads with very
+ering more complex workloads, e.g., in-memory transaction                small task sizes such as memcached. The difference is pri-
+processing with a TPC-C-like mix of requests or with more                marily due to IX’s adaptive bounded batching, which is not
+aggressive SLO targets.                                                  currently supported in Z YG OS. (§6.2)
+   We present Z YG OS1 , a new approach to system software                  (5) Last but not least, we evaluate the benefits of Z YG OS
+optimized for µs-scale, in-memory computing. Z YG OS im-                 for an in-memory, transactional database running the TPC-
+plements a work-conserving scheduler free of any head-of-                C workload. Our setup uses Silo [65], a state-of-the-art, in-
+line blocking. While the design decisions voluntarily deviate            memory transactional database prototype. As Silo is only a
+from dataplane principles, Z YG OS retains the bulk of their             library, we added client/server support to Silo, ported it to
+performance advantages. The design, implementation, and                  Linux, IX, and Z YG OS, and benchmarked it using an open-
+evaluation of Z YG OS makes the following contributions:                 loop load generator for an SLO of 1000µs at the 99th per-
+                                                                         centile tail latency. Z YG OS can deliver a 1.63× speedup over
+   (1) The design of Z YG OS, which leverages many con-                  Linux and a 1.26× speedup over IX. The speedup over Linux
+ventional operating system building blocks such as the use               is explained by the use of many dataplane implementation
+of symmetric multiprocessing networking stacks, alternate                principles in Z YG OS. The speedup over IX is explained by
+use of polling and interrupts, inter-processor interrupts (IPI),         Z YG OS’s work-conserving scheduler, which rebalances tasks
+and task stealing with the overall goal of delivering a work-            to deliver consistently low tail latency nearly up to the point
+conserving schedule. Z YG OS is architected into three distinct          of saturation (§6.3).
+layers: (a) a lower networking layer, which runs in strict iso-
+lation on each core, (b) a middle shuffle layer which allows                The source code of Z YG OS, along with benchmarks, scripts
+idle cores to aggressively steal pending events, and (c) an              and simulation models, is available in open source [75].
+upper execution layer, which exposes a commutative API to                   The rest of the paper is organized as follows: §2 provides
+applications for scalability [10]. The shuffle layer eliminates          background on the problem and the theory. §3 describes the
+head-of-line-blocking while also offering strong ordering se-            experimental methodology and characterizes existing systems.
+mantics of events associated with the same connection.                   We describe the design (§4), implementation (§5) and evalua-
+                                                                         tion of Z YG OS (§6). We discuss a key tradeoff (§7), related
+1 The Greek word for balancing scales.                                   work (§8), and conclude.
+
+
+
+
+                                                                   326
+ZygOS: Achieving Low Tail Latency for µs-scale Networked Tasks                    SOSP ’17, October 28, 2017, Shanghai, China
+
+2 BACKGROUND                                                                            FCFS                                      FCFS
+                                                                          ƛ                                        random
+                                                                                                           ƛ
+2.1 Scaling remote procedure calls                                                      FCFS
+                                                                                                                   selector
+                                                                                                                                  FCFS
+In-memory data services are typically exposed by remote
+                                                                               (a) M/G/2/FCFS                  (b) 2xM/G/1/FCFS
+procedure calls (RPC). The problem of efficiently handling
+incoming RPCs dates back to the original C10k problem [7]                                                                         PS
+when socket scalability was the primary bottleneck. Today,                             PS
+                                                                          ƛ                                        random
+fine-tuned commodity operating systems can serve millions                              PS                 ƛ        selector
+                                                                                                                                  PS
+of requests per second and over a million of concurrent con-
+nections on a commodity server [50, 69, 72].                                    (c) M/G/2/PS                   (d) 2xM/G/1/PS
+   The initial approaches to building scalable applications al-
+located a kernel thread or process per connection; servicing a                 Figure 1: Queuing models for n = 2 processors.
+new request required a scheduling decision. However, despite
+the sophistication of modern operating system schedulers
+such as Completely Fair Scheduler (CFS) [8] and Borrowed
+                                                                         of dataplanes forces each thread to process only the packets
+Virtual Time (BVT) [16], context switch and stack manage-
+                                                                         that were directed to it by the NIC hardware. Assuming a
+ment overheads made developers move to more performant
+                                                                         balanced, high-connection count fan-in pattern, such a design
+designs to serve incoming requests.
+                                                                         does not substantially impact throughput or even mean latency
+   Today’s scalable designs fall into two main event-oriented
+                                                                         as all cores would get on average the same amount of work. It,
+patterns: symmetrical and asymmetrical ones. Symmetrical
+                                                                         however, has a dramatic impact on tail latency when the load
+designs split connections onto threads, and each thread in-
+                                                                         is below saturation as some cores may be idle while others
+teracts with the operating system using non-blocking system
+                                                                         have a backlog. Dataplanes that rely on historical information
+calls. This pattern is used by the popular libevent and
+                                                                         to rebalance future traffic from the NIC can only address
+libuv frameworks [37, 38]. On Linux, this pattern typically
+                                                                         persistent imbalances and resource allocations problems [5].
+relies on the epoll system call, which has long provided
+                                                                         The same limitation exists for applications that are explicitly
+a way to statically map connections to threads. To avoid
+                                                                         designed to statistically distribute the load on all cores such
+cases of load imbalance across cores because of imbalance
+                                                                         as MICA in its CREW and CRCW execution models [39].
+across connections, developers tried sharing the same con-
+                                                                         While such a design prevents any sustained imbalance, the
+nection among multiple threads. However, this led to thun-
+                                                                         randomized selection process of mapping requests to cores
+dering herd problems [32]. The recent addition in Linux 4.5
+                                                                         does nothing to prevent temporary imbalance between cores.
+of EPOLLEXCLUSIVE avoids such problems since in most
+cases only one thread is woken up to serve epoll [19].
+   In the asymmetrical pattern, a small number of threads han-           2.3    Just enough queuing theory
+dle all network I/O, identify RPC boundaries and add RPC                 There are at least three distinct forms of imbalance which
+requests to a centralized queue from which other tasks pull re-          impact tail latency that can be observed in systems:
+quests. This pattern is used by frameworks such as gRPC [23]               (1) Persistent imbalance occurs when different NIC queues
+and applications such as recent versions of nginx [46] and                     observe different packet arrival rates over long intervals.
+Apache Lucene [41]. While this pattern may increase the la-                    Unless the system can share the load dynamically, some
+tency of an individual request and impact throughput when                      cores will be busier than others. This situation can occur
+the tasks are small, it provides for an elegant separation of                  if there is connection skew when some clients request
+concerns and enables the efficient use of all worker cores.                    substantially more data than the average, or if there is
+                                                                               data access skew (e.g., the CREW protocol in MICA
+2.2    Kernel bypass and sweeping                                              balances reads but not writes across cores [39]).
+       simplifications                                                     (2) Arrival bursts cause temporary queuing even when the
+Data plane approaches such as IX [5], Arrakis [51] and user-                   system is not saturated. The well-known Poisson ar-
+level stacks [14, 26, 52, 56, 59, 63] bypass the kernel and rely               rival process has such bursts which cause the gradual
+on I/O polling to both increase throughput and reduce latency                  increase in tail latency as a function of load, even if the
+jitter [34, 36]. For example, IX increases the throughput of                   time to process each request is fixed. In a multi-queue
+memcached by up to 6.4× over Linux [5].                                        system, the Poisson arrival process generates bursts on
+    While these sweeping simplifications provide substantial                   different cores at different points in time. This creates
+throughput improvements, they come at a key cost when it                       a form of temporary imbalance that also impacts tail
+comes to resource efficiency: the synchronization-free nature                  latency.
+
+
+
+
+                                                                   327
+SOSP ’17, October 28, 2017, Shanghai, China                                                                               G.Prekas, M.Kogias and E.Bugnion
+
+
+                                                         16xM/G/1/PS          16xM/G/1/FCFS         M/G/16/FCFS           M/G/16/PS
+
+
+          14                                        14                                         14                                      14
+
+          12                                        12                                         12                                      12
+
+          10                                        10                                         10                                      10
+Latency
+
+
+
+
+           8                                        8                                          8                                       8
+
+           6                                        6                                          6                                       6
+
+           4                                        4                                          4                                       4
+
+           2                                        2                                          2                                       2
+
+           0                                        0                                          0                                       0
+                    0.25   0.50       0.75   1.00               0.25   0.50      0.75   1.00           0.25   0.50       0.75   1.00        0.25   0.50      0.75   1.00
+                           Load                                        Load                                       Load                             Load
+
+                  (a) Deterministic                             (b) Exponential                         (c) Bimodal-1                        (d) Bimodal-2
+
+               Figure 2: Simulation results for the 99t h percentile tail latency for four service time distributions with S¯ = 1.
+
+          (3) Service time variability will also create backlog and                                 • M/G/n/PS idealizes the thread-oriented pattern (1 thread
+              head-of-line blocking. A long request can occupy the                                     per connection) deployed on time-sharing operating sys-
+              processor for a long time, thus leading to a backlog of                                  tems. In practice, the task size granularity must be a
+              pending requests and a severe increase in tail latency.                                  multiple of the operating system time quantum.
+                                                                                                    • n×M/G/1/PS similarly idealizes the thread-oriented pat-
+                                                                                                       tern when the operating system does not rebalance
+   We use four open-loop queuing models to build an intuition
+                                                                                                       threads among cores.
+for the impact of arrival bursts and service time variability
+on tail latency. We use Kendall’s notation to describe the                                         Figure 2 illustrates simulation results for these idealized
+models, where in the following expression A/S/n/K, A is                                         queueing models for a system with n = 16 processors. The
+the inter-arrival distribution, S is the service time distribution,                             figure shows the result for four well-known distributions [40]:
+n is the number of workers and K is the policy implemented,                                         • deterministic P[X = S] ¯ =1
+i.e., first-come-first-serve (FCFS) or processor sharing (PS).                                      • exponential with mean service time S¯
+For simplicity of the analysis, all models assume a Poisson                                         • bimodal-1:P[X = S/2]¯ = .9; P[X = 5.5 × S]  ¯ = .1
+inter-arrival time of requests (A=M). This is expected of many                                      • bimodal-2:P[X = S/2]¯ = .999; P[X = 500.5× S]   ¯ = .001
+open-queuing models and representative of datacenter traffic                                       For each distribution, Figure 2 shows the tail request la-
+with high fan-in connection counts. The Poisson process will                                    tency (queuing delay + service time) at the 99th percentile as
+generate arrival bursts and temporary imbalance in the multi-                                   a function of the load. Intuitively we understand that as the
+queue models, but no persistent imbalance.                                                      system load increases and approaches the system’s limits, the
+   Figure 1 illustrates the four different modes. Each delivers                                 number of requests in the queues also increases. That leads to
+the same maximum throughput at saturation (λ = n/S),        ¯ but
+                                                                                                an increase in the queueing time and tail latency. As expected,
+with different tail latencies. The models idealize the imple-                                   the minimum 99th-percentile latency is 1 for the deterministic
+mentations of the systems of §2.                                                                distribution and 4.6 for the exponential distribution. As for
+                                                                                                the two bimodal distribution, b1 has a minimum tail latency
+           • The centralized-FCFS model (formally M/G/n/FCFS)                                   of 5.5, which corresponds to the slow requests and b2 has
+             idealizes event-driven applications that process events                            a minimum tail latency of 0.5, which corresponds to its fast
+             from a single queue or that float connections across                               requests.
+             cores (e.g., using the epoll exclusive flag).                                         We make two observations that inform our system design:
+           • The partitioned-FCFS model (formally n×M/G/1/FCFS)
+             idealizes event-driven applications that partition con-                            Observation 1: Single-queue systems (i.e., M/G/n/*) per-
+             nections among cores (e.g., libevent-based applica-                                form better compared to systems with multiple queues
+             tions) and associate each core with its own private work                           (i.e., n×M/G/1/*): Systems with multiple queues, even with
+             queue. This model can be deployed on conventional                                  random assignment of events to queues, suffer from tempo-
+             operating systems or shared-nothing dataplanes                                     rary load imbalance. This imbalance can create a backlog on
+                                                                                                some processors while other queues are empty. The lack of
+
+
+
+
+                                                                                        328
+ZygOS: Achieving Low Tail Latency for µs-scale Networked Tasks                     SOSP ’17, October 28, 2017, Shanghai, China
+
+work conservation in such models limits performance. In con-             load of 53.7% for the partitioned-FCFS model and of 96.3%
+trast, single-queue models with a work-conserving scheduler              for centralized-FCFS.
+(whether FCFS or PS) can immediately schedule the next task
+on any available processor.                                              3.2     Experimental Environment
+                                                                         Our experimental setup consists of a cluster of 11 clients and
+Observation 2: FCFS performs better in regards to tail
+                                                                         one server connected by a Quanta/Cumulus 48x10GbE switch
+latency for distributions with low dispersion: This result
+                                                                         with a Broadcom Trident+ ASIC. The client machines are a
+has also been theoretically analyzed by Wierman et al. [70].
+                                                                         mix of Xeon E5-2637 @ 3.5 GHz and Xeon E5-2650 @ 2.6
+In Figure 2, FCFS outperforms PS for the deterministic, ex-
+                                                                         GHz. The server is a Xeon E5-2665 @ 2.4 GHz with 8 cores
+ponential and bimodal-1 distribution. PS only outperforms
+                                                                         (16 hyperthreads) and 256 GB of DRAM. All machines are
+FCFS when the variance in service times increases, as in the
+                                                                         configured with Intel x520 10GbE NICs (82599EB chipset).
+case for bimodal-2. Note that partitioned-FCFS performs that
+                                                                         We connect the clients and the server to the switch through a
+poorly in bimodal-2 that is not obvious in these axis scales.
+                                                                         single NIC port each. The client machines run mutilate [34] as
+                                                                         a load generator: 10 machines generate load and the 11th one
+3     EXPERIMENTAL METHODOLOGY                                           measures latency. The machines connect to the server over a
+                                                                         total of 2752 TCP/IP connections. To minimize client laten-
+We now describe the experimental methodology used to eval-
+                                                                         cies, we modified the latency-measurement agent of mutilate
+uate existing low-latency systems. The challenge is to define
+                                                                         to use a DPDK-based, simple TCP/IP stack.
+metrics that help determine (a) the inherent design tradeoffs
+                                                                             The machines run an Ubuntu LTS 16.04 distribution run-
+by comparing real-life systems with the idealized models of
+                                                                         ning Linux kernel version 4.11. Systems are tuned to reduce
+§2.3; and (b) the sweet spot, in terms of mean service time and
+                                                                         jitter: all power management features, including CPU fre-
+distribution, of each system. We use synthetic microbench-
+                                                                         quency governors and TurboBoost, and support for transpar-
+marks to compare analytical results with experimental base-
+                                                                         ent huge pages, are disabled.
+line results for three OS configurations.
+                                                                         3.3     Evaluated Systems
+3.1    Approach and metrics                                              The synthetic microbenchmark models an event-oriented,
+We rely on microbenchmarks with synthetic execution times                scalable RPC server. During the setup phase, it accepts all
+to systematically compare different systems approaches for               connections from the client machines. During the benchmark,
+different task granularities. From the perspective of user-level         it simply receives request messages from the open connec-
+execution, the applications are trivial: for each request, the           tions, spins during the requested amount of time and returns
+application spins for an amount of time randomly selected to             a response. The server is setup as a 16-way multi-threaded
+match both service time (S) ¯ and distribution. From a systems           application that uses all cores (and hyperthreads) and mem-
+perspective, the application follows the event-driven model              ory of the CPU socket connected to the NIC. We deliberately
+to accept remote procedure calls sent over TCP/IP socket                 leave the other socket unused to eliminate the potential impact
+by client machines. The clients approximate an open-loop                 of NUMA policies in this study. We compare three config-
+load-generator where incoming requests follow a Poisson                  urations designed to support a large number of incoming
+inter-arrival time on randomly-selected connections [58]. All            connections:
+throughputs (requests per second) and 99t h percentile tail                    • Linux-partitioned: This mode minimizes communi-
+latencies are measured on the client-side.                                       cation and application logic at the expense of load-
+   We use two metrics to compare systems: (a) the conven-                        imbalance: each thread accepts its set of connections
+tional "tail latency vs. throughput" is used to compare the                      (as directed by the RSS in the NIC [57]) and then polls
+efficiency of different systems for a given task granularity                     on that same set during the benchmark. Partitioned-
+and distribution; (b) the "maximum load @ SLO" is used to                        FCFS models the performance upper bound.
+compare the efficiency across timescales, for a given SLO                      • Linux-floating: In this mode, all open connections are
+expressed as a multiple of the mean service time.                                put into a single pool from which all threads may poll.
+   This second metric is used to determine how fast different                    Our implementation uses a simple locking protocol to
+systems converge (or not) to the expected behavior of their                      serialize access to the same socket. Centralized-FCFS
+idealized model, as the service time increases. For example,                     models the upper bound of performance.
+consider an SLO that requires 99% of requests to complete                      • IX: The application uses the native dataplane ABI to re-
+within ≤ 10 × S. ¯ Queuing theory predicts a maximum load
+                                                                                 ceive socket events and respond correspondingly. This
+for each configuration, e.g., for the exponential distribution a                 is also modeled as centralized-FCFS.
+
+
+
+
+                                                                   329
+SOSP ’17, October 28, 2017, Shanghai, China                                                                         G.Prekas, M.Kogias and E.Bugnion
+
+
+
+                          M/G/16/FCFS             16xM/G/1/FCFS       Linux (floating connections)     IX               Linux (partitioned connections)
+
+       1.0                                                  1.0                                                   1.0
+
+
+       0.8                                                  0.8                                                   0.8
+
+
+       0.6                                                  0.6                                                   0.6
+Load
+
+
+
+
+       0.4                                                  0.4                                                   0.4
+
+
+       0.2                                                  0.2                                                   0.2
+
+
+       0.0                                                  0.0                                                   0.0
+             0     50         100           150       200         0    50          100           150        200         0           50          100           150   200
+                        Service time (µs)                                    Service time (µs)                                            Service time (µs)
+
+                   (a) Deterministic                                     (b) Exponential                                                 (c) Bimodal-1
+
+Figure 3: Maximum load that meets the SLO as a function of the mean service time S.   ¯ The SLO is set at ≤ (10 × S¯)
+at the 99t h percentile. The grey lines correspond to the ideal upper bounds determined by the centralized-FCFS and
+partitioned-FCFS models.
+
+Linux configuration: The Linux systems were tuned to min-                             In addition, the centralized model assumes a perfect, global
+imize latency and maximize throughput, by settling them on                            FCFS order of the allocation of requests to idle processors.
+a configuration that limits the number of returned events by                             Figure 3 shows the result for three of the four distributions
+epoll to 1. We did observe that some of these settings had                            studied analytically in Figure 2. We omit the bimodal-2 results
+a surprisingly small, or even negative impact on either la-                           as the analysis of §2.3 showed that multi-queue systems have
+tency or throughput (e.g., the EPOLLEXCLUSIVE commit                                  pathological tail latency with an FCFS scheduler. The figure
+evaluated the impact on thundering herds on a 250-thread                              shows clearly that:
+setup whereas we only use one per core [19]). We attribute                               (a) IX and Linux-partitioned both converge asymp-
+this to the fact that we pinned each application thread to a                          totically to the expected 16×M/G/1 level of performance. In-
+distinct core, thereby avoiding many of the subtle interactions                       tuitively, we understand that as the service time increases, the
+associated with CPU scheduling.                                                       overhead of the operating system becomes less prevalent. IX,
+                                                                                      which is optimized for small tasks, reaches 90% efficiency
+IX configuration: IX can process bounded batches of packets                           with tasks ≥25µs, ≥25µs, and ≥60µs for the deterministic,
+to completion, which improves throughput only for very small                          exponential, and bimodal-1 distributions. Larger tasks are
+task sizes. Unless when explicitly mentioned, we disabled it                          required for Linux-partitioned to reach the same level of effi-
+in our experiments as disabling batching noticeably improves                          ciency, i.e., ≥120µs, ≥120µs, and ≥90µs, respectively.
+tail latency. We also disabled the control plane and configured                          (b) Yet, Linux-floating actually provides the best
+IX to use all 16 hardware threads of the socket and use the                           performance for larger tasks and slowly converges to the upper
+CPU at its nominal frequency of 2.4GHz.                                               bound predicted by the centralized-FCFS model. The ability
+                                                                                      to rebalance tasks across cores allows it to outperform IX for
+                                                                                      tasks that are ≥50µs, ≥20µs, and ≥14µs for the deterministic,
+3.4          Baseline results                                                         exponential and bimodal-1 distributions.
+Figure 3 shows the maximum load that meets the SLO of the
+99t h percentile ≤ 10 × S¯ for three baseline operating system
+configurations described in §3.3. We include in greyscale two
+                                                                                      4 DESIGN
+horizontal lines that correspond to the upper bound in perfor-                        4.1 Requirements
+mance, as predicted by the partitioned-FCFS and centralized-                          The theoretical analysis suggests, and in fact proves, that
+FCFS, respectively. These upper bounds assume zero operat-                            synchronization-free dataplane approaches cannot provide
+ing system overheads, no scheduling overheads, no propaga-                            a robust solution to the tail latency problem, in particular
+tion delays, no head-of-line blocking, no interrupt delays, etc.                      when the service time distribution has a high dispersion. Yet,
+
+
+
+
+                                                                               330
+ZygOS: Achieving Low Tail Latency for µs-scale Networked Tasks                           SOSP ’17, October 28, 2017, Shanghai, China
+
+
+                                                                                                         3
+                                    3                 Batched                                                 app
+            Event                       app           syscalls
+ user
+
+
+
+
+          Conditions                                         a       steal
+
+
+          shuﬄe queue                                                               b
+                                                                                                                                  shuﬄe
+                                                                 Remote                        ø                                   layer
+                                                             batched syscalls
+ kernel
+
+
+
+
+                       2   tcp/ip
+                                                  tcp/ip                                ø       tcp/ip                tcp/ip
+                                                   out           5                                in                   out
+                             in               4
+           1
+
+                                                                               ø
+                                                                                                    remote core
+                               home core
+
+
+Figure 4: Dataflow in the Z YG OS operating system. Steps (1) – (6) correspond to the normal execution on the home core.
+Steps (a)-(b) occur during stealing and involve the home and remote cores.
+
+synchronization-free dataplanes provide substantial through-                  4.2       Z YG OS High-level Design
+put improvements over conventional operating systems.                         Z YG OS shares a number of architectural and implementation
+   We design Z YG OS, a single-address space operating sys-                   building blocks with IX [5]: each Z YG OS instance runs a
+tem for the latency-sensitive data services, components of                    single application in a single address space, and accesses
+large-scale, online, data-intensive applications. Our design                  the network through its dedicated NIC (physical or virtual
+does not make any client-side assumptions or require any                      function) with a dedicated IP address; each Z YG OS instance
+changes to the network protocol stack. We set the following                   runs on top of the Dune framework [4]; a separate control
+hard requirements for our system design:                                      plane can adjust resource allocations among instances.
+   (1) Designed for current-generation datacenter architec-                      Despite the lineage, Z YG OS is designed with radically
+tures: Xeon multicore processors, 10GbE+ NICs with state-                     different scheduling and communication principles than IX:
+less offloads, Ethernet connectivity.                                         IX is designed around a coherency-free execution model, i.e.,
+   (2) Build a robust, multi-core, work-conserving scheduler                  no cache-coherence traffic among cores is necessary, in the
+free of head-of-line blocking for event-driven applications.                  common case, to receive packets, open connections, or exe-
+   (3) Provide clean, ordering semantics of task-stealing oper-               cute application tasks; Z YG OS is optimized for task stealing
+ations to multi-threaded applications when handling back-to-                  which has intrinsic communication requirements. IX achieves
+back events for the same socket.                                              high throughput through adaptive batching, an approach that
+   (4) Minimally degrade the throughput of short tasks when                   ensures that a batch of packets is first carried through the
+compared with state-of-the-art, shared-nothing dataplanes.                    networking stack and then —without further buffering— pro-
+                                                                              cessed by the application; Z YG OS uses intermediate buffering
+  These hard requirements constrain the design space. While                   to enable stealing. Finally, IX is also designed around a run-
+commodity operating systems such as Linux meet require-
+                                                                              to-completion model where it alternates execution between
+ments #1 and #2, they provide only partial support for #3,
+                                                                              network processing and application execution, which cannot
+which we will discuss in §4.3. As discussed in §3, the strict                 be interrupted; Z YG OS relies on intermediate buffering and
+run-to-completion approach of dataplanes and their shared-                    IPIs to eliminate head-of-line blocking.
+nothing design is not an appropriate architectural foundation.                   Z YG OS achieves work-conservation with minimal through-
+We also rule out asymmetrical approaches which dedicate                       put impact by architecturally separating the execution stack
+some cores to specific purposes (such as network process-
+                                                                              into three distinct layers, illustrated in Figure 4:
+ing) as the partitioning of resources is highly sensitive to
+                                                                                 (1) the lower networking layer executes independently on
+assumptions on task granularities.                                            each core, in a coherency-free manner. This includes the hard-
+                                                                              ware/software driver layer, which relies on RSS to dispatch
+                                                                              flow-consistent traffic to one receive queue per core. This also
+
+
+
+
+                                                                        331
+SOSP ’17, October 28, 2017, Shanghai, China                                                      G.Prekas, M.Kogias and E.Bugnion
+
+includes the layer-4 TCP/IP and UDP/IP layer, all of their                 and the data structures of the shuffle queue that eliminates
+associated data structures, intermingled queues, and timers.               head-of-line blocking (§4.4).
+This design eliminates the need for any locking within the
+networking stack and ensures good cache locality.                          4.3    Ordering semantics in multi-threaded
+   (2) the intermediate shuffle layer introduces a new data                       applications
+structure per core: the shuffle queue is a single-producer,
+                                                                           When TCP sockets are statically assigned to threads, applica-
+multiple-consumer queue which contains the list of ready
+                                                                           tions can rely on intuitive ordering and concurrency seman-
+connections originating from a given core. Connections in the
+                                                                           tics [33]. The situation changes dramatically when sockets
+shuffle queue contain at least one outstanding event and can
+                                                                           can float across cores as the read system call is not commu-
+be consumed by the core that produced it —the home core—,
+                                                                           tative when two threads access the same socket. Even though
+or atomically stolen by another remote core.
+                                                                           the Linux system call epoll allows it, and was even recently
+   (3) the application execution layer manages the interac-
+                                                                           optimized for this use case [19], the implications on applica-
+tions between the kernel and the application through event
+                                                                           tions are far from trivial. Consider the case of back-to-back
+conditions and batched system calls [61]. Each core has its
+                                                                           messages sent to the same socket (e.g., two distinct RPC of
+own data structures and also operates in a coherency-free exe-
+                                                                           the memcached protocol) for a multi-threaded application
+cution manner within that layer. Obviously, the application
+                                                                           that uses the Linux-floating model of §3.3. Unless the applica-
+itself may have synchronization or shared-memory commu-
+                                                                           tion takes additional steps at user-level to synchronize across
+nication between cores and does not, in the general case,
+                                                                           requests, race conditions lead to broken parsing of requests,
+execute in a coherency-free manner.
+                                                                           out-of-order responses, or worse, intermingled responses on
+   Figure 4 shows the typical flow of events. Events numbered              the wire. As a practical manner, applications or frameworks
+(1) – (5) occur when the packet is processed on its home core              must, therefore, build their own synchronization and lock-
+(i.e., when no stealing occurs): (1) the driver dequeues packets           ing layer to eliminate these system races. This is sufficiently
+from the hardware ring into a software queue; (2) the TCP/IP               non-trivial that no known popular applications have done it to
+stack processes a batch of packets and enqueues ready con-                 date, to the best of our knowledge. A related approach is the
+nections into the shuffle queue; (3) the application execution             recent KCM kernel patch that provides a multiplexing layer
+layer dequeues the top entry, generates corresponding event                of messages to TCP connections [28, 29].
+conditions for the application and transfers execution to it.                 With its goal to ensure very fine-grain work-stealing, we
+This, in turn, generates batched, system calls; (4) some system            designed Z YG OS to free the application layer from the bur-
+calls may call back into the network stack leading to execution            den of synchronizing access to connection-oriented TCP/IP
+of timers and/or (5) packet transmits. While the control flow              sockets. In this case, Z YG OS has an ownership model that
+resembles that of IX, the data flow is distinct as the shuffle             ensures the events that relate to the same socket are implicitly
+queue breaks the run-to-completion assumptions as data is                  ordered without the need for synchronization: whenever the
+asynchronously produced into it and consumed from it.                      home core or a remote core grabs an event for processing
+   Figure 4 also shows the interactions during a steal as the              at the application layer, it grabs the exclusive access to the
+steps (a)-(b) in red. Consider the case where the remote core              socket until the event execution has completed, including
+has no pending packets in the hardware queue, no pending                   sending the replies on the TCP socket.
+packets in the software queue and no pending events in its
+shuffle queue. In step (a), it can then steal from another shuffle         4.4    Eliminating Head-of-Line Blocking
+queue, which leads to the normal execution of the events in                The ordering semantics of §4.3 introduce a substantial compli-
+userspace, as step (3). The resulting batched system calls                 cation to the design of the shuffle queue. Z YG OS eliminates
+that relate to the networking stack are then enqueued for                  head-of-line blocking by grouping events in the home core by
+processing back at the home core in a multiple-producer,                   socket. The shuffle queue has the ordered subset of sockets
+single-consumer queue, shown in step (b). Similar to the TCP               that are (a) not currently being processed on a core and (b)
+input path, the TCP output path therefore also executes in a               have pending data. The event queues are held in the per-socket
+coherency-free manner on the home core.                                    protocol control block (PCB). While it offers strong ordering
+   Figure 4 is only a high-level illustration of the system. In            semantics to applications, this pre-sorting step does have an
+Z YG OS, each core is the home core of a set of flow-groups,               implication on the global order of packets, which is no longer
+as defined by the NIC RSS configuration and can act as the                 guaranteed to be FCFS.
+remote core for any other flow whenever it is idle. We now                    Figure 5 shows the state machine diagram that controls the
+describe the ordering semantics that enable stealing (§4.3)                decisions for each socket. Changes to the state machine and
+                                                                           to the shuffle queue are atomic.
+
+
+
+
+                                                                     332
+ZygOS: Achieving Low Tail Latency for µs-scale Networked Tasks                     SOSP ’17, October 28, 2017, Shanghai, China
+
+
+Busy
+                                                                          before network processing as well as after application execu-
+                                                                          tion, since network processing explicitly takes place in the
+                                    Batched                               home core.
+                                                       Remote
+    Event              app          syscalls                                 First, consider the case where packets are available for
+                                                       batched
+  Conditions                                           syscalls           network processing in the hardware NIC queue but the shuffle
+                                                                          queue is empty. This is the queue shown around step (1) in
+                                                                          Figure 4. As long as that core is executing application code,
+                                                                          no remote core can steal the task. Idle cores poll both software
+         dequeue                                                          and hardware remote packets queues. If pending packets exist,
+                                                                          it sends an IPI to the remote core can force the execution of
+                                 pending
+                                 events?
+                                                                          the networking stack, which replenishes the shuffle queue.
+                                               no
+                         yes                                                 Second, remote batched system calls are enqueued by the
+                                                                          remote core for execution on the home core (shown as step
+                                                                          (b) of Fig 4). In a cooperative model, these system calls are
+                                                                          only executed after the completion of application code, which
+              Ready                             Idle                      unfortunately directly impacts RPC latency as some of these
+                               enqueue                                    system calls write responses on the socket. Here also, an IPI
+                               on tcp-in                                  ensures the timely execution of these remote system calls.
+          home core                         remote core                      The shared IPI handler, therefore, performs two simple
+                                                                          tasks when interrupting user-level execution: (1) process in-
+Figure 5: Connection state machine transitions for the                    coming packets if the shuffle queue is empty and (2) execute
+general case where an event is executed on a remote core                  all remote system calls and transmit outgoing packets on the
+(in blue). The connection is present in the shuffle queue                 wire. The IPI interrupts only user-level execution since kernel
+exactly once when it is in the “ready” state, and never                   processing is short and bounded. The kernel executes with
+otherwise.                                                                interrupts disabled, thus avoiding starvation or reentrancy
+                                                                          issues in the TCP/IP stack.
+
+
+      • idle: Sockets in this state have no pending incoming              5   IMPLEMENTATION
+        events, events currently processed by the application,            The system architecture of Z YG OS is derived from the IX
+        or outgoing batched system calls.                                 open-source release v1.0 [53]: it relies on hardware virtualiza-
+      • ready: The socket has pending incoming events, but is             tion and the Dune framework [4] to host a protected operating
+        not currently being processed by the application and              system with direct access to VMX non-root mode ring 0 in the
+        has no pending system calls.                                      x86-64 architecture [66]. The kernel links in with DPDK [14]
+      • busy: The socket is associated with an execution core,            for NIC drivers and lwIP for TCP/IP [17]. The modifications
+        which is either the home or remote core.                          to the application libraries are minor, but the kernel changes
+   The execution core dequeues the first ready connection and             are extensive. Specifically, we modified ∼2000 LOC of the
+creates the event conditions for the application. As previously           IX kernel and ∼200 LOC of Dune. While we retain the tight
+discussed, system calls are returned back to the home core                code base of IX, we revisit many of its fundamental design
+for processing. System calls may each generate asynchronous               assumptions and principles.
+responses for that socket. After the execution of all system
+                                                                          The shuffle layer: We chose a simple implementation to
+calls, the socket transitions either into the idle state if there
+                                                                          ensure the atomic transitions described in §4.4. There is one
+is nothing further to process or into the ready state otherwise.
+                                                                          spinlock per core which protects the shuffle queue of that
+In the latter case, the PCB is once-again enqueued into the
+                                                                          core as well as the state machine transitions for sockets that
+shuffle queue.
+                                                                          call that core home. The lightweight nature of the operations
+                                                                          that access it makes such a coarse-grain approach possible.
+4.5     Inter-processor Interrupts                                        Remote cores rely on trylock for their steal attempts to
+The design in §4.4 eliminates head-of-line blocking concerns              further reduce contention. Each PCB maintains a distinct
+from the shuffle queue itself. In a purely cooperative imple-             event queue of pending events. This is a single-producer (the
+mentation of Z YG OS, the cores poll on each other’s data                 home core) and single consumer (the execution core) queue,
+structures, which causes head-of-line blocking situations both            implemented with one spinlock per PCB. The transitions from
+
+
+
+
+                                                                    333
+SOSP ’17, October 28, 2017, Shanghai, China                                                      G.Prekas, M.Kogias and E.Bugnion
+
+the busy state must test whether the PCB queue is empty and               6.1     Synthetic micro-benchmarks
+must first grab that lock.                                                Figure 6 shows the latency vs. throughput of the three syn-
+                                                                          thetic micro-benchmarks of §3. We compare Z YG OS with
+Idle loop polling logic: The core design principle of Z YG OS             existing systems (IX and Linux) as well as the theoretical
+is to ensure that an idle core will aggressively identify pending         performance of a zero-overhead M/G/16/FCFS model for two
+work. A core is idle when its shuffle queue, remote batch                 granularities of interest, namely 10µs and 25µs. We observe
+system call queue, and software raw packet queue are all
+                                                                          that:
+empty. When it enters its idle mode, it starts to poll a sequence
+of memory locations, all of which are reads from cacheable
+locations. These locations include, in order of priority (a)                    • Z YG OS and Linux-floating both approximate
+the head of its own NIC hardware descriptor ring, (b) the                         the theoretical model, with Z YG OS substantially reduc-
+shuffle queue of all other cores, (c) the head of all unprocessed                 ing tail latency over IX;
+software packet queues of all other cores, and (d) the head of                  • Z YG OS and IX have comparable throughput, even for
+the NIC hardware descriptor of all other cores. For steps (b-c-                   tasks as small as 10µs; both clearly outperform Linux;
+d), the order of access is randomized. While heuristics could                   • for the exponential distribution, Z YG OS achieves 75%
+tradeoff a reduction of interrupts for a slight degree of non-                    throughput efficiency at the SLO at 10 × S¯ for S¯ = 10µs
+work conservation, our current implementation aggressively                        (Figure 6b) and 88% for S¯ = 25µs (Figure 6e);
+sends interrupts as soon as a remote core detects a pending                     • interrupts are necessary to eliminate head-of-line block-
+packet in the hardware queue and the home core is executing                       ing with medium and high dispersion workloads, and
+at user-level.                                                                    the cooperative model of Zygos-no-interrupts,
+                                                                                  which is typical of pure user-level application, visibly
+Exit-less Inter-processor Interrupts: Z YG OS relies on inter-                    impacts tail latency.
+processor interrupts to force a home core to process pending
+packets identified in steps (c) and (d) of the idle loop and to
+execute remote system calls back on the home core. Using an               Efficiency for the 10 × S¯ tail latency SLO: Figure 7 reports
+approach similar to ELI [22], we added support in Dune for                the efficiency (in terms of max load at SLO) as a function
+exit-less interrupts in non-root mode, based on the assump-               of task size. We compare Z YG OS with the baseline shown
+tion that Z YG OS kernel’s interrupt handler will redirect to the         in Figure 3. We note the reduced X-axis truncated to 50µs
+Linux host operating system the interrupts that are destined to           for visibility; efficiency is stable beyond that point. Z YG OS
+it. There is, however, no guarantee that the destination CPU              clearly outperforms IX and Linux for any tasks sizes ≥5
+will be VMX non-root mode when it receives the interrupt.                 µs and all three distributions for such a tight SLO. Z YG OS
+We use interrupt 242, which is also used by KVM [30]. Inter-              reaches 90% of the maximum possible load as determined
+rupts received in root-mode are simply ignored by the KVM                 by the zero-overhead centralized-FCFS theoretical model
+handler. As interrupts are used exclusively as hints, the unre-           for tasks ≥30µs for the deterministic distribution, ≥40µs for
+liability of delivery impacts tail latency, but not correctness.          exponential and ≥40µs for bimodal-1.
+
+Control plane interactions: The IX control plane implement                How much task stealing occurs?: Figure 8 provides an in-
+energy proportionality or workload consolidation by dynami-               sight into the rate of stealing events as a function of load. The
+cally adjusting processor frequency and core allocation [54].             results are for the exponential distribution of Figure 6e but
+It operates in conjunction with the IX dataplane, which re-               are remarkably similar for other distributions and timescales.
+programs the NIC RSS settings. In principle, Z YG OS is com-              As expected, there are few steals at low loads as more cores
+patible with these RSS settings changes, although policies                are near idle, and no steals at saturation as all cores are busy
+and mechanisms would have to be adjusted as Z YG OS in-                   processing their own queue.
+troduces new forms of buffering. We leave the evaluation of                  Without interrupts, temporary imbalances lead to a steal
+these interactions to future work.                                        rate that peaks at ∼33%. This rate is consistent with the peak
+                                                                          of ∼35% measured in a discrete event simulator that emulates
+                                                                          the shuffle queue in a cooperative model without interrupts.
+6   EVALUATION                                                            Interrupts, —which are necessary to eliminate head-of-line
+We use the same experimental setup explained in Section 3 to              blocking—, substantially increase the steal rate. At the peak,
+evaluate Z YG OS in a series of microbenchmarks, use mem-                 which corresponds to 77% of saturation, steals, and therefore
+cached [43] to evaluate overheads on tiny tasks, and with a               interrupts are very frequent. Stealing opportunities become
+real application running TPC-C [64].                                      less frequent as the load further increases.
+
+
+
+
+                                                                    334
+ZygOS: Achieving Low Tail Latency for µs-scale Networked Tasks                                                                       SOSP ’17, October 28, 2017, Shanghai, China
+
+
+                                             SLO           Linux (floating connections)               IX         ZygOS (no interrupts)             ZygOS                   Theoretical M/G/16/FCFS
+
+                      140                                                            140                                                               140
+
+                      120                                                            120                                                               120
+
+                      100                                                            100                                                               100
+       Latency (µs)
+
+
+
+
+                       80                                                                 80                                                            80
+
+                       60                                                                 60                                                            60
+
+                       40                                                                 40                                                            40
+
+                       20                                                                 20                                                            20
+
+                          0                                                               0                                                              0
+                              0.00   0.25     0.50 0.75 1.00 1.25          1.50                0.00   0.25   0.50 0.75 1.00 1.25           1.50              0.00   0.25        0.50 0.75 1.00 1.25              1.50
+                                                 Throughput (MRPS)                                             Throughput (MRPS)                                                  Throughput (MRPS)
+
+                                          (a) Fixed (S¯ = 10µs)                                       (b) Exponential (S¯ = 10µs)                                    (c) Bimodal-1 (S¯ = 10µs)
+
+
+                      350                                                            350                                                               350
+
+                      300                                                            300                                                               300
+
+                      250                                                            250                                                               250
+       Latency (µs)
+
+
+
+
+                      200                                                            200                                                               200
+
+                      150                                                            150                                                               150
+
+                      100                                                            100                                                               100
+
+                       50                                                                 50                                                            50
+
+                          0                                                                0                                                             0
+                              0.0     0.1      0.2    0.3    0.4   0.5      0.6                0.0    0.1     0.2   0.3    0.4   0.5        0.6               0.0   0.1         0.2   0.3    0.4   0.5           0.6
+                                                 Throughput (MRPS)                                             Throughput (MRPS)                                                 Throughput (MRPS)
+
+                                          (d) Fixed (S¯ = 25µs)                                       (e) Exponential (S¯ = 25µs)                                    (f) Bimodal-1 (S¯ = 25µs)
+
+Figure 6: 99t h percentile tail latency according to throughput for three distributions, each with 10µs and 25µs mean task
+granularity. The horizontal line corresponds to the SLO of ≤ 10 × S.  ¯
+
+
+                                          M/G/16/FCFS              16xM/G/1/FCFS                ZygOS            Linux (floating connections)            IX               Linux (partitioned connections)
+
+
+       1.0                                                                          1.0                                                                 1.0
+
+
+       0.8                                                                          0.8                                                                 0.8
+
+
+       0.6                                                                          0.6                                                                 0.6
+Load
+
+
+
+
+       0.4                                                                          0.4                                                                 0.4
+
+
+       0.2                                                                          0.2                                                                 0.2
+
+
+       0.0                                                                          0.0                                                                 0.0
+                      0              10         20        30          40       50          0            10       20        30         40          50           0           10        20        30           40          50
+                                               Service time (µs)                                                Service time (µs)                                                   Service time (µs)
+
+                                          (a) Deterministic                                                  (b) Exponential                                                      (c) Bimodal-1
+
+Figure 7: Maximum load that meets the SLO of the 99th percentile ≤ 10 × S.
+                                                                        ¯ The grey lines correspond to the ideal upper
+bounds of the two theoretical, zero-overheads, models (centralized-FCFS and partitioned-FCFS).
+
+
+
+
+                                                                                                                 335
+SOSP ’17, October 28, 2017, Shanghai, China                                                                        G.Prekas, M.Kogias and E.Bugnion
+
+                     60         ZygOS                                                        improves throughput but at an increase in tail latency. Such
+                                ZygOS (no interrupts)                                        a behaviour is hard to restrict since Z YG OS doesn’t know
+                     50
+                                                                                             the boundaries of the requests in the TCP byte stream. Linux
+Steals / event (%)
+
+
+
+
+                     40                                                                      applications which use KCM sockets [28] can potentially
+                                                                                             handle this situation.
+                     30
+
+
+                     20                                                                      6.3    A real application: Silo running TPC-C
+                     10
+                                                                                             We validate the tail latency benefits of Z YG OS using Silo [65],
+                                                                                             a state-of-the-art in-memory database optimized for multicore
+                      0                                                                      scalability.
+                          0.0      0.1         0.2         0.3       0.4   0.5   0.6
+                                                     Throughput (MRPS)
+                                                                                                6.3.1 Application setup. Silo was originally implemented
+                                                                                             and evaluated as a library linked in with the benchmark. In the
+Figure 8: Normalized rate of stealing vs throughput for                                      original evaluation, each thread runs as a closed loop issuing
+exponential service time with mean 25 µs                                                     transaction requests, and in particular the TPC-C mix.
+                                                                                                We ported Silo to run as a networked server accepting
+6.2                       Overheads of Z YG OS on tiny tasks:                                requests over sockets. We replaced the main loop of Silo with
+                                                                                             an event loop, which we used to run the workload on top of
+                          memcached                                                          Linux, IX, and Z YG OS. The workload uses mutilate [34] with
+We compare the overheads of Z YG OS to IX for tiny tasks                                     the same setup described in §3.2 to initiate transactions that
+with the goal of identifying the task granularity where the                                  then execute totally within the database server. Each remote
+sweeping simplifications of shared-nothing dataplanes such as                                procedure call generates one transaction from the TPC-C mix
+IX noticeably improve throughput. We use memcached as an                                     of requests.
+application (< 2µs mean task size), and use the methodology                                     We did not attempt to implement a marshalling of the full
+and reproduce the results from IX [5]. We consider mem-                                      SQL queries and their responses, e.g., over a JDBC-like pro-
+cached a near worst case for Z YG OS as the application has                                  tocol, as this falls outside the scope of the research question.
+very small task size with a small dispersion best approximated                               We also note that Silo has a garbage-collection phase tied to
+by a deterministic distribution.                                                             its epoch-based commit protocol, which introduces a periodic
+   Figure 9 shows the latency vs. throughput for the USR                                     barrier for all threads, with transaction latencies exceeding
+and ETC workloads, [1], as modelled by mutilate [34]. We                                     1ms. We disabled garbage collection for our measurements
+compare Linux, Z YG OS, and IX. For IX, we choose two con-                                   as it adds experimental variability, especially at the 99th per-
+figurations: with adaptive batching disabled (B=1) and with                                  centile, depending on the experiment (and that taming the
+adaptive batching enabled with the default setting (B=64).                                   tail latency impact of Silo’s GC also falls clearly outside the
+   First, we observe that Z YG OS and IX both clearly outper-                                scope of this work)
+form Linux. We then note that for this particular SLO (500
+µs), Z YG OS outperforms IX with batching disabled but lags                                     6.3.2 Results. Figure 10a shows the complementary cu-
+behind IX with adaptive bounded batching. IX implements                                      mulative distribution of service time for the TPC-C bench-
+a strict run-to-completion model bounded by the batch size                                   mark for each of the five transaction types of the benchmark as
+(B). Z YG OS currently implements adaptive bounded batching                                  well as the mix. The results were computed using Silo’s mas-
+only on the receive path. It then processes events individually,                             ter branch [60], with Silo locally driving the TPC-C bench-
+interleaving between user and kernel code. While this hurts                                  mark. There is, therefore, no network activity, and indeed
+cache locality, it avoids head-of-line blocking. Similarly, it                               nearly no operating system activity. We run with GC disabled
+eagerly sends packets through the TX TCP/IP path and the                                     across all 16 hardware threads of a single CPU socket. The
+NIC, also to avoid head-of-line blocking.                                                    Figure reports the service time rather than that the end-to-end
+   Of note, Z YG OS has a differently shaped latency vs through-                             latency (i.e., it excludes any queueing delays).
+put curve for this workload. As described in §4.3 and §4.4,                                     In this setup, the achieved transaction rate was 460 KTPS,
+Z YG OS does not respect strict FIFO ordering on servicing                                   which corresponds to the maximal throughput of the appli-
+packets across different connections. For this workload con-                                 cation, excluding any SLO and operating system overheads.
+figuration, up to four distinct memcached requests can be                                    Note that this TPS is consistent with the reported results in
+pipelined onto the same connection. The resulting reordering                                 [65], given the differences in thread counts and processors.
+leads to a form of implicit batching of events, but only for                                 For the full mix, the average service time is 33µs, the me-
+those corresponding to the same flow. This implicit batching                                 dian is 20µs, and the 99th percentile is 203µs. The figure
+
+
+
+
+                                                                                       336
+ZygOS: Achieving Low Tail Latency for µs-scale Networked Tasks                                                                          SOSP ’17, October 28, 2017, Shanghai, China
+
+
+                                                                    Linux           IX B=1             ZygOS                            IX B=64          SLO
+
+
+                  700                                                                                                 700
+
+                  600                                                                                                 600
+
+                  500                                                                                                 500
+   Latency (µs)
+
+
+
+
+                                                                                                       Latency (µs)
+                  400                                                                                                 400
+
+                  300                                                                                                 300
+
+                  200                                                                                                 200
+
+                  100                                                                                                 100
+
+                    0                                                                                                   0
+                            0               1             2                     3                                               0              1         2           3             4         5          6
+                                                  Throughput (MRPS)                                                                                          Throughput (MRPS)
+
+                                                  (a) ETC                                                                                                    (b) USR
+
+          Figure 9: 99t h percentile tail latency vs. throughput for two memcached workloads for Linux, IX and, Z YG OS.
+
+
+                  100
+                                                                                    99th percentile                   1400                SLO
+                                                                                    OrderStatus                                           Linux
+                                                                                    Payment                           1200                IX
+                  10-1                                                                                                                    ZygOS
+                                                                                    NewOrder
+                                                                                                                      1000
+                                                                                    StockLevel
+                                                                                                       Latency (µs)
+
+
+
+
+                                                                                    Delivery
+        CCDF
+
+
+
+
+                                                                                                                       800
+                  10-2                                                              Mix
+                                                                                                                       600
+
+                  10-3                                                                                                 400
+
+                                                                                                                       200
+
+                       -4
+                  10                                                                                                        0
+                             0        100        200             300          400            500                                    0     50       100       150     200     250       300       350   400
+                                                       Service time (µs)                                                                                      Throughput (KRPS)
+
+                            (a) Complementary CDF of task execution time (Linux)                                                (b) 99th percentile end-to-end latency vs. throughput
+
+                                                                Figure 10: Silo running the TPC-C benchmark.
+
+                  System          Max load@SLO           Speedup               Tail Lat.@50%                                        Tail Lat.@75%                        Tail Lat.@90%
+                  Linux             211 KTPS              1.00×            310µs (1.5×) @111 KTPS                               335µs (1.6×)@156 KTPS                356µs (1.8×) @189 KTPS
+                  IX                267 KTPS              1.26×            379µs (1.9×) @133 KTPS                               530µs (2.6×)@200 KTPS                774µs (3.8×) @256 KTPS
+                  Zygos             344 KTPS              1.63×            265µs (1.3×) @178 KTPS                               279µs (1.4×)@266 KTPS                323µs (1.6×) @311 KTPS
+Table 1: Maximum throughput under the SLO of 1000 µs and respective latencies at approximately 50%, 75%, and
+90% of that load for each Silo running the TPC-C benchmark. The number in the parentheses is the ratio of the 99th
+percentile end-to-end latency to Silo’s 99th percentile service time (203µs).
+
+
+
+clearly shows that Silo’s service time distribution is overall                                                                  • Z YG OS can support 344 KTPS without violating the
+multi-modal with small task granularity in the µs-scale.                                                                          SLO; this corresponds to a speedup of 1.63× over
+   Figure 10b shows the tail latency at the 99t h percentile for                                                                  Linux. This demonstrates the benefits of our approach
+Silo as a function of the load. To compare maximum loads,                                                                         for real-life in-memory applications. The achieved trans-
+we selected a stringent SLO of 1000µs, which corresponds                                                                          action rate corresponds to 75% of the ideal, zero-overhead
+to ∼33× the average and ∼5× the 99t h percentile tail latency.                                                                    load with no SLO restrictions.
+We observe:
+
+
+
+
+                                                                                                      337
+SOSP ’17, October 28, 2017, Shanghai, China                                                  G.Prekas, M.Kogias and E.Bugnion
+
+    • This rate also corresponds to a speedup of 1.26× over            a connection to be served by any available core. Hanford
+      IX. Z YG OS’s work-conserving scheduler and its ability          et al. [24] investigated the impact of affinity on application
+      to rebalance requests across cores avoids SLO viola-             throughput and proposed to distribute packet processing tasks
+      tions until the system becomes CPU bound on all cores.           across multiple CPU cores to improve CPU cache hit ratio.
+   Table 1 further quantifies the benefits of Z YG OS in terms         Although our work does not consider cache effects, we also
+of throughput at SLO and tail latency at a specific fraction           conclude that strict request affinity can harm performance.
+of their respective maximum load. Z YG OS and Linux both
+                                                                       Traditional multi-threading model: Operating systems pre-
+deliver low end-to-end tail latencies for up to 90% of their
+                                                                       emptive schedulers such as CFS [8], BVT [16] favor latency-
+respective capacity: 1.6× the 99t h percentile service time
+                                                                       sensitive tasks. Applications can benefit from multithreading
+for Z YG OS and 1.8× for Linux. This is anticipated by the
+                                                                       to lower tail latency of completion of tasks when the granular-
+centralized-FCFS model. In contrast, as anticipated by the
+                                                                       ity is a multiple of the scheduling quantum and the distribution
+partitioned-FCFS model, IX delivers substantially higher tail
+                                                                       has a high dispersion.
+latencies, e.g.,1.9× when operating at half capacity, 2.6× at
+75% capacity, and 3.8× at 90% capacity.                                Shared-nothing dataplanes architectures: Systems such as
+                                                                       Arrakis [51], IX [5], mTCP [26], MICA [39], Seastar [59]
+7   DISCUSSION: THE IMPACT OF SLO ON                                   and Sandstorm [42] bypass the kernel(via frameworks such
+    SYSTEMS                                                            as DPDK [14] or netmap [56]) and rely on NIC RSS to
+The choice of an SLO is driven by application requirements             partition flows among cores. These shared-nothing architec-
+and scale, with the intuitive understanding that a more strin-         tures (at the system-level) with run-to-completion approaches
+gent SLO reduces the delivery capacity of the system. We               completely eliminate the need to make scheduling decisions.
+show that the choice of an SLO also informs on the choice of           These sweeping simplifications noticeably increase through-
+the underlying operating system and scheduling strategy.               put but are oblivious to temporary imbalances across cores.
+   Figure 11 illustrates the tradeoff through the latency vs.          MICA uses a client-side randomizing protocol (CREW or
+throughput curves for the synthetic benchmark of §6.1 with             CRCW) to eliminate some causes for persistent imbalances
+an exponential service time of S¯ =10 µs. Figure 11a and               among cores but does not address temporary imbalances.
+11b actually show the results of the same experiment but               Decibel [45] and Reflex [31] are designed for storage disag-
+on two different Y-axis corresponding to two different SLO.            gregation, depend on the shared-nothing assumption and sim-
+Z YG OS consistently shines on the more stringent SLO of               ilarly do not handle imbalance. Z YG OS is designed to elim-
+100µs (Figure 11a, 10 × S) ¯ as the work-conserving scheduler          inate such cases of imbalance though work-stealing. RAM-
+tames the tail latency, followed by IX with batching disabled.         cloud clients leverage RDMA hardware to bypass the kernel
+For this SLO, IX (with batching enabled) consistently delivers         and communicate with a cluster of RAMcloud servers, with
+the highest tail latency and violates the SLO with the lowest          an asymmetric, push-based approach to task scheduling [48].
+throughput.                                                            Z YG OS works with commodity Ethernet NICs and handles
+   However, for a more lenient SLO (Figure 11b, 100 × S),   ¯          I/O and protocol processing symmetrically on all cores, with
+IX’s adaptive batching delivers marginally higher throughput           a pull-based, work-stealing scheme for task execution.
+than Z YG OS before violating the SLO.
+                                                                       Work-stealing within applications: This commonly-used
+8   RELATED WORK                                                       technique that has been mostly implemented either within
+                                                                       the application or in a userspace run-time that runs on top of
+                                                                       the operating system. Run-times such as Intel’s Cilk++, In-
+Traditional event-driven models: This is the de-facto stan-
+                                                                       tel’s C++ Threading Building Blocks (TBB), Java’s Fork/Join
+dard approach for online data-intensive services with high
+                                                                       Framework and OpenMP implement work-stealing schemes.
+connection fan-in. On Linux, the use of the epoll has sub-
+                                                                       Optimizing or building such run-times has also been stud-
+stantially improved system scalability. While epoll can be
+                                                                       ied intensely academically, e.g., [9, 11, 13]. Statically map-
+used in a floating model, and the recent epoll-exclusive
+                                                                       ping connections to cores can result in load imbalance in
+eliminates thundering herds [19], applications must still rely
+                                                                       event-based programs and requires a solution at the library
+on additional, complex synchronization to take advantage of
+                                                                       level [21, 73]. Recent focus on work stealing for latency-
+the feature. Z YG OS delivers built-in, ordered semantics that
+                                                                       critical applications is at coarser timescales. [25, 35, 71]. The
+guarantee that the replies from back-to-back remote procedure
+                                                                       prior work largely targets applications with millisecond-scale
+calls on the same socket will be returned in order. However,
+                                                                       task granularities that are easily accommodated by conven-
+unlike the case of Affinity-accept [50] where each connection
+                                                                       tional operating systems. Z YG OS implements work-stealing
+remains local to the core that accepted it, Z YG OS enables
+
+
+
+
+                                                                 338
+ZygOS: Achieving Low Tail Latency for µs-scale Networked Tasks                                                  SOSP ’17, October 28, 2017, Shanghai, China
+
+
+
+                   140                                                                             1400          SLO
+                                                                                                                 IX B=64
+                   120                                                                             1200          IX B=1
+                                                                                                                 ZygOS
+                   100                                                                             1000
+    Latency (µs)
+
+
+
+
+                                                                                    Latency (µs)
+                    80                                                                              800
+
+                    60                                                                              600
+
+                    40                                                                              400
+
+                    20                                                                              200
+
+                    0                                                                                0
+                         0.0   0.2   0.4        0.6        0.8    1.0   1.2   1.4                         0.0     0.2      0.4      0.6       0.8    1.0    1.2      1.4
+                                              Throughput (MRPS)                                                                  Throughput (MRPS)
+
+                                           (a) 100 µs SLO                                                                   (b) 1000 µs SLO
+
+Figure 11: Comparison of IX (batch size 1 and 64) and Z YG OS for a deterministic service time of 10 µs and 2 different
+SLOs.
+
+within the operating system itself for network-driven to elimi-                                    ACKNOWLEDGEMENTS
+nate both persistent and temporary imbalances and is suitable                                      We thank Katerina Argyraki, Ashvin Goel, James Larus, the
+for µs-scale tasks. As an operating system, Z YG OS’s use                                          SOSP anonymous reviewers and our shepherd Ion Stoica for
+of IPIs eliminates all cooperative multitasking assumptions                                        their detailed comments. Moreover, we would like to thank
+between the threads.                                                                               Christos Kozyrakis and Mia Primorac for participating in
+                                                                                                   many early discussions that lead to Z YG OS. Finally, we grate-
+Cluster-level work-stealing: Finally, load imbalance has                                           fully acknowledge Adrien Ghosn and Utku Sirin that helped
+been extensively studied at cluster-scale. Lu et al. [40] pro-                                     understanding Silo and setting up the related experiments.
+posed a 2-level load balancing scheme based on the power                                              This work was funded in part by the Microsoft-EPFL Joint
+of two to load balance traffic towards the front-end of cloud
+                                                                                                   Research Center, the NanoTera YINS project, and a VMware
+services. Sparrow [49] also relies on power-of-two choices
+                                                                                                   Research Grant. George Prekas is supported by a Google
+for batch job scheduling. Google’s Maglev [18] is a generic                                        Graduate Research Fellowship.
+distributed network load balancer that leverages consistent
+hashing to load balance packets across the corresponding                                           REFERENCES
+services.
+                                                                                                    [1] ATIKOGLU , B., X U , Y., F RACHTENBERG , E., J IANG , S., AND
+                                                                                                        PALECZNY, M. Workload analysis of a large-scale key-value store. In
+                                                                                                        Proceedings of the 2012 ACM SIGMETRICS International Conference
+                                                                                                        on Measurement and Modeling of Computer Systems (2012), pp. 53–64.
+                                                                                                    [2] BARROSO , L. A., C LIDARAS , J., AND H ÖLZLE , U. The Datacenter
+9          CONCLUSION                                                                                   as a Computer: An Introduction to the Design of Warehouse-Scale Ma-
+We presented Z YG OS, a work-conserving operating system                                                chines, Second Edition. Synthesis Lectures on Computer Architecture.
+designed for latency-critical, in-memory applications with                                              Morgan & Claypool Publishers, 2013.
+                                                                                                    [3] BARROSO , L. A., M ARTY, M., PATTERSON , D., AND R AN -
+high connection fan-in, high requests rates, and short individ-                                         GANATHAN , P. Attack of the killer microseconds. Commun. ACM 60,
+ual task execution times. Z YG OS applies some well-proven                                              4 (2017), 48–54.
+work-stealing ideas within the framework of an execution                                            [4] B ELAY, A., B ITTAU , A., M ASHTIZADEH , A. J., T EREI , D., M AZ -
+environment but avoids the fundamental limitations of dat-                                              IÈRES , D., AND K OZYRAKIS , C. Dune: Safe User-level Access to
+
+aplane designs with static partitioning of connections. We                                              Privileged CPU Features. In Proceedings of the 10th Symposium on
+                                                                                                        Operating System Design and Implementation (OSDI) (2012), pp. 335–
+validate our ideas on a series of synthetic microbenchmarks                                             348.
+(with known theoretical bounds) and with a state-of-the-art,                                        [5] B ELAY, A., P REKAS , G., P RIMORAC , M., K LIMOVIC , A., G ROSS -
+in-memory transactional database. Z YG OS demonstrates that                                             MAN , S., K OZYRAKIS , C., AND B UGNION , E. The IX Operating
+it is possible to schedule µs-scale tasks on multicore sys-                                             System: Combining Low Latency, High Throughput, and Efficiency
+tems to deliver high throughout together with low tail latency,                                         in a Protected Dataplane. ACM Trans. Comput. Syst. 34, 4 (2017),
+                                                                                                        11:1–11:39.
+nearly up to the point of saturation.                                                               [6] B RONSON , N., A MSDEN , Z., C ABRERA , G., C HAKKA , P., D IMOV,
+                                                                                                        P., D ING , H., F ERRIS , J., G IARDULLO , A., K ULKARNI , S., L I ,
+
+
+
+
+                                                                              339
+SOSP ’17, October 28, 2017, Shanghai, China                                                                    G.Prekas, M.Kogias and E.Bugnion
+
+     H. C., M ARCHUKOV, M., P ETROV, D., P UZAR , L., S ONG , Y. J.,                [25] H AQUE , M. E., E OM , Y. H., H E , Y., E LNIKETY, S., B IANCHINI , R.,
+     AND V ENKATARAMANI , V. TAO: Facebook’s Distributed Data Store                      AND M C K INLEY, K. S. Few-to-Many: Incremental Parallelism for Re-
+     for the Social Graph. In Proceedings of the 2013 USENIX Annual                      ducing Tail Latency in Interactive Services. In Proceedings of the 20th
+     Technical Conference (ATC) (2013), pp. 49–60.                                       International Conference on Architectural Support for Programming
+ [7] 10 thousand connections problem. http://www.kegel.com/c10k.html,                    Languages and Operating Systems (ASPLOS-XX) (2015), pp. 161–175.
+     1999.                                                                          [26] J EONG , E., W OO , S., JAMSHED , M. A., J EONG , H., I HM , S., H AN ,
+ [8] Linux cfs scheduler. https://www.kernel.org/doc/Documentation/                      D., AND PARK , K. mTCP: a Highly Scalable User-level TCP Stack
+     scheduler/sched-design-CFS.txt.                                                     for Multicore Systems. In Proceedings of the 11th Symposium on
+ [9] C HASE , D., AND L EV, Y. Dynamic circular work-stealing deque. In                  Networked Systems Design and Implementation (NSDI) (2014), pp. 489–
+     Proceedings of the 17th ACM Symposium on Parallelism in Algorithms                  502.
+     and Architectures (SPAA) (2005), pp. 21–28.                                    [27] K APOOR , R., P ORTER , G., T EWARI , M., VOELKER , G. M., AND
+[10] C LEMENTS , A. T., K AASHOEK , M. F., Z ELDOVICH , N., M ORRIS ,                    VAHDAT, A. Chronos: predictable low latency for data center ap-
+     R. T., AND KOHLER , E. The Scalable Commutativity Rule: Designing                   plications. In Proceedings of the 2012 ACM Symposium on Cloud
+     Scalable Software for Multicore Processors. ACM Trans. Comput. Syst.                Computing (SOCC) (2012), p. 9.
+     32, 4 (2015), 10:1–10:47.                                                      [28] Kernel connection multiplexer. https://lwn.net/Articles/657999/, 2015.
+[11] C ONTRERAS , G., AND M ARTONOSI , M. Characterizing and improv-                [29] Kernel connection multiplexer patch. https://lwn.net/Articles/657970/,
+     ing the performance of Intel Threading Building Blocks. In Proceedings              2015.
+     of the 2008 IEEE International Symposium on Workload Characteriza-             [30] K IVITY, A., K AMAY, Y., L AOR , D., L UBLIN , U., AND L IGUORI , A.
+     tion (IISWC) (2008), pp. 57–66.                                                     kvm: the Linux virtual machine monitor. In Proceedings of the Linux
+[12] D EAN , J., AND BARROSO , L. A. The tail at scale. Commun. ACM 56,                  symposium (2007), vol. 1, pp. 225–230.
+     2 (2013), 74–80.                                                               [31] K LIMOVIC , A., L ITZ , H., AND KOZYRAKIS , C. ReFlex: Remote Flash
+[13] D INAN , J., L ARKINS , D. B., S ADAYAPPAN , P., K RISHNAMOORTHY,                   ≈ Local Flash. In Proceedings of the 22nd International Conference
+     S., AND N IEPLOCHA , J. Scalable work stealing. In Proceedings of the               on Architectural Support for Programming Languages and Operating
+     2009 ACM/IEEE Conference on Supercomputing (SC) (2009).                             Systems (ASPLOS-XXII) (2017), pp. 345–359.
+[14] Data plane development kit. http://www.dpdk.org/.                              [32] L AADAN , O., N IEH , J., AND V IENNOT, N. Structured linux kernel
+[15] D RAGOJEVIC , A., NARAYANAN , D., C ASTRO , M., AND H ODSON , O.                    projects for teaching operating systems concepts. In Proceedings of
+     FaRM: Fast Remote Memory. In Proceedings of the 11th Symposium                      the 42nd ACM Technical Symposium on Computer Science Education
+     on Networked Systems Design and Implementation (NSDI) (2014),                       (SIGCSE) (2011), pp. 287–292.
+     pp. 401–414.                                                                   [33] L EUNG , K.-C., L I , V. O. K., AND YANG , D. An Overview of Packet
+[16] D UDA , K. J., AND C HERITON , D. R. Borrowed-virtual-time (BVT)                    Reordering in Transmission Control Protocol (TCP): Problems, Solu-
+     scheduling: supporting latency-sensitive threads in a general-purpose               tions, and Challenges. IEEE Trans. Parallel Distrib. Syst. 18, 4 (2007),
+     schedular. In Proceedings of the 17th ACM Symposium on Operating                    522–535.
+     Systems Principles (SOSP) (1999), pp. 261–276.                                 [34] L EVERICH , J., AND KOZYRAKIS , C. Reconciling high server utiliza-
+[17] D UNKELS , A. Design and Implementation of the lwIP TCP/IP Stack.                   tion and sub-millisecond quality-of-service. In Proceedings of the 2014
+     Swedish Institute of Computer Science 2 (2001), 77.                                 EuroSys Conference (2014), pp. 4:1–4:14.
+[18] E ISENBUD , D. E., Y I , C., C ONTAVALLI , C., S MITH , C., KONONOV,           [35] L I , J., AGRAWAL , K., E LNIKETY, S., H E , Y., L EE , I.-T. A., L U , C.,
+     R., M ANN -H IELSCHER , E., C ILINGIROGLU , A., C HEYNEY, B.,                       AND M C K INLEY, K. S. Work stealing for interactive services to meet
+     S HANG , W., AND H OSEIN , J. D. Maglev: A Fast and Reliable Soft-                  target latency. In Proceedings of the 21st ACM SIGPLAN Symposium
+     ware Network Load Balancer. In Proceedings of the 13th Symposium                    on Principles and Practice of Parallel Programming (PPoPP) (2016),
+     on Networked Systems Design and Implementation (NSDI) (2016),                       pp. 14:1–14:13.
+     pp. 523–535.                                                                   [36] L I , J., S HARMA , N. K., P ORTS , D. R. K., AND G RIBBLE , S. D.
+[19] Epollexclusive kernel patch. https://lwn.net/Articles/667087/, 2015.                Tales of the Tail: Hardware, OS, and Application-level Sources of
+[20] F ÄRBER , F., C HA , S. K., P RIMSCH , J., B ORNHÖVD , C., S IGG , S.,              Tail Latency. In Proceedings of the 2014 ACM Symposium on Cloud
+     AND L EHNER , W. SAP HANA database: data management for modern                      Computing (SOCC) (2014), pp. 9:1–9:14.
+     business applications. SIGMOD Record 40, 4 (2011), 45–51.                      [37] libevent. http://libevent.org/.
+[21] G AUD , F., G ENEVES , S., L ACHAIZE , R., L EPERS , B., M OTTET, F.,          [38] libuv. http://libuv.org/.
+     M ULLER , G., AND Q UÉMA , V. Efficient Workstealing for Multi-                [39] L IM , H., H AN , D., A NDERSEN , D. G., AND K AMINSKY, M. MICA:
+     core Event-Driven Systems. In Proceedings of the 30th IEEE Interna-                 A Holistic Approach to Fast In-Memory Key-Value Storage. In Pro-
+     tional Conference on Distributed Computing Systems (ICDCS) (2010),                  ceedings of the 11th Symposium on Networked Systems Design and
+     pp. 516–525.                                                                        Implementation (NSDI) (2014), pp. 429–444.
+[22] G ORDON , A., A MIT, N., H AR ’E L , N., B EN -Y EHUDA , M., L ANDAU ,         [40] L U , Y., X IE , Q., K LIOT, G., G ELLER , A., L ARUS , J. R., AND G REEN -
+     A., S CHUSTER , A., AND T SAFRIR , D. ELI: bare-metal performance                   BERG , A. G. Join-Idle-Queue: A novel load balancing algorithm for
+     for I/O virtualization. In Proceedings of the 17th International Con-               dynamically scalable web services. Perform. Eval. 68, 11 (2011), 1056–
+     ference on Architectural Support for Programming Languages and                      1071.
+     Operating Systems (ASPLOS-XVII) (2012), pp. 411–422.                           [41] Apache lucene. https://lucene.apache.org/.
+[23] gRPC. http://www.grpc.io/.                                                     [42] M ARINOS , I., WATSON , R. N. M., AND H ANDLEY, M. Network stack
+[24] H ANFORD , N., A HUJA , V., BALMAN , M., FARRENS , M. K.,                           specialization for performance. In Proceedings of the ACM SIGCOMM
+     G HOSAL , D., P OUYOUL , E., AND T IERNEY, B. Characterizing the                    2014 Conference (2014), pp. 175–186.
+     impact of end-system affinities on the end-to-end performance of high-         [43] Memcached. https://memcached.org/.
+     speed flows. In Proceedings of the Third International Workshop on             [44] In-memory mongodb.               https://docs.mongodb.com/manual/core/
+     Network-Aware Data Management (2013), pp. 1:1–1:10.                                 inmemory/.
+
+
+
+
+                                                                              340
+ZygOS: Achieving Low Tail Latency for µs-scale Networked Tasks                                     SOSP ’17, October 28, 2017, Shanghai, China
+
+[45] NANAVATI , M., W IRES , J., AND WARFIELD , A. Decibel: Isolation                    [64] TPC-C Benchmark. http://www.tpc.org/tpcc/, 2010.
+     and Sharing in Disaggregated Rack-Scale Storage. In Proceedings of                  [65] T U , S., Z HENG , W., KOHLER , E., L ISKOV, B., AND M ADDEN , S.
+     the 14th Symposium on Networked Systems Design and Implementation                        Speedy transactions in multicore in-memory databases. In Proceedings
+     (NSDI) (2017), pp. 17–33.                                                                of the 24th ACM Symposium on Operating Systems Principles (SOSP)
+[46] Nginx thread pool usage.                     https://www.nginx.com/blog/                 (2013), pp. 18–32.
+     thread-pools-boost-performance-9x/.                                                 [66] U HLIG , R., N EIGER , G., RODGERS , D., S ANTONI , A. L., M ARTINS ,
+[47] N ISHTALA , R., F UGAL , H., G RIMM , S., K WIATKOWSKI , M., L EE ,                      F. C. M., A NDERSON , A. V., B ENNETT, S. M., K ÄGI , A., L EUNG ,
+     H., L I , H. C., M C E LROY, R., PALECZNY, M., P EEK , D., S AAB ,                       F. H., AND S MITH , L. Intel Virtualization Technology. IEEE Computer
+     P., S TAFFORD , D., T UNG , T., AND V ENKATARAMANI , V. Scaling                          38, 5 (2005), 48–56.
+     Memcache at Facebook. In Proceedings of the 10th Symposium on                       [67] Voltdb. https://www.voltdb.com/.
+     Networked Systems Design and Implementation (NSDI) (2013), pp. 385–                 [68] W EI , X., S HI , J., C HEN , Y., C HEN , R., AND C HEN , H. Fast in-
+     398.                                                                                     memory transaction processing using RDMA and HTM. In Proceedings
+[48] O USTERHOUT, J. K., G OPALAN , A., G UPTA , A., K EJRIWAL , A.,                          of the 25th ACM Symposium on Operating Systems Principles (SOSP)
+     L EE , C., M ONTAZERI , B., O NGARO , D., PARK , S. J., Q IN , H.,                       (2015), pp. 87–104.
+     ROSENBLUM , M., RUMBLE , S. M., S TUTSMAN , R., AND YANG ,                          [69] What’sapp 2m connections. https://https://blog.whatsapp.com/196/
+     S. The RAMCloud Storage System. ACM Trans. Comput. Syst. 33, 3                           1-million-is-so-2011.
+     (2015), 7:1–7:55.                                                                   [70] W IERMAN , A., AND Z WART, B. Is Tail-Optimal Scheduling Possible?
+[49] O USTERHOUT, K., W ENDELL , P., Z AHARIA , M., AND S TOICA , I.                          Operations Research 60, 5 (2012), 1249–1257.
+     Sparrow: distributed, low latency scheduling. In Proceedings of the                 [71] YANG , X., B LACKBURN , S. M., AND M C K INLEY, K. S. Elfen
+     24th ACM Symposium on Operating Systems Principles (SOSP) (2013),                        Scheduling: Fine-Grain Principled Borrowing from Latency-Critical
+     pp. 69–84.                                                                               Workloads Using Simultaneous Multithreading. In Proceedings of the
+[50] P ESTEREV, A., S TRAUSS , J., Z ELDOVICH , N., AND M ORRIS , R. T.                       2016 USENIX Annual Technical Conference (ATC) (2016), pp. 309–
+     Improving network connection locality on multicore systems. In Pro-                      322.
+     ceedings of the 2012 EuroSys Conference (2012), pp. 337–350.                        [72] YASUKATA , K., H ONDA , M., S ANTRY, D., AND E GGERT, L.
+[51] P ETER , S., L I , J., Z HANG , I., P ORTS , D. R. K., W OOS , D., K RISH -              StackMap: Low-Latency Networking with the OS Stack and Dedi-
+     NAMURTHY, A., A NDERSON , T. E., AND ROSCOE , T. Arrakis: The                            cated NICs. In Proceedings of the 2016 USENIX Annual Technical
+     Operating System Is the Control Plane. ACM Trans. Comput. Syst. 33,                      Conference (ATC) (2016), pp. 43–56.
+     4 (2016), 11:1–11:30.                                                               [73] Z ELDOVICH , N., Y IP, A., DABEK , F., M ORRIS , R., M AZIÈRES , D.,
+[52] Pf_ring. http://www.ntop.org/products/packet-capture/pf_ring/.                           AND K AASHOEK , M. F. Multiprocessor Support for Event-Driven
+[53] P REKAS , G., B ELAY, A., P RIMORAC , M., K LIMOVIC , A., G ROSS -                       Programs. In USENIX Annual Technical Conference (2003), pp. 239–
+     MAN , S., K OGIAS , M., G ÜTERMANN , B., K OZYRAKIS , C., AND                            252.
+     B UGNION , E. IX Open-source version 1.0 – Deployment and Evalua-                   [74] Z HANG , H., D ONG , M., AND C HEN , H. Efficient and Available
+     tion Guide. Tech. rep., EPFL Technical Report 218568, 2016.                              In-memory KV-Store with Hybrid Erasure Coding and Replication.
+[54] P REKAS , G., P RIMORAC , M., B ELAY, A., KOZYRAKIS , C., AND                            In Proceedings of the 14th USENIX Conference on File and Storage
+     B UGNION , E. Energy proportionality and workload consolidation                          Technologie (FAST) (2016), pp. 167–180.
+     for latency-critical applications. In Proceedings of the 2015 ACM                   [75] Zygos kernel. https://github.com/ix-project/zygos, 2017.
+     Symposium on Cloud Computing (SOCC) (2015), pp. 342–355.
+[55] Redis. https://redis.io/.
+[56] R IZZO , L. netmap: A Novel Framework for Fast Packet I/O. In
+     Proceedings of the 2012 USENIX Annual Technical Conference (ATC)
+     (2012), pp. 101–112.
+[57] Microsoft corp. receive side scaling. http://msdn.microsoft.com/library/
+     windows/hardware/ff556942.aspx.
+[58] S CHROEDER , B., W IERMAN , A., AND H ARCHOL -BALTER , M. Open
+     Versus Closed: A Cautionary Tale. In Proceedings of the 3rd Symposium
+     on Networked Systems Design and Implementation (NSDI) (2006).
+[59] S CILLA DB P ROJECT. Seastar – high-performance service-application
+     framework. https://github.com/scylladb/seastar/.
+[60] Silo: Multicore in-memory storage engine.              https://github.com/
+     stephentu/silo.
+[61] S OARES , L., AND S TUMM , M. FlexSC: Flexible System Call Sched-
+     uling with Exception-Less System Calls. In Proceedings of the 9th
+     Symposium on Operating System Design and Implementation (OSDI)
+     (2010), pp. 33–46.
+[62] S TONEBRAKER , M., M ADDEN , S., A BADI , D. J., H ARIZOPOULOS ,
+     S., H ACHEM , N., AND H ELLAND , P. The End of an Architectural
+     Era (It’s Time for a Complete Rewrite). In Proceedings of the 33rd
+     International Conference on Very Large DataBases (VLDB) (2007),
+     pp. 1150–1160.
+[63] T HEKKATH , C. A., N GUYEN , T. D., M OY, E., AND L AZOWSKA ,
+     E. D. Implementing Network Protocols at User Level. In Proceedings
+     of the ACM SIGCOMM 1993 Conference (1993), pp. 64–73.
+
+
+
+
+                                                                                   341
+

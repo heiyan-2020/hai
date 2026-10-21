@@ -1,0 +1,1290 @@
+                          Canopy: An End-to-End Performance
+                             Tracing And Analysis System
+           Jonathan Kaldor† Jonathan Mace∗ Michał Bejda† Edison Gao† Wiktor Kuropatwa†
+               Joe O’Neill† Kian Win Ong† Bill Schaller† Pingjia Shan† Brendan Viscomi†
+                      Vinod Venkataraman† Kaushik Veeraraghavan† Yee Jiun Song†
+                                                           †
+                                                               Facebook              ∗
+                                                                                         Brown University
+Abstract                                                                                      Dynamic factors also influence performance, such as con-
+This paper presents Canopy, Facebook’s end-to-end perfor-                                  tinuous deployment of new code, changing configurations,
+mance tracing infrastructure. Canopy records causally related                              user-specific experiments, and datacenters with distinct char-
+performance data across the end-to-end execution path of                                   acteristics. The metrics and events relevant to performance
+requests, including from browsers, mobile applications, and                                are diverse and continually changing; different endpoints may
+backend services. Canopy processes traces in near real-time,                               have different metric definitions, while some endpoints en-
+derives user-specified features, and outputs to performance                                compass end-to-end flows that cross multiple layers of the
+datasets that aggregate across billions of requests. Using Canopy,                         system stack. Engineers need ready access to performance
+Facebook engineers can query and analyze performance data                                  data, ideally tailored to the problem they’re trying to solve and
+in real-time. Canopy addresses three challenges we have en-                                the questions they typically ask.
+countered in scaling performance analysis: supporting the                                     This paper describes the design and implementation of
+range of execution and performance models used by differ-                                  Canopy, Facebook’s end-to-end performance tracing infras-
+ent components of the Facebook stack; supporting interac-                                  tructure. Canopy is a pervasive tracing infrastructure that
+tive ad-hoc analysis of performance data; and enabling deep                                records and processes performance traces, combining perfor-
+customization by users, from sampling traces to extracting                                 mance data from the end-to-end execution path with struc-
+and visualizing features. Canopy currently records and pro-                                tured and causally-related execution traces, to enable cus-
+cesses over 1 billion traces per day. We discuss how Canopy has                            tomized performance analysis. Canopy extends prior tracing
+evolved to apply to a wide range of scenarios, and present case                            systems such as X-Trace [24] and Dapper [54]; at its core,
+studies of its use in solving various performance challenges.                              Canopy constructs traces by propagating identifiers through
+                                                                                           the system to correlate information across components. How-
+1    Introduction                                                                          ever, Canopy addresses three broader challenges we have faced
+End-users of Facebook services expect a consistently perfor-                               at Facebook in using tracing to solve performance problems.
+mant experience. However, understanding, analyzing, and                                       First, end-to-end performance data is heterogeneous, with
+troubleshooting performance can be difficult. End-users can                                multiple execution models and wide variations in the granular-
+perform a wide range of actions and access Facebook through                                ity and quality of data available to be profiled. Consuming in-
+heterogeneous clients, including web browsers and mobile                                   strumented data directly is cumbersome and infeasible at scale
+apps, which offer varying levels of information and control                                because engineers and tools must understand the mappings
+over the application. Each action, such as loading a page on                               from low-level event data to higher-level semantic structures
+Facebook.com, entails complex executions spanning clients,                                 across all components of Facebook’s stack. However, designat-
+networks, and distributed back-end services.                                               ing a higher-level model in instrumentation leads to issues
+                                                                                           because instrumentation is pervasive, includes legacy compo-
+                                                                                           nents, must anticipate future components, and is difficult to
+                                                                                           change even when integrated into common infrastructure.
+Permission to make digital or hard copies of part or all of this work for personal
+or classroom use is granted without fee provided that copies are not made or                  Second, there is a mismatch in granularity between the high-
+distributed for profit or commercial advantage and that copies bear this notice            level, aggregated, exploratory analysis that operators perform
+and the full citation on the first page. Copyrights for third-party components             in practice, and the rich, fine-scale data in a single trace. Eval-
+of this work must be honored. For all other uses, contact the owner/author(s).             uating interactive queries over raw traces is computationally
+SOSP ’17, October 28, 2017, Shanghai, China                                                infeasible, because Facebook captures over one billion traces
+© 2017 Copyright held by the owner/author(s).
+                                                                                           per day, with individual traces comprising thousands of events.
+ACM ISBN 978-1-4503-5085-3/17/10.
+https://doi.org/10.1145/3132747.3132749                                                    Nonetheless, rapidly solving performance problems requires
+SOSP ’17, October 28, 2017, Shanghai, China                                                                            J. Kaldor et al.
+
+tools that can efficiently slice, group, filter, aggregate, and sum-   cross-system performance scenarios. Each system was spe-
+marize traces based on arbitrary features.                             cialized for a specific use case and difficult to extend to other
+   Finally, end-to-end performance over the whole stack means          domains. For example, backend services had RPC call-tree
+many engineers share the same tracing infrastructure. Only             instrumentation that was difficult to adapt to other execution
+a small fraction of data in each trace may be relevant to each         models like event loops. Browser page-load tracing focused
+engineer, pertaining to specific features or products under in-        on joining data from the client and a single server, and had
+vestigation. However, by design, traces contain all of the data        difficulty scaling to cover other backend systems. Mobile ap-
+necessary for any engineer to identify issues. This presents           plications had standalone OS-provided tracing that lacked the
+an information overload, and motivates the need for both (1)           ability to look at aggregate production data. In each of these
+generalized interfaces as an entry-point for casual usage and          cases, analysis over traces was confined to fixed workflows,
+high-level scenarios, and (2) deep customization of everything         with limited customization for per-domain features and slow
+from the traces to sample, to the features to extract, to the          iteration time for new features or analyses.
+ways to navigate the extracted data.                                      This siloed approach to tracing led to several problems. It
+   Canopy addresses these challenges with a complete pipeline          was difficult to get cross-system insights when the tools them-
+for extracting performance data from system-generated traces           selves didn’t cross all systems, and it meant that engineers
+across the stack, including browsers, mobile applications, and         needed to understand multiple tracing tools and when to use
+backend services. Canopy emphasizes customization at each              and switch between them. Each tracing system evolved to meet
+step of the pipeline, and provides a novel separation of con-          specific needs and respond to gaps in other tracing systems,
+cerns between components to allow for their individual evo-            but no single system could handle the broad spectrum of issues
+lution. At development time, Facebook engineers can instru-            that arise in practice. The type of analysis supported by each
+ment their systems using a range of APIs tailored to different         system was also fairly rigid and changes took days to deploy.
+execution models. At runtime, Canopy maps the generated                   Based on these experiences we designed Canopy, a flexible
+performance data to a flexible underlying event-based repre-           multi-domain tracing system for consuming and analyzing
+sentation. Canopy’s backend pipeline receives events in near-          trace data in aggregate. Canopy addressed a growing need for
+realtime; reconstructs a high-level trace model that is more           a single tracing system, applicable to many domains, that engi-
+convenient for analyzing and querying; extracts user-specified         neers could customize to quickly target relevant information.
+features from traces; and outputs the results to datasets for          2.1 Canopy in Action
+customized aggregate visualizations.
+                                                                       We begin by motivating Canopy with an example of how engi-
+   Canopy has been deployed in production at Facebook for
+                                                                       neers typically investigate regressions in our web stack. When
+the past 2 years, where it generates and processes 1.3 billion
+                                                                       a performance issue arises in one component, its symptoms
+traces per day spanning end-user devices, web servers, and
+                                                                       might manifest in a different part of the stack; diagnosing per-
+backend services, and backs 129 performance datasets ranging
+                                                                       formance issues thereby requires a global view, yet granular
+from high-level end-to-end metrics to specific customized use
+                                                                       attribution, of performance.
+cases. This paper makes the following contributions:
+                                                                          When an end-user loads a page on Facebook.com, it is as-
+● A decoupled design for tracing that separates instrumenta-           sembled from numerous page pieces that are developed by
+  tion from the trace model, enabling independent evolution            many different product groups. Facebook’s core framework
+  and the composition of different execution models.                   code combines page pieces, and runs them both on web servers
+● A complete pipeline to transform traces into a custom set            and within client browsers. In March 2017, the average time
+  of extracted features to enable rapid analysis.                      needed to display the initial portion of a particular page re-
+● A set of customizable tracing components to provide multi-           gressed by 300ms, or approximately 13%, illustrated in Fig-
+  ple views of the same data for different use cases.                  ure 1a. Canopy calculates this metric by recording end-to-end
+                                                                       traces of requests, including execution in both the browser
+The rest of this paper proceeds as follows. We discuss previ-          and throughout Facebook backends. Canopy backends receive
+ous experiences with tracing and motivate Canopy in §2. In             traces in near-realtime, derive a range of metrics including
+§3-4 we describe Canopy’s design and implementation. We                page load latency from each trace, and pipe them to various
+present case studies and evaluation in §5. Finally, we discuss         long-lived datasets of performance metrics.
+our experiences, related work, and future challenges in §6-8.             To investigate the regression, engineers typically start with
+2 Motivation                                                           a breakdown of page load time across the constituent compo-
+For several years prior to Canopy, a number of tracing systems         nents. Figure 1b shows how server execution time and network
+were developed at Facebook to address various single- and              time were relatively unchanged, whereas browser execution
+                                                                       time and resource-fetching time (CSS, JS, etc.) were elevated.
+Canopy                                                                                       SOSP ’17, October 28, 2017, Shanghai, China
+
+To calculate these metrics, Canopy derives the critical path                      +13%
+                                                                                                                      Page Load Latency
+of requests, using comprehensive timing and dependency in-           (a)
+                                                                                  Regression
+                                                                                                                                     +300ms
+formation from the client and across all server-side processes.                   Previous
+                                                                                  Week
+                                                                                                  0                 0.5                           1.5             2
+Canopy’s instrumentation APIs capture this for a range of dif-                                                                 Time (days)
+ferent execution models (e.g. threads, events, continuations,                                             Critical Path Latency Breakdown
+                                                                              +50%    Client      Browser      Resources     Network     Server
+queues, RPCs); internally, Canopy unifies the information us-        (b)      +25%
+ing a generic underlying representation for trace data.                    Prev Wk
+                                                                              −25% 0
+   The next step in the investigation was to diagnose the change                        1    2 0     1     2 0     1     2 0    1    2 0    1   2
+in resource loading time. The useful high-level metrics for                        85% JS Prediction Accuracy     50% CSS Prediction Accuracy
+
+resource loading relate to a server-side mechanism called early      (c)                                                                                       −5%
+flush. Early flush optimizes the page load time by predicting                     75% 0          0.5     1    1.5               2 40% 0          0.5       1     1.5         2
+and preemptively sending batches of resources that might be                         2           Early-Flush Misses               110kB                 CSS Bytes
+needed by the client. Canopy measures the success of early           (d)             1                         +1
+                                                                                                                                                               +10kB
+flush by capturing information when resources are received on                       00           0.5       1         1.5        2 90kB 0         0.5       1      1.5        2
+the client, then incorporating them into critical path metrics.                                                      Page Piece CSS Bytes
+Figure 1c plots the prediction accuracy for JavaScript and CSS                  +10kB
+                                                                                             Suggestions        MainContent             Navigation             UserInput
+resources – 80% accuracy means that 80% of the resources sent        (e)                                                                                                  +10kB
+                                                                              Prev Wk
+were actually necessary for the initial page display. The page                   −5kB 0           1        2 0             1      2 0        1          2 0           1      2
+load regression corresponded to a 5% drop in CSS prediction
+                                                                                                           Page Piece Critical Path Latency
+accuracy and an additional 10kB of CSS before the page could                     +50%                  MainContent                                UserInput
+display (1d); this unnecessary CSS took the place of useful          (f)
+                                                                                 +25%
+                                                                                                                                                           +150ms
+                                                                              Prev Wk
+resources, forcing clients to wait for the next batch of resources               −25%
+                                                                                         0       0.5 Time (days) 1.5              2 0        0.5 Time (days) 1.5             2
+before the page could display (an early flush miss).
+   These metrics pointed to a problem at the page granular-          Figure 1: Using Canopy, an engineer quickly identifies UserInput as
+ity, but do not yet point to what caused the change. Canopy’s        responsible for a 300ms page load time regression (cf. §2.1).
+datasets further break down metrics at the granularity of page
+pieces, and grouping by page piece (1e) identified the culprit
+– the UserInput page piece had added an additional 10kB of           to allow human-generated hypotheses to be tested and proved
+CSS to the page load critical path. By comparison, other com-        or disproved quickly, enabling rapid iteration. To achieve this,
+ponents were unchanged. This pointed at the root cause – the         we must overcome three broad challenges.
+launch of a new feature in the UserInput page piece changed          Modeling Trace Data Performance traces incorporate a wide
+the set of resources that it required. The early flush compo-        range of information from all components on the execution
+nent was unaware of this change, and grouped resources sub-          path of requests, from clients through backend services. Causal
+optimally. On the client, the UserInput page piece stalled wait-     relationships between events provide further information about
+ing for resources that weren’t initially available, increasing its   the concurrency and dependencies of execution. In their most
+time on the critical path (1f). Engineers fixed the regression       general form, these traces are directed, acyclic graphs (DAGs),
+by re-configuring the early flush mechanism.                         with nodes representing events in time, and edges representing
+                                                                     causality [23, 31]. However, exposing traces at this granularity
+2.2 Challenges
+                                                                     is inappropriate for two reasons.
+This example illustrates how a range of different information,           First, in order to reconstruct high-level concepts, engineers
+related across system components, is necessary to diagnose           must understand and interpret trace events and their causal
+problems. However, it is difficult to predict the information        relationships. For example, a segment of processing might de-
+that will be useful or the steps that engineers will take in their   limit itself with start and end events, derive its latency from
+analysis. In practice at Facebook, successful approaches to di-      event timestamps, and describe interesting features using in-
+agnosing performance problems are usually based on human             termediary events. Similarly, causal edges might be classified
+intuition: engineers develop and investigate hypotheses, draw-       as network communication if they link events annotated with
+ing on different kinds of data presented in different ways: indi-    different hostnames. However, many engineers and teams par-
+vidual traces, aggregates across many traces, historical trends,     ticipate in recording traces, making ad-hoc decisions about
+filtered data and breakdowns, etc. In the research literature,       the events and information to record. There is wide variation
+a recent study of Splunk usage [3] drew similar conclusions          in the granularity and quality of data captured by different
+that human inference tends to drive analysis, while the use of       software versions, and missing data is common due to best-
+automated techniques is “relatively rare”. The goal of Canopy is     effort delivery from remote clients. In practice it is infeasible
+SOSP ’17, October 28, 2017, Shanghai, China                                                                           J. Kaldor et al.
+
+to consume traces of this granularity, as few, if any, engineers      granularity for ad-hoc analysis, even when the they are ab-
+understand all mappings to high-level concepts.                       stracted to a higher level model as described in the previous
+   Second, events are an inappropriate abstraction to expose to       challenge. This is for two reasons.
+engineers adding instrumentation to systems. Engineers must              First, traces are very rich, with an individual trace com-
+understand how to describe their system’s execution model –           prising potentially tens of thousands of performance events.
+e.g. segments of computation, RPC calls – in terms of events,         Queries over traces, including historical data, can apply to an
+and do so in a coherent manner across all system components.          extremely large volume of traces – Canopy currently records
+However, researchers and practitioners consistently describe          1.3 billion traces per day. Simultaneously we want to support
+instrumentation as the most time consuming and difficult part         engineers analyzing traces at interactive time scales. It is com-
+of deploying tracing frameworks [22–24, 28, 50, 53].                  putationally infeasible to directly query this volume of traces
+   To bridge these challenges, previous tracing frameworks            in real-time in response to some user query.
+proposed that a higher-level trace representation should be a            Second, it is cognitively demanding to expect users to write
+first-class primitive [12, 54, 60]. This approach aligns instru-      queries at the granularity of traces. It should not be necessary
+mentation abstractions with the system’s execution model,             to know how to calculate high-level metrics such as page load
+making it easier to instrument systems; it also directly en-          time, critical path breakdown, or CSS byte attributions (cf.
+codes meaningful high level concepts in traces, making them           §2.1); in practice it is non-trivial to derive many such features
+easier to consume. For example, Dapper models traces as trees         from traces. However, unless we provide further abstractions,
+of spans – segments of computation – which naturally describe         users will have to consume trace data directly, which entails
+executions in Google’s RPC-based infrastructure and can be            complicated queries to extract simple high-level features.
+intuitively visualized as a call stack. [54]                          Supporting Multiple Use Cases Facebook traces have evolved
+   However, promoting a first-class trace model led to sev-           over time as operators find new data they are interested in, and
+eral problems in the open-source community. Frameworks                new subsystems integrate with our tracing systems. Traces are
+lost generality; for example, Zipkin [60] users struggled to in-      useful to different people in different ways, and we continually
+strument execution models not easily described as span trees,         encounter new use cases for tracing, new metrics and labels of
+such as queues [65], asynchronous executions [41, 42, 44], and        interest, new aggregations and breakdowns, etc. The volume
+multiple-parent causality [9, 10, 43, 45]. Changing trace mod-        of data in a trace can overwhelm users and make it difficult to
+els entailed exhaustively revisiting system-level instrumenta-        distill the parts relevant to particular use cases.
+tion [4, 8, 11, 13, 14], or elaborate workarounds such as inferring      This presents a delicate trade-off; on one hand, we want
+new attributes [22, 35, 46]. Mismatched models affected com-          simplicity and ease-of-use for the broadest possible audience,
+patibility between mixed system versions; e.g. Accumulo and           implying a shared, curated, comprehensive entry point for
+Hadoop were impacted by the “continued lack of concern in the         users. On the other hand, users should be able to view traces
+HTrace project around tracing during upgrades” [4, 5, 7]. Some        through a lens appropriate for their particular task or compo-
+tracing frameworks suffered “severe signal loss” [40] because a       nent, i.e. avoiding features and metrics that pertain to other
+simpler trace model discarded useful causal relationships.            components. We must also support end-to-end analysis for
+   We experienced similar challenges at Facebook. Instrument-         problems that span multiple components, and support drilling-
+ing core frameworks is useful for making tracing widely avail-        down to the lowest-level details of individual traces.
+able and reducing the need for every system to maintain its              These challenges imply that users should have control over
+own instrumentation. However, there are a wide variety of             the data presented to them, especially in terms of exploratory
+custom system designs, third party code, and other issues that        analysis. This includes piping data to custom backends; view-
+limit use of those core frameworks. Furthermore, instrumenta-         ing data through custom visualizations; extracting custom
+tion is typically compiled into services as they are released, so     features and metrics; and ensuring low QPS systems and un-
+even when tracing is integrated into core frameworks, a single        derrepresented execution types are sufficiently sampled.
+trace may cross through multiple services each with their own
+version of instrumentation. Thus, instrumentation must be             3 Design
+flexible and adaptable in order to inter-operate correctly both       Canopy addresses these challenges by providing a pipeline
+within the trace, and across system components.                       for extracting performance data from system-generated traces
+Analyzing Data Engineers need to be able to view, filter, and         across the stack. Canopy emphasizes user-customization at
+aggregate metrics based on arbitrary features across all traces,      each step of the pipeline, and provides a separation of concerns
+e.g. to view changes in specific counters, track durations of         between components to allow for their individual evolution.
+well-defined subphases, compare metrics before and after a            In this section we describe Canopy’s high level design and the
+regression; etc. However, traces are an inappropriate level of        flow for processing and analyzing performance traces.
+Canopy                                                                                                 SOSP ’17, October 28, 2017, Shanghai, China
+
+                                                                     Key
+    1                                                                                 the tailer aggregates events in memory (○      5 ) and persists them
+                                                                  Engineers
+        3                                                         Facebook            to storage (○  6 ). Once the tailer determines all events have been
+2
+            TraceID                                               Components          received for a request, they are queued for processing (○       7 ). Pro-
+                                                                  Requests            cessing begins by mapping events to a trace model (○         8 ), which
+                                                                  Instrumentation
+                                                                  APIs                provides a single high-level representation for performance
+                                                        4         Canopy Events       traces that unifies the different instrumentation models and
+                                                                                      APIs used by Facebook developers. Next, Canopy evaluates
+(a) Engineers instrument Facebook components using a range of                         user-supplied feature lambdas (○      9 ) which extract or compute
+different Canopy instrumentation APIs (○).1 At runtime, requests                      interesting features from each modeled trace. Users bundle
+traverse components (○)
+                      2 and propagate a TraceID (○);
+                                                 3 when requests
+                                                                                      their feature lambdas with a dataset configuration that speci-
+trigger instrumentation, Canopy generates and emits events (○).
+                                                            4
+                                                                                      fies predicates for filtering unwanted traces and directions for
+                                                                                  4   where to output the extracted features (○     10 ); typically, datasets
+
+                                5     Event Aggregation          6                    are piped to Scuba [1], an in-memory database designed for
+        Canopy        Trace
+                                                                                      performance data.
+                                                                         Raw Trace
+        Engineers     Model                 7                            Events            Finally, Facebook engineers can query datasets directly and
+                                8    Model Construction                               view visualizations and dashboards backed by the datasets
+        Performance Feature                                                           (○11 ). In addition to user-configured datasets, Canopy provides
+        Engineers   Lambdas
+                                                                                      several shared datasets and visualizations containing common
+                                9     Feature Extraction
+                                                                                      high-level features, plus tools for drilling down into the under-
+        Any Facebook Dataset                       10
+                                                                         Trace        lying traces if deeper inspection is needed (○      12 ).
+        Engineer     Queries                                             Datasets
+                                       Query Evaluation
+                                                                                      3.2 Instrumentation APIs
+                                11
+                                                                             12
+                                                                                      Instrumentation broadly comprises three tasks: 1) propagating
+                           Query Results, Visualizations, Graphs, etc.                the TraceID alongside requests as they execute, to associate per-
+                                                                                      formance data generated by different components; 2) recording
+(b) Canopy’s tailer aggregates events (○),
+                                         5 constructs model-based
+                                                                                      the request structure, e.g. where and when it executes, causality
+traces (○),
+        8 evaluates user-supplied feature extraction functions (○),
+                                                                  9                   between threads and components, and network communica-
+and pipes output to user-defined datasets (○).
+                                           10 Users subsequently run                  tion; and 3) capturing useful performance data, e.g. logging
+queries, view dashboards and explore datasets (○,
+                                               11 ○).
+                                                  12                                  statements, performance counters, and stack traces.
+Figure 2: Overview of how (a) developers instrument systems to                           Each Canopy instrumentation API performs a slice of these
+generate events and (b) Canopy processes trace events (cf. §3.1).                     tasks depending on what best aligns with the component
+                                                                                      or programming language in question. Canopy’s low-level li-
+3.1 Canopy Overview                                                                   braries in several languages allow users to manually log events
+                                                                                      and pass TraceIDs between threads; however most APIs layer
+Figure 2 illustrates Canopy’s architecture. We refer to the num-
+                                                                                      higher-level concepts on top of these. For instance, in most
+bers in the figure in our description. To begin, Facebook engi-
+                                                                                      Facebook components, causality tracking is handled automat-
+neers instrument system components to record performance
+                                                                                      ically as part of a RequestContext interface that is solely re-
+information (○   1 ). Canopy provides several instrumentation
+                                                                                      sponsible for passing around metadata like TraceIDs. Instead
+APIs to capture different aspects of performance, e.g. counters,
+                                                                                      of events, some higher-level libraries have constructs for an-
+logs, causal dependencies, etc.
+                                                                                      notating segments of processing, such as try-with-resources
+   At runtime, incoming requests to Facebook will traverse the
+                                                                                      statements in Java:
+instrumented system components (○     2 ). To relate performance
+events to requests, Canopy assigns each request a unique Tra-                          try (Block b = Canopy.block(“Doing some work”)) { . . . }
+ceID and propagates it along the request’s end-to-end execu-
+tion path (○3 ), including across process boundaries and when
+                                                                                         Conversely, Facebook’s web servers are heavily continuation
+requests fan out and in. When instrumentation is triggered,                           based, so Canopy does not expose these concepts because it is
+Canopy generates events capturing performance information                             difficult to manually track causality through asynchronous calls
+and causality with respect to prior events during execution (○4 ).
+                                                                                      and accurately attribute performance counters to work done.
+Internally, all instrumentation APIs map down to a common                             Instead, Canopy’s PHP instrumentation library only supports
+underlying event representation.                                                      noting points in time and wrapping functions to profile, e.g.:
+   Canopy routes events to the tailer, its sharded backend pro-
+cessing pipeline. We shard by TraceID, so that events for each                               Canopy()->inform(‘Evicting Cache Entry’);
+trace route to the same tailer instance. Upon receiving them,                                Canopy()->measure(‘Evicting’, $evictFunction);
+SOSP ’17, October 28, 2017, Shanghai, China                                                                       J. Kaldor et al.
+
+ struct Event {
+   1: required string traceID;                                        To record structural information, instrumentation libraries
+   2: required string type;                                        generate multiple related events which can be later recom-
+   3: required string id1;                                         bined to reason about the structures. For example, a segment
+   4: optional string id2;
+   5: optional i64 sequenceNumber;                                 of computation might comprise a labeled start event (e.g.,
+   6: required i64 timestamp;                                      “Doing some work”) and an end event referencing the start
+   7: optional map<string,string> annotations;
+ }                                                                 event. Canopy uses sequence numbers and timestamps to or-
+        Figure 3: Thrift [55] declaration of Canopy events.        der events within the same process or thread, and random IDs
+                                                                   to relate events to shared concepts. For example, to capture
+Internally, Facebook’s web runtime will: propagate the TraceID;
+                                                                   inter-process causality, we typically generate and log an Even-
+track causality through continuations; snapshot lightweight per-
+                                                                   tID on the sender, propagate both the TraceID and EventID to
+formance counters exposed by the server; and generate events
+                                                                   the receiver, then also log the EventID on the receiver.
+that capture the order of, and relationships between, asynchro-
+                                                                      Canopy does not enforce or restrict a mapping from high-
+nous function calls. In several languages Canopy provides or-
+                                                                   level concepts to events, and different instrumentation APIs or
+thogonal performance APIs, e.g. to register user-defined coun-
+                                                                   system versions may represent the same concepts in different
+ters which Canopy will regularly record; to enable and disable
+                                                                   ways. New instrumentation libraries can reuse existing com-
+stack trace sampling; and to capture OS-level information.
+                                                                   mon event types or define new ones; we currently define 22
+   There are several reasons decoupling instrumentation APIs
+                                                                   event types. This loose coupling is important for compatibility,
+is a successful approach. First, for any particular instrumenta-
+                                                                   since a single trace will cross through multiple services that
+tion task, engineers have access to a narrow API that naturally
+                                                                   must inter-operate across different instrumentation library
+fits the specific task at hand. This lowers the barrier to entry
+                                                                   versions. See §5.3 for a case study.
+for engineers to adopt tracing, and reduces instrumentation
+errors. Second, by restricting engineers to narrow APIs, the       3.4 Modeled Traces
+recorded data is more robust because APIs hide the underly-        Canopy users do not consume events directly; instead Canopy
+ing representation; this avoids inconsistencies that arise when    constructs a modeled trace from events. Modeled traces are
+developers are responsible for manually constructing and re-       a higher-level representation of performance data that hide
+porting trace elements. Third, there is no single perspective on   inconsistencies in the low-level events, which may arise due
+instrumentation, and no first-class system model, so we can        to different component and instrumentation versions.
+introduce APIs to capture new aspects of performance with-            In its current iteration, Canopy’s model describes requests
+out invalidating existing instrumentation; this is necessary to    in terms of execution units, blocks, points, and edges. Execu-
+support the wide spectrum of custom system designs, third          tion units are high level computational tasks approximately
+party code, and legacy instrumentation. This has also enabled      equivalent to a thread of execution; blocks are segments of
+us to integrate third-party tracing libraries with Canopy, such    computation within an execution unit; points are instanta-
+as HTrace [12] and Cassandra tracing [6]                           neous occurrences of events within a block; and edges are
+3.3 Trace Events                                                   non-obvious causal relationships between points.
+                                                                      Specific logic for constructing model elements varies by
+Canopy does not designate a single execution or performance
+                                                                   event type. For example, segments of computation with ex-
+model to be the only possible trace representation. Instead,
+                                                                   plicit begin and end events naturally map to a block element;
+Canopy traces have a generic underlying representation based
+                                                                   intermediary events in the same thread typically annotate the
+on events. When instrumentation is triggered, it generates
+                                                                   block or create points within the block, depending on their
+and emits events that encode performance information and
+                                                                   type. On the other hand, an instrumentation API for queues
+causal relationships to other events. Together, the events of a
+                                                                   might instead generate events for the enqueue, dequeue and
+trace form a directed, acyclic graph (DAG). Event DAGs make
+                                                                   complete operations (similarly for locks, request, acquire, and
+minimal assumptions about execution models, performance
+                                                                   release); mapping these events to the trace model entails creat-
+data, or causality, and can describe any computation [31].
+                                                                   ing several blocks in potentially multiple execution units, and
+   Figure 3 outlines Canopy’s event definition. Canopy attaches
+                                                                   describing their dependencies explicitly using edges.
+the request’s TraceID to each event, so that the subsequent
+                                                                      Edges represent causality, both between processes and ma-
+processing stage can accumulate events related to each re-
+                                                                   chines, as well as between blocks and execution units within
+quest. Canopy has an implicit and extensible set of event types
+                                                                   the same process. Edges are especially useful for patterns such
+that determine how Canopy’s backend will interpret the event.
+                                                                   as streaming between long-running execution units, bidirec-
+Instrumentation libraries map high-level concepts down to
+                                                                   tional communication; and indirect or application-level block
+events, and annotate performance information. Annotations
+                                                                   dependencies. For brevity we do not record some causal edges
+are opaque to the event representation, but enable Canopy’s
+backend to reconstruct the high-level concepts.
+Canopy                                                                                      SOSP ’17, October 28, 2017, Shanghai, China
+
+within an execution unit; due to their nested structure, exe-                 1
+cution units, blocks, and points have implicit causality that is           0.75                            Figure 4: Frequency of columns
+                                                                                                           occurring in dataset queries, for
+
+
+
+
+                                                                     CDF
+sufficiently captured by timestamps and sequence numbers.                   0.5
+                                                                           0.25                            2,852 columns in 45 datasets,
+   All trace elements can be annotated with performance data,                                              from 6 months of queries to
+                                                                              0
+such as messages, labels, stack traces, sets of values, and coun-                 1     10 100 1k 10k 100k Canopy’s main querying UI.
+ters with an associated unit. Performance data is decoded from                        Usage Count of Column
+event annotations, with type information in the annotation key.
+Counters have no strict rules governing their usage; in prac-           The main requirements for feature extraction are to: 1) en-
+tice they either represent absolute values at a point, or deltas     able engineers to iterate and deploy changes quickly; 2) be
+over the duration of a block or edge. On edges, annotations          extensible to support new and unanticipated types of analysis;
+let us convey more information about relationships beyond            and 3) encourage modular and composable extraction func-
+just causal ordering, e.g. timing and queuing information is         tions, since custom datasets are often assembled as composites
+useful to accurately understand critical path dependencies, a        of other, higher level datasets. To this end, Canopy provides
+limitation of prior systems [35, 46].                                several ways to write feature extraction functions (cf. §4.4).
+   All Canopy traces are backed by the same underlying trace         The choice of features to extract, and what elements to extract
+model. This may seem counter-intuitive given that user cus-          them from, is done on a per-dataset or per-query level; we
+tomization is a goal of Canopy. However, this approach pro-          do not make this decision globally. Features can be extracted
+vides a necessary bridge across all system components and            as traces arrive or retroactively, and new feature extraction
+performance data. This allows analysis across system compo-          functions can be quickly deployed to production.
+nents; without it we risk siloed and incompatible performance        Analysis Canopy outputs features to subsequent processing
+models, and a loss of generality. So far, we have successfully in-   pipelines, including both online in-memory table stores and
+corporated a wide range of systems and performance data. By          persistent storage for offline batch analysis. These databases
+decoupling the trace model from instrumentation, we can also         can quickly query large datasets, which enables the kind of
+update the model as necessary to incorporate new structures,         interactive, ad-hoc analysis we presented in §2.1.
+causal relationships, and types of performance data.                    Although pre-computing features can leave a large quantity
+                                                                     of data from each trace unused, in practice we find it sufficient
+3.5 Trace Datasets
+                                                                     for several reasons. First, the source events and modeled traces
+Trace-derived datasets are Canopy’s high-level output. They          remain stored in our storage layer and can be retrieved for
+comprise information collected across many traces, and are the       either individual viewing or batch ad-hoc analysis. When engi-
+main access point for Facebook engineers doing performance           neers form hypotheses about possible new features, they can re-
+analysis. Each row of a dataset corresponds to some element          visit existing traces with the new extraction functions. Second,
+in a trace – e.g. one high level dataset has a row per trace and     features are causally related, so dataset queries can combine
+aggregates statistics such as overall latency, country of origin,    and break down data in myriad ways; that is, we can slice data
+browser type, etc; conversely, a dataset for deeper analysis of      by different dimensions without having to infer or compute
+web requests has one row for each page piece generated by            causality between distributions. In practice most problems
+each request, i.e. it is keyed by (TraceID, PagePieceID). The        are solved by exploring different combinations of a small set
+case study in §2.1 used both of these datasets.                      of features, and combining common features such as latency
+Features Each column of a dataset is a feature derived from          with less common features (cf. §2.1 and §5.4). To illustrate,
+a trace. A feature might simply be a label taken from a trace        Figure 4 plots the usage frequency for 2,852 columns from
+element. It can also be a straightforward aggregation, such          45 datasets, aggregated over 6 months of queries to Canopy’s
+as the count of block occurrences or the change in a counter         main dataset-querying UI. The most popular column is page
+value over a particular range. More elaborate features may           load latency from the main Canopy dataset, used by 23,224
+consider structural relationships, or compute statistics along       queries. However, most columns contributed to fewer than
+the critical path between two points in the trace. Features may      100 queries, with a median of 70.
+be any database column type; in practice, we make heavy use
+of numerics, strings, stacktraces, sets, and lists.                  4      Implementation
+Extraction Canopy transforms traces to features by applying          In this section we present details of Canopy’s implementation.
+feature extraction functions:                                        4.1 Canopy Client Library
+              f: Trace  Collection<Row<Feature>>                    Canopy’s instrumentation APIs internally map down to a core
+Functions are stateless and operate over a single trace at a time.   client API that provides two main functions: starting a trace,
+A row corresponds to an element in the trace and comprises           and logging an event. Figure 5 illustrates this core API, and
+features computed over that element or related elements.             we refer to the numbers in the figure in our descriptions.
+SOSP ’17, October 28, 2017, Shanghai, China                                                                                                         J. Kaldor et al.
+
+                                                                              requests                                                                     Web Servers
+                                                                                                            3 Sample Trace                                 & Backends
+                                           Log Event       5 Log Perf Data                                    sampling decision 
+  Start Trace 1     3 Start Trace
+                          Policy APIs                           Instr. APIs                   1 Connect                             4 Server        5 Flush Events
+                                                                                                   Server                             Response        To Server
+                                                                In-Memory
+                    4 Evaluate                                  Buffering                request
+                       Sampling Policies                                                                      2 Log Events
+                                                            Convert To Events              Browser/Mobile
+                                                                                                                                                           Browsers
+   Canopy                                                                                                                                      In-Memory   & Mobile
+   API                                                                                     Instrumentation API                                 Storage     Clients
+               2 Acquire Token                         6 Write Event
+        Distributed
+                                   Configerator           Scribe         Publish         Figure 6: Clients initially cache events in memory. If the server sam-
+        Token Bucket                                                   7 Events
+                                                                                         ples the trace, clients flush their events to the server.
+    Token Bucket Config                                   Sampling Policies
+       (Canopy Engineers)                                 (Performance Engineers)
+
+Figure 5: Components (e.g. web and backend services) invoke Canopy                       sampling strategy, and only if it passes do we finally acquire
+client APIs to start traces (○, 3 and log data (○)
+                             1 ○)               5 (cf. §4.1).                            a token from the relevant tenant’s bucket (○         2 ). This approach
+                                                                                         gives users fine-grained control over which traces to target,
+Initiating Traces Due to the number of requests and the                                  independent of Canopy engineer involvement, while the un-
+potentially rich set of captured detail, tracing all Facebook                            derlying token bucket provides safety in case of configuration
+requests is infeasible. Instead Canopy only initiates traces for                         errors. A local Configerator [57] daemon manages Canopy’s
+a subset of requests1 . A call to start a trace (○   1 ) must first ac-                  sampling and token bucket configurations in-memory and
+quire a token from a distributed token bucket (○        2 ). The token                   synchronizes global updates in real-time, thereby enabling
+bucket rate-limits traces both globally and per-tenant. Upon                             users to rapidly deploy sampling policies.
+acquiring a token, the call generates and returns a TraceID,                                 In some scenarios, such as for backend services, we only
+otherwise tracing is disabled. Rate limiting is necessary to                             support a subset of sampling policy features. When integrating
+limit undesirably high volumes or bursts of trace data that can                          Canopy in new frameworks or languages, we typically begin
+occur due to, e.g. too-aggressive instrumentation. By default,                           by interacting directly with the distributed token bucket, and
+Canopy allocates tenants 5 traces per second, a relatively low                           gradually introduce support for sampling policies as needed.
+rate. Changing this limit is done by Canopy engineers.                                   Generating Events
+Sampling Policies From the user’s perspective, rate limiting                                 For sampled traces, calls to Canopy’s instrumentation APIs
+is an insufficient granularity for sampling traces, for several                          (○5 ) will internally log events (○   6 ). Some instrumentation APIs
+
+reasons: low QPS API calls will be underrepresented; users                               buffer data in memory before flushing events; primarily in
+cannot target requests with specific properties; different ten-                          systems that won’t benefit from partial trace data when crashes
+ants cannot initiate traces from the same entry point; and it                            occur. Finally, events are flushed to Scribe (○        7 ), a distributed
+
+takes a long time to change the rate of generated traces, since                          messaging system for log data [27].
+it involves interacting with Canopy engineers.                                           Opportunistic Tracing Canopy typically evaluates sampling
+    To address this, we introduce a higher-level sampling policy                         decisions at the beginning of a request. However, for a subset
+abstraction for users to specify how to sample traces. Each                              of use cases there are restraints that can only be evaluated part-
+sampling policy specifies: 1) an owner, e.g. a user, team, etc.; 2)                      way through the request; for example, a web request which
+a sampling strategy, either a probability or a rate; 3) restraints                       begins on the client but has server-side restraints. Figure 6
+that the request must satisfy, e.g. a specific endpoint, datacen-                        illustrates how Canopy captures events that precede the sam-
+ter, region, Gatekeeper [57] feature, etc.; 4) a lifetime for the                        pling decision. After a client makes a request (○          1 ) to a server
+policy; and 5) the level of detail to record – the coarsest level                        that might sample a trace, the client opportunistically persists
+collects just a few high level events; finer levels capture in-                          in memory any events (○        2 ). After the server makes a sampling
+ternal service details. These options enable users to express                            decision (○  3 ), it communicates that decision back to the client
+policies targeting a range of different scenarios. For example,                          in the response (○    4 ). The Canopy client then flushes or discards
+rate-based policies and restraints enable users to target low                            the pending events (○       5 ). In general, opportunistic tracing is
+QPS systems and infrequent events. Canopy also allows teams                              only supported when the number of traced components are
+to mark a codepath as having been reached; they can then                                 small and known; it is infeasible for large fanouts or multi-
+define policies that target those particular paths.                                      ple hops, because turning tracing off requires informing all
+    For web and mobile requests, before acquiring a token, a call                        systems to which we have already propagated the TraceID.
+to initiate a trace (○  3 ) will first consult the user-defined sam-
+                                                                                         4.2 Canopy Pipeline
+pling policies to determine whether any user is interested in                            Canopy’s tailer is a sharded backend process that receives, pro-
+the request (○4 ). If a policy matches, the call invokes the policy’s
+                                                                                         cesses, and persists trace data. The tailer balances two priori-
+1 Other scenarios also trigger tracing, such as scroll events and client interactions.   ties: to ensure all traces get processed, and to do so as quickly
+Canopy                                                                                            SOSP ’17, October 28, 2017, Shanghai, China
+
+                  1 Poll Events                                                   schedules the trace to be processed after a trigger-specified
+  Scribe
+                            Fetchers               2          H
+                                                                     H HBase
+                                                                                  timeout. Fetchers evaluate and schedule triggers regardless of
+                                                           client
+                                                  3                               whether the event was successfully cached. Example triggers
+      Evaluate Triggers 4
+                                                                                  include processing traces 10 minutes after their first event is re-
+                                                In-Memory                         ceived, 10 minutes after the first client browser event, and one
+                      Scheduler                 Cache                    ad-hoc
+                                                                          jobs
+                                       6                                          day after identifying a trace from Facebook’s automated build
+      Timeout Elapsed 5                          (expired/evicted)
+                                                                     7            system (due to their long duration). In most cases Canopy
+                            Builders                                              receives all of a trace’s events before a timeout elapses. Oc-
+                                                                     Delayed
+                                  8                   (queue full)   Extractor    casionally, Canopy will process a trace only to receive more
+                                                                                  events later. In this case, triggers are evaluated again, and it is
+                                                  Isolation
+Dataset Configs
+                                                   Queues                         processed twice. However, in practice this occurs rarely; less
+  (Performance
+   Engineers)
+                                  9 Deficit Round-Robin
+                                                                                  than 0.03% of traces are processed more than once, with the
+                                                                         Scuba,   vast majority from traces that include user clients.
+                  Config-                  Extractors                    etc.
+                   erator                                                         Load Shedding A pool of builder threads initiate processing
+                                                                                  for traces after timeouts elapse (○5 ). For each trace-trigger pair,
+        Figure 7: Tailer architecture; see §4.2 for description.
+                                                                                  a builder will first retrieve the trace’s events from cache (○   6)
+                                                                                  before processing. If its events expired from the cache, the
+as possible – ideally in near-real time. This is challenging be-                  builder abandons the trace-trigger pair and instead enqueues
+cause of exceptional cases such as fluctuations in load, missing                  it to a separate persistent global queue which is read by a
+and delayed events, and resource contention from expensive                        separate tier of machines called delayed extractors (○ 7 ). Delayed
+datasets. In this section we describe the tailer’s constituent                    extractors process traces from this queue, performing the same
+components, illustrated in Figure 7.                                              actions as the tailer but retrieving their events from HBase.
+Routing Events Scribe [27] routes events from instrumented                        Delayed extractors also process ad-hoc user jobs, e.g. to extract
+Facebook components to tailers, and shards events by TraceID                      new features from old traces. In practice most traces (99.5%)
+to ensure all events for a given trace will route to the same                     are successfully processed directly from cache, since timeouts
+tailer. A pool of fetcher threads run a loop of polling Scribe                    exploit the temporal locality of events.
+(○1 ) and handling received events. Fetchers immediately write
+                                                                                  Model Construction To construct a modeled trace, for each
+each event to HBase for persistent storage (○    2 ), then insert into
+                                                                                  event builders inspect its type (e.g. “Edge Begin”, “Add Anno-
+an in-memory cache (○    3 ). The cache groups events by TraceID,
+                                                                                  tation”, etc.) and delegates to an event handler for that type.
+and expires a trace 15 minutes after its last event was added.                    Event handlers mutate trace state by either creating model
+If the cache is full, the least recently used trace is evicted by                 elements or adding information to existing elements. Since
+discarding all of its cached events, which account for the bulk                   instrumentation may be buggy or incomplete, builders make
+of its memory footprint. To prevent a trace re-entering the                       further passes over the trace to: 1) handle incomplete model
+cache with future events, we maintain an auxiliary cache of                       elements, e.g. blocks or edges missing end events; 2) correct
+TraceIDs seen in the past 5 hours.                                                any errors, e.g. points that occur outside the bounds of their
+Handling Events Next, fetchers must determine when the                            containing block; 3) infer additional model elements, e.g. infor-
+trace an event belongs to is ready to be processed, i.e. all the                  mation from services without data; and 4) align timestamps
+trace’s events have been received. However, we have no guaran-                    across distinct hosts using causal edges, establishing a single
+tee that events will be received in-order, or even at all — events                timeline relative to the start of the trace. Builders annotate
+may be dropped, components may not be instrumented, and                           model elements with any changes or corrections — we track
+clients may fail to send data. End-user clients with intermit-                    model errors in several datasets so that Canopy engineers can
+tent or slow network connectivity are particularly problematic:                   revisit and fix the model or instrumentation. Finally, builders
+there is a long tail of clients that both take a long time to suc-                validate a set of invariants on the trace, e.g. ensuring the trace
+cessfully transmit their events and have outlier performance                      has no cycles (which should be impossible).
+that is important to track.                                                       Feature Extraction Builders next evaluate user-defined dataset
+    Our approach targets the common case that trace events ar-                    configs. A dataset config comprises: 1) an owner; 2) a filtering
+rive unhindered and temporally proximate. We pattern match                        predicate; 3) an extraction expression; and 4) output database
+incoming events and initiate trace processing after sensible                      information. Builders apply the filtering predicates to deter-
+timeouts. For each event, fetchers evaluate a set of triggers,                    mine valid configs, then enqueue the trace into one or more
+which examine the event for distinguishing markers or fea-                        isolation queues based on the config owners (○       8 ). Isolation
+tures that can categorize the request (○  4 ). If a trigger matches,
+                                                                                  queues are short, and if a builder cannot enqueue a trace due
+and the trace-trigger pair is not already scheduled, the fetcher
+SOSP ’17, October 28, 2017, Shanghai, China                                                                               J. Kaldor et al.
+
+to capacity restrictions it abandons the trace and writes the       (a) Find the earliest client-side point
+                                                                        Begin = ExecUnits | Filter(name=“Client”) | Points | First
+TraceID to the delayed extractor queue.
+   A separate pool of extractor threads poll isolation queues for   (b) Find the client-side “display done” marker.
+traces, using deficit round-robin [52] to fairly share CPU time         DisplayDone = ExecUnits | Filter(name=“Client”) | Points |
+                                                                                      Filter(marker=“display_done”) | First
+between queues (○    9 ). Extractors evaluate extraction expres-
+sions and output to the configured databases. Most datasets         (c) Calculate display done latency.
+                                                                        DisplayDone | Timestamp | Subtract(Begin | Timestamp) |
+output to either Scuba [1], an in-memory database for real-              RecordAs(“display_done”)
+time aggregation and queries, or Hive [59] tables, for offline
+processing as part of a general data warehouse pipeline.            (d) Find all network resource loading on the critical path.
+                                                                        ResourceEdges = CriticalPath(Begin->DisplayDone) | Edges |
+   Fair sharing is necessary for two reasons: arbitrary user-                           Filter(type=“resource”)
+supplied extraction expressions are potentially very expensive;
+                                                                    (e) Calculate the total resource loading time on the critical path.
+and users may misconfigure sampling policies to collect too             ResourceEdges | Duration | Sum | RecordAs(“res_load”)
+many traces. We offload surplus processing to delayed extrac-
+tors to prevent lag from impacting other users.                     (f) Calculate the total CSS bytes on the critical path.
+                                                                        ResourceEdges | Filter(resource=“css”) | Counter(bytes) |
+4.3   Scalability                                                        Sum | RecordAs(“css_bytes”)
+
+Routing Events We shard Canopy’s backend by TraceID, so                  Figure 8: Extraction expressions for features used in §2.1.
+for any given trace, all events will route to the same tailer.
+Consequently, there is no communication between tailers and         to 3 days due to Scribe’s data retention guarantees; however in
+Canopy’s backend trivially scales by provisioning more ma-          practice they only lag by between 20 and 40 seconds.
+chines. Routing events to tailers is Canopy’s main scalabil-
+ity bottleneck; TraceIDs are random, so events generated by         4.4 Feature Extraction
+one component can potentially route to any tailer. Canopy           Canopy provides a domain-specific language (DSL) for describ-
+currently generates and processes approximately 1.16 GB/s of        ing features as pipelines of functions. Each function specified
+event data. However, Scribe can scale several orders of mag-        in the DSL is optimized and compiled into an efficient under-
+nitude beyond this, and this is a small fraction of the overall     lying implementation. Figure 8 illustrates DSL expressions for
+capacity of Facebook’s Scribe infrastructure                        several features from the case study from §2.1.
+Events and Datasets Canopy has two secondary scalability               Feature extraction is Canopy’s most heavily iterated com-
+concerns. As instrumentation in Facebook components has             ponent. We designed Canopy’s DSL when many features were
+matured, the number of events per trace has steadily grown:         straightforward functional extractions of trace data. The DSL
+~160 for backend services; >4500 for browser traces; and >7500      initially offered a limited set of transforms with modest ex-
+for mobile. This impacts the runtime overheads of generating        pressibility, and we expected to regularly extend the DSL with
+trace data, which are more pronounced for verbose traces (cf.       new functions as necessary. In practice, computed features
+§5.1). To address this, we introduced multiple levels of trace      grew more complex than expected, and the DSL had to in-
+detail that users can specify in their sampling policies, as de-    corporate more general-purpose features like data structures.
+scribed in §4.1. The number of users of Canopy and generated        Furthermore, engineers found the DSL insufficiently expres-
+datasets has also grown over time, from 35 datasets in Novem-       sive for speculative or exploratory feature analysis, and were
+ber 2015 to 129 datasets in April 2017.                             forced to jump to another language to write a user-defined
+Load Shedding Under normal operation, fetchers consume              function, then wait for redeployment. To address this, for ad-
+<5% CPU, builders ~25%, and extractors >55%. Under heavy            hoc queries we currently allow for integration with iPython
+load, isolation queues back up, and traces above each owner’s       notebooks (§4.5), and we are expanding support for dataset
+fair share offload to delayed extractors. On rare occasions         extraction to allow these to be stream processed online.
+builders fail to keep up with the rate of traces, causing lag       4.5 Querying and Visualization
+to accrue between triggers timing out and a builder picking         Canopy provides multiple entry points to consume trace data,
+up the trace; consequently, builders encounter more traces          illustrated in Figure 9. Typically, engineers start from an aggre-
+expiring from cache. Due to the default expiry of 15 minutes,       gate view of the collected trace data. Figure 9a shows a visual-
+builder lag does not exceed 5 minutes; beyond that all traces       ization for comparing function calls between two populations
+expire, and it is cheap to clear expired traces. On several prior   to identify regressions in the Facebook mobile app. Figure 9b
+occasions, issues with HBase caused fetcher threads to exhaust      is a customized view for browser traces that visualizes time
+client-side buffers and block on writing events to HBase. When      spent in different critical path components; the visualization
+this occurs events accumulate in Scribe, since fetchers only        is interactive and users can drill down into the data, view dis-
+receive events from Scribe by polling. Fetchers can lag by up       tributions, and select samples. Engineers also interact with
+Canopy                                                                                                                                                                                                                                                   SOSP ’17, October 28, 2017, Shanghai, China
+          1870 traces                                                 734 traces                                                                            1136 traces
+
+
+
+
+(a)                                                                                                                                                                                                   (b)                                                                                    (c)
+                                                                                                                                                                                                                          Interaction Time
+
+
+
+
+                                                                                                                                                                                                                                                                                                                    p5
+
+
+
+
+                                                                                                                                                                                                                                                                                                                          p25
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                     p50
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                            mean
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                    p75
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                                                   p95
+      Version
+Sampled       [A] ﬁlters...Date after Apr 11, 2017
+        Functions                                          Date before Apr 13, 2017                               Version [B]             Date after Apr 8, 2017          Date before Apr 10, 2017                                                                                                              7
+                                                                                                                                                                                                                                                                                                                6
+
+
+
+
+                                                                                                                                                                                                                                                                                                      Percent
+Function                                                                                                       Trace %           Incl. ms           Nrm. ms          Nrm. Δms ▼         Excl. ms                                                                                                                5
+ com/facebook/Layout::create                                                                                    50                 543                269
+                                                                                                                                                                          269              0                                                                                                                    4
+ …                                                                                                               0                   0                  0                                  0
+                                                                                                                                                                                                                                              Total: XXXX ms                                                    3
+ com/facebook/layout/Lifecycle::createLayout
+ …
+                                                                                                                50
+                                                                                                                 0
+                                                                                                                                   392
+                                                                                                                                     0
+                                                                                                                                                      198
+                                                                                                                                                        0                 198              0
+                                                                                                                                                                                           0
+                                                                                                                                                                                                                                                                                                                2
+ com/facebook/tools/tracing/RunnableWrapper::run                                                                56                2,278             1,266
+                                                                                                                                                                          182              2
+                                                                                                                                                                                                                                                                                                                1
+ …                                                                                                              54                2,017             1,085                                  2
+
+ com/facebook/layout/LayoutDeﬁnition::prepare                                                                   52                 266                139
+                                                                                                                                                                          139              0                                                                                                                    0
+ …                                                                                                               0                   0                  0                                  0
+                                                                                                                                                                                                                                                                                                                    2M   3M     4M     5M      6M         7M   8M   9M   10M 11M 12M
+ android/support/v7/widget/RecyclerView::dispatchLayout
+ …
+                                                                                                                56
+                                                                                                                54
+                                                                                                                                   559
+                                                                                                                                   383
+                                                                                                                                                      311
+                                                                                                                                                      206                 105              0
+                                                                                                                                                                                           0                                                                                                                                    Trace Duration Micros
+ android/support/v7/widget/RecyclerView::onLayout                                                                                                           tti 3.7             server_only 4.5                       dd 5.5
+(d)                                                                                                                                                                                                                                                                                           (f)
+                                                                                                                56                 557                309                                0
+                                                                                                                                                                          103
+ …                                                                                                              54                 383                206                                0
+                                                                                                                                                                                                                                                                                               page_piece_user_input:RENDER                                Counters Details Points Edges
+                                 0.0                 0.5               1.0             1.5             2.0             2.5                    3.0              3.5                  4.0         4.5             5.0             5.5                 6.0         6.5            7.0
+                                                                                                                                                                                                                                                                                              cpu
+   Client
+                                                                                                                                                                                                                                                                                              cpu_duration                                                      40.92ms
+       Javascript
+                                                                                                                                                                                                                                                                                              db
+   Server                                                                                                                                                                                                                                                                                     db_connect_duration                                               0.9301ms
+
+   Resource                                                                                                                                                                                                                                                                                   db_duration                                                       1.34ms
+                                                                                                                                                                                                                                                                                              db_read_count                                                     1
+       js: Rxqi7lfkvHd
+                                                                                                                                                                                                                                                                                              db_read_duration                                                  0.4098ms
+
+(e)
+       Main Thread_6430_P[0]                           DataLoaderUIHandler::doSendStoriesT oUI [DataLoader]                  …                                                                                              Choreographer#doFrame to Missing
+                                                           DataUnitCollection::addElementsAtTail [DataUnitCollection.add …                                                                                                             traversal to Missing                                   cache
+                                                           ObservableAdaptersCollection$ListItemCollectionObserver::onI…                                                                                                             layout
+                                                                                                                                                                                                                                                                                              cache_bytes                                                       9.14 KB
+                                                                                   FeedUnitAdapter::lazyGroupPrepare […                                                                              NewsFeedRecyclerView::onLayout [NewsFeedRecyclerView.onLayout]
+                                                                                                                                                                                                                               RV OnLayout
+                                                                                                                                                                                                                                                                                              cache_count                                                       169
+                                                                                                                                                                                                                  RecyclerView::onLayout [RV OnLayout]                                        cache_duration                                                    0.6320ms
+                                                                                                                                                                     RV OnBindView                                                 RV OnBindView                         RV CreateView
+                                                                                                                                                                                                                                                                                              mem
+                                                                                                                                             RecyclerView$Adapter::bindViewHolder [RV OnBindView]                         RecyclerView$Adapter::bind…          RecyclerView$Adapter::createViewHo
+                                                                                                                                               SinglePartHolder::prepare [SinglePartHolder.prepare]                        SinglePartHolder::prepare […
+                                                                                                                                                                                                                                                                                              mem_alloc_bytes                                                   859 KB
+                                                                                                                                               createLayout:FeedTreePropsWra…                                                                                                                 mem_peak_bytes                                                    1.84 MB
+                                                                                                                                               createLayout:FeedStoryMessage…
+                                                                                                                                                                                                                                                                                              page piece
+
+
+Figure 9: Engineers can use aggregate visualizations (a-c) to explore features. They can continue to drill down to individual traces (d-e) or                                                                                                                                                 page_piece_wait_duration                                          1.79ms
+
+
+
+
+elements within the trace (f). All visualizations support customizations to focus on relevant data for that view (cf. §4.5)
+
+                                                                               Mean 1st        25th 50th 75th 99th                                                                                          5         Evaluation
+        CPU                                                                    6.76% 1 1.1 1% 7.31% 6.86% 6.44% 4.44%
+WWW Wallclock                                                                  2.28% 7.1 1% 2.18% 2.14% 2.38% 2.70%                                                                                         Canopy has been deployed in production at Facebook for the
+Android Cold Start                                                             8.57% 5.29% 4.88% 10.78% 13.37% 0.00%                                                                                        past 2 years. In this section we present case studies where
+        ServiceA Wallclock                                                     8.15% 6.83% 7.03% 7.15% 7.53% 10.44%                                                                                         Canopy has enabled Facebook engineers to detect and diag-
+Service ServiceB Wallclock                                                     0.76% 0.72% 0.79% 0.80% 0.79% 0.38%
+                                                                                                                                                                                                            nose performance problems. We examine Canopy’s overheads
+Table 1: Latency increase with tracing enabled (Mean and Percentiles).                                                                                                                                      and load-shedding properties, and show that in addition to
+                                                                                                                                                                                                            addressing the challenges described in §2.2, Canopy:
+datasets through visualizations and query interfaces provided                                                                                                                                               ● Enables rapid performance analysis across heterogeneous
+by the underlying datastores. For example, Scuba [1] supports                                                                                                                                                 systems with different execution and performance models;
+a subset of SQL2 and provides a wide range of visualization                                                                                                                                                 ● Supports many users concurrently and enables customiza-
+and charting options (9c).                                                                                                                                                                                    tion for different use cases;
+   Each of these views provides ways to filter and slice features,                                                                                                                                          ● Enables independent evolution of the trace model, to adapt
+enabling engineers to quickly explore the data along different                                                                                                                                                to new use cases and execution types;
+dimensions. These also link between each other, so engineers
+                                                                                                                                                                                                            ● Scales to a large number of traces with low overhead.
+can always jump from one custom view to other relevant views,
+or to the underlying view for the datastore.                                                                                                                                                               5.1 Overheads
+   At some point in an investigation, engineers may need to                                                                                                                                                Table 1 details how the latency distributions change when trac-
+pivot from viewing aggregate data to exploring a single trace.                                                                                                                                             ing is enabled, for requests loading Facebook.com, starting
+From aggregate views, individual traces matching the filtered                                                                                                                                              the Android app, and two backend services (ServiceA and Ser-
+characteristics can be found and then explored. These views                                                                                                                                                viceB). The median wallclock time for web requests increases
+may also be customized based on the type of trace and nature                                                                                                                                               by 2.14% with tracing enabled, and by 10.78% for Android cold-
+of the investigation. Web traces have custom markers denoting                                                                                                                                              start at the finest granularity of tracing. In all cases, wallclock
+important phases and execution units grouped by type (9d);                                                                                                                                                 time increases less than CPU time, since some tasks happen
+mobile traces display sampled profiling data as a flame chart                                                                                                                                              off the critical path. For backend services, overheads are typi-
+(9e). Engineers can inspect properties of individual model                                                                                                                                                 cally proportional to request duration: ServiceA requests are
+elements (9f), customized to group, aggregate, and display                                                                                                                                                 short and instrumented in detail, incurring 8.15% overhead;
+certain properties. Due to Canopy’s single underlying trace                                                                                                                                                conversely ServiceB requests are longer and do not extend the
+model, a single trace may be viewed through many different                                                                                                                                                 default instrumentation, so incur < 1%. Overheads are higher
+visualizations, each emphasizing different aspects.                                                                                                                                                        in clients than on servers because we often lack system-level
+   To analyze traces and datasets programmatically, Canopy                                                                                                                                                 methods for capturing data and instead rely on application-
+integrates with iPython and we provide several iPython tem-                                                                                                                                                level methods. Finally, Canopy’s backend components require
+plates to get started. Engineers can load individual traces; write                                                                                                                                         less than 0.1% of available datacenter resources.
+DSL functions or UDFs and process traces in bulk; or load                                                                                                                                                  5.2 Load Shedding
+and explore datasets from backend datastores.
+                                                                                                                                                                                                           In this experiment we evaluate the tailer’s ability to isolate
+                                                                                                                                                                                                           tenants, manage load spikes, and prevent tenant interference.
+2 Scuba SQL supports grouping and aggregations, but not joins. By default                                                                                                                                  We mirror traffic from one production tailer for a period of 2
+Scuba subsamples data beyond 30 days and gives confidence bounds for                                                                                                                                       hours and 40 minutes, and simulate a load spike by gradually
+aggregation queries. Scuba queries typically complete within a few seconds.                                                                                                                                inserting additional load for the Mobile tenant (Figure 10a).
+SOSP ’17, October 28, 2017, Shanghai, China                                                                                          J. Kaldor et al.
+
+Load increases at t=10, t=40, and t=70; we sustain maximum                                  8 Additional Load                                   Mobile
+
+
+
+
+                                                                           MB/s
+                                                                     (a)                    4
+load from t=70-115; and revert to normal at t=115.                                          0
+   Load introduced at t=40 pushes Mobile above its fair share.                              5 Isolation Queue                                   Mobile
+At t=50, the 10-minute triggers start elapsing for these traces,     (b)                      Median Length
+                                                                                            0
+and Mobile’s isolation queue backs up (10b). From t=50-125,
+                                                                                          200 Rescheduled Traces                                Mobile
+
+
+
+
+                                                                           Minutes Traces/s
+the queue is consistently at or near its capacity of 5 traces, and   (c)                  100                                                   Non-
+                                                                                                                                                Mobile
+some Mobile traces are scheduled for delayed extraction (10c).                              0
+However, traces from non-mobile tenants remain unaffected.                                 40 Trace Processing            95th Percentile
+   Figure 10d plots the processing lag for traces on the delayed     (d)                   20 Lag (Mobile)                Median
+extractor, i.e. the time between being queued and processed.                                0
+From t=0-90, the delayed extractor is under-utilized and pro-                            120k Output Rows (Non-Mobile)                      Production
+                                                                                                                                            Experiment
+
+
+
+
+                                                                           Rows/s
+cesses traces immediately. At t=90, traces are queued faster         (e)                      80k
+than they can be processed, increasing the processing lag. After                              40k
+load reverts to normal at t=115, the delayed extractor continues                                    0   30      60        90          120         150
+                                                                                                                 Time (minutes)
+processing traces and clears its backlog by t=155.
+                                                                     Figure 10: Load-shedding experiment using traffic mirrored from a
+   Figure 10e plots output rows generated for non-Mobile ten-        production tailer: (a) we insert additional Mobile Load; (b) Mobile
+ants, comparing the experiment to the source production tailer       exceeds its fair share and its queue fills up; (c) excess Mobile traces
+whose traffic we mirror. The figure shows little discrepancy         are sent for delayed extraction; (d) the delayed extractor lags behind
+between experiment and production, and demonstrates how              processing excess Mobile traces but clears the backlog after load
+                                                                     reverts to normal; (e) non-Mobile traffic is unaffected and processed
+Canopy isolates non-Mobile tenants from the load spike.              at the same rate as on the production tailer.
+   In practice, load spikes can happen for a variety of reasons.
+The distributed token bucket assumes a fixed cost per trace ini-        Our second model (11b) introduced execution units, dis-
+tiation, but in practice the number of events generated for one      tinct from blocks, so that processes could more naturally de-
+trace can vary significantly. New instrumentation that gener-        pict their internal events. We added new instrumentation to
+ates additional events can therefore increase the cost per trace.    measure idle time and incorporated that information into the
+Changes to dataset configs can also change the cost of process-      model. We reused the same event types as our initial instru-
+ing a trace, i.e. by introducing expensive extraction functions.     mentation, and simply relaxed the model to allow client receive
+This is usually caught by a canary system for changes, but           events to occur within a different block (C) from client send
+sometimes the effects aren’t observed for hours. For example,        (A). However, while this approach enabled accurate measure-
+an instrumentation bug increased the number of blocks in             ment of client idle time, it did not account for time between
+each browser trace; this increased backend costs because sev-        receiving and processing the RPC response, which primarily
+eral datasets for browser traces do work proportional to the         occurs in two ways: backend servers that have dedicated net-
+number of blocks. However, lag only began accumulating the           work IO threads read responses from the network and enqueue
+following morning, corresponding to the daily traffic peak.          them while the main thread is busy completing other work
+5.3 Trace Model Evolution                                            (11c); and asynchronous execution models can demarshall re-
+                                                                     sponses in the same threads that run the response handler,
+Canopy has enabled us to evolve our trace model as new use
+                                                                     but defer the handler to a later time (11d) – this is common in
+cases arise, without having to revisit existing system instru-
+                                                                     web browsers. To handle these cases, we added a new event
+mentation. Figure 11 illustrates several successive refinements
+                                                                     type called client queue (CQ) generated when a response is
+we made to our model of RPC communication. Initially we
+                                                                     received and queued to be processed, and extended the trace
+modeled RPC communication using a block-based model (11a)
+                                                                     model’s RPC structure with metadata to indicate this queuing
+analogous to Dapper’s spans [54]. Each block corresponded to
+                                                                     time. Finally, as more systems at Facebook integrated with
+a request within one process and was identifiable by a unique
+                                                                     Canopy we encountered a wider range of patterns, such as
+block ID (e.g. A, B, etc.). When making an RPC, the sender
+                                                                     one-way RPCs, RPCs that send multiple responses, and more
+(A) would generate a block ID (B) for the child and include
+                                                                     general streaming and pub-sub communication. This led us to
+the ID within the call. To record the RPC, we used four event
+                                                                     decouple our model’s representation of RPCs into sets of edges
+types corresponding to client send (CS), server receive (SR),
+                                                                     as described in §3.4, where an edge is a one-way communica-
+server send (SS), and client receive (CR), and annotated events
+                                                                     tion between any two blocks (11e). With this, any two blocks
+with the block ID to enable later reconstruction of the RPC
+                                                                     can indicate network communication by generating a send
+structure in the trace. However, we were unable to express
+                                                                     event on sender (A, D) and a receive event on the receiver
+more fine-grained dependencies within services, such as time
+                                                                     (B, C). Although we no longer require the four event types
+blocked waiting for the RPC response.
+                                                                     of the initial model (11a), the existing instrumentation is still
+Canopy                                                                                                                               SOSP ’17, October 28, 2017, Shanghai, China
+
+             Block A                  Block A              Block C                                 Block A                          Block A                Block C            Block A
+    A                            A      A                        C                    A                           A    A              A                C      C                  A
+                                                                                                                                                                               S B                Block C
+ CS B                     CR B     CS B                 CR B                   CS B                    CQ B CR B            CS B           CQ B CR B                                        D
+                                                                                                                                                                                                    R C
+                                                                                                                                                                                 A
+            A
+         SR B
+                            A
+                         SS B
+                                                A
+                                             SR B
+                                                           C
+                                                        SS B
+                                                                                              A
+                                                                                           SR B
+                                                                                                           A
+                                                                                                        SS B                         SR B
+                                                                                                                                           A      C
+                                                                                                                                               SS B                          R B                   D
+                                                                                                                                                                                                 S C
+                                                                                                                                                                             Block B
+            Block B                           Block B                                      Block B                                   Block B                                               Block D
+                 (a)                            (b)                        (c)                       (d)                        (e)
+                       Figure 11: Evolution of Canopy’s instrumentation and model for RPCs and network communication (cf. §5.3)
+
+
+   MainContent                                                     Server:AwaitSuggestions
+    MainLayout                                                     Server:ParseSuggestions
+        Headers                                                 Client:SuggestionsReceived
+     Reminders                                                      Client:ShowSuggestions
+   ContentCard                                                                                      0            100    200    300     400 500 0                     1         2      3        4         5
+   LastResponse                                                                                                 Block Frequency (thousands)                              Page Load Latency (s)
+    Suggestions
+         Footer                                             (b) ‘Suggestions’ appears on the critical path in two circumstances: on slow clients that receive
+ Announcements                                              suggestions before the page is done loading; and on the server during initial page construction.
+                   0    10     20    30    40     50                                                                           Time (s)
+                    Page Piece Frequency (millions)                                                2                       3                     4                       5     5.4
+                                                                                           3
+                                                                                           ○                                                                                             Client
+                                                                               1
+                                                                               ○                                                                              5
+                                                                                                                                                              ○              6
+                                                                                                                                                                             ○           Browser
+                                                                     Threads
+
+
+
+
+                                                                                                                               4
+                                                                                                                               ○                                                         Server
+(a) The low-priority ‘Suggestions’ page piece un-
+expectedly appears on the execution critical path                                           2
+                                                                                            ○                                                                                            Suggestions
+                                                                                                                                                                                         Blocks
+in 10.4M requests, initiating the investigation.
+                                                  (c) ‘Suggestions’ blocks server execution (○)2 and delays flush (ideal ○,3 actual ○).
+                                                                                                                                      5
+  Figure 12: An engineer sees something unusual on the critical path and investigates, ultimately finding a server execution issue (cf. §5.4)
+
+compatible with each revision of the model, as they simply                                                      as a result, the server may wait for these continuations even
+translate to a pair of edges in the current model.                                                              though the code wasn’t. Figure 12c illustrates the execution
+Other Integrations Canopy’s flexible model lets us incorpo-                                                     timeline of an affected request: when the server received the
+rate the output of other trace systems and profilers. For exam-                                                 initial request, it executed an asynchronous call to ‘Sugges-
+ple, to integrate HTrace [12] with Canopy, we map HTrace                                                        tions’ (○1 ). However, it unexpectedly blocked waiting for this
+spans to blocks; timeline annotations to points within the                                                      continuation (○  2 ). Normally, the server would have flushed
+block; and parent-child relationships to edges between blocks.                                                  some initial high-priority page pieces (○   3 ); instead, execution
+Parent-child relationships in HTrace only convey hierarchy                                                      was blocked waiting for further computation to complete (○       4)
+and not fine-grained timing information, so the edges map                                                       which delayed flushing data to the client ( ) and eventually
+                                                                                                                                                                ○ 5
+between the block begin points (and similarly for the ends).                                                    displaying the page (○  6 ). This issue only occurred in a subset
+                                                                                                                of requests; however, Canopy was still able to surface these as
+5.4 Case Studies
+                                                                                                                an issue. The customized feature extraction exposed this as an
+Causal Ordering The Facebook.com page load process is care-                                                     issue, and was also able to identify how often this happened
+fully ordered to try and get important page-pieces displayed                                                    and the estimated overall impact.
+early, with distinct phases for groups of page-pieces. One of
+                                                                                                                Regressions in Subpopulations Sometimes shifts happen as
+the features extracted for analysis is the set of page-pieces
+                                                                                                                a result of internal changes, but sometimes those changes are
+on the critical path for these phases. An engineer looking
+                                                                                                                exogenous. An example of this occurred in December 2016
+at this data was surprised to see a low-priority ‘Suggestions’
+                                                                                                                and January 2017, when internet to the Indian subcontinent
+page-piece sometimes appearing on the critical path of the
+                                                                                                                was disrupted on multiple occasions, due to a cyclone and
+highest-priority phase (Figure 12a). To investigate, the engineer
+                                                                                                                multiple submarine cable cuts, respectively. This caused re-
+checked which specific ‘Suggestions’ blocks were appearing
+                                                                                                                gressions in performance for affected end-users, and was large
+on the critical path, and cross-referenced with the average
+                                                                                                                enough to cause a global regression in pageload latency of
+request latency when present (Figure 12b). When ‘Suggestions’
+                                                                                                                ~50ms. Country is an extracted feature, so splitting the data
+is on the client-side critical path, the high latency provides a
+                                                                                                                on that axis clearly showed the difference, while the critical
+sufficient explanation – the server sent all page-piece phases
+                                                                                                                path breakdown showed that the largest change for those end-
+but the client was slow to process them. However, it was un-
+                                                                                                                users was in network and resource downloads, as expected.
+expected to find ‘Suggestions’ on the server-side critical path.
+                                                                                                                Here, Canopy was able to help engineers rapidly identify the
+The engineer inspected an affected trace and discovered the
+                                                                                                                cause and prevent long-term investigation for something ulti-
+root cause: a bug in the server execution environment, where
+                                                                                                                mately outside of their control.
+some asynchronous continuations were treated differently;
+SOSP ’17, October 28, 2017, Shanghai, China                                                                           J. Kaldor et al.
+
+Identifying Improvements In addition to dataset exploration,          6   Experiences
+Canopy traces can also be used to perform hypothetical anal-          Some observations from our experiences with Canopy:
+ysis. Engineers responsible for the early flush component de-
+                                                                      ● Common datasets give casual users an entry point without
+scribed in §2.1 improved page load time by considering the
+                                                                        exposing them to the underlying trace structure. Since not
+cause for the performance breakdowns in the critical path.
+                                                                        all features are applicable to all trace types, our common
+Their analysis showed that clients were spending an inordinate
+                                                                        datasets vary by domain. For example, we widely use critical
+amount of time on the critical path waiting for additional re-
+                                                                        path breakdowns for web stack analysis, but not for mobile,
+sources (CSS/JavaScript) before the page load was complete.
+                                                                        where it is more difficult to correctly instrument all block-
+This occurred because Facebook.com already sent down re-
+                                                                        ing (locks, CPU scheduling, framework code, etc.). Instead,
+sources at the start of the page that were expected to be needed
+                                                                        mobile datasets center on common resource counters.
+later on, but it was possible for page pieces to require addi-
+tional resources after construction. They predicted that send-        ● It is an open question whether a DSL can express all possible
+ing down a second wave of resources midway through the page             analyses, or if a general purpose language is required.
+load, particularly those typically used by low priority page-         ● Canopy is applicable to average case, edge case, and tail
+pieces, would lead to a noticeable performance improvement,             latency analysis, because at scale, many strange behaviors
+which was borne out when the feature was implemented.                   are frequent enough to identify as statistical outliers. One
+Mobile Clients Canopy is used across many domains at Face-              limitation is investigating a specific instance or request that
+book to analyze production trace data, including mobile ap-             wasn’t sampled, e.g. a single user error report of an anomaly.
+plications. Canopy helps to identify resource bottlenecks and         ● Canopy is suitable for tracing any action with a well-defined
+expensive function calls during various phases of important             begin and end. We currently trace user-facing systems (web,
+flows like cold-start (the time to start the application) and long-     mobile), backend systems (services, data analytics), and data
+scroll-frames (other application work preventing timely display         provenance scenarios (e.g. the end-to-end lifecycle of a user
+updates). Engineers used Canopy’s feature extraction of call-           notification). Trace durations vary by multiple orders of mag-
+stacks to identify a slow-building regression over multiple             nitude, which we handle with per-domain triggers and time-
+releases caused by a gradual increase in the number of initial-         outs. The main scenarios we’ve encountered where Canopy’s
+ization modules. Ad-hoc queries with Python notebooks have              assumptions don’t apply are long running dataflow pipelines
+also been used to investigate metric quality; a query found             and scenarios with multiple beginning points.
+cold-start traces with large gaps with nothing executing, which       ● Our most effective and scalable instrumentation strategies
+led engineers to find that their startup metric was including           include instrumenting core frameworks, and capturing data
+background app starts that they wanted to exclude.                      from existing profilers and loggers.
+Exploratory Analysis Features determined to be generally              ● Common instrumentation errors include conflating TraceID
+useful for a broad set of users are exposed in general datasets         propagation with tracing (and wanting to trace all requests),
+for engineers to use for quick investigations. Sometimes there’s        and propagating TraceIDs incorrectly (causing traces that
+a slow request, and engineers just want quick help to find the          never end). The latter leads to a large number of events
+cause. As an example, in February 2017, an engineer noticed             being generated for a single trace; to deal with this, we added
+a poorly performing endpoint which frequently timed out,                triggers for blacklisting erroneous traces.
+and so examined features from a few traces. One of these was
+database time along the critical path, which led the engineer         ● We only support opportunistic tracing (cf. §4.1) in a subset
+to find and fix an expensive query without an index, speeding           of components, because it requires updating instrumenta-
+up the DB query by 99% and page load time by 50%.                       tion to propagate sampling metadata in addition to the Tra-
+                                                                        ceID. It is an open question whether context propagation
+Custom Analysis For longer or more complex investigations,
+                                                                        can generalize, i.e. to propagate arbitrary metadata without
+engineers can define custom views. Canopy allows these teams
+                                                                        requiring instrumentation changes.
+to quickly set up a customized table, and reuse many of the
+features from general tables, without forcing all features to
+                                                                      7   Related Work
+exist in a shared global table. As an example, search results
+were broken up into several page-pieces, where the first may          In §2.2 we discuss the challenges Canopy addresses that are
+be empty. The latency of this page was defined as the display of      shared with many other tracing tools. We complement the
+the first non-empty page-piece. Engineers defined this metric         discussion on related work here.
+as a complex extracted feature in a dataset, added existing,          Generating Performance Data Existing tools for troubleshoot-
+modular critical path features to further break it down, and          ing distributed systems make use of a range of different input
+then used this dataset for long-term monitoring of the flow.          data. They include tools that ingest existing per-process and
+Canopy                                                                                   SOSP ’17, October 28, 2017, Shanghai, China
+
+per-component logs [29, 37, 66]; end-to-end tracing tools that          Similarly, Facebook developers have made extensive use of
+generate causally-related event data [12, 24, 39, 50, 54, 60]; state-   statistical comparison techniques to find correlations between
+monitoring systems that track system-level metrics and per-             features and compare distributions, e.g. between application
+formance counters [36]; and aggregation systems to collect              versions. However, operator-driven exploration is a prerequi-
+and summarize application-level monitoring data [30, 34, 61].           site to most automated approaches in order to identify salient
+Wang et al. provide a comprehensive overview of datacenter              features [37]. In a recent analysis of Splunk usage, Alspaugh et
+troubleshooting tools in [63]. Canopy is designed to provide a          al. noted that the use of statistical and machine learning infer-
+common entry point for this breadth of data, since all of these         ence techniques is “relatively rare” and that human inference
+input types are useful for different kinds of analysis.                 is the key driver of analyses [3]. Canopy’s primary use case
+   Like Canopy, many tools record causality between events ex-          is to support ad hoc high-level exploratory analysis, because
+plicitly by propagating identifiers along the request execution         problems arising in practice are difficult to anticipate and there
+path [12,24,39,50,54,60]. Prior systems alleviate the instrumen-        are a wide range of potential features to explore [34].
+tation burden (cf. §2.2) by propagating context in shared under-           Several prior systems support ad hoc exploration similar
+lying communication and concurrency layers [24, 49, 54, 56];            to the case studies we present. G2 [25] is a system for writ-
+recent work has also used source and binary rewriting tech-             ing queries over execution traces at the level of raw traces, so
+niques to automatically instrument common execution mod-                faces the scalability and abstraction challenges of §2.2. For
+els [26, 32, 34, 48].                                                   example, evaluating a G2 query over 130 million events takes
+   An alternative approach to instrumenting systems is to in-           100 seconds; by comparison, interactive Canopy queries de-
+fer correlation or causality from existing outputs such as logs.        rive from trillions of events. Stratified sampling can improve
+Approaches include combining identifiers – i.e. call ID, IP ad-         query time by returning approximate results [62]; similarly,
+dress, etc.– present across multiple logging statements [16, 22,        for historical data older than 30 days, Scuba subsamples and
+29, 58, 66, 67]; inferring causality using machine learning and         provides confidence bounds (cf. §4.5). Pivot Tracing [34] is a
+statistical techniques [18, 35, 38, 66]; and augmenting models          dynamic instrumentation framework that enables operators
+with static source code analysis [66–68]. In practice it is chal-       to iteratively install new queries during the diagnosis process;
+lenging to scale black-box analysis because inferring causal            however it does not apply to historical analysis, which is an
+relationships is expensive; for example, computing a Facebook           important Facebook use case that necessitates capturing and
+model from 1.3M traces took 2 hours for the Mystery Ma-                 storing full traces.
+chine [22]. Canopy scales well beyond this, to 1.3 billion traces
+                                                                        8   Conclusion
+per day currently, because of its sharded backend; we require
+no communication between either traces or shards (cf. §4.3).            In this paper we presented Canopy, which emphasizes a decou-
+                                                                        pled, customizable approach to instrumentation and analysis,
+Analyzing Data Prior work in troubleshooting distributed
+                                                                        allowing each to evolve independently. Canopy addresses sev-
+systems has presented a variety of automated analysis tech-
+                                                                        eral challenges in generating, collecting, and processing trace
+niques: semi-automatically honing in on root causes of perfor-
+                                                                        data, and introduces feature extraction as an important inter-
+mance anomalies [64]; identifying statistical anomalies [29];
+                                                                        mediary step for aggregate analysis. Canopy has been used for
+online statistical outlier monitoring [15]; analyzing critical
+                                                                        the past 2 years to solve numerous production performance
+path dependencies, slack, and speedup [22,47]; and explaining
+                                                                        problems across the Facebook stack, over both end-user client
+structural and statistical differences between ‘before’ and ‘after’
+                                                                        code as well as server-side code.
+traces [35, 51]. Manual analysis has covered an even broader
+range of issues, such as requests whose structure or timing             9 Acknowledgements
+deviate from the norm [2, 17, 20, 21, 46, 51]; identifying slow         We thank our shepherd Rebecca Isaacs and the anonymous
+components and functions [19, 35, 54]; and modelling work-              SOSP reviewers for their invaluable feedback and suggestions,
+loads and resource usage [16, 17, 35, 58]. Use cases for tracing        and Canopy team members and collaborators past and present,
+tools deployed in production at 26 companies range from                 including Philippe Ajoux, David Chou, Jim Hunt, Delyan
+debugging individual anomalous requests, to capturing perfor-           Kratunov, Jérémie Marguerie, Ben Maurer, and Dawid Pus-
+mance, resource, and latency metrics, to correlating failures           tulka.
+and behavioral clustering [33].
+   Canopy does not obviate any of these techniques, but in-             References
+stead provides the data extraction pipeline that generates the           [1] Abraham, L., Allen, J., Barykin, O., Borkar, V., Chopra, B., Gerea,
+                                                                             C., Merl, D., Metzler, J., Reiss, D., Subramanian, S., Wiener, J. L.,
+input to many of them. For example, Spectroscope [51] di-
+                                                                             and Zed, O. Scuba: Diving into Data at Facebook. In 39th International
+agnoses regressions between before- and after- sets of traces,               Conference on Very Large Data Bases (VLDB ’13). (§3.1, 4.2, and 4.5).
+by comparing trace structures and performing ANOVA tests.
+SOSP ’17, October 28, 2017, Shanghai, China                                                                                           J. Kaldor et al.
+
+ [2] Aguilera, M. K., Mogul, J. C., Wiener, J. L., Reynolds, P., and              32nd IEEE/IFIP International Conference on Dependable Systems and
+     Muthitacharoen, A. Performance Debugging for Distributed Systems             Networks (DSN ’02). (§7).
+     of Black Boxes. In 19th ACM Symposium on Operating Systems Principles   [22] Chow, M., Meisner, D., Flinn, J., Peek, D., and Wenisch, T. F. The
+     (SOSP ’03). (§7).                                                            Mystery Machine: End-to-end Performance Analysis of Large-scale In-
+ [3] Alspaugh, S., Di Chen, B., Lin, J., Ganapathi, A., Hearst, M. A.,            ternet Services. In 11th USENIX Symposium on Operating Systems Design
+     and Katz, R. H. Analyzing Log Analysis: An Empirical Study of User           and Implementation (OSDI ’14). (§2.2 and 7).
+     Log Mining. In 28th USENIX Large Installation System Administration     [23] Fonseca, R., Freedman, M. J., and Porter, G. Experiences with Trac-
+     Conference (LISA ’14). (§2.2 and 7).                                         ing Causality in Networked Services. In 2010 USENIX Internet Network
+ [4] Apache. ACCUMULO-3741: Reduce incompatibilities with htrace 3.2.0-           Management Workshop/Workshop on Research on Enterprise Networking
+     incubating. Retrieved January 2017 from https://issues.apache.org/           (INM/WREN ’10). (§2.2).
+     jira/browse/ACCUMULO-3741. (§2.2).                                      [24] Fonseca, R., Porter, G., Katz, R. H., Shenker, S., and Stoica, I.
+ [5] Apache. ACCUMULO-4171: Update to htrace-core4. https://issues.               X-Trace: A Pervasive Network Tracing Framework. In 4th USENIX Sym-
+     apache.org/jira/browse/ACCUMULO-4171. [Online; accessed January              posium on Networked Systems Design and Implementation (NSDI ’07).
+     2017]. (§2.2).                                                               (§1, 2.2, and 7).
+ [6] Apache. CASSANDRA-10392: Allow Cassandra to trace to custom             [25] Guo, Z., Zhou, D., Lin, H., Yang, M., Long, F., Deng, C., Liu, C., and
+     tracing implementations. Retrieved January 2017 from https://issues.         Zhou, L. G2 : A Graph Processing System for Diagnosing Distributed
+     apache.org/jira/browse/CASSANDRA-10392. (§3.2).                              Systems. In 2011 USENIX Annual Technical Conference (ATC). (§7).
+ [7] Apache. HBASE-12938: Upgrade HTrace to a recent supportable in-         [26] Jiang, Y., Ravindranath, L., Nath, S., and Govindan, R. WebPerf:
+     cubating version. Retrieved January 2017 from https://issues.apache.         Evaluating “What-If ” Scenarios for Cloud-hosted Web Applications. In
+     org/jira/browse/HBASE-12938. (§2.2).                                         2016 Conference of the ACM Special Interest Group on Data Communica-
+ [8] Apache. HBASE-9121: Update HTrace to 2.00 and add new example                tion (SIGCOMM). (§7).
+     usage. Retrieved January 2017 from https://issues.apache.org/jira/      [27] Johnson, R. Facebook’s Scribe technology now open source. (Octo-
+     browse/HBASE-9121. (§2.2).                                                   ber 2008). Retrieved August 2017 from https://www.facebook.com/note.
+ [9] Apache. HDFS-11622 TraceId hardcoded to 0 in DataStreamer, cor-              php?note_id=32008268919. (§4.1 and 4.2).
+     relation between multiple spans is lost. Retrieved April 2017 from      [28] Karumuri, S. PinTrace: Distributed Tracing at Pinterest. (August 2016).
+     https://issues.apache.org/jira/browse/HDFS-11622. (§2.2).                    Retrieved July 2017 from https://www.slideshare.net/mansu/pintrace-
+[10] Apache. HDFS-7054: Make DFSOutputStream tracing more fine-                   advanced-aws-meetup. (§2.2).
+     grained. Retrieved January 2017 from https://issues.apache.org/jira/    [29] Kavulya, S. P., Daniels, S., Joshi, K., Hiltunen, M., Gandhi, R., and
+     browse/HDFS-7054. (§2.2).                                                    Narasimhan, P. Draco: Statistical Diagnosis of Chronic Problems in
+[11] Apache. HDFS-9080: update htrace version to 4.0.1. Retrieved January         Large Distributed Systems. In 42nd IEEE/IFIP Conference on Dependable
+     2017 from https://issues.apache.org/jira/browse/HDFS-9080. (§2.2).           Systems and Networks (DSN ’12). (§7).
+[12] Apache. HTrace. Retrieved January 2017 from http://htrace.              [30] Ko, S. Y., Yalagandula, P., Gupta, I., Talwar, V., Milojicic, D., and
+     incubator.apache.org/. (§2.2, 3.2, 5.3, and 7).                              Iyer, S. Moara: Flexible and Scalable Group-Based Querying System. In
+[13] Apache. HTRACE-118: support setting the parents of a span after the          9th ACM/IFIP/USENIX International Conference on Middleware (Mid-
+     span is created. Retrieved January 2017 from https://issues.apache.          dleware ’08). (§7).
+     org/jira/browse/HTRACE-118. (§2.2).                                     [31] Leavitt, J. End-to-End Tracing Models: Analysis and Unification. B.Sc.
+[14] Apache. HTRACE-209: Make span ID 128 bit to avoid collisions. Re-            Thesis, Brown University, 2014. (§2.2 and 3.3).
+     trieved January 2017 from https://issues.apache.org/jira/browse/        [32] Li, D., Mickens, J., Nath, S., and Ravindranath, L. Domino: Under-
+     HTRACE-209. (§2.2).                                                          standing Wide-Area, Asynchronous Event Causality in Web Applications.
+[15] Bailis, P., Gan, E., Madden, S., Narayanan, D., Rong, K., and Suri,          In 6th ACM Symposium on Cloud Computing (SoCC ’15). (§7).
+     S. MacroBase: Analytic Monitoring for the Internet of Things. arXiv     [33] Mace, J. End-to-End Tracing: Adoption and Use Cases. Survey,
+     preprint arXiv:1603.00567 (2016). (§7).                                      Brown University, 2017. http://cs.brown.edu/people/jcmace/papers/
+[16] Barham, P., Donnelly, A., Isaacs, R., and Mortier, R. Using Mag-             mace2017survey.pdf. (§7).
+     pie for Request Extraction and Workload Modelling. In 6th USENIX        [34] Mace, J., Roelke, R., and Fonseca, R. Pivot Tracing: Dynamic Causal
+     Symposium on Operating Systems Design and Implementation (OSDI ’04).         Monitoring for Distributed Systems. In 25th ACM Symposium on Oper-
+     (§7).                                                                        ating Systems Principles (SOSP ’15). (§7).
+[17] Barham, P., Isaacs, R., Mortier, R., and Narayanan, D. Magpie:          [35] Mann, G., Sandler, M., Krushevskaja, D., Guha, S., and Even-Dar,
+     Online Modelling and Performance-Aware Systems. In 9th USENIX                E. Modeling the Parallel Execution of Black-Box Services. In 3rd USENIX
+     Workshop on Hot Topics in Operating Systems (HotOS ’03). (§7).               Workshop on Hot Topics in Cloud Computing (HotCloud ’11). (§2.2, 3.4,
+[18] Beschastnikh, I., Brun, Y., Ernst, M. D., and Krishnamurthy, A. In-          and 7).
+     ferring Models of Concurrent Systems from Logs of Their Behavior with   [36] Massie, M. L., Chun, B. N., and Culler, D. E. The Ganglia Distributed
+     CSight. In 36th ACM International Conference on Software Engineering         Monitoring System: Design, Implementation, and Experience. Parallel
+     (ICSE ’14). (§7).                                                            Computing 30, 7 (2004), 817–840. (§7).
+[19] Chanda, A., Cox, A. L., and Zwaenepoel, W. Whodunit: Transactional      [37] Nagaraj, K., Killian, C. E., and Neville, J. Structured Comparative
+     Profiling for Multi-Tier Applications. In 2nd ACM European Conference        Analysis of Systems Logs to Diagnose Performance Problems. In 9th
+     on Computer Systems (EuroSys ’07). (§7).                                     USENIX Symposium on Networked Systems Design and Implementation
+[20] Chen, M. Y., Accardi, A., Kiciman, E., Patterson, D. A., Fox, A., and        (NSDI ’12). (§7).
+     Brewer, E. A. Path-Based Failure and Evolution Management. In 1st       [38] Oliner, A. J., Kulkarni, A. V., and Aiken, A. Using Correlated Surprise
+     USENIX Symposium on Networked Systems Design and Implementation              to Infer Shared Influence. In 40th IEEE/IFIP International Conference on
+     (NSDI ’04). (§7).                                                            Dependable Systems and Networks (DSN ’10). (§7).
+[21] Chen, M. Y., Kiciman, E., Fratkin, E., Fox, A., and Brewer, E. Pin-     [39] OpenTracing. OpenTracing. Retrieved January 2017 from http://
+     point: Problem Determination in Large, Dynamic Internet Services. In         opentracing.io/. (§7).
+Canopy                                                                                           SOSP ’17, October 28, 2017, Shanghai, China
+
+[40] OpenTracing. Specification 5: Non-RPC Spans and Mapping to                [55] Slee, M., Agarwal, A., and Kwiatkowski, M. Thrift: Scalable Cross-
+     Multiple Parents. Retrieved February 2017 from https://github.com/             Language Services Implementation. Technical Report, Facebook, 2007.
+     opentracing/specification/issues/5. (§2.2).                                    (§3).
+[41] OpenZipkin. Zipkin 1189: Representing an asynchronous span in Zipkin.     [56] Spring. Spring Cloud Sleuth. Retrieved January 2017 from http://cloud.
+     Retrieved January 2017 from https://github.com/openzipkin/zipkin/              spring.io/spring-cloud-sleuth/. (§7).
+     issues/1189. (§2.2).                                                      [57] Tang, C., Kooburat, T., Venkatachalam, P., Chander, A., Wen,
+[42] OpenZipkin. Zipkin 1243: Support async spans. Retrieved January 2017           Z., Narayanan, A., Dowell, P., and Karl, R. Holistic Configuration
+     from https://github.com/openzipkin/zipkin/issues/1243. (§2.2).                 Management at Facebook. In 25th ACM Symposium on Operating Systems
+[43] OpenZipkin. Zipkin 1244: Multiple parents aka Linked traces. Re-               Principles (SOSP ’15). (§4.1 and 4.1).
+     trieved January 2017 from https://github.com/openzipkin/zipkin/           [58] Thereska, E., Salmon, B., Strunk, J., Wachs, M., Abd-El-Malek, M.,
+     issues/1244. (§2.2).                                                           Lopez, J., and Ganger, G. R. Stardust: Tracking Activity in a Distributed
+[44] OpenZipkin. Zipkin 925: How to track async spans? Retrieved January            Storage System. In 2006 ACM International Conference on Measurement
+     2017 from https://github.com/openzipkin/zipkin/issues/925. (§2.2).             and Modeling of Computer Systems (SIGMETRICS). (§7).
+[45] OpenZipkin. Zipkin 939: Zipkin v2 span model. Retrieved January 2017      [59] Thusoo, A., Sarma, J. S., Jain, N., Shao, Z., Chakka, P., Zhang, N.,
+     from https://github.com/openzipkin/zipkin/issues/939. (§2.2).                  Antony, S., Liu, H., and Murthy, R. Hive - A Petabyte Scale Data
+[46] Ostrowski, K., Mann, G., and Sandler, M. Diagnosing Latency in                 Warehouse Using Hadoop. In 26th IEEE International Conference on
+     Multi-Tier Black-Box Services. In 5th Workshop on Large Scale Dis-             Data Engineering (ICDE ’10). (§4.2).
+     tributed Systems and Middleware (LADIS ’11). (§2.2, 3.4, and 7).          [60] Twitter. Zipkin. Retrieved July 2017 from http://zipkin.io/. (§2.2
+[47] Ousterhout, K., Rasti, R., Ratnasamy, S., Shenker, S., and Chun,               and 7).
+     B.-G. Making Sense of Performance in Data Analytics Frameworks. In        [61] Van Renesse, R., Birman, K. P., and Vogels, W. Astrolabe: A Robust
+     12th USENIX Symposium on Networked Systems Design and Implementa-              and Scalable Technology For Distributed System Monitoring, Manage-
+     tion (NSDI ’15). (§7).                                                         ment, and Data Mining. ACM Transactions on Computer Systems 21, 2
+[48] Ravindranath, L., Padhye, J., Mahajan, R., and Balakrishnan, H.                (2003), 164–206. (§7).
+     Timecard: Controlling User-Perceived Delays in Server-Based Mobile        [62] Wagner, T., Schkufza, E., and Wieder, U. A Sampling-Based Ap-
+     Applications. In 24th ACM Symposium on Operating Systems Principles            proach to Accelerating Queries in Log Management Systems. In Poster
+     (SOSP ’13). (§7).                                                               presented at: 7th ACM SIGPLAN International Conference on Systems, Pro-
+[49] Reynolds, P., Killian, C. E., Wiener, J. L., Mogul, J. C., Shah, M. A.,         gramming, Languages and Applications: Software for Humanity (SPLASH
+     and Vahdat, A. Pip: Detecting the Unexpected in Distributed Systems.           ’16). (§7).
+     In 3rd USENIX Symposium on Networked Systems Design and Implemen-         [63] Wang, C., Kavulya, S. P., Tan, J., Hu, L., Kutare, M., Kasick, M.,
+     tation (NSDI ’06). (§7).                                                       Schwan, K., Narasimhan, P., and Gandhi, R. Performance Trou-
+[50] Sambasivan, R. R., Shafer, I., Mace, J., Sigelman, B. H., Fonseca, R.,         bleshooting in Data Centers: An Annotated Bibliography. ACM SIGOPS
+     and Ganger, G. R. Principled Workflow-Centric Tracing of Distributed           Operating Systems Review 47, 3 (2013), 50–62. (§7).
+     Systems. In 7th ACM Symposium on Cloud Computing (SOCC ’16). (§2.2        [64] Wang, C., Rayan, I. A., Eisenhauer, G., Schwan, K., Talwar, V.,
+     and 7).                                                                        Wolf, M., and Huneycutt, C. VScope: Middleware for Troubleshooting
+[51] Sambasivan, R. R., Zheng, A. X., De Rosa, M., Krevat, E., Whitman,             Time-Sensitive Data Center Applications. In 13th ACM/IFIP/USENIX
+     S., Stroucken, M., Wang, W., Xu, L., and Ganger, G. R. Diagnosing              International Middleware Conference (Middleware ’12). (§7).
+     Performance Changes by Comparing Request Flows. In 8th USENIX             [65] Workgroup, D. T. Tracing Workshop. (February 2017). Retrieved Feb-
+     Symposium on Networked Systems Design and Implementation (NSDI ’11).           ruary 2017 from https://goo.gl/2WKjhR. (§2.2).
+     (§7).                                                                     [66] Xu, W., Huang, L., Fox, A., Patterson, D., and Jordan, M. I. Detecting
+[52] Shreedhar, M., and Varghese, G. Efficient Fair Queuing Using Deficit           Large-Scale System Problems by Mining Console Logs. In 22nd ACM
+     Round Robin. In 1995 Conference of the ACM Special Interest Group on           Symposium on Operating Systems Principles (SOSP ’09). (§7).
+     Data Communication (SIGCOMM). (§4.2).                                     [67] Zhao, X., Rodrigues, K., Luo, Y., Yuan, D., and Stumm, M. Non-
+[53] Sigelman, B. H. Towards Turnkey Distributed Tracing. (June 2016). Re-          Intrusive Performance Profiling for Entire Software Stacks Based on the
+     trieved January 2017 from https://medium.com/opentracing/towards-              Flow Reconstruction Principle. In 12th USENIX Symposium on Operating
+     turnkey-distributed-tracing-5f4297d1736. (§2.2).                               Systems Design and Implementation (OSDI ’16). (§7).
+[54] Sigelman, B. H., Barroso, L. A., Burrows, M., Stephenson, P.,             [68] Zhao, X., Zhang, Y., Lion, D., Faizan, M., Luo, Y., Yuan, D., and
+     Plakal, M., Beaver, D., Jaspan, S., and Shanbhag, C. Dapper, a                 Stumm, M. lprof: A Non-intrusive Request Flow Profiler for Distributed
+     Large-Scale Distributed Systems Tracing Infrastructure. Technical Re-          Systems. In 11th USENIX Symposium on Operating Systems Design and
+     port, Google, 2010. (§1, 2.2, 5.3, and 7).                                     Implementation (OSDI ’14). (§7).
+

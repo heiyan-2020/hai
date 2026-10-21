@@ -1,0 +1,1245 @@
+         AIFM: High-Performance,
+    Application-Integrated Far Memory
+Zhenyuan Ruan, MIT CSAIL; Malte Schwarzkopf, Brown University;
+  Marcos K. Aguilera, VMware Research; Adam Belay, MIT CSAIL
+      https://www.usenix.org/conference/osdi20/presentation/ruan
+
+
+
+
+ This paper is included in the Proceedings of the
+ 14th USENIX Symposium on Operating Systems
+          Design and Implementation
+                       November 4–6, 2020
+                          978-1-939133-19-9
+
+
+
+                                 Open access to the Proceedings of the
+                                 14th USENIX Symposium on Operating
+                                  Systems Design and Implementation
+                                        is sponsored by USENIX
+              AIFM: High-Performance, Application-Integrated Far Memory
+
+            Zhenyuan Ruan   Malte Schwarzkopf †     Marcos K. Aguilera ‡   Adam Belay
+                      MIT CSAIL    † Brown University    ‡ VMware Research
+
+Abstract. Memory is the most contended and least elas-               Throughput [accesses/sec]      64B object    4KB object
+tic resource in datacenter servers today. Applications can          Paging-based (Fastswap [6])          582K          582K
+use only local memory—which may be scarce—even though                                   AIFM           3,975K        1,059K
+memory might be readily available on another server. This
+leads to unnecessary killings of workloads under memory           Figure 1: AIFM achieves 6.8× higher throughput for 64B
+pressure and reduces effective server utilization.                objects and 1.81× higher throughput for 4KB objects, com-
+   We present application-integrated far memory (AIFM),           pared to Fastswap [6], a page-granular, kernel-integrated far
+which makes remote, “far” memory available to applications        memory approach. AIFM performs well since it (i) avoids IO
+through a simple API and with high performance. AIFM              amplification and (ii) context switches while waiting for data.
+achieves the same common-case access latency for far mem-
+ory as for local RAM; it avoids read and write amplification      such as disks or remote memory. But OS swap mechanisms
+that paging-based approaches suffer; it allows data structure     operate at a fixed and coarse granularity and incur substantial
+engineers to build remoteable, hybrid near/far memory data        overheads. To swap in a page, the OS must handle a page
+structures; and it makes far memory transparent and easy to       fault, which requires entering the kernel and waiting until the
+use for application developers.                                   data arrives. Figure 1 shows the throughput a recent page-
+   Our key insight is that exposing application-level semantics   based far memory system (viz., Fastswap [6]) achieves when
+to a high-performance runtime makes efficient remoteable          accessing remote objects using up to four CPU cores. Ker-
+memory possible. Developers use AIFM’s APIs to make allo-         nel swapping happens at the granularity of 4KB pages, so
+cations remoteable, and AIFM’s runtime handles swapping           page-based far memory suffers read/write amplification when
+objects in and out, prefetching, and memory evacuation.           accessing small objects, as at least 4KB must always be trans-
+   We evaluate AIFM with a prototypical web application           ferred. Moreover, the Linux kernel spins while waiting for
+frontend, a NYC taxi data analytics workload, a memcached-        data from swap to avoid the overheads of context switch and
+like key-value cache, and Snappy compression. Adding AIFM         interrupt handling. That means the wait time (about 15–20k
+remoteable memory to these applications increases their avail-    cycles with Fastswap’s RDMA backend) is wasted.
+able memory without performance penalty. AIFM outper-                We describe a fundamentally different approach:
+forms Fastswap, a state-of-the-art kernel-integrated, paging-     application-integrated far memory (AIFM), which ties
+based far memory system [6] by up to 61×.                         swapping to individual application-level memory objects,
+                                                                  rather than the virtual memory (VM) abstraction of pages.
+1   Introduction                                                  Developers write remoteable data structures whose backing
+Memory (RAM) is the most constrained resource in today’s          memory can be local and “far”—i.e., on a remote server—
+datacenters. For example, the average memory utilization          without affecting common-case latency or application
+on servers at Google [73] and Alibaba [46] is 60%, with           throughput. When AIFM detects memory pressure, its
+substantial variance across servers, compared to an average       runtime swaps out objects and turns all pointers to the objects
+CPU utilization of around 40%. But memory is also the most        into remote pointers. When the application dereferences a
+inelastic resource: once a server runs out of available memory,   remote pointer, a lightweight green threads runtime restores
+some running applications must be killed. In a month, 790k        the object to local memory. The runtime’s low context switch
+jobs at Google had at least one instance killed, in many cases    cost permits other green threads to make productive use
+due to memory pressure [73]. A killed instance’s work and         of the wait cycles, which hides remote access latency and
+accumulated state are lost, wasting both time and energy. This    maintains high throughput. Due to these fast context switches,
+waste happens even though memory may be available on              AIFM achieves 81% higher throughput than page-based
+other servers in the cluster, or even locally: around 30% of      approaches when accessing 4KB objects, and because AIFM
+server memory are “cold” and have not been accessed for           avoids amplification, it achieves 6.8× higher throughput for
+minutes [41], suggesting they could be reclaimed.                 small objects (Figure 1).
+   Operating systems today support memory elasticity primar-         AIFM’s programming interface is based on four key ideas:
+ily through swap mechanisms, which free up RAM by pushing         a fast, low-overhead remoteable pointer abstraction, a pause-
+unused physical memory pages to a slower tier of memory,          less memory evacuator, runtime APIs that allow data struc-
+
+
+
+USENIX Association                          14th USENIX Symposium on Operating Systems Design and Implementation            315
+tures to convey semantic information to the runtime, and a         with the kernel virtual memory subsystem, it is transparent
+remote device interface that helps offload light computations      to user-space applications. But this transparency also forces
+to remote memory. These AIFM APIs allow data structure en-         swapping granularity to the smallest virtual memory primitive,
+gineers to build hybrid local/remote data structures with ease,    a 4KB page. Combined with memory objects smaller than
+and provide a developer experience similar to C++ standard         4KB, this leads to I/O amplification: when accessing an object,
+library data structures. The pauseless memory evacuator en-        the kernel must swap in a full 4KB page independent of the
+sures that application threads never experience latency spikes     object’s actual memory size. Moreover, supplying application
+due to swapping. Because data structures convey their seman-       semantic information, such as the expected memory access
+tics to the runtime, AIFM supports custom prefetching and          pattern, the appropriate prefetch strategy, or memory hotness,
+caching policies—e.g., prefetching remote data in a remote-        is limited to coarse and inflexible interfaces like madvise.
+able list and streaming of remote data that avoids polluting the      AIFM uses far memory in a different way from swap-
+local memory cache. Finally, AIFM’s offloading reduces data        ping, by operating at object granularity rather than page-
+movement and alleviates the network bottleneck that most           granularity—an idea that we borrow from prior work on
+far-memory systems experience.                                     distributed shared memory (see below), memory compres-
+   The combination of these ideas allows AIFM to achieve           sion [75], and SSD storage [1]. These investigations all point
+object access latencies bounded only by hardware speed: if an      to page-level I/O amplification as a key motivation.
+object is local, its access latency is comparable to an ordinary      AIFM provides transparent access to far memory using
+pointer dereference; when it is remote, AIFM’s access latency      smart pointers and dereference scopes inspired by C++ weak
+is close to the hardware device latency.                           pointers [69], and Folly RCU guards [26].
+   We evaluate AIFM with a real-world data analytics work-
+                                                                   Disaggregated and distributed shared memory. Disag-
+load built on DataFrames [16], a synthetic web application
+                                                                   gregated memory [58] refers to a hardware architecture where
+frontend that uses several remoteable data structures, as well
+                                                                   a fast fabric connects hosts to a pool of memory [29, 33],
+as a memcached-style workload, Snappy compression, and mi-
+                                                                   which is possibly managed by a cluster-wide operating sys-
+crobenchmarks. Our experiments show that AIFM maintains
+                                                                   tem [33, 66]. Disaggregated memory requires new hardware
+high application request throughput and outperforms a state-
+                                                                   that has not yet made it to production. AIFM focuses on
+of-them-art, page-based remote memory system, Fastswap,
+                                                                   software solutions for today’s hardware.
+by up to 61×. In summary, our contributions are:
+                                                                      Distributed shared memory (DSM) provides an abstraction
+  1. Application-integrated far memory (AIFM), a new de-
+                                                                   of shared memory implemented over message passing [7, 10,
+      sign to extend a server’s effective memory size using
+                                                                   44, 50, 64, 65]. Like far memory, DSM systems can be page-
+      “far” memory on other servers or storage devices.
+                                                                   based or object-based. DSM differs from far memory both
+  2. A realization of AIFM with convenient APIs for devel-
+                                                                   conceptually and practically. Conceptually, DSM provides a
+      opment of applications and remoteable data structures.
+                                                                   different abstraction, where data is shared across different
+  3. A high-performance runtime design using green threads
+                                                                   hosts (the “S” in DSM). Practically, this abstraction leads
+      and a pauseless memory evacuator that imposes minimal
+                                                                   to complexity and inefficiency, as DSM requires a cache co-
+      overhead on local object accesses and avoids wasting
+                                                                   herence protocol that impairs performance. For instance, ac-
+      cycles while waiting for remote object data.
+                                                                   cessing data must determine if a remote cache holds a copy
+  4. Evaluation of our AIFM prototype on several workloads,
+                                                                   of the data. By contrast, data in far memory is private to a
+      and microbenchmarks that justify our design choices.
+                                                                   host—a stricter abstraction that makes it possible to realize
+Our prototype is limited to unshared far memory objects on a
+                                                                   far memory more efficiently. Finally, DSM systems were de-
+single memory server. Future work may add multi-server sup-
+                                                                   signed decades ago, and architectural details and constants of
+port, devise strategies for dynamic sizing of remote memory,
+                                                                   modern hardware differ from their environments.
+or investigate sharing.
+                                                                   Technologies to access remote data. TCP/IP is the domi-
+2     Background and Related Work                                  nant protocol for accessing data remotely, and AIFM currently
+OS swapping and far memory. Operating systems to-                  uses TCP/IP. Faster alternatives to TCP/IP exist, and could
+day primarily achieve memory elasticity by swapping phys-          be used to improve AIFM further, but these technologies are
+ical memory pages out into secondary storage. Classically,         orthogonal or complementary to AIFM’s key ideas.
+secondary storage consisted of disks, which are larger and            RDMA is an old technology that has recently been com-
+cheaper but slower than DRAM. The use of disk-based swap           moditized over Ethernet [32], generating new interest. Much
+has been rare in datacenters, since it incurs a large perfor-      work is devoted to using RDMA efficiently in general [39, 51,
+mance penalty. More recent efforts consider swapping to a          76] or for specific applications, such as key-value stores (e.g.,
+faster tier of memory or far memory, such as the remote mem-       [38, 49]) or database systems [11]. Smart NICs use CPUs or
+ory of a host [3, 6, 21, 27, 28, 31, 40, 45, 48, 67] or a com-     FPGAs [47, 52, 70] to provide programmable remote func-
+pression cache [24, 41, 81, 82]. Since swapping is integrated      tionality [18, 43, 68]. AIFM requires no specialized hardware.
+
+
+
+316    14th USENIX Symposium on Operating Systems Design and Implementation                                  USENIX Association
+Abstractions for remote data. Remote Procedure Calls                 Phase Linux Kernel Swapping                      AIFM
+                                                                      P1   Page fault, trap to kernel                 Deref far pointer, issue I/O
+(RPCs) [12] are widely used to access remote data, including          P2   Lock, get PTE, allocate page               Lightweight context-switch
+over RDMA [19, 71] or TCP/IP [37]. Memory-mapped files                     frame, allocate swap cache entry
+can offer remote memory behind a familiar abstraction [2,             P3   Issue read I/O, spin, insert PFN in        Run another green thread
+67], while data structure libraries for remote data [4, 15], offer         global LRU list
+                                                                      P4   cgroup accounting, reclaim mem-            I/O completion, context-
+maps, sets, multisets, lists, and other familiar constructs to             ory if past limit                          switch back
+developers. This is similar in spirit to data structure libraries     P5   Set page mapping, unlock                   —
+for persistent memory [59, 62]. AIFM offers a lower-level
+service that helps programmers develop such data structures.                              HW limit        P1     P2       P3       P4      P5
+                                                                         Linux
+I/O amplification. As mentioned, page-based access leads                 AIFM
+to I/O amplification, a problem studied extensively in the con-
+text of storage systems [1, 61] and far-memory systems [17],                     0                   5               10                   15
+where hardware-based solutions can reduce amplification by                                               Time [µs; median]
+tracking accesses at the granularity of cache lines.                 Figure 2: Linux kernel-based swapping has high overheads
+                                                                     over hardware I/O limits (blue line, 6µs). Both Linux and
+Garbage collection and memory evacuation. Moving ob-
+                                                                     AIFM use an SSD device backend in this experiment.
+jects to remote memory in AIFM (“evacuation”) is closely
+related to mark-compact garbage collection (GC) in managed
+                                                                                                     Application
+languages. The main difference is that AIFM aims to increase
+                                                                                                     C++ STL API
+memory capacity by moving cold, but live objects to remote
+                                                                               Remoteable Datastructures (array, hashtable, ...)
+memory, while GCs focus on releasing dead, unreferenced ob-
+                                                                                     RT API
+jects’ memory. AIFM uses referencing counting to free dead
+objects, avoiding the need for a tracing stage. Instead of invent-              AIFM Runtime                       AIFM RT         DS code
+ing a new evacuation algorithm, AIFM borrows ideas from the                Local Memory
+                                                                                               Memory
+                                                                                               Evacuator
+GC literature and adapts them to far-memory systems. Like                                                                 Remote Server
+GCs, AIFM leverages a read/write barrier to maintain object
+                                                                     Figure 3: Applications use remoteable data structures (gray),
+hotness [5, 14, 34], but AIFM uses a one-byte hotness counter
+                                                                     and data structure developers rely on the AIFM runtime (yel-
+instead of a one-bit flag, allowing more fine-grained replace-
+                                                                     low) to handle local memory management and interact with
+ment policies. Like AIFM, some copying collectors optimize
+                                                                     remote memory. Data structures can have active remote com-
+data locality by separating hot and cold data during GC, but
+                                                                     ponents (i.e., the “DS code” box) to offload light computation.
+target different memory hierarchies; e.g., the cache-DRAM
+hierarchy [34], the DRAM-NVM hierarchy [5, 79, 80], and
+the DRAM-disk hierarchy [14]. Finally, memory evacuation
+                                                                     4     AIFM Design
+interferes with user tasks and impacts their performance. To         The goal of Application-Integrated Far Memory (AIFM) is
+reduce the interference, AIFM adopts an approach similar to          to provide an easy-to-use, efficient interface for far memory
+the pauseless GC algorithms in managed languages [20], as            without the overheads of page-granular far memory.
+opposed to the stop-the-world GC algorithms [36].
+                                                                     4.1      Overview
+3   Motivation                                                       AIFM targets two constituencies: application developers and
+                                                                     data structure developers. AIFM provides application devel-
+Kernel paging mechanisms impose substantial overheads over           opers with data structures with familiar APIs, allowing devel-
+the fundamental cost of accessing far memory.                        opers to treat these remoteable data structures mostly as black
+   Consider Figure 2, which breaks down the costs of Linux           boxes; and AIFM provides simple, but powerful APIs to data
+(v5.0.0) retrieving a swapped-out page from an SSD. The              structure engineers, allowing them to implement a variety of
+device’s hardware latency is about 6µs, but Linux takes over         efficient remoteable memory data structures. Figure 3 shows
+15µs (2.5×) due to overheads associated with locking (P1,            a high-level overview of AIFM’s design: applications interact
+P5), virtual memory management (P2, P3, P5), accounting              with data structures (gray) implemented using primitives and
+(P4), and read IO amplification (P3). Moreover, due to the           APIs provided by the AIFM runtime (yellow).
+high cost of context switches, Linux spins while waiting for            For an application developer, programming applications
+data (P3), wasting 11.7µs of possible compute time.                  that use far memory should feel almost the same as program-
+   AIFM, by contrast, provides low-overhead abstractions and         ming with purely local data structures. In particular, the de-
+an efficient user-space runtime that avoid these costs, bringing     veloper should not need to be aware of whether an object is
+its latency (6.8µs) close to the hardware limit of 6µs. We           currently local or remote (i.e., far memory is transparent),
+explain these concepts in the next two sections.                     and remoteable memory data structures should offer the same
+
+
+
+USENIX Association                             14th USENIX Symposium on Operating Systems Design and Implementation                             317
+performance as local ones in the common case. For example,           H                    P S D                  E        Object Data Address (47b)
+idiomatic C++ code for reading several hash table entries and        63        ···        55 54 53   ···         47 46               ···              0
+
+an array element computed from them might look as follows:
+                                                                  (a) Local object. H: hot, P: present, S: shared, D: dirty, E: evacuating.
+std::unordered_map<key_t, int> hashtable;
+std::array<data_t> arr;                                                   DS ID (8b)      1 S Object Size (16b)                  Object ID (38b)
+
+void print_data(std::vector<key_t>& request_keys) {                  63        ···     56 55 54 53         ···           38 37             ···        0
+
+  int sum = 0;
+  for (auto key : request_keys) {
+                                                                  (b) Remote (swapped-out) object. DS ID means data structure ID.
+    sum += hashtable.at(key);
+  }                                                               Figure 4: Remoteable unique pointer representations for local
+  std::cout << arr.at(sum) << std::endl;                          and remote objects. AIFM inverts the H/P/D bit meaning (0 =
+}
+                                                                  hot/present/dirty) for a more efficient hot path execution.
+The same code written using AIFM looks like this:
+                                                                  Memory representation. Unique remoteable pointers,
+RemHashtable<key_t, int> hashtable;                               which correspond to C++’s std::unique_ptr, have the same
+RemArray<data_t> arr;                                             size as ordinary 64-bit pointers, while shared pointers are
+void print_data(std::vector<key_t>& request_keys) {               128-bits wide (like std::shared_ptr). Figure 4 shows the
+  int sum = 0;                                                    memory layout of a remoteable unique pointer. Depending
+  for (auto key : request_keys) {                                 on whether a remoteable pointer is local or remote, we adopt
+    DerefScope s1; // Explained in Section 4.2.2.
+                                                                  a different format. If the memory is local (Figure 4a), the
+    sum += hashtable.at(key, s1);
+  }                                                               pointer contains a virtual memory address in its lower 47 bits
+  DerefScope s2;                                                  (enough to represent user-space addresses), and control bits in
+  std::cout << arr.at(sum, s2) << std::endl;                      the upper 17 bits, including standard dirty (D) and present (P)
+}
+                                                                  bits (cf. page tables). It also contains bits to track whether the
+   The remoteable memory data structures themselves               pointer is hot (H) and whether it is being concurrently evac-
+(RemHashtable and RemArray above) are written by data             uated (E). For unique pointers, the shared (S) bit is set to 0.
+structure engineers, who use AIFM’s runtime APIs to in-           We byte-align the D, E, and H bits, allowing each of them to
+clude remoteable memory objects in their data structures.         be accessed by mutators and runtime evacuators concurrently
+When memory becomes tight, AIFM’s runtime moves some              and atomically, as a byte is the smallest read/write unit.
+of these memory objects to remote memory; when the data              If the memory is remote (Figure 4b), it contains metadata to
+structure needs to access remote objects, the AIFM runtime        assist in retrieving the object from remote memory, such as the
+fetches them. Data structure engineers have substantial de-       data structure ID, the object size, and the object ID. Each data
+sign freedom: they can rely entirely on AIFM to fetch remote      structure instance has a unique data structure ID managed by
+objects, or they can deploy custom logic on the remote side.      the runtime. The object ID refers to a data structure-specific
+   Remote servers store the actual remote data in their mem-      object identifier (such as a key in a hash table), which is used
+ory, and run a counterpart AIFM runtime, which may call           by the remote memory server to identify the object.
+into custom data structure logic. This is helpful, e.g., if the      AIFM’s remoteable shared pointer, which allows pointer
+remoteable memory data structure needs to chase pointers,         aliasing and corresponds to C++’s std::shared_ptr differs
+which would otherwise require multiple round-trips.               from the unique pointer in two ways. First, its S bit is set to 1;
+                                                                  and second, the pointer has an additional 8 bytes for chaining
+4.2     Remoteable Memory Abstractions                            the shared pointers to the same object. When AIFM’s runtime
+AIFM is designed around four core abstractions: remoteable        evacuates the referred object or moves it locally (§5.3), it
+pointers, dereference scopes, evacuation handlers, and remote     traverses the chain to update all shared pointers.
+devices. We designed the abstractions such that they impose
+minimal overheads (as low as three micro-ops) on “hot path”       API. Listing 1 shows the API of the remoteable unique
+access to local objects, and try to ensure that the “cold path”   pointer (the shared pointer’s API is largely identical).
+remote access incurs little latency above hardware limits.        RemUniquePtr has two constructors: one for already-local
+                                                                  objects and one for currently remote objects. The second con-
+4.2.1    Remoteable Pointers                                      structor allows data structures to form remoteable pointers
+A remoteable pointer represents a memory object (i.e., an         to objects that are currently remote. This helps data structure
+allocation) that is currently either local, or remote (in “far”   engineers reference remote objects from their data structures
+memory). AIFM supports unique and shared remoteable point-        without having to fetch those objects.
+ers, whose interface makes them suitable for use in any place        To turn a remote pointer into a local one, the programmer
+where a data structure would use an ordinary, local pointer.      dereferences it via the deref and deref_mut API methods.
+
+
+
+318     14th USENIX Symposium on Operating Systems Design and Implementation                                                     USENIX Association
+class RemUniquePtr<T> {                                                RemVector<value_t> vec;
+  uint64_t metadata; // 64 bits, see Figure 4.                         // ...
+  // Construct local object                                            for (uint64_t i = 0; i < vec.size(); i++) {
+  RemUniquePtr(DSID, T* obj_addr);                                       {
+  // Construct remote object                                                DerefScope scope;
+  RemUniquePtr(DSID, ObjID);                                                auto& value = vec->at(i, scope);
+  const T* deref(DerefScope& scope); // Immutable.                          // process value
+  T* deref_mut(DerefScope& scope); // Mutable.                           }
+}                                                                        // scope destroyed, can evacuate value’s object
+                                                                       }
+        Listing 1: AIFM remoteable unique pointer API.
+                                                                               Listing 2: AIFM dereference scope example.
+Dereferencing. When the dereferencing methods are
+called, the runtime inspects the present bit of the remoteable         outside the dereference scope is undefined behavior. In the
+pointer. If the object is local, it sets the hot bit and returns the   future, AIFM might leverage static analysis to catch lifetime
+address stored in the pointer. Otherwise, the runtime fetches          violations, as in the Rust compiler [78].
+it from the remote server, sets the hot bit and dirty bit (in             Our scope API is familiar to C/C++ programmers; it
+deref_mut), and returns a local pointer to the data.                   shares similarity with C++11’s std::weak_ptr and, e.g., the
+                                                                       rcu_reader guard in Facebook’s RCU API [26]. Note that
+   AIFM’s hot path for local access is carefully optimized
+                                                                       the lifetime of the DerefScope is separate from the lifetime
+and takes five x86-64 machine instructions: one mov to load
+                                                                       of the remoteable pointer: a remoteable pointer may still be
+the pointer, one andl to check present and evacuating bits,
+                                                                       alive even when its data has been swapped to the remote.
+a conditional branch to the cold path if neither is set, a shift
+                                                                       This is unlike, e.g., std::unique_ptr, where the pointer’s
+(shrq) to extract the object address, and a mov to return it.
+                                                                       destructor terminates the lifetime of the object data.
+Modern x86-64 processors macro-fuse the second and third
+                                                                          Dereference scopes require developers to modify the appli-
+instructions (test and branch), so the hot path requires four
+                                                                       cation code. An alternative API might avoid the need for a
+micro-ops, a three-micro-op overhead over an ordinary pointer
+                                                                       dereference scope at the cost of copying the object into local
+dereference. The cold path is slower, as it calls into the AIFM
+                                                                       memory on dereference. AIFM’s core APIs aim to achieve
+runtime to potentially swap in a remote object.
+                                                                       maximum performance, so we avoid copying by default. The
+   One challenge to making this API work is managing the
+                                                                       overhead of a copying API is highly application-dependent;
+local lifetime of the dereferenced data: while the application
+                                                                       our experiments suggest that 3–8% overhead are typical for
+holds a pointer returned from dereferencing a RemUniquePtr,
+                                                                       applications with high compute/memory access ratios.
+the runtime must never swap out the object. This is hard to
+achieve in unmanaged languages like C/C++, since after get-            4.2.3   Evacuation Handlers
+ting the raw address, application code could store it virtually        When an object is not protected by a DerefScope, AIFM’s
+anywhere (e.g., on the heap, stack, or even in registers). The         runtime may evacuate it to far memory. Evacuation changes
+runtime lacks sufficient information to detect whether any             the pointer to this object from local to remote status, and fu-
+such pointer continues to exist, and thus whether the data is          ture dereferences will cause AIFM to swap the object back
+still being used. The Boehm garbage collector [13] tackles a           in. But some use cases may wish to implement custom be-
+similar reference lifetime problem by scanning the whole ad-           havior on evacuation. For example, when AIFM evacuates an
+dress space to find any possible references. Such scans would          object contained in a hash table, the hash table may register
+impose an unacceptable performance overhead for AIFM.                  an evacuation handler to remove the key and object pointer
+Our solution is to instead leverage application semantics to           to save local space. (In this case, future lookup misses for
+tie the lifetime of the local, dereferenced data to the lifetime       the key will reconstitute the key and pointer, and add them
+of the AIFM’s dereference scopes.                                      to the hash table.) AIFM offers evacuation handlers for this
+4.2.2    Dereference Scopes                                            purpose, enabling developers to incorporate the data structure
+                                                                       semantics into the runtime evacuator.
+Listing 2 demonstrates the usage of DerefScope. Before ac-                Evacuation handlers are also critical for handling embed-
+cessing the remoteable object, the developer must construct a          ded remoteable pointers inside objects. For example, data
+DerefScope. AIFM container’s API provides a compile-time               structure engineers can use evacuation handlers to support
+check by taking a DerefScope& argument. (This is also why              embedded remoteable unique pointers in objects that are them-
+the remoteable pointer has its own dereferencing methods,              selves remoteable. When an object is remoted, any embedded
+rather than overloading operator*.)                                    remoteable pointers must either be moved to the local heap, or
+   Under the hood, DerefScope’s constructor creates an evac-           the object it references must be moved to remote memory, and
+uation fence, which blocks upcoming evacuations until it is            the remoteable pointer must be updated with an identifier to
+destructed. The lifetime of all local dereferenced data is there-      later retrieve the remote object from a remote device (§4.2.4).
+fore tied to the scope lifetime. Accessing dereferenced data           As a result, the evacuator never has to retrieve remote memory
+
+
+
+USENIX Association                              14th USENIX Symposium on Operating Systems Design and Implementation             319
+// The AIFM runtime will invoke the handler on evacuating           class RemDevice {
+// the object to the remote server (phase 4 in Section 5.3).          void register_active_component(DSType, ActiveComponent&);
+using EvacHandler = std::function<                                    DSID construct(DSType, ByteArray params);
+    void(Object&, const Runtime::CopyToRemoteFn&)>;                   void destruct(DSID);
+// Registers an evacuation handler for a data structure ID.           void read_obj(DSID, ObjID, ByteArray& obj_data);
+void Runtime::RegisterEvacHandler(DSID id, EvacHandler h);            void write_obj(DSID, ObjID, ByteArray obj_data);
+                                                                      bool delete_obj(DSID, ObjID);
+          Listing 3: AIFM evacuation handler API.                     void compute(DSID, OpCode, ByteArray in, ByteArray& out);
+                                                                    };
+to update a remoteable pointer.
+   AIFM provides an evacuation handler API (Listing 3). The                     Listing 4: AIFM remoteable device API.
+evacuation handler gets invoked on evacuating the object to         addition, the compute method invokes a custom function, ex-
+the remote server (phase 4 in §5.3), right before the runtime       ecuting a lightweight computation on the remote server. This
+frees the object’s local memory. The runtime passes two argu-       is useful, for example, for efficiently aggregating a sum across
+ments to EvacHandler—the object to be evacuated and the             objects in a data structure without wasting network bandwidth
+function that triggers the runtime to copy the object to the        to bring all objects into local memory first.
+remote side. The first argument allows the handler to mutate           We implemented remote active components to improve the
+the object data before copying (e.g., modify the state of its em-   performance of hashtables (§8.2.1) and DataFrames (§8.1.2).
+bedded pointers) and further cleanup the local data structure
+after copying (e.g., remove its pointer from the hash table in-     4.2.5    Semantic Hints
+dex). The second argument offers the flexibility in the timing      AIFM’s APIs allow injecting information about application-
+of copying the object to remote.                                    and object-specific semantics into the runtime.
+   Data structure developers register their evacuation handlers
+by invoking RegisterEvacHandler. An evacuation handler              Hotness tracking. To dereference a remoteable pointer, the
+is tied to a unique data structure ID, which each data structure    user invokes our library, which sets the hot bit of the pointer.
+allocates in its constructor, and which data structure engineers    Under memory pressure, the memory evacuator uses this hot-
+must use consistently. This way, different data structures or       ness information to ensure that frequently accessed objects are
+instances of the same data structure coexist in the same appli-     local. On evacuation, the evacuators clear the hot bit. AIFM
+cation, while the runtime invokes the appropriate handler.          initialization allows developers to customize the number of
+                                                                    hot bits to use in the pointer (up to eight) and the replace-
+4.2.4    Remote Devices                                             ment policy by data structure ID. With several hot bits, AIFM
+AIFM’s RemDevice provides functionality at the remote mem-          supports, e.g., a CLOCK replacement policy [72].
+ory server (Listing 4). The remote device, by default, uses a       Prefetching. AIFM includes a library that data structures
+key-value store abstraction: when the client dereferences a         can use to maintain a per-thread window of the history of
+remote pointer, the runtime sends the data structure ID and         dereferenced locations and predict future accesses using a
+object ID to the remote server, which looks up the object by        finite-state machine (FSM). It updates the window and the
+data structure ID and object ID, and sends the object data          FSM on each dereference. The FSM detects patterns of se-
+back. When evacuating an object, the runtime sends IDs and          quential access and strided access. When a pattern is detected,
+object data to the remote server, which inserts the object.         it starts prefetcher threads that swap in objects from the re-
+   AIFM also gives datastructure engineers the flexibility to       mote server. With enough prefetching, application threads
+override this default behavior to integrate custom active com-      always access local memory when dereferencing remoteable
+ponents at the remote server. This is accomplished by register-     pointers. The library estimates the prefetch window size con-
+ing their implementation on their own data structure type to        servatively using the network bandwidth-delay product. Data
+the remote device (register_active_component). A cus-               structure engineers can also add custom prefetching policies.
+tom active component is especially beneficial when the appli-
+cation’s compute intensity is low, as this setting often makes      Nontemporal Access1 . For remoteable pointers to objects
+it more efficient to perform operations on remote memory            without temporal locality, it makes sense to limit the local
+than paying the cost of bringing the objects into local mem-        memory used to store their object data. This avoids pollut-
+ory. After registering the active component at the remote, data     ing local memory, which multiple data structures may share,
+structure engineers invoke RemDevice’s client-side bindings         with data that a data structure engineer knows is unlikely
+to interact with the remote components. They use construct          to be accessed again. To achieve this, AIFM’s pointer API
+and destruct to instantiate and destroy remote components.          supports non-temporal dereferences (Listing 5). This im-
+If an object is not present when dereferencing a remote pointer,    mediately marks the object pointed to by rmt_ptr as re-
+the runtime invokes the read_obj to swap in the missing ob-         claimable, though the actual evacuation happens only after the
+ject. On evacuation, the evacuator invokes write_obj to swap           1 We use “nontemporal” in the sense of x86’s nontemporal load/store in-
+
+out cold objects and delete_obj to release dead objects. In         structions [35], which conceptually bypass the CPU cache to avoid pollution.
+
+
+
+
+320     14th USENIX Symposium on Operating Systems Design and Implementation                                          USENIX Association
+                                                                                       Non-temporal Used logs                   Temporal Used Logs
+DerefScope scope;                                                                                 ...                               ...
+// non-temporal dereference ⇓ allows immediate reclaim
+T* p1 = rmt_ptr1.deref_mut<true>(scope);                                                                              ...          Free Logs
+                                                                       global
+// temporal deref; deref_mut(scope) works too
+T* p2 = rmt_ptr2.deref_mut<false>(scope);                             Per-core                Core 0 Logs              Core 1 Logs               Core N Logs
+                                                                                      hdr               data
+      Listing 5: Non-temporal and temporal dereferences.                         P     NT                               NT                 ...    NT
+                                                                                 C
+                                                                                 A
+DerefScope ends. Without a hint, a dereference is temporal                       B
+                                                                                       T                  obj               T              ...     T
+by default; §8.1.1 evaluates the benefit of the hint.
+                                                                                     Hdr    Data Head Ptr                                 First Remote-
+5     AIFM Runtime                                                                   Len    Len   Addr
+                                                                                                          Object ID   Data
+                                                                                                                                             able Ptr
+
+AIFM’s runtime is built on “green” threads (light-weight,
+user-level threading), a kernel-bypass TCP/IP networking             Figure 5: The layout of local remoteable memory in AIFM.
+stack, and a pauseless memory evacuator. Applications link           There are three global lists: a free list, a temporal used list, and
+the runtime into their user-space process. This allows us to         a non-temporal used list. Each list stores many logs, and each
+co-design the runtime with AIFM’s abstractions and provides          log stores many objects. There is a per-core allocation buffer
+high-performance far memory without relying on any OS                (PCAB) that keeps two free logs to allocate new objects, one
+kernel abstractions.                                                 log for temporal objects, the other for non-temporal ones.
+   Two high-level objectives guide our runtime design: (i) the
+runtime should productively use the cycles spent waiting dur-        and manages the local remoteable memory in the granularity
+ing the inevitable latency when fetching objects from remote         of logs (Figure 5). The log size is 2MB, which helps reduce
+memory; and (ii) application threads should never have to            TLB misses by allocating huge pages. The runtime maintains
+wait for the memory evacuator.                                       three global lists: a free list, a non-temporal used list, and a
+                                                                     temporal used list. Each list stores many logs. For core scala-
+5.1     Hiding Remote Access Latency                                 bility, each core owns two logs for new allocations: one log
+We want to hide the latency of fetching data from far memory         for temporal objects, the other for non-temporal ones. The
+by doing useful work during the fetch.                               logs are kept in a per-core allocation buffer (PCAB). To allo-
+   Existing OS kernel threads pay high context-switching             cate an object, the runtime first tries to allocate from a log in
+costs: e.g., on Linux, rescheduling a task takes around 500ns.       the PCAB. If that log runs out of space, the runtime appends
+These costs are a nontrivial fraction of remote memory latency,      the log to the global non-temporal or temporal used list, and
+so Linux and Fastswap adopt a design where they busy-spin            obtains a new log from the global free list. To free an object,
+while waiting for a network response [6]. This avoids context-       the runtime marks the object as free. AIFM leverages a mark-
+switch overheads, but also wastes several microseconds of            compact evacuator to achieve a low memory fragmentation
+processing time. This approach also places tremendous pres-          ratio, as shown with other copying log allocators [63].
+sure on network providers to support even lower latency to              A log has a 1B header indicating whether it stores non-
+reduce the amount of wasted cycles [9, 28]. AIFM takes a             temporal or temporal data. The remaining space stores ob-
+different approach: it relies on low-overhead green threads to       jects. Each object has a Hdr Len bytes header and a Data
+do application work while waiting for remote data fetches.           Len bytes data. The 6-byte Head Ptr Addr stores the ad-
+   Consistent with literature on garbage collection (GC), we         dress of the remoteable pointer that points to the object. For
+refer to normal application threads as mutator threads in the        a unique pointer, Head Ptr Addr stores the address of the
+following. Each mutator thread accesses far memory, block-           only pointer; for a shared pointer, it stores the address of the
+ing whenever it needs to fetch a remote object. When that            first shared pointer in the chain. Dead objects have Head Ptr
+happens, another mutator thread can run and make produc-             Addr set to nullptr. The variable-sized Object ID stores
+tive use of available CPU cycles. Moreover, AIFM’s runtime           the object’s unique identifier. The header is used on evacua-
+spawns prefetcher threads to pull in objects that it predicts will   tion, when the runtime passes the object ID to write/delete
+be dereferenced in the future, allowing it to avoid blocking         endpoints on the remote device and the remoteable pointer ad-
+mutator threads when the predictions are correct.                    dress to the evacuation handler, and when the runtime swaps
+   Using green threads, AIFM tolerates network latency with-         in an object and passes the object ID to the remote device.
+out sacrificing application-level throughput, wasting fewer
+cycles than systems that busy-poll for network completion.
+                                                                     5.3    Pauseless Memory Evacuator
+                                                                     Upon memory pressure, the runtime’s memory evacuator
+5.2     Remoteable Memory Layout                                     moves cold objects to the remote server. Like with many
+For the local memory managed by AIFM, its runtime em-                garbage collectors in managed languages, a key feature of
+braces the idea of log-structured memory [63], which splits          AIFM is to allow mutator threads to run concurrently while
+
+
+
+USENIX Association                             14th USENIX Symposium on Operating Systems Design and Implementation                                            321
+the runtime evacuates local memory. The evacuator executes           pointer metadata and continues executing. If the CAS fails,
+four phases in sequence, described in the following para-            the evacuator has already changed the remoteable pointer to
+graphs. To ensure correctness under race conditions, the evac-       remote status, so the mutator’s copy of the object may be
+uator maintains an invariant: it only starts to move object          corrupt. Consequently, the mutator frees the copy it made and
+O after setting the mutator-side synchronization barrier on          obtains a remote reference.
+accessing O. The evacuator sets the barrier by setting the              4. Concurrent Evacuation Phase. The master thread
+pointer evacuation bit (phase 2). The RCU writer wait (phase         spawns more worker threads to evacuate objects and run
+3) ensures all mutators have observed the set bits to enforce        their evacuation handlers. Again, the master divides the previ-
+the timing order in the invariant.                                   ously selected logs among the workers. Each worker iterates
+   1. Log Selection Phase. The goal of the evacuator is to           through each log and each object within the log. For each cold
+maintain the local free memory ratio above the min_free_ratio        object, the worker copies the object to the remote and executes
+(0.12 by default). The master thread of the evacuator picks          a CAS on the head remoteable pointer to simultaneously clear
+total_log_cnts·(current_free_ratio−min_free_ratio) of logs           the presence bit and set the remote pointer metadata. If the
+to be evacuated. The evacuator picks logs in FIFO order              CAS succeeds, the object has been evacuated, and the worker
+from the global non-temporal used list, and then picks from          updates all pointers in the pointer chain with the head pointer
+the global temporal used list if necessary, to prioritize non-       metadata and invokes the evacuation handler. Otherwise, a
+temporal objects. AIFM could also use more sophisticated             mutator thread succeeded with a racing CAS and has copied
+schemes, e.g., prioritizing logs by occupancy and age [23].          the object to another location. Either way, the log entry is now
+   2. Concurrent Marking Phase. The master evacuation                unused and reclaimable. For each hot object, the worker com-
+thread spawns worker threads and divides the previously-             pacts and copies it into a new log, updates the object address
+selected logs among them. Each worker thread iterates                in the remoteable pointers, and resets the hot bits.
+through the objects in its logs to find live objects. For each       5.4    Co-design with the Thread Scheduler
+such object, the worker sets the evacuation bit of all remote-
+able pointers of the object by traversing the pointer chain          Evacuation is an urgent task when the runtime is under mem-
+starting from the head pointer address (i.e., the Head Ptr           ory pressure. With a naive thread scheduler, evacuation can
+Addr field). This marks the object for evacuation.                   be starved by mutator threads, leading to out-of-memory er-
+   3. Evacuator Waiting Phase. The runtime can evacuate              rors and application crashes. There are two challenges that
+objects only when they are not being dereferenced by mutator         we need to address. First, a large number of mutator threads
+threads. Rather than following a naive approach of having mu-        may allocate memory faster than evacuation can free memory.
+tators and the evacuator to acquire a per-object lock—which          Second, evacuation sometimes blocks on mutator threads in a
+would impose high overhead on the hot path of mutators ac-           dereference scope, and this creates a dilemma. On one hand,
+cessing local objects—AIFM uses an approach inspired by              the scheduler needs to execute mutator threads so they can
+read-copy-update (RCU) synchronization. AIFM’s runtime               unblock evacuation. On the other hand, executing mutator
+treats mutators as RCU readers and the evacuator master              threads may consume more memory.
+thread as an RCU writer, thereby moving the synchronization             To address these issues, we co-design the runtime’s green
+overhead to the evacuator. This choice makes sense because           thread scheduler with AIFM to prioritize the activities neces-
+(i) the mutators do application work, so AIFM should steer           sary for evacuation, both in mutator threads and evacuation
+overhead away from them; and (ii) evacuation is a rare event.        threads. First, each thread keeps a status field that is set by the
+The result is that the evacuator master thread waits for a qui-      AIFM runtime and read by the scheduler, which allows the
+escent period to ensure all mutator threads have witnessed the       scheduler to know whether a thread is in a dereference scope.
+newly-set evacuation bits.                                           The scheduler runs a multi-queue algorithm and assigns the
+   If a mutator thread subsequently dereferences a pointer to        first priority to mutators in a dereference scope, second prior-
+an object that the runtime is evacuating, the mutator sees that      ity to evacuation threads, and third priority to other mutator
+the evacuation bit is set. A naive approach would now block          threads. Second, to avoid priority inversion [42] when the sys-
+the mutator thread while the evacuation bit is set. Instead,         tem is short of memory, the allocation function in the AIFM
+AIFM opts for an approach that avoids such pauses: the mu-           runtime triggers a signal to all running threads to force them
+tator copies the object to another log in its PCAB, and then         to yield their cores back to the scheduler for re-scheduling.
+executes a compare-and-swap (CAS) on the head remoteable             6     Remoteable Data Structure Examples
+pointer (which serves as a synchronization point) to simulta-
+neously clear the evacuation bit, set the present bit, and set the   We implemented six remoteable AIFM data structures.
+new data location. This CAS will race with the evacuator (see        Array. The remoteable array consists of a native array of
+next phase below). If the CAS succeeds, the mutator copied           RemUniquePtrs. Each pointer points to an array element to
+an intact object, so it obtains a local reference. The mutator       enable fine-grained data placement decisions. Alternatively,
+then updates all pointers in the pointer chain with the head         users can configure the pointed object as multiple consecutive
+
+
+
+322   14th USENIX Symposium on Operating Systems Design and Implementation                                      USENIX Association
+array elements to reduce the memory overhead of pointer            connects to a single remote memory server, and the remote
+metadata. The object IDs of pointers are their remote-side         memory cannot be shared by different clients. Finally, the
+object addresses. The prefetcher records accessed indices at       local and remote memory size cannot be changed at runtime.
+all array access APIs; it starts prefetching when detecting a      We plan to address them in the future.
+strided access pattern.
+                                                                   8     Evaluation
+Vector. The remoteable vector is similar to the remote-
+able array except that it is dynamically sized, and uses a         Our evaluation of AIFM seeks to answer three questions:
+std::vector to store RemUniquePtrs. Additionally, the               1. What performance does AIFM achieve for end-to-end
+vector has an active remote component that supports offload-           applications, including ones that combine multiple re-
+ing operations like copies and aggregations, which are used            moteable data structures? (§8.1)
+by the DataFrame application (§8.1.2).                              2. How does AIFM’s performance compare to a state-of-
+                                                                       the-art far memory system, Fastswap [6]? (§8.1–§8.2)
+List. The remoteable list is similar to the remoteable vector,      3. What factors contribute to AIFM’s performance? (§8.3)
+except that it uses a local list that stores RemUniquePtrs
+to support efficient insert and erase operations. The list         Setup. We run experiments on two xl170 nodes on Cloud-
+supports traversals in forward and reverse directions, which       Lab [25] with 10-core Intel Xeon E5-2640 v4 CPUs (2.40
+offers strong semantic hints to the prefetcher. When detecting     GHz), 64GB RAM, and a 25 Gbits/s Mellanox ConnectX-4
+a direction, the prefetcher walks through the local list in the    Lx MT27710 NIC. We enabled hyper-threads, but disabled
+same direction to prefetch remote list objects.                    CPU C-states, dynamic CPU frequency scaling, transparent
+                                                                   huge pages, and kernel mitigations for speculation attacks
+Stack and Queue. The remoteable stack and queue are                in line with prior work [55]. We use Ubuntu 18.04.3 (ker-
+simple wrappers around remoteable lists.                           nel v5.0.0) and DPDK 18.11.0, except for experiments with
+Hashtable. The remoteable hashtable consists of a table            Fastswap, which use Linux kernel v4.11, the latest version
+index (stored on the local heap) and key-value data (stored        Fastswap supports. All AIFM experiments use the default
+in AIFM’s remoteable heap). In the index, each hash bucket         configuration settings and the default built-in prefetchers of
+stores a RemUniquePtr to a key-value object. The object IDs        remoteable data structures. We do not tune prefetching policy
+of pointers are their hashtable keys. The hashtable has an         specifically for evaluated applications.
+active remote component that maintains a separate hashtable
+in remote memory. In this architecture, the local hashtable is a   8.1     End-to-end Performance
+cache (inclusive or exclusive) of its remote counterpart. When     We evaluate AIFM’s end-to-end performance with two appli-
+the referenced object is missing from the local cache, the ac-     cations. First, we designed a synthetic application that mimics
+tive remote component assists the chain lookup at the remote       a typical web service frontend to understand AIFM’s perfor-
+hashtable to avoid multiple network round-trips. Data struc-       mance with multiple remoteable data structures and the im-
+ture engineers might also realize different hashtable designs      pact of semantic hints. Second, we also ported an open-source
+via AIFM’s APIs.                                                   C++ DataFrame library [16] with an interface similar to Pan-
+                                                                   das [56] to AIFM, and use it to understand the porting effort
+7   Implementation                                                 required and AIFM’s performance for an existing application.
+AIFM’s implementation consists of the core runtime library
+                                                                   8.1.1   Synthetic Web Service Frontend
+(§5) and the data structure library (§6). The core runtime is
+built on top of Shenango [55] to leverage its fast user-level      In response to client requests, the application fetches struc-
+threading runtime and I/O stack. AIFM is written in C and          tured data (e.g., a list of user IDs) from an in-memory key-
+C++, with 6,451 lines in the core runtime, 5,535 lines in the      value store, and then uses the retrieved values to compute
+data structure library, and 750 lines of modifications to the      an index into a large collection of 8KB objects (e.g., profile
+Shenango runtime. The system runs on unmodified Linux.             pictures). Finally, the application fetches one 8KB object,
+   We integrated two far memory backends into AIFM: a re-          encrypts it, and compresses it for the response to the client.
+mote memory server based on a DPDK-based TCP stack, and               This application uses our remoteable hashtable (for the key-
+an NVMe SSD using an SPDK-based storage stack. Unlike              value pairs) and our remoteable array (for the 8KB objects).
+the remote memory backend, the SSD backend does not sup-           Each client request looks up 32 keys in the hashtable and
+port active remote components (since the storage drive does        fetches a single 8KB array element. We load the hashtable
+not have a general compute unit), and it has an inherent I/O       with 128M key-value pairs (10GB total data, of which 6GB
+amplification because it is limited to a fixed block size. Our     are index data and 4GB are value data), and create an array of
+evaluation focuses on the remote memory backend.                   2M objects of 8KB each (16GB total). The two data structures
+   The current implementation has some limitations. First, we      share 5GB of available local memory, i.e., the local memory
+do not support TCP offloading or RDMA, which would reduce          size is 19% of the total data set size. We generate closed-loop
+CPU overhead of our runtime. Second, a local compute server        client requests from a Zipf distribution with parameter s: a uni-
+
+
+
+USENIX Association                           14th USENIX Symposium on Operating Systems Design and Implementation              323
+                                              Fastswap     AIFM (NT)                                          Fastswap             AIFM (NT)
+                                              AIFM (T)     Local Only                                         Local Only                                                    Array           Hashtable
+   90th percentile latency [µs]
+
+
+
+
+                                                                         Normalized Throughput
+                                                                                                 1.0                                                           100
+                                  400
+
+
+
+
+                                                                                                                                               Miss Rate [%]
+                                                                                                 0.5                                                           50
+                                  200
+
+
+                                   0                                                             0.0                                                             0
+                                        0.0   0.1 0.2 0.3 0.4                                          0             50           100                                0             50           100
+                                              Offered load [Mops]                                          Local Memory [% of 26GB]                                      Local Memory [% of 26GB]
+
+      (a) Latency as a function of offered load.                        (b) Throughput as a function of local memory.                                          (c) AIFM miss rates in Figure 6b.
+
+Figure 6: In a web frontend-like application with a hashtable and array, AIFM outperforms Fastswap by 20× (a) and achieves
+90% of local memory performance with 5× less memory (b), as non-temporal array access avoids polluting local memory (c).
+“AIFM(NT)”: non-temporal access; “AIFM(T)”: temporal access; “Local Only”: entire working set in local memory.
+
+form distribution corresponds to s = 0, while values of s close                                                            size (on the x-axis, as a fraction of 26GB). While Fastswap’s
+to 1 indicate high skew. Each request accesses Zipf-distributed                                                            throughput starts near zero and grows roughly in proportion to
+keys in the hashtable and uses their values to calculate an (also                                                          the local memory size, AIFM’s throughput starts at 30% of the
+Zipf-distributed) array index to access; the request then en-                                                              ideal and quickly reaches 85% of the in-memory throughput
+crypts the array data via AES-CBC using crypto++ [22] and                                                                  at 5.0GB local memory (20% of 26GB).
+compresses the result using Snappy [30]. We compare two                                                                       Figure 6c illustrates why this happens. At the left-hand
+AIFM settings—with and without non-temporal dereferences                                                                   side of the plot (5% local memory), AIFM sees high miss
+for array elements—against Fastswap [6] and an idealized                                                                   rates in both hashtable (52%) and array (89%). But as local
+baseline with all 26GB in local memory. A good result for                                                                  memory grows, the hashtable miss rate quickly drops to near-
+AIFM would show improved performance over Fastswap, a                                                                      zero, since AIFM’s non-temporal dereferences for the array
+benefit to non-temporal array accesses, and performance not                                                                ensure that most of the local memory is dedicated to hash
+much lower than keeping the entire data in local memory.                                                                   table entries. Correspondingly, the array miss rate drops more
+                                                                                                                           slowly and in proportion to the local memory available. By
+   Figure 6a shows a throughput-latency plot for a Zipf pa-
+                                                                                                                           contrast, Fastswap (not shown here) has high miss rates in
+rameter of s = 0.8 (i.e., a skewed distribution). The x-axis
+                                                                                                                           both data structures, as its page-granular approach manages
+shows the offered load in the system, and the y-axis plots
+                                                                                                                           local memory inefficiently.
+the measured 90th percentile latency. Each setup eventually
+encounters a “hockey-stick” when it can no longer keep up                                                                  8.1.2   DataFrame Application
+with the offered load. Fastswap tolerates a load of up to 19k
+                                                                                                                           The DataFrame abstraction, popularized in Pandas [56], pro-
+requests/second, but its overheads and the amplification for
+                                                                                                                           vides a convenient set of APIs for data science and ML work-
+the hashtable lookups quickly dominate. AIFM with a tem-
+                                                                                                                           loads. A DataFrame is a table-structured, in-memory datas-
+poral array dereference scales 7× further, but fails to keep
+                                                                                                                           tructure exposing various slicing, filtering, and aggregation
+up beyond 140k requests/second because the 8KB array ac-
+                                                                                                                           operations. DataFrames often have hundreds of columns and
+cesses pollute its local memory. To make room for an 8KB
+                                                                                                                           millions of rows, and their full materialization in memory
+array element, the runtime often evicts hundreds of hashtable
+                                                                                                                           often pushes the limits of available memory on a machine [54,
+entries, causing a high miss rate on hashtable lookups. AIFM
+                                                                                                                           57, 60]. By making remote memory available, AIFM can
+with non-temporal access to the array, however, scales to
+                                                                                                                           help data scientists interactively explore DataFrames without
+370k requests/second (20× Fastswap’s maximum through-
+                                                                                                                           worrying about running out of memory.
+put). This is 16% lower throughput than the 440k request-
+                                                                                                                              We ported a popular open-source C++ DataFrame li-
+s/second achieved by an idealized setup with 26GB in local
+                                                                                                                           brary [16] to AIFM’s APIs. The primary data structure used
+memory. In other words, AIFM achieves 84% of the perfor-
+                                                                                                                           in the library is an std::vector storing DataFrame columns
+mance of an entirely local setup with 5× less local memory.
+                                                                                                                           and indexes, and we replaced this vector with the AIFM-
+   Additional local memory helps bring AIFM performance                                                                    enabled equivalent. In addition, we also added support for
+closer to the in-memory ideal. Figure 6b shows the percent-                                                                offloading key operations with low compute intensity but high
+age of the all-local memory throughput achieved by the non-                                                                memory access frequency to the remote side. We achieve this
+temporal version of AIFM when varying the local memory                                                                     by offloading three operations using AIFM’s remote device
+
+
+
+324                           14th USENIX Symposium on Operating Systems Design and Implementation                                                                                  USENIX Association
+                                                         Offloaded Rem. Dev. Operations
+                                                         Copy    Shuffle    Aggregate                                            Offload copy+shuffle+agg         Offload copy
+                                        Filter            3                                                                      Offload copy+shuffle             No offload
+         DataFrame
+
+
+
+
+                                                                                               Normalized Throughput
+                                  Range extraction        3                                                            1.0
+            API
+
+
+
+                                  Add column/index        3
+                                   Sort by column                  3                                                   0.8
+                                      GroupBy                      3           3                                       0.6
+Table 1: DataFrame APIs (rows) and the offloaded operations                                                            0.4
+they use via AIFM’s remote device API (columns). Copy                                                                  0.2
+and Shuffle are memory-only operations, while Aggregate                                                                0.0
+                                                                                                                             0        20         40      60      80      100
+performs light remote-side computation.
+                                                                                                                                           Local Memory [% of 31GB]
+                                Local only        AIFM     AIFM w/o offload   Fastswap
+                                                                                             Figure 8: Performance gains from offloading the operations
+  Normalized Throughput
+
+
+
+
+                          1.0
+                                                                                             in Table 1. AIFM benefits most from offloading Copy, which
+                          0.8
+                                                                                             increases throughput by 18–38%.
+                          0.6
+                          0.4                                                                over 90% of the working set are in local memory. AIFM’s
+                          0.2                                                                high performance comes from avoiding Fastswap’s page fault
+                          0.0                                                                overheads, and from reducing expensive data movements over
+                                 0           20         40      60      80       100         network by offloading operations with low compute inten-
+                                                  Local Memory [% of 31GB]                   sity. Without offloading, AIFM outperforms Fastswap until
+                                                                                             60% of the working set are local, as Fastswap incurs fre-
+Figure 7: An AIFM-enabled DataFrame library [16] achieves
+                                                                                             quent minor faults. Beyond 60%, the fault rate in Fastswap
+78–97% of in-memory throughput for a data analytics work-
+                                                                                             drops sufficiently for most memory accesses to outperform
+load [53], outperforming Fastswap. Offloading operations
+                                                                                             AIFM’s dereference-time overhead for low compute intensity
+with low compute intensity is crucial to AIFM’s performance.
+                                                                                             operations (e.g., memory copies). Offloading these operations
+                                                                                             to the remote side helps AIFM avoid this cost, while high
+API (§4.2.4). The Copy and Shuffle operations copy a vector                                  compute-intensity operations amortize the dereference cost
+(i.e., a DataFrame column), with shuffle also reordering rows                                and happen locally. We also prototyped a batched API for
+by index positions in another column; Aggregate computes                                     AIFM that amortizes the dereference overhead across groups
+aggregate values (sums, averages, etc.). These three opera-                                  of vector elements when offloading is not possible, and found
+tions are used in five DataFrame API calls, including filters,                               that it improves AIFM’s throughput without offloading to 60–
+column creation, sorts, and aggregations (Table 1). To achieve                               80% of in-memory throughput. We believe this could make a
+coverage sufficient to run the New York City taxi trip anal-                                 good future addition to AIFM’s API to speed up low compute
+ysis workload [53], we modified 1,192 lines of code in the                                   intensity operations if they must be performed locally.
+DataFrame library (which has 24.3k lines), and wrote 233                                        Figure 8 breaks down the effect of offloading. Offloading
+lines of remote device code. These modifications took one                                    Copy contributes the largest throughput gains (18%–38%); of-
+author about five days.                                                                      floading shuffle contributes 2.9%–13%; and offloading Aggre-
+   We benchmark our AIFM-enabled DataFrame with the                                          gate contributes 4.5%–12%. These results show that AIFM
+Kaggle NYC taxi trip analysis workload [53], which explores                                  achieves high performance with small local memory for a
+trip dimensions including the number of passengers, trip dura-                               real-world workload, and that AIFM’s operation offloading
+tions, and distances, on the NYC taxi trip dataset [74] (16GB).                              is crucial to good performance when a workload includes
+The workload’s full in-memory working set is 31GB. In the                                    operations with low compute intensity.
+experiment, we vary the size of available local memory be-
+tween 1GB and 31GB. We compare AIFM with Fastswap and                                        8.2                       Data Structures
+a baseline with all data in local memory. In addition, we also                               We pick two representative data structures—the hashtable
+investigate the impact of offloading on this workload, which                                 and the array—from §6. We evaluate them in isolation, and
+consists of an operation with low compute intensity (Aggre-                                  explore the impact of prefetching, non-temporal local storage,
+gate in Table 1) and some pure memory-copy operations                                        and read/write amplification-reducing techniques.
+(Copy and Shuffle). We would hope to find AIFM outperform
+Fastswap and come close to the local memory baseline.                                        8.2.1                      Hashtable
+   Figure 7 shows the results. AIFM achieves 78% of in-                                      Hash tables provide unordered maps that typically see ran-
+memory throughput even with 1GB of local memory (3.2%)                                       dom accesses, often with high temporal locality. A remoteable
+and exceeds 95% of ideal performance from about 20% (6GB)                                    hash table should benefit from temporal caching of popular
+local memory. Fastswap, by contrast, achieves only 20% of in-                                key-value (KV) pairs in local memory. Note that with AIFM,
+memory performance at 1GB and only comes close to it once                                    the caching policy is controlled by the data structure engi-
+
+
+
+USENIX Association                                                       14th USENIX Symposium on Operating Systems Design and Implementation                                    325
+                                                                                                          60M                                                  16M
+
+
+
+
+                                                                                   Throughput [ops/sec]
+
+
+
+
+                                                                                                                                        Throughput [ops/sec]
+ Throughput [ops/sec]
+
+
+                                     All in local memory
+                        200M                                                                                                                                   12M
+                                     AIFM                                                                 40M
+                                     Fastswap                                                                                                                  8M
+                        100M                                                                              20M
+                                                                                                                                                               4M
+                                                                                                          0M                                                   0M
+                           0                                                                                    0%    50%        100%                                0        200        400
+                               0.0   0.2   0.4     0.6   0.8    1.0   1.2   1.4                                      Miss rate                                           Number of threads
+                                           Zipf skew parameter (s)
+                                                                                  (a) GET throughput as a function of (b) GET throughput as a function
+                                                                                  the miss rate.                      of thread count (80% miss rate).
+Figure 9: An AIFM hash table is competitive with local
+memory when the access distribution is skewed (Zipf factors                                                Figure 10: AIFM hash table microbenchmarks.
+≥ 0.8), and outperforms a hashtable in Fastswap by up to 61×
+                                                                                     This difference comes from three factors against Fastswap:
+as Fastswap suffers from amplification and other overheads.
+                                                                                  (i) amplification due to page-granular swapping, (ii) lack of
+                                                                                  per-KV pair hotness information, and (iii) the overheads of
+neer, while with Fastswap (or any swap-based far memory                           kernel paging. Since a page contains 128 key-value pairs,
+system), the caching policy is determined by the kernel page-                     page-granular swapping incurs up to 128× read and write
+reclamation policy, which in turn is based on page-granular                       amplification. This amplification increases the network band-
+hotness information.                                                              width required and pollutes the local memory, increasing
+Comparison. We evaluate the hashtable over Fastswap and                           Fastswap’s miss rate with identical memory available. For
+AIFM with a memcached-style workload that issues GET re-                          example, at s = 1.25, Fastswap still uses 140MB/s of net-
+quests, with keys sampled from a Zipf distribution whose                          work bandwidth, while AIFM’s bandwidth use rapidly drops
+parameter s we vary. Our key and value sizes are based on                         beyond s = 0.8. Fastswap also cannot swap out only cold
+those reported for Facebook’s USR memcached pool [8]. We                          key-value pairs, as a page contains entries with varying hot-
+load the hash table with 128M KV pairs (10GB total data),                         ness, but the kernel tracks access only at page granularity.
+and compare performance to a baseline that keeps the entire                       Finally, Fastswap incurs the cost of kernel crossings, page
+hash table in local memory. Fastswap and AIFM instead allow                       faults, identifying and reclaiming victim pages (38% of cy-
+a maximum of 5GB local data, split as follows. In Fastswap,                       cles at s = 0.8) and wasted cycles waiting for I/O (49%).
+the OS manages the both hashtable index (6GB) and value                           AIFM’s overheads are limited to running the evacuator (0.8%
+data (4GB) in swapable memory, with least recently used                           of cycles at s = 0.8), TCP stack overheads (1.7%), and thread
+(LRU) [77] eviction at page granularity to decide on remote                       scheduler overhead (14%).
+pages. In AIFM, we provision 3GB local memory region for                          Microbenchmarks. Figure 10a shows how hash table per-
+index data and the other 2GB local memory region for value                        forms at different miss rates when requests are uniformly,
+data; the runtime manages them separately. The hashtable’s                        rather than Zipf-distributed. It achieves a best-case through-
+own object-granular CLOCK replacement algorithm guides                            put of 53M requests/second, reduced to 10M requests/second
+AIFM’s memory evacuator to pick KV pairs to evict to remote                       when it is close to 100% miss rate. Figure 10b measures,
+memory. In this experiment, we use a hashtable configured as                      for the same uniform distribution and an 80% miss rate, the
+an exclusive cache, i.e., the evacuation handler removes local                    throughput AIFM achieves with an increasing number of ap-
+index entries for remote key-value pairs.                                         plication threads. Up to 160 threads, AIFM extracts more
+   Figure 9 shows the throughput achieved as a function of                        throughput by scheduling additional requests while it waits
+the Zipf parameter s, ranging from near-uniform at zero to                        for requests to complete.
+highly skewed at s = 1.35. AIFM achieves about 17M opera-
+                                                                                  8.2.2                     Array
+tions/second at low skew (≈ 60% miss rate at s = 0), about
+one third of the 53M operations/second that a fully-local hash                    Depending on the access pattern, an array may benefit from
+table achieves. As skew increases and the miss rate drops,                        caching (for random access with temporal locality), prefetch-
+AIFM comes closer to local-only performance: for example,                         ing (for sequential access), and non-temporal storage (if there
+at s = 0.8 (1% miss rate), it reaches 57M operations/second;                      is no temporal locality).
+and from s = 0.8, it matches the performance of the local-only                       We evaluate our array with the Snappy library [30]. The
+hashtable. Fastswap, by contrast, sees a throughput of 0.54M                      benchmark performs in-memory compression/decompression
+operations/second at s = 0 (30× less than AIFM) and only                          by reading input files from a RemArray and writing output
+matches the local-only baseline beyond s = 1.3. At s = 0.8,                       files to another RemArray. For benchmarking compression,
+AIFM has its largest advantage over Fastswap (61×).                               we use 16 input files of 1GB each. For decompression, we use
+
+
+
+326                      14th USENIX Symposium on Operating Systems Design and Implementation                                                                    USENIX Association
+                                                                                               90th percentile latency [cycles]      read     write
+                    1.0                             1.0                                          C++ unique_ptr (uncached)            570      408
+ Normalized Perf.
+
+
+                                                                                                      AIFM object (uncached)          489      309
+                                All in local mem.                                                           (a) Hot path (local object).
+                    0.5                             0.5
+                                AIFM
+                                Fastswap                                                     90th percentile latency [cycles]         read     write
+                    0.0                             0.0                                     Fastswap total                          23,712    26,382
+                           0       50        100           0       50        100                            RDMA transfer (4KB)      16,521    16,521
+                                                                                            ... of which
+                          Local Mem. [% of 16GB]          Local Mem. [% of 16GB]                                     Overheads        7,191     9,861
+                                                                                            AIFM total (64B object)                 18,582    18,369
+                      (a) Compression.                    (b) Decompression.                                   TCP transfer (64B)    17,694    17,673
+                                                                                            ... of which
+                                                                                                                       Overheads        888       696
+Figure 11: AIFM achieves nearly identical performance to lo-                                AIFM total (4KB object)                 27,183    27,279
+                                                                                                               TCP transfer (4KB)    26,055    26,121
+cal memory when compressing/decompressing an array with                                     ... of which
+                                                                                                                       Overheads      1,128     1,158
+Snappy [30] (sequential access), and outperforms Fastswap.
+                                                                                                           (b) Cold path (remote object).
+30 input files of 0.5GB each. The compression ratio is around
+                                                                                    Figure 12: AIFM is competitive with an ordinary pointer
+2. Both operations perform streaming, sequential access to
+                                                                                    dereference, and it has lower overheads than Fastswap.
+the array and never revisit any object. We compare Fastswap
+and an ideal, completely local in-memory baseline.                                  hides some of this latency, and we observe a 2× throughput
+   AIFM’s array prefetcher captures application semantics                           overhead for L1 hits.
+through the array access APIs and performs prefetching en-                             We also measured AIFM’s cold path latency, and com-
+tirely in user space. OS-based paging systems, by contrast,                         pared it to Fastswap’s. Fastswap always fetches at least 4KB
+must rely on page faults (major faults for unprefetched pages                       from the remote server, but its RDMA backend is faster
+and minor faults for prefetched pages) to pass application se-                      than AIFM’s TCP backend. This might amortize some of
+mantics, which imposes high overheads. For each system, we                          the overheads associated with page-granular far memory that
+measure performance with different amounts of local memory                          Fastswap suffers from. A good result would show AIFM with
+available (for Fastswap, we restrict memory via cgroups; for                        comparable latency to Fastswap for large objects (4KB), and
+AIFM, we set the local memory size). A good result would                            lower latency for small objects (64B).
+avoid AIFM’s slow path, as every far pointer dereference                               Figure 12b shows the results. While Fastswap’s raw data
+would find local data already.                                                      transfers are indeed faster than AIFM’s, AIFM achieves lower
+   Figure 11 shows the results. We see that AIFM achieves                           latency for cache-line-sized (64B) objects due to its 10×
+performance close to the in-memory baseline, independent of                         lower overheads. For 4KB objects, AIFM is close to Fastswap,
+the local memory size, while Fastswap’s performance depends                         but has 10% higher latency on reads; AIFM with an RDMA
+on local memory size and only matches AIFM when nearly                              backend would come closer. In addition, AIFM can produc-
+all memory is local. This demonstrates the benefit of AIFM’s                        tively use its wait cycles, which yields a 1.8–6.8× throughput
+non-temporal access and prefetching.                                                increase over Fastswap (Figure 1).
+8.3                   Design Drill-Down                                             8.3.2     Operating Point
+We now evaluate specific aspects of the AIFM design using                           AIFM is designed for applications that perform some compute
+microbenchmarks.                                                                    for each remoteable data structure access, as this compute
+                                                                                    allows AIFM to hide the latency of far memory by prefetching.
+8.3.1                 Fast/Slow Path Costs                                          But if an application has a huge amount of compute per data
+AIFM seeks to provide access to local objects with latency                          structure access, AIFM will offer limited benefit over page-
+close to normal memory access. This means that AIFM’s                               granular approaches like Fastswap, despite their overheads.
+remoteable pointer must minimize overheads on the “fast                             We ran a sensitivity analysis with a synthetic application that
+path”, when no remote memory access is required.                                    spins for a configurable amount of time in between sequential
+   We measured the hot path latency of dereferencing a                              accesses into a remoteable array. This should allow AIFM’s
+RemUniquePtr and compared it to the latency for derefer-                            prefetcher to run ahead and load successive elements before
+encing a C++ unique_ptr, both when the pointer and data                             they are dereferenced. We compare to Fastswap, which we
+pointed to are cached and uncached. Figure 12a shows that                           configure with the maximum prefetching window (32 pages).
+AIFM offers comparable latency to an ordinary C++ smart                                Figure 13 shows the results, normalized to the benchmark
+pointer. For an object in L1 cache, AIFM has a 4× latency                           runtime against a purely in-memory array. AIFM becomes
+overhead: four micro-ops vs. a single pointer dereference oper-                     competitive with local memory access from about 1.2µs of
+ation. In practice, modern CPU’s instruction-level parallelism                      compute between array accesses. Fastswap’s overheads amor-
+
+
+
+USENIX Association                                              14th USENIX Symposium on Operating Systems Design and Implementation                    327
+                                  4                                                                                 20%
+                                                                         Fastswap
+             Normalized runtime
+
+                                                                                                                                Evac. threshold       without prio.         with prio.
+
+
+
+
+                                                                                                      Free memory
+                                  3                                      AIFM
+                                                                         All in local memory                        10%
+                                  2
+
+                                  1
+                                                                                                                     0%
+                                                                                                                          0.0        0.5             1.0              1.5                2.0
+                                  0
+                                          0 1 2 3 4 5 6 7 8 9 10 11 12                                                                            Time [sec]
+                                          Microseconds of compute per far memory access              Figure 15: Thread prioritization in the runtime is essential to
+                                                                                                     ensure that evacuation always succeeds. 12% free memory is
+Figure 13: AIFM becomes competitive with local memory                                                the threshold for AIFM to trigger evacuation.
+access at around 1.2µs of compute per sequential far memory
+                                                                                                     Thread Scheduler Co-design. In this experiment, we run
+access (4KB object) in a microbenchmark, while kernel-based
+                                                                                                     100 mutator threads that each iterates to read 1MB of data
+swapping mechanisms require higher compute ratios (ca. 50µs
+                                                                                                     from a remoteable array and perform 20ms of computation.
+per memory access; not shown) to compete.
+                                                                                                     We run AIFM with the scheduler’s thread prioritization (§5.4)
+                                                                                                     enabled and disabled, and measure the free local memory over
+                         400                                                                         time. For a responsive system, local memory should never run
+ Time per iter. [ms]
+
+
+
+
+                                                STW Evacuator             Pauseless Evacuator
+                                                                                                     out entirely, and the evacuator should be able to free memory
+                                                                                                     fast enough to keep up with the mutators.
+                         200
+                                                                                                        Figure 15 shows that the runtime without prioritization fails
+                                                                                                     to keep up and runs out of memory after around 0.7 seconds.
+                                  0                                                                  AIFM’s prioritizing scheduler, on the other hand, ensures that
+                                      0         25     50       75        100      125         150   sufficient memory remains available. This illustrates that the
+                                                             Iteration                               benefit of co-locating thread scheduler and memory evacuator
+                                                                                                     in a user-space runtime.
+Figure 14: Pauseless evacuation is essential for low latency
+accesses: a stop-the-world (STW) evacuator frequently en-                                            9              Conclusion
+counters 10× higher latency as it swaps out objects.                                                 We presented Application-Integrated Far Memory (AIFM),
+                                                                                                     a new approach to extending a server’s available RAM with
+tize more slowly—its line converges with AIFM’s around                                               high-performance remote memory. Unlike prior, kernel-based,
+50µs of compute per array access. This demonstrates that                                             page-granular approaches, AIFM integrates far memory with
+AIFM supports efficient remote memory in a wider range of                                            application data structures, allowing for fine-grained partial
+applications than page-granular approaches like Fastswap.                                            remoting of data structures without amplification or high over-
+                                                                                                     heads. AIFM is based on four key components: (i) the remote
+8.3.3                              Memory Evacuator
+                                                                                                     pointer abstraction; (ii) the pauseless memory evacuator; (iii)
+We evaluate two key aspects of AIFM’s memory evacuator                                               the data structure APIs with rich semantics; (iv) and the re-
+design: the choice to never pause mutator threads (§5.3) and                                         mote device abstraction. All parts work together to deliver
+the thread scheduler co-design (§5.4).                                                               high performance and convenient APIs for application devel-
+                                                                                                     opers and data structure engineers.
+Pauseless Evacuation. In this experiment, we run 10 muta-                                               Our experiments show that AIFM delivers performance
+tor threads (the number of physical CPU cores in our machine)                                        close to, or on par with, local DRAM at operating points that
+that keep entering the dereference scope, dereferencing and                                          prior far memory systems could not efficiently support.
+marking dirty 4MB of data each time. Therefore, the run-                                                AIFM is available as open-source software at https://
+time periodically triggers memory evacuation. We compare                                             github.com/aifm-sys/aifm.
+AIFM’s pauseless evacuator design to a stop-the-world mem-
+ory evacuator, and measure the latency per mutator iteration
+                                                                                                     Acknowledgements
+(4MB write). Figure 14 shows that a stop-the-world evacuator                                         We thank our shepherd Emmett Witchel, the anonymous re-
+design causes periodic mutator latency spikes up to 340ms. By                                        viewers, and members of the MIT PDOS group for their help-
+contrast, AIFM’s pauseless evacuator consistently runs an iter-                                      ful feedback. We appreciate Cloudlab [25] for providing the
+ation in about 25ms. (The tiny spikes of the pauseless line are                                      experiment platform used. This work was supported in part
+mainly caused by hyperthread and cache contention between                                            by a Facebook Research Award and a Google Faculty Award.
+evacuators and mutators.) This confirms that a pauseless evac-                                       Zhenyuan Ruan was supported by an MIT Robert J. Shillman
+uator is essential to consistent application performance.                                            Fund Fellowship.
+
+
+
+328                               14th USENIX Symposium on Operating Systems Design and Implementation                                                         USENIX Association
+References                                                     [10] John K. Bennett, John B. Carter, and Willy
+ [1]   Ahmed Abulila, Vikram Sharma Mailthody, Zaid                 Zwaenepoel. “Munin: Distributed Shared Mem-
+       Qureshi, Jian Huang, Nam Sung Kim, Jinjun Xiong,             ory Based on Type-specific Memory Coherence”.
+       and Wen-mei Hwu. “FlatFlash: Exploiting the Byte-            In: ACM Symposium on Principles and Practice of
+       Accessibility of SSDs within a Unified Memory-               Parallel Programming (PPoPP). 1990.
+       Storage Hierarchy”. In: International Conference on     [11] Carsten Binnig, Andrew Crotty, Alex Galakatos, Tim
+       Architectural Support for Programming Languages and          Kraska, and Erfan Zamanian. “The End of Slow Net-
+       Operating Systems (ASPLOS). 2019.                            works: It’s Time for a Redesign”. In: Proceedings of
+ [2]   Marcos K. Aguilera, Nadav Amit, Irina Calciu, Xavier         the VLDB Endowment 9.7 (2016).
+       Deguillard, Jayneel Gandhi, Stanko Novaković, Arun     [12] Andrew D. Birrell and Bruce Jay Nelson. “Implement-
+       Ramanathan, Pratap Subrahmanyam, Lalith Suresh, Ki-          ing Remote Procedure Calls”. In: ACM Transactions
+       ran Tati, Rajesh Venkatasubramanian, and Michael Wei.        on Computer Systems (TOCS) 2.1 (1984).
+       “Remote regions: a simple abstraction for remote mem-   [13] Hans-Juergen Boehm and Mark Weiser. “Garbage col-
+       ory”. In: USENIX Annual Technical Conference (ATC).          lection in an uncooperative environment”. In: Software:
+       2018.                                                        Practice and Experience 18.9 (1988).
+ [3]   Marcos K. Aguilera, Nadav Amit, Irina Calciu, Xavier    [14] Michael D. Bond and Kathryn S. McKinley. “Tolerat-
+       Deguillard, Jayneel Gandhi, Pratap Subrahmanyam,             ing Memory Leaks”. In: ACM SIGPLAN Notices 43.10
+       Lalith Suresh, Kiran Tati, Rajesh Venkatasubramanian,        (2008).
+       and Michael Wei. “Remote Memory in the Age of Fast
+       Networks”. In: ACM Symposium on Cloud Computing         [15] Benjamin Brock, Aydın Buluç, and Katherine Yelick.
+       (SoCC). 2017.                                                “BCL: A cross-platform distributed container library”.
+                                                                    In: International Conference on Parallel Processing
+ [4]   Marcos K Aguilera, Kimberly Keeton, Stanko No-               (ICPP). 2019.
+       vakovic, and Sharad Singhal. “Designing far memory
+       data structures: Think outside the box”. In: Workshop   [16] “C++ DataFrame for statistical, Financial, and ML
+       on Hot Topics in Operating Systems (HotOS). 2019.            analysis”. In: https : / / github . com /
+                                                                    hosseinmoein / DataFrame (last accessed on
+ [5]   Shoaib Akram, Jennifer B. Sartor, Kathryn S. McKin-          10/15/2020).
+       ley, and Lieven Eeckhout. “Write-Rationing Garbage
+       Collection for Hybrid Memories”. In: ACM SIGPLAN        [17] Irina Calciu, Ivan Puddu, Aasheesh Kolli, Andreas
+       Conference on Programming Language Design and                Nowatzyk, Jayneel Gandhi, Onur Mutlu, and Pratap
+       Implementation (PLDI). 2018.                                 Subrahmanyam. “Project PBerry: FPGA Acceleration
+                                                                    for Remote Memory”. In: Workshop on Hot Topics in
+ [6]   Emmanuel Amaro, Christopher Branner-Augmon, Zhi-             Operating Systems (HotOS). 2019.
+       hong Luo, Amy Ousterhout, Marcos K. Aguilera, Auro-
+       jit Panda, Sylvia Ratnasamy, and Scott Shenker. “Can    [18] Adrian M. Caulfield, Eric S. Chung, Andrew Putnam,
+       Far Memory Improve Job Throughput?” In: European             Hari Angepat, Jeremy Fowers, Michael Haselman,
+       Conference on Computer Systems (EuroSys). 2020.              Stephen Heil, Matt Humphrey Puneet Kaur, Joo-Young
+                                                                    Kim, Daniel Lo, Todd Massengill, Kalin Ovtcharov
+ [7]   Cristiana Amza, Alan L Cox, Sandhya Dwarkadas,               Michael Papamichael, Lisa Woods, Sitaram Lanka,
+       Pete Keleher, Honghui Lu, Ramakrishnan Rajamony,             Derek Chiou, and Doug Burger. “A cloud-scale ac-
+       Weimin Yu, and Willy Zwaenepoel. “Treadmarks:                celeration architecture”. In: IEEE/ACM International
+       Shared memory computing on networks of worksta-              Symposium on Microarchitecture (MICRO). 2016.
+       tions”. In: Computer 29.2 (1996).
+                                                               [19] Youmin Chen, Youyou Lu, and Jiwu Shu. “Scalable
+ [8]   Berk Atikoglu, Yuehai Xu, Eitan Frachtenberg, Song           RDMA RPC on Reliable Connection with Efficient
+       Jiang, and Mike Paleczny. “Workload Analysis of a            Resource Sharing”. In: European Conference on Com-
+       Large-Scale Key-Value Store”. In: ACM SIGMETRIC-             puter Systems (EuroSys). 2019.
+       S/PERFORMANCE Joint International Conference on
+       Measurement and Modeling of Computer Systems (SIG-      [20] Cliff Click, Gil Tene, and Michael Wolf. “The pause-
+       METRICS). 2012.                                              less GC algorithm”. In: ACM/USENIX international
+                                                                    conference on Virtual execution environments (VEE).
+ [9]   Luiz André Barroso, Mike Marty, David A. Patterson,          2005.
+       and Parthasarathy Ranganathan. “Attack of the killer
+       microseconds”. In: Communications of the ACM 60.4       [21] Douglas Comer and Jim Griffioen. “A New Design for
+       (2017).                                                      Distributed Systems: The Remote Memory Model”. In:
+                                                                    Summer USENIX Conference. 1990.
+
+
+
+
+USENIX Association                         14th USENIX Symposium on Operating Systems Design and Implementation       329
+[22] “Crypto++ Library 8.2”. In: https : / / www .            [34] Xianglong Huang, Stephen M. Blackburn, Kathryn S.
+     cryptopp.com/ (last accessed on 10/15/2020).                  McKinley, J Eliot B. Moss, Zhenlin Wang, and Perry
+[23] David Detlefs, Christine Flood, Steve Heller, and Tony        Cheng. “The Garbage Collection Advantage: Improv-
+     Printezis. “Garbage-First Garbage Collection”. In:            ing Program Locality”. In: ACM SIGPLAN Confer-
+     International Symposium on Memory Management                  ence on Object-Oriented Programming, Systems, Lan-
+     (ISMM). 2004.                                                 guages, and Applications (OOPSLA). 2004.
+[24] Fred Douglis. “The compression cache: Using on-line      [35] “Intel 64 and IA-32 Architectures Developer’s Man-
+     compression to extend physical memory”. In: Winter            ual: Vol. 1”. In: https : / / www . intel . com /
+     USENIX Conference. 1993.                                      content/www/us/en/architecture-and-
+                                                                   technology / 64 - ia - 32 - architectures -
+[25] Dmitry Duplyakin, Robert Ricci, Aleksander Mar-               software - developer - vol - 1 - manual .
+     icq, Gary Wong, Jonathon Duerig, Eric Eide, Leigh             html (last accessed on 10/15/2020).
+     Stoller, Mike Hibler, David Johnson, Kirk Webb,
+     Aditya Akella, Kuangching Wang, Glenn Ricart, Larry      [36]   “Java SE documentation. Chapter 6: The Parallel Col-
+     Landweber, Chip Elliott, Michael Zink, Emmanuel                 lector”. In: https : / / docs . oracle . com /
+     Cecchet, Snigdhaswin Kar, and Prabodh Mishra. “The              javase / 8 / docs / technotes / guides / vm /
+     Design and Operation of CloudLab”. In: USENIX An-               gctuning / parallel . html (last accessed on
+     nual Technical Conference (ATC). 2019.                          10/15/2020).
+[26] “Facebook Folly RCU Library”. In: https : / /            [37] Anuj Kalia, Michael Kaminsky, and David Andersen.
+     github . com / facebook / folly / blob /                      “Datacenter RPCs can be General and Fast”. In: Sym-
+     master / folly / synchronization / Rcu . h                    posium on Networked Systems Design and Implemen-
+     (last accessed on 10/15/2020).                                tation (NSDI). 2019.
+[27] Michail D. Flouris and Evangelos P. Markatos. “The       [38] Anuj Kalia, Michael Kaminsky, and David G. An-
+     Network RamDisk: Using Remote Memory on Hetero-               dersen. “Using RDMA Efficiently for Key-value Ser-
+     geneous NOWs”. In: Cluster Computing 2.4 (1999).              vices”. In: ACM SIGCOMM Conference on Applica-
+                                                                   tions, Technologies, Architectures, and Protocols for
+[28] Peter X. Gao, Akshay Narayan, Sagar Karandikar, Joao
+                                                                   Computer Communications (SIGCOMM). 2014.
+     Carreira, Sangjin Han, Rachit Agarwal, Sylvia Rat-
+     nasamy, and Scott Shenker. “Network Requirements         [39] Anuj Kalia, Michael Kaminsky, and David G. Ander-
+     for Resource Disaggregation”. In: Symposium on Op-            sen. “Design Guidelines for High Performance RDMA
+     erating Systems Design and Implementation (OSDI).             Systems”. In: USENIX Annual Technical Conference
+     2016.                                                         (ATC). 2016.
+[29] “Gen-Z: hardware architecture for disaggregated mem-     [40] Samir Koussih, Anurag Acharya, and Sanjeev Setia.
+     ory”. In: https://genzconsortium.org (last                    “Dodo: A User-level System for Exploiting Idle Mem-
+     accessed on 10/15/2020).                                      ory in Workstation Clusters”. In: IEEE International
+                                                                   Symposium on High Performance Distributed Comput-
+[30] “Google’s fast compressor/decompressor”. In:
+                                                                   ing (HPDC). 1998.
+     https://github.com/google/snappy (last
+     accessed on 10/15/2020).                                 [41] Andres Lagar-Cavilla, Junwhan Ahn, Suleiman Souh-
+                                                                   lal, Neha Agarwal, Radoslaw Burny, Shakeel Butt,
+[31] Juncheng Gu, Youngmoon Lee, Yiwen Zhang,
+                                                                   Jichuan Chang, Ashwin Chaugule, Nan Deng, Junaid
+     Mosharaf Chowdhury, and Kang G. Shin. “Effi-
+                                                                   Shahid, Greg Thelen, Kamil Adam Yurtsever, Yu Zhao,
+     cient Memory Disaggregation with Infiniswap”.
+                                                                   and Parthasarathy Ranganathan. “Software-Defined
+     In: Symposium on Networked Systems Design and
+                                                                   Far Memory in Warehouse-Scale Computers”. In: In-
+     Implementation (NSDI). 2017.
+                                                                   ternational Conference on Architectural Support for
+[32] Chuanxiong Guo, Haitao Wu, Zhong Deng, Gaurav                 Programming Languages and Operating Systems (AS-
+     Soni, Jianxi Ye, Jitu Padhye, and Marina Lipshteyn.           PLOS). 2019.
+     “RDMA over Commodity Ethernet at Scale”. In: ACM
+     SIGCOMM Conference on Applications, Technologies,        [42] Butler W Lampson and David D Redell. “Experience
+     Architectures, and Protocols for Computer Communi-            with processes and monitors in Mesa”. In: Communi-
+     cations (SIGCOMM). 2016.                                      cations of the ACM 23.2 (1980).
+
+[33] “HPE Powers Up The Machine Architecture”. In:
+     https : / / www . nextplatform . com /
+     2017 / 01 / 09 / hpe - powers - machine -
+     architecture (last accessed on 10/15/2020).
+
+
+
+330   14th USENIX Symposium on Operating Systems Design and Implementation                          USENIX Association
+[43] Bojie Li, Zhenyuan Ruan, Wencong Xiao, Yuanwei            [54] “Opening a 20GB file for analysis with pandas”. In:
+     Lu, Yongqiang Xiong, Andrew Putnam, Enhong Chen,               https : / / datascience . stackexchange .
+     and Lintao Zhang. “KV-Direct: High-Performance In-             com/questions/27767/opening-a-20gb-
+     Memory Key-Value Store with Programmable NIC”.                 file - for - analysis - with - pandas/ (last
+     In: ACM Symposium on Operating Systems Principles              accessed on 10/15/2020).
+     (SOSP). 2017.                                             [55] Amy Ousterhout, Joshua Fried, Jonathan Behrens,
+[44] Kai Li and Paul Hudak. “Memory Coherence in Shared             Adam Belay, and Hari Balakrishnan. “Shenango:
+     Virtual Memory Systems”. In: 7.4 (1989).                       Achieving High CPU Efficiency for Latency-sensitive
+[45] Shuang Liang, Ranjit Noronha, and Dhabaleswar K.               Datacenter Workloads”. In: Symposium on Networked
+     Panda. “Swapping to Remote Memory over Infini-                 Systems Design and Implementation (NSDI). 2019.
+     Band: An Approach using a High Performance Net-           [56] “pandas - Python Data Analysis Library”. In: https:
+     work Block Device”. In: IEEE International Confer-             / / pandas . pydata . org/ (last accessed on
+     ence on Cluster Computing (CLUSTER). 2005.                     10/15/2020).
+[46] Chengzhi Lu, Kejiang Ye, Guoyao Xu, Cheng-Zhong           [57] “Pandas: Scaling to large datasets”. In: https :
+     Xu, and Tongxin Bai. “Imbalance in the cloud: An anal-         / / pandas . pydata . org / pandas - docs /
+     ysis on alibaba cluster trace”. In: IEEE International         stable / user _ guide / scale . html (last ac-
+     Conference on Big Data (Big Data). IEEE. 2017.                 cessed on 10/15/2020).
+[47] “Mellanox Innova-2 Flex Open Programmable Smart-          [58] Nathan Pemberton. “Exploring the disaggregated mem-
+     NIC”. In: https : / / www . mellanox . com /                   ory interface design space”. In: Workshop on Resource
+     products/smartnics/innova-2-flex (last                         Disaggregation (WORD). 2019.
+     accessed on 10/15/2020).                                  [59] “Persistent Memory Development Kit”. In: https:
+[48] Feeley Michael J, William E. Morgan, Frederic H.               //pmem.io/pmdk/ (last accessed on 10/15/2020).
+     Pighin, Anna R. Karlin, and Henry M. Levy. “Imple-        [60] “Quora: Is anyone successful in using Python Pandas
+     menting Global Memory Management in a Worksta-                 while dealing with millions of rows or more than a
+     tion Cluster”. In: ACM Symposium on Operating Sys-             billion?” In: https : / / www . quora . com / Is -
+     tems Principles (SOSP). 1995.                                  anyone - successful - in - using - Python -
+[49] Christopher Mitchell, Yifeng Geng, and Jinyang Li.             Pandas-while-dealing-with-millions-
+     “Using One-Sided RDMA Reads to Build a Fast, CPU-              of- rows- or- more- than- a- billion- If-
+     Efficient Key-Value Store”. In: USENIX Annual Tech-            not-what-else-did-you-do (last accessed on
+     nical Conference (ATC). 2013.                                  10/15/2020).
+[50] Jacob Nelson, Brandon Holt, Brandon Myers, Preston        [61] Pandian Raju, Rohan Kadekodi, Vijay Chidambaram,
+     Briggs, Luis Ceze, Simon Kahan, and Mark Oskin.                and Ittai Abraham. “PebblesDB: Building Key-
+     “Latency-tolerant Software Distributed Shared Mem-             Value Stores Using Fragmented Log-Structured Merge
+     ory”. In: USENIX Annual Technical Conference (ATC).            Trees”. In: ACM Symposium on Operating Systems
+     2015.                                                          Principles (SOSP). 2017.
+[51] Stanko Novakovic, Yizhou Shan, Aasheesh Kolli,            [62] Andy Rudoff. “Persistent memory programming”. In:
+     Michael Cui, Yiying Zhang, Haggai Eran, Boris Pis-             Login: The Usenix Magazine 42 (2017).
+     menny, Liran Liss, Michael Wei, Dan Tsafrir, and Mar-     [63] Stephen M. Rumble, Ankita Kejriwal, and John Ouster-
+     cos K. Aguilera. “Storm: a fast transactional dataplane        hout. “Log-structured Memory for DRAM-based Stor-
+     for remote data structures”. In: ACM International             age”. In: USENIX Conference on File and Storage
+     Conference on Systems and Storage (SYSTOR). 2019.              Technologies (FAST). 2014.
+[52] “NVIDIA Mellanox BlueField DPU”. In: https :              [64] Daniel J. Scales, Kourosh Gharachorloo, and Chan-
+     / / www . mellanox . com / products /                          dramohan A. Thekkath. “Shasta: A Low Overhead,
+     bluefield - overview (last accessed on                         Software-only Approach for Supporting Fine-grain
+     10/15/2020).                                                   Shared Memory”. In: International Conference on Ar-
+[53] “NYC Taxi Trips - Exploratory Data Analysis”.                  chitectural Support for Programming Languages and
+     In: https : / / www . kaggle . com /                           Operating Systems (ASPLOS). 1996.
+     kartikkannapur / nyc - taxi - trips -
+     exploratory - data - analysis / notebook
+     (last accessed on 10/15/2020).
+
+
+
+
+USENIX Association                        14th USENIX Symposium on Operating Systems Design and Implementation       331
+[65] Ioannis Schoinas, Babak Falsafi, Alvin R. Lebeck,       [75] Po-An Tsai and Daniel Sanchez. “Compress Objects,
+     Steven K. Reinhardt, James R. Larus, and David A.            Not Cache Lines: An Object-Based Compressed Mem-
+     Wood. “Fine-grain Access Control for Distributed             ory Hierarchy”. In: International Conference on Ar-
+     Shared Memory”. In: International Conference on Ar-          chitectural Support for Programming Languages and
+     chitectural Support for Programming Languages and            Operating Systems (ASPLOS). 2019.
+     Operating Systems (ASPLOS). 1994.
+                                                             [76] Shin-Yeh Tsai and Yiying Zhang. “LITE Kernel
+[66] Yizhou Shan, Yutong Huang, Yilun Chen, and Yiy-              RDMA Support for Datacenter Applications”. In: ACM
+     ing Zhang. “LegoOS: A Disseminated, Distributed OS           Symposium on Operating Systems Principles (SOSP).
+     for Hardware Resource Disaggregation”. In: Sympo-            2017.
+     sium on Operating Systems Design and Implementa-        [77] “Understanding the Linux Virtual Memory Manager,
+     tion (OSDI). 2018.                                           Chapter 10 Page Frame Reclamation”. In: https :
+[67] Yizhou Shan, Shin-Yeh Tsai, and Yiying Zhang. “Dis-          / / www . kernel . org / doc / gorman / html /
+     tributed shared persistent memory”. In: ACM Sympo-           understand / understand013 . html (last ac-
+     sium on Cloud Computing (SoCC). 2017.                        cessed on 10/15/2020).
+[68] David Sidler, Zeke Wang, Monica Chiosa, Amit Kulka-     [78] “Validating References with Lifetimes”. In: https:
+     rni, and Gustavo Alonso. “StRoM: smart remote mem-           / / doc . rust - lang . org / book / ch10 -
+     ory”. In: European Conference on Computer Systems            03- lifetime- syntax.html (last accessed on
+     (EuroSys). 2020.                                             10/15/2020).
+[69] “std::weak_ptr”. In: https : / / en .
+                                                             [79] Chenxi Wang, Ting Cao, John Zigman, Fang Lv, Yun-
+     cppreference . com / w / cpp / memory /
+                                                                  quan Zhang, and Xiaobing Feng. “Efficient Manage-
+     weak_ptr (last accessed on 10/15/2020).
+                                                                  ment for Hybrid Memory in Managed Language Run-
+[70] “Stingray SmartNIC Adapters and IC”. In: https://            time”. In: Network and Parallel Computing (NPC).
+     www.broadcom.com/products/ethernet-                          Edited by Guang R. Gao, Depei Qian, Xinbo Gao, Bar-
+     connectivity / smartnic (last accessed on                    bara Chapman, and Wenguang Chen. 2016.
+     10/15/2020).
+[71] Patrick Stuedi, Animesh Trivedi, Bernard Metzler, and   [80] Chenxi Wang, Huimin Cui, Ting Cao, John Zigman,
+     Jonas Pfefferle. “DaRPC: Data Center RPC”. In: ACM           Haris Volos, Onur Mutlu, Fang Lv, Xiaobing Feng, and
+     Symposium on Cloud Computing (SoCC). 2014.                   Guoqing Harry Xu. “Panthera: Holistic Memory Man-
+                                                                  agement for Big Data Processing over Hybrid Memo-
+[72] Andrew S Tanenbaum and Herbert Bos. Modern Oper-             ries”. In: ACM SIGPLAN Conference on Programming
+     ating Systems. 2015.                                         Language Design and Implementation (PLDI). 2019.
+[73] Muhammad Tirmazi, Adam Barker, Nan Deng, Md E.
+     Haque, Zhijing Gene Qin, Steven Hand, Mor Harchol-      [81] Paul Wilson. “Operating System Support for Small
+     Balter, and John Wilkes. “Borg: The next Generation”.        Objects”. In: International Workshop on Object Orien-
+     In: European Conference on Computer Systems (Eu-             tation in Operating Systems (IWOOOS). 1991.
+     roSys). 2020.                                           [82] Paul R. Wilson, Scott F. Kaplan, and Yannis Smarag-
+[74] “TLC Trip Record Data”. In: https://www1.nyc.                dakis. “The Case for Compressed Caching in Virtual
+     gov/site/tlc/about/tlc-trip-record-                          Memory Systems”. In: USENIX Annual Technical Con-
+     data.page (last accessed on 10/15/2020).                     ference (ATC). 1999.
+
+
+
+
+332   14th USENIX Symposium on Operating Systems Design and Implementation                        USENIX Association
+

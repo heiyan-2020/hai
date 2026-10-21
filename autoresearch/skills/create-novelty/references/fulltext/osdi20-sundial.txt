@@ -1,0 +1,1103 @@
+    Sundial: Fault-tolerant Clock Synchronization
+                    for Datacenters
+ Yuliang Li, Google Inc. and Harvard University; Gautam Kumar, Hema Hariharan,
+   Hassan Wassel, Peter Hochschild, and Dave Platt, Google Inc.; Simon Sabato,
+Lilac Cloud; Minlan Yu, Harvard University; Nandita Dukkipati, Prashant Chandra,
+                            and Amin Vahdat, Google Inc.
+            https://www.usenix.org/conference/osdi20/presentation/li-yuliang
+
+
+
+
+         This paper is included in the Proceedings of the
+         14th USENIX Symposium on Operating Systems
+                  Design and Implementation
+                               November 4–6, 2020
+                                   978-1-939133-19-9
+
+
+
+                                          Open access to the Proceedings of the
+                                          14th USENIX Symposium on Operating
+                                           Systems Design and Implementation
+                                                 is sponsored by USENIX
+                Sundial: Fault-tolerant Clock Synchronization for Datacenters
+
+    Yuliang Li*† , Gautam Kumar*, Hema Hariharan*, Hassan Wassel*, Peter Hochschild*, Dave Platt*,
+            Simon Sabato‡ , Minlan Yu† , Nandita Dukkipati*, Prashant Chandra*, Amin Vahdat*
+                             Google Inc.*, Harvard University† , Lilac Cloud‡
+
+
+
+                          Abstract                                  tency in distributed databases. Another example is consis-
+                                                                    tent snapshots, which are commonly used for debugging or
+Clock synchronization is critical for many datacenter applica-      handling failures in distributed systems. To ensure consis-
+tions such as distributed transactional databases, consistent       tency among snapshots, each node needs to wait for its time-
+snapshots, and network telemetry. As applications have in-          uncertainty bound (ε) before recording the states.
+creasing performance requirements and datacenter networks
+                                                                       Traditional clock synchronization techniques provide ε at
+get into ultra-low latency, we need submicrosecond-level
+                                                                    the millisecond level (e.g., <10ms in TrueTime [12]), which is
+bound on time-uncertainty to reduce transaction delay and en-
+                                                                    no longer effective for modern datacenter applications with in-
+able new network management applications (e.g., measuring
+                                                                    creasing performance requirements and ultra low latency dat-
+one-way delay for congestion control). The state-of-the-art
+                                                                    acenter networks (e.g., with latency around 5µs [25]). Today’s
+clock synchronization solutions focus on improving clock pre-
+                                                                    applications can benefit significantly from submicrosecond-
+cision but may incur significant time-uncertainty bound due
+                                                                    level ε. For example, FaRMv2 [32], an RDMA-based trans-
+to the presence of failures. This significantly affects applica-
+                                                                    actional system, observes the median transaction delay can
+tions because in large-scale datacenters, temperature-related,
+                                                                    drop by 25% if we improve ε from ∼20µs to 100ns. Cock-
+link, device, and domain failures are common. We present
+                                                                    roachDB [3] can significantly reduce the retry rate when ε
+Sundial, a fault-tolerant clock synchronization system for dat-
+                                                                    drops from 1ms to 100ns based on an experiment in [13].
+acenters that achieves ∼100ns time-uncertainty bound under
+                                                                       Providing submicrosecond-level ε can also enable new
+various types of failures. Sundial provides fast failure detec-
+                                                                    network management applications. For example, with
+tion based on frequent synchronization messages in hardware.
+                                                                    submicrosecond-level clock differences across devices, we
+Sundial enables fast failure recovery using a novel graph-
+                                                                    can measure one-way delay, locate packet losses, and identify
+based algorithm to precompute a backup plan that is generic
+                                                                    per-hop latency bursts [23, 24]. It also enables synchronized
+to failures. Through experiments in a >500-machine testbed
+                                                                    network snapshots [37] which are useful for identifying RTT-
+and large-scale simulations, we show that Sundial can achieve
+                                                                    scale network imbalance and collect global forwarding state.
+∼100ns time-uncertainty bound under different types of fail-
+                                                                    Accurate one-way delay provides a better congestion signal
+ures, which is more than two orders of magnitude lower than
+                                                                    to delay-based congestion control [17, 29] to differentiate
+the state-of-the-art solutions. We also demonstrate the ben-
+                                                                    between forward and reverse path congestion.
+efit of Sundial on applications such as Spanner and Swift
+congestion control.                                                    There are several systems that achieve submicrosecond-
+                                                                    level clock precision. The state-of-the-art commercial so-
+1    Introduction                                                   lution on precise clock synchronization is Precision Time
+Clock synchronization is increasingly important for datacen-        Protocol (PTP) [4]. PTP is widely available in switches and
+ter applications such as distributed transactional databases [12,   NICs [6,8,9]. Each switch or NIC has a hardware clock driven
+32], consistent snapshots [11, 16], network telemetry, conges-      by an oscillator, generates timestamped synchronization mes-
+tion control, and distributed logging.                              sages in software, and sends them over a spanning tree to
+   One key metric for clock synchronization is the time-            synchronize with other nodes. Normally, oscillator drifts stay
+uncertainty bound for each node, denoted as ε in this paper,        within ±100µs per second and the devices synchronize every
+which bounds the difference between local clock and other           15ms to 2 seconds [4, 8]. A recent proposal DTP [21] sends
+clocks. This concept is used by TrueTime in Spanner [12].           messages in the physical layer every few microseconds and
+Spanner leverages TrueTime to guarantee the correctness             can also achieve ∼100ns precision. Huygens [13] is a clock-
+properties around concurrency control and provide consis-           synchronization system built in software that achieves <100ns
+
+
+
+USENIX Association                           14th USENIX Symposium on Operating Systems Design and Implementation            1171
+precision by using Support Vector Machines to accurately es-           2   Need for Tight Time-uncertainty Bound
+timate one-way propagation delays.                                     A clock synchronization system for datacenters need not only
+   While these works provide high clock precision under nor-           a current value of time but also time-uncertainty bound that is
+mal cases, the time-uncertainty bound ε grows to 10-100s of            used by applications for correctness as well as performance.
+µs as datacenters are subject to a variety of failures. In large-      We describe several datacenter applications and how tight
+scale datacenters, there are common temperature-related fail-          time-uncertainty bound benefits them below.
+ures which affect oscillator drifts. There are also frequent link,     Distributed Transactional Databases: Spanner [12],
+device, and domain failures (i.e., a domain of links and de-           FaRMv2 [32] and CockroachDB [3] are some examples of
+vices that fail together) that affect the synchronization across       distributed databases deployed at scale in production that di-
+nodes (see §3).                                                        rectly use time-uncertainty bound to guarantee consistency –
+   In this paper, we present Sundial, which provides                   transactions wait out time-uncertainty bound before commit-
+∼100ns time-uncertainty bound (ε) under failures including             ting a transaction. Spanner is the first to use ε in production
+temperature-related, link, device and domain failures and re-          transactional systems. While it is globally distributed, its idea
+ports ε to applications – two orders of magnitude better than          of using ε is adopted in many intra-datacenter systems such as
+current designs. Even in cases of simultaneous failures across         FaRMv2 [32]. However, inside datacenters, with recent soft-
+domains, Sundial provides correct ε to applications. Sundial           ware and hardware improvements such as RDMA, NVMe,
+achieves this with a hardware-software codesign that enables           and in-memory storage, transaction latencies are going to-
+fast failure detection and recovery:                                   wards microsecond level. For example, FaRMv2 is built atop
+Fast failure detection based on frequent synchronous                   RDMA for datacenters and has ε of ∼20µs which already
+messaging on commodity hardware: Sundial exchanges                     accounts for 25% of median transaction latency! Tight ε im-
+messages every ∼100µs in hardware without changing the                 proves the performance of these systems both in terms of
+physical layer. The frequent message exchange enables fast             latency and throughput.
+failure detection and recovery, and frequent reduction of ε.
+                                                                       Consistent snapshots: Consistent snapshots [11, 16] is an-
+To ensure fast failure detection for remote nodes in the span-
+                                                                       other important application for datacenters for debugging,
+ning tree, Sundial introduces synchronous messaging which
+                                                                       failure handling, and recovery for cloud VMs. The consis-
+ensures that each node sends a new message only when it
+                                                                       tency across servers can be guaranteed by waiting out ε to
+receives a message from the upstream.
+                                                                       ensure the scheduled snapshot time is passed. With recent
+Fast failure recovery with precomputed backup plan that                software and hardware improvements, ε becomes a perfor-
+is generic to all types of failures: To enable fast failure re-        mance bottleneck at a similar level as in distributed databases,
+covery, Sundial controller precomputes a backup plan con-              limiting the frequency of taking snapshots.
+sisting of one backup parent for each node and a backup root,
+                                                                       Network telemetry: As network latency reduces to the or-
+so that each device can recover locally. The backup plan is
+                                                                       der of a few microseconds, millisecond-level ε is too coarse-
+generic to different types of failures (i.e., link, device failures,
+                                                                       grained. Tight ε enables a wide range of fine-grained network
+root failures, and domain failures) and ensures that after fail-
+                                                                       telemetry. For example, per-link latency or packet losses can
+ure recovery, the devices remain connected without loops. We
+                                                                       be measured by comparing the timestamps or counters at both
+introduce a new search algorithm for the backup plan that ex-
+                                                                       ends of a link read at the same time [23, 24, 40]. Synchro-
+tends a variant of edge-disjoint spanning tree algorithm [35]
+                                                                       nized network snapshots at RTT scale can be enabled with
+but with additional constraints such as no-ancestor condition
+                                                                       tight time-uncertainty bound, and can be used for various
+(the edge in the current tree cannot be a forward edge in the
+                                                                       telemetry needs such as measuring traffic imbalance across
+backup tree) and disjoint-failure-domain condition (no do-
+                                                                       different links/paths in the dataceter [37].To achieve these,
+main failure can take down both the parent and the backup
+                                                                       switch clocks also need to be synchronized.
+parent for any device). Our algorithm only takes 148ms on
+average to run on an example Jupiter [33] topology with 88K            One-way delay (OWD): Synchronized clocks enable the
+nodes.                                                                 measurement of one-way delays. Small ε provides a tighter
+   We evaluate Sundial with experiments in a >500 machine              bound on the error in the measurement especially under fail-
+prototype implementation and via large-scale simulations.              ures. Measurement of OWD is useful for many applications in-
+Sundial achieves ∼100ns time-uncertainty bound both under              cluding telemetry and congestion control. For example, OWD
+normal time and under different types of failures, which is            differentiates between forward and reverse-path congestion
+more than two orders of magnitude lower than the state-of-             improving performance of delay-based congestion control
+the-art solutions such as PTP [4], Huygens [13], and DTP [21].         algorithms such as Swift [17] (§6.3).
+Sundial reduces the commit-wait latency of Spanner [12] run-           Distributed logging: A key challenge for debugging large-
+ning inside a datacenter by 3-4x, and improves the throughput          scale distributed systems is to analyze logs collected from
+of Swift congestion control [17] by 1.6x under reverse-path            different devices with clock differences. Tighter ε enables
+congestion.                                                            more useful analysis and opens up more distributed debug-
+
+
+
+1172    14th USENIX Symposium on Operating Systems Design and Implementation                                     USENIX Association
+             dAB
+                               T2A                                      Synchronization          A                                         B
+                                                            Clock A     between neighbors
+       T1A
+                                            Send T2A to B
+                                                            Clock B     Synchronization
+                   T1B   T2B                                            over multiple hops       A                                         B
+       Figure 1: Message exchanges to synchronize B to A.
+ging opportunities. Our ∼100ns ε is about the same as L3                         Device                   Physical link                Queue
+cache miss time, so it can help order all log messages in a                           Forward path                        Backward path
+datacenter. We note that this class of applications has an addi-      Figure 2: Benefit of synchronization between neighbors: symmetric
+tional requirement in that the synchronized clocks follow a           forward and backward paths, and no noises from queuing delay.
+master clock that reflects the physical time of day (§4.5).           direct neighbors in the physical network and sync-messages
+3     Failures in Clock Synchronization System                        flow periodically from the root across the spanning tree.1 This
+In this section, we discuss the different failure scenarios af-       has two advantages. First, it allows switch clocks to also be
+fecting a clock synchronization system and their respective           synchronized enabling additional telemetry applications (§2).
+impacts. We start with a brief background on clock synchro-           Second, it significantly improves the measurement of dAB as
+nization to aid the discussion.                                       shown in Figure 2. Noises in estimation of dAB by halving the
+                                                                      RTT can arise due to (1) asymmetric propagation delays of
+3.1    Background on Clock Synchronization
+                                                                      the forward path and the reverse path, and (2) queuing delays.
+The clock is driven by a crystal oscillator. Every device             For direct neighbors in the physical network, propagation de-
+has a clock, whose value is incremented on every tick of a            lay asymmetry is near zero, and there is no queuing delay2 .
+hardware oscillator. Different oscillators, even of the same          There are proposals that do not use a spanning tree as the syn-
+type, have slightly different frequencies. The frequency of           chronization structure but either they don’t reflect the physical
+an oscillator may change over time, due to factors such as            time [21] (§4.5) or they cannot provide submicrosecond-level
+temperature changes, voltage changes, or aging resulting in           precision [12, 27, 28] (§7).
+clocks to drift away over time. As an example, oscillators
+                                                                      Time-uncertainty bound. As clocks can drift apart over
+in production networks can have a frequency variation of
+                                                                      time, time-uncertainty bound (ε) can be calculated as:
+±100 ppm (parts per million) [7], meaning that the oscillator
+                                                                              ε = εbase + (now − Tlast_sync ) × max_drift_rate      (1)
+can drift within the range of ±100µs per second compared
+to running at the nominal frequency. More stable oscillators          ε of a clock exhibits a sawtooth function. Tlast_sync is the last
+(e.g., atomic clocks based on Cesium, Hydrogen or Rubidium            time when the clock is synchronized to the root (not just its di-
+particles or oven-controlled oscillators) are too expensive to        rect parent), now−Tlast_sync increases with time and goes back
+deploy on every device in production.                                 to zero after synchronization to the root, and max_drift_rate
+Clocks exchange messages with each other for synchro-                 is a constant representing the maximum possible drift rate be-
+nization. To ensure that clocks remain close to each other,           tween the local clock and the root’s clock. The εbase is a small
+we need to periodically adjust the clocks to account for poten-       constant (a few nanoseconds) that accounts for other noises
+tial drift. Figure 1 shows an example where clock B synchro-          (e.g., timestamping errors, bidirectional delay asymmetry of
+nizes to A. A sends a synchronization message (abbreviated            physical links, etc.).
+as sync-message in this paper) with a timestamp T1A based                We will show that in the face of failures in production en-
+on A’s clock, and B records the receiving time (timestamped           vironments, max_drift_rate should be conservatively derived
+by B) of the sync-message T1B . Now, if B knows the message           (§3.2.1), and now − Tlast_sync can be large (§3.2.2).
+delay dAB from A to B, B can compute the offset between A             3.2     Impact of Failures on ε
+and B as T1A + dAB − T1B . To know dAB , B sends another mes-         We classify failures affecting clock synchronization into three
+sage to A to measure RTT, and use half of RTT to estimate:            categories and study their impact on ε – failures that induce
+dAB = (T2A − T1A − (T2B − T1B ))/2. B uses offset to adjust its       large frequency variations and need a conservative setting
+clock. A periodically sends out these sync-messages at an in-         of max_drift_rate, connectivity failures that affect Tlast_sync ,
+terval denoted by sync-interval. The accuracy of dAB depends          and incorrect behaviors due to broken clocks and message
+on multiple factors and we discuss them below.                        corruption that need to be detected and addressed.
+A network of clocks synchronize using a synchronization               3.2.1 Failures that Induce Large Frequency Variations
+structure. A common way to do this is to construct a span-            An oscillator’s frequency can incur a large variation in the
+ning tree over which sync-messages are sent, e.g., PTP which          event of sudden temperature or voltage fluctuation. Cooling
+is the most widely available system for datacenter clock syn-         failures are common and can affect thousands of machines.
+chronization uses a spanning tree with one device serving as             1 Note that PTP doesn’t require this to be the case.
+the root (called master or grandmaster). The model for best              2 While the devices may have local queues, the timestamp is marked at
+
+case synchronization is that each device’s parent is one of its       dequeue/egress time and is not subject to local queuing delay.
+
+
+
+
+USENIX Association                          14th USENIX Symposium on Operating Systems Design and Implementation                           1173
+                                                                                                                                  Synchronization msg
+In an cooling incident that occurred in production recently, it                      A            Link A to B fails
+resulted in errors related to clock synchronization in a large                                                                                        A
+                                                                                                                   B detects         Centralized failure
+fraction of machines (and not just the ones affected by the                                                     failure locally          recovery
+failure). The temperature variation resulted in oscillator fre-                          B                                                              B
+quency variation to exceed max_drift_rate and the operator
+had to shut down many machines.3 Thus, the max_drift_rate                            C                                                                  C
+                                                                                                                        time taken
+needs to be set very conservatively (e.g., 200ppm in True-                       Figure 3: Challenge of determining Tlast_sync . Node C cannot deter-
+Time [12]) to tolerate frequency variations under a wide range                   mine if it is synchronized to the root or not, so C has to always set
+of temperature (e.g., up to 85 °C) even though in normal cases,                  Tlast_sync conservatively early to account for possible down time.
+temperature variations occur slowly [13]. This entails that
+in order to keep ε small, we need to reduce now − Tlast_sync
+through frequent messaging – ε of 100ns with max_drift_rate
+of 200ppm needs sync-interval to be <500µs. Software cost
+of reducing sync-interval to such low values is high – PTP
+takes one core to process thousands of sync-messages and
+associated computations per second [1], and Huygens con-
+sumes 0.44% CPU for a sync-interval of 2s (which grows
+                                                                                 Figure 4: Number of link down events per second in a 1000-machine
+proportionally as the interval is reduced). We need hardware
+                                                                                 cluster during a near two-minute window of a failure incident.
+support for efficiency (§4.1).
+3.2.2 Connectivity Failures                                                         There are many possible causes of connectivity failures:
+Failures that break the connectivity of the spanning tree also                   besides the common link or switch down, there are incidents
+affect ε. For example, if a device or a link in the spanning tree                that can take down massive (10s to 100s) devices or links,
+fails, the whole subtree under this device or link loses connec-                 such as failures related to patch panels, link bundles, power
+tivity to the root4 , until a new spanning tree is reconfigured                  domains, or human operations [38, 39]. Figure 4 shows the
+by the SDN controller. ε grows proportionally to the time it                     time series of link down events in a 1000-machine cluster
+takes for recovery – if it takes 100 ms, ε grows to more than                    during a failure incident. The suspected cause was a software
+20µs. Even a distributed spanning tree protocol supported by                     bug related to a patch panel but its impact on device/link
+PTP (best master clock algorithm) is slow to converge.                           failures lasted across nearly two minutes – a total of 133 links
+   What is worse, is that the inflation of ε is not only for a                   go down. Thus, in order to provide small ε, the system must
+device affected by the failure at a given time; instead, almost                  recover from connectivity failures quickly.
+all devices have to report high ε, all the time and not only                     3.2.3 Broken Clocks and Message Corruption
+during the failure duration. This is because a device cannot                     Clocks may break and stop functioning well resulting in actual
+distinguish whether it is affected by a failure or not. Consider                 drift rate to exceed max_drift_rate. While this is rare relative
+a 3-node setup as depicted in Figure 3 with A as the root of                     to more severe hardware problems – statistics from production
+the spanning tree and B and C as A’s child and grandchild                        show that broken CPUs are 6 times more likely than broken
+respectively. When A fails, B detects the failure but C con-                     clocks [12] – they need to be taken care of to provide correct
+tinues synchronizing to B without noticing the failure. This                     ε to applications. Similarly, sync-message corruption may
+means at any time, there is no way for C to tell if it is in-sync                garble the associated timestamp and affect correctness of
+or not, no matter if there is an actual failure or not and thus,                 reported ε. A fault-tolerant clock synchronization system must
+it has to always report large ε (i.e., > 20µs) even during nor-                  detect and address such anomalies.
+mal periods.5 Another way to look at this is in the context of
+Equation 1, C cannot set Tlast_sync to the time it receives the                  4    Sundial Design and Implementation
+last sync-message from its parent Tlast_msg ; instead, for cor-                  Motivated by the discussion above, we identify two key re-
+rectness, C has to always set Tlast_sync = Tlast_msg − Trecovery ,               quirements to build a fault-tolerant clock synchronization sys-
+where Trecovery is the maximum time to recover from any fail-                    tem for datacenters that achieves performant time-uncertainty
+ure that may break its connectivity to the root. All non-direct                  bounds. First is a small sync-interval (§3.2.1) – this is well
+descendants of the root are affected by this.                                    served with a hardware implementation to avoid high CPU
+   3 Normally, after a cooling system failure, operators let machines continue   overhead of receiving and transmitting synchronization mes-
+running for 10s of minutes before the recovery of cooling system or a grad-      sages in software. Second is fast failure recovery so that ε
+ual shutdown of machines, because this is usually safe and a sudden total        continues to be small even when failures happen (§3.2.2).
+shutdown should be avoided as much as possible.                                  The challenge here is that recovering solely via a centralized
+   4 PTP is configured on a per-port basis (not per-device), so sync-message
+
+cannot bypass the failed link or the link associated with the failed device.
+                                                                                 controller is slow for our target ε requirements. Instead, as
+   5 Without changing the PTP standard, B cannot explicitly communicate to       we show later, we can recover from most failures locally by
+C about the failure.                                                             adding redundancy to the synchronization graph, where in
+
+
+
+1174     14th USENIX Symposium on Operating Systems Design and Implementation                                                     USENIX Association
+  Existing solution                                                                                                            0
+   Failure Failure detected locally     Controller reconfig switches
+                                                                               0          1         2        3           4            6
+         <1ms                100s ms ~ seconds                      Time
+   Our solution
+                                                   Failure handled slowly
+                                                                               4          5         6        7    8      9     1     10    11
+           Failure detected locally
+   Failure & enable backup plan         Controller reconfig switches                                                     5            7
+                                                                               8          9         10       11
+         <1ms               100s ms ~ seconds                      Time                                                  2            3
+           Failure handled quickly                                                            (a)                             (b)
+ Figure 5: Fast failure recovery using precomputed backup plan.
+                                                                                              0                                0
+   Legend:           Software               Hardware                                  4                  6               4            6
+   Controller:
+   - Initially, calculate the spanning tree & backup plan                      8      9       1         10   11   8      9     1     10    11
+   - Recalculate upon failure reports
+              Configure                     Report failure                            5                  7               5            7
+   Device                                                                             2                  3               2            3
+    Failure handler:                                                                          (c)                             (d)
+    - Pickup the backup plan                                                Figure 7: Failure cases in a k=4 FatTree. (a) is the raw FatTree. To
+               Configure              Interrupt                             show the spanning tree clearer, we draw an equivalent topology in
+      RX                        Timer                 TX                    (b) and a spanning tree in it. An arrow is from a parent to its child,
+      - Adjust clock & ε        - Detect failure      - Send msg            and a dashed line indicates an edge not used in the spanning tree. (c)
+      - Trigger TX              - Trigger TX                                shows one way of adjusting the spanning tree when the link between
+                                Config                                      4 and 8 fails; not only the directly impacted nodes (node 8), but also
+Figure 6: Sundial Framework. Solid arrows are the fast local recov-         other nodes (node 5) have to change parent. (d) shows one way of
+ery. Dashed arrows are slower but non-critical paths of recovery.           adjustment when node 4 fails; the way node 5 changes its parent (to
+                                                                            node 3) is different from the case in (c) (change to node 9).
+addition to the primary spanning tree, each device maintains a
+backup parent, such that it can transition to the backup parent             increments on every oscillator cycle, and triggers message
+locally upon detecting a failure. As shown in Figure 5, this                transmission when the time since last transmission exceeds
+takes the round trip time to the controller and the computation             the configured sync-interval. We configure sync-interval on
+time out of the critical path of failure handling.                          the root device to be around 100µs. The sync-messages are
+                                                                            sent at the highest priority, but the network overhead remains
+   Thus, Sundial uses a hardware-software codesign. Figure 6
+                                                                            extremely small – a 100-byte packet every 100µs only con-
+depicts Sundial’s framework, which has three main compo-
+                                                                            sumes less than 0.01% bandwidth and adds at most 10ns
+nents. Sundial implement the most essential functions of ex-
+                                                                            queuing delay for other traffic.
+changing synchronization messages and detecting failures in
+                                                                               For non-root devices, a challenge is that an upstream failure
+hardware such that it can synchronize frequently and quickly
+                                                                            can affect all devices in that subtree. Consider the case in Fig-
+detect failures. Sundial relies on software components to take
+                                                                            ure 7(c), if link 4-to-8 goes down, 8 needs to switch to 5 as its
+action once a failure is detected, by invoking a failure handler
+                                                                            parent, which needs 5 to change its parent as well. A potential
+in software which reconfigures the hardware to transition to
+                                                                            solution is explicit notification of failures to other devices, but
+the backup parent pre-programmed by a centralized controller
+                                                                            this has two issues – not only can this be unreliable (since the
+(also in software). We use the topology in Figure 7(a) as a
+                                                                            notification messages may get dropped), it also adds complex-
+toy example to aid with the discussion in this section with
+                                                                            ity to the hardware. Instead, we solve this via synchronous
+Figure 7(b) as an example spanning tree.
+                                                                            messaging where message transmission is triggered only upon
+4.1     Sundial Hardware Design                                             receipt of a message from upstream. In this way, an upstream
+Sundial’s hardware has three main components. It implements                 failure implies that messages stop propagating downstream,
+frequent transmission of sync-messages in a synchronous                     and devices can take corrective actions.
+fashion, i.e., sync-messages are sent downstream only upon                  4.1.2 Fast Failure Detection
+their receipt. The hardware is also responsible for detecting               Sundial’s hardware uses a timeout to detect if it stops receiv-
+failures and triggering software handlers for quick recovery.               ing messages indicating an upstream failure. The timeout is
+Finally, the hardware maintains the current value of ε. We                  set to span multiple sync-intervals, such that occasional mes-
+detail out these components below.                                          sage drop or corruption doesn’t trigger it. It’s implemented
+4.1.1 Frequent Synchronous Messaging                                        using a counter that is incremented on every oscillator cycle,
+Sundial’s hardware supports frequent message sending to                     and cleared on receiving a sync-message – once it’s exceeded,
+prevent clocks from drifting apart significantly. On the root,              the hardware issues an interrupt to the software.
+this is done via a hardware timer maintaining a counter that                   To detect broken clocks and message corruption, each de-
+
+
+
+USENIX Association                                   14th USENIX Symposium on Operating Systems Design and Implementation                  1175
+vice verifies the incoming timestamp (adjusted for link delay).        Main tree
+                                                                                                   A link down cuts off a
+If the adjusted value lies outside the local ε, the message is                                      sub-tree of k nodes.
+marked invalid and doesn’t trigger an update and message                                                           k nodes have k backup
+                                                                                                                   parents. If they do not form
+transmissions. A broken clock can cause continuous invalid                                                         a loop, at least one node’s
+                                                                                                                   backup parent is outside.
+messages and thus, we don’t reset the timeout counter on their
+receipt. Once a broken clock is detected, the failure handler       Figure 8: No-loop condition. It is sufficient to guarantee connectiv-
+in device software is triggered to handle it (§4.2.2).              ity after any link failure.
+4.1.3 Time-uncertainty Bound Calculation                            We can now expand the main tree to include C since C is
+The hardware maintains ε according to Equation 1. In our            connected to the main tree via its backup edge. We can then
+implementation, we configure max_drift_rate = 200ppm and            iteratively add the remaining k − 1 nodes to the main tree.
+εbase = 5ns×depth where depth is the distance of the device         (2) No-ancestor condition: The backup parent of a node is
+from the root in the tree.                                          not its ancestor. This and property (1) together ensure that the
+   Tlast_sync is updated when receiving a sync-message. In          backup plan is generic to any non-root node failure. Other-
+PTP, Tlast_sync should be set to earlier than Tlast_msg . Thanks    wise, if that ancestor fails, that node has no backup parent.
+to synchronous messaging, Sundial sets it to Tlast_msg since a      (3) Reachability condition: The backup root must be able
+device stops receiving messages on an upstream failure. This        to reach all nodes through backup paths. This is necessary
+lowers now − Tlast_sync which in turn lowers ε.                     and sufficient to be generic to the root failure. When the root
+4.2    Sundial Software Design                                      fails, all nodes change to their backup parents, and the backup
+There are two main components to round out the fault-tolerant       root will become the new root. To synchronize all nodes, they
+design of Sundial – a centralized SDN controller that pre-          must be reachable from the backup root.
+calculates backup plans and programs them on the devices            (4) Disjoint-failure-domain condition: Domain failures
+and a failure handler in device software that quickly moves to      present a unique challenge, because they may take down mul-
+the backup when a failure is detected by the hardware.              tiple devices or links. If a domain failure breaks the connec-
+4.2.1 Centralized Controller                                        tivity of a device s to the root, s will turn to its backup parent;
+The centralized controller in Sundial is responsible for com-       but if the domain failure also takes down its backup parent,
+puting the primary spanning tree along with the backup plan         then s cannot recover its connectivity.
+based on the current topology and configures the devices ac-           The following property solves this problem: for any node s,
+cordingly. Comparing Figure 7(c) and 7(d), we see that not          there shouldn’t be a single domain failure that both breaks s’s
+all neighbors of a node (e.g., node 5 in the figure) can be the     connectivity to the root and takes down the backup parent or
+backup parent under different failures. Sundial uses a search       backup edge, unless that failure also takes down the node s.
+algorithm (detailed below) to compute a fault-tolerant backup          Formally, if the set of failure domains that can break s’s
+plan that is generic to link, non-root node, root node, and do-     connectivity to the root6 is D p , the set of failure domains that
+main failures (which can take down multiple links or devices).      can take down s’s backup parent or backup edge is Db , and
+We break down this requirement into 5 properties.                   the set of failure domains that s belongs to is Ds , we should
+Properties of a fault-tolerant backup plan. We briefly              have D p ∩ Db ⊆ Ds .
+introduce the terminology used. The primary spanning                   The necessity is obvious. We present the intuition behind
+tree is one that is currently being used to propagate sync-         the proof of the sufficiency. If a domain failure happens, s
+messages. The backup plan consists of a backup-parent for           has two possibilities: either s’s connectivity is unaffected, or
+each node/device and a backup root. Terms like parent, edges,       s connects to its backup parent b. If it is the latter, then the
+paths, and ancestors apply separately to the primary and the        questions is whether b is connected to the root, which also has
+backup graph (graph formed by the edges in the backup plan).        two possibilities. Doing this recursively, s keeps connecting
+                                                                    to more nodes along a backup path. The backup path will
+(1) No-loop condition: For any primary subtree, the backup
+                                                                    not go indefinitely due to the no-loop condition, so it finally
+edges of nodes in the subtree do not form a loop. This is a
+                                                                    reaches either an unaffected node or the root.
+necessary and sufficient condition to be generic to any single
+link failure. The necessity is obvious: if there is a loop, the     (5) Root failure detection: Upon root failure, the backup root
+nodes in the loop do not synchronize to the root after a failure.   needs to collect sufficient information to elect itself. Figure 9
+We prove the sufficiency by induction as follows. Suppose a         describes the approach – the backup root is chosen amongst
+k-node subtree is affected by a link failure, and the k backup      root’s children so it has one source of information by itself.
+edges do not form a loop (Figure 8); the nodes other than the          To get information from additional sources, we set up the
+k nodes are unaffected and still form a tree (called the main       backup graph to have a backup path from the subtree of an-
+tree). At least one of the k nodes’ (say, C) parent is in the       other child of the primary root (i.e., the backup path from node
+main tree; otherwise, all k nodes’ parents are in the k nodes,         6 Any device or link failure along the primary path from the root to s can
+
+which must form a loop, contradicting the no-loop condition.        break s’s connectivity.
+
+
+
+
+1176    14th USENIX Symposium on Operating Systems Design and Implementation                                           USENIX Association
+                                       0                                             Backup root ignores this edge
+  Backup root                                                                        after the second timeout
+          1                                                                                           Backup root
+                                                                                           Backup edge
+                             2                    3                4                     Backup sub-tree
+
+      Primary edge          Primary path        Sub-tree       Backup path
+                                                                                   Figure 10: Backup Graph. There is exactly one loop with the backup
+                                                                                   root in it. Each node in the loop is the root of a subtree.
+Figure 9: Root failure detection. Under any non-root failure, the
+backup root continues receiving messages, which can be used to                             Backup root       0                 Backup root     0
+distinguish other failures.                                                                          4               6                  4             6
+2 to 1 in Figure 9). In this way, if the link between the primary
+                                                                                              8      9       1       10   11     8      9      1     10      11
+root and the backup root fails (link from 0 to 1), the backup
+root knows the primary root is still alive because it contin-                        Primary edge    5               7                  5             7
+                                                                                                                                                          Same
+ues receiving sync-messages that come through the backup
+                                                                                     Backup edge     2               3                  2             3 domain
+path. We can continue this backup path to cross more subtrees                                                (a)                               (b)
+of children of the primary root to get additional sources of
+                                                                                   Figure 11: (a) A primary tree and a backup graph that meet all
+information (e.g., crossing node 3 and 4 in Figure 9).                             properties in Figure 7. But if node 3 and 11 are in the same domain,
+   In this way, as long as the root is alive, the backup root                      node 7 cannot have them as its primary and backup parents, so its
+continues receiving sync-messages. Only when the root fails,                       backup parent becomes node 2 in (b).
+the backup root stops receiving messages. So the backup root
+                                                                                   Algorithm for computing backup plan. Sundial uses a
+can detect the primary root failure using a second timeout of
+                                                                                   search algorithm to calculate the backup plan which includes
+not receiving messages after it first turns to its backup parent,
+                                                                                   a primary tree and the backup graph. Note that not every pri-
+and it elects itself as the new root after the second timeout.
+                                                                                   mary tree has a valid backup graph. Thus, the goal is to search
+Putting all 5 properties together. Only non-root nodes have                        for a primary tree and its backup graph together. The search
+backup parents, so there are N-1 nodes and N-1 edges in the                        heuristic is based on the score of a primary tree – the maxi-
+backup graph (N is the total number of nodes), so there must                       mum number of edges in the backup graphs it supports. The
+be exactly one loop7 in the backup graph, and each node in                         corresponding backup graphs are called the largest backup
+the loop has a backup subtree (can be a single node) under it                      graphs (of the primary tree).
+(Figure 10). With property (3), the backup root must be in the                        Algorithm 1 describes the algorithm. pending is the set
+loop, so that the backup root can reach all nodes. The loop                        of primary trees that are pending to be checked, initialized
+should cross multiple primary subtrees of root’s children, so it                   with a simple BFS (Line 1). After initialization (Line 2), we
+meets both property (1) and property (5) (it delivers multiple                     start the S EARCH function (Line 3) that will return a pair of
+sources of primary root’s information to the backup root).                         primary tree and backup graph. In S EARCH, each time, we
+Lastly, the backup graph should meet properties (2) and (4).                       pick the primary tree p with the highest score (Line 6) – the
+   Figure 11(a) shows an example of primary tree and backup                        most promising one – and find the largest backup graphs for it
+graph for the topology in Figure 7. Note that the computed pri-                    (Line 7). If some backup graph is complete, i.e., every device
+mary tree is different to support a backup graph. The backup                       (including the backup root) has a backup parent, the search
+graph has a loop (between node 4 and 8) with the backup root                       successfully returns (Line 8 - 9). Otherwise, we update the
+4 on it; the loop crosses the two primary subtrees of root’s                       best score so far (Line 10), and mutate p (Line 11) to get a
+children (node 8 is under node 6’s primary subtree). To show                       new set of primary trees in pending and iterate.
+how property (4) handles domain failures, we add a failure                            In M UTATE, for each backup graph b (Line 14), we try to
+domain that includes both node 11 and 3 (primary and backup                        expand b to include edge <x, y> (Line 15). Since <x, y> is not
+parents of node 7 in Figure 11(a)). Now in the new backup                          usable in backup graphs of p8 (i.e., U SABLE I N BACKUP(<x,
+graph (Figure 11(b)), to meet property (4), node 7’s backup                        y>, p) is false), we I MPROVE p to make <x, y> usable (Line
+parent becomes node 2, so that even if both node 3 and 11 go                       16). We then add each improved version p0 to pending if not
+down, node 7 (and other nodes) is still connected.                                 already tested (Line 19). After all the mutations, p is removed
+   We want to highlight how the system recovers when the                           from pending (Line 22). We will discuss the optimizations in
+root fails. All backup edges get enabled forming a loop, but                       Line 20 - 21 later.
+no sync-messages flow at this time. At the second timeout,                            F IND L ARGEST BACKUP and I MPROVE are the key func-
+the backup root elects itself and ignores incoming messages,                       tions. F IND L ARGEST BACKUP conforms to the 5 properties.
+effectively disabling the edge towards it (Figure 10). In this                     Properties (2) and (4) decide what edges can be used in
+way, sync-messages do not loop.                                                    backup graphs given a primary tree p, as expressed in function
+   7 A graph with equal numbers of nodes and edges has at least one loop. In          8 <x, y> is not usable for sure; otherwise b is not the largest because it can
+
+addition, if there is more than one loop, then the graph is not fully connected.   readily include <x, y>.
+
+
+
+
+USENIX Association                                     14th USENIX Symposium on Operating Systems Design and Implementation                                  1177
+Algorithm 1 Searching for a primary tree and a backup graph.           Algorithm 3 Finding the largest backup graph of p.
+ 1: pending = {BFS(prim_root)};                                         1: function F IND L ARGEST BACKUP(p)
+ 2: tested = 0;
+              / best_score = 0;                                         2:    b=BFS_ForBackup(backup_root, p);             . BFS uses
+ 3: return S EARCH();                                                      U SABLE I N BACKUP to avoid unusable edges.
+ 4: function S EARCH                                                    3:    Find <y, backup_root> where y ∈ b && U SABLE I N -
+ 5:     while pending is not empty do                                      BACKUP(<y, backup_root>, p) && the loop crosses multiple
+ 6:        p = pending.get_best(); tested∪={p};                            subtrees of prim_root in p; Add <y, backup_root> to b;
+ 7:        backup_set = F IND L ARGEST BACKUP(p);                       4:    return {b};
+ 8:        if ∃b ∈ backup_set|b is complete then
+ 9:             return p, b;                                           Algorithm 4 Changing p to make <x, y> usable and keep as many
+                                                                       b’s edges usable as possible.
+10:        best_score=max{best_score,calc_score(p)};
+11:        M UTATE(p, backup_set);                                      1: function I MPROVE(p, <x, y>, b)
+12:    return NotFound;                                                 2:    if x is y’s ancestor in p then
+                                                                        3:         for each edge <u, v> on the path x y in p do
+13: procedure M UTATE(p, backup_set)
+                                                                        4:             new_prim_set∪ = R ECONNECT(v, x, p, b);
+14:    for b in backup_set do
+15:        for each <x, y> | x ∈ b, y ∈
+                                      / b do                            5:     if <x, y> fails disjoint-failure-domain condition then
+16:            new_prim_set=I MPROVE(p, <x, y>, b);                     6:          new_prim_set∪ = R ECONNECT(y, x, p, b);
+17:            for p0 in new_prim_set do                                7:     return new_prim_set;
+18:                if p0 ∈
+                         / tested then                                  8: function R ECONNECT(v, x, p, b)
+19:                     pending∪={p0 };                                 9:     BFS from v along reverse edges, and stops at nodes outside
+20:                    if calc_score(p0 )>best_score then                  x-subtree in p, while keeping as many b’s edges usable as pos-
+21:                         return ;                                       sible. It gives a set of paths S={w v|w is outside x-subtree in
+22:    pending-=p;                                                         p}
+                                                                       10:     for path in S do
+Algorithm 2 Check if <x, y> is usable in backup graphs of p.           11:          For each <i, j> ∈ path set j’s parent to i in p to get p0 ;
+ 1: function U SABLE I N BACKUP(<x, y>, p)                             12:          new_prim_set∪ = {p0 };
+ 2:    return (x is not y’s ancestor in p) && (y’s ancestor in p and   13:     return new_prim_set;
+      x meet disjoint-failure-domain condition);
+                                                                       original p remains in pending. (ii) F IND L ARGEST BACKUP
+U SABLE I N BACKUP (Algorithm 2). Properties (1), (3), and (5)         only returns one of the largest backup graphs, rather than all
+decide how the backup graph should look like. We can simply            of them. This is sufficient as all largest backup graphs for a
+use BFS starting from the backup root (property (3)) to find           primary tree connect the same set of nodes and we use this
+the tree (property (1)) that is largest, and then enumerate the        strategy in Algorithm 3. (iii) I MPROVE just returns the set of
+backup parent for the backup root and see if it forms a loop           p0 that keeps the largest number of b’s edges usable. This tries
+that meets property (5). I MPROVE’s goal is to change p to p0          to keep as many useful fruits of past iterations as possible, so
+so that <x, y> becomes usable (i.e., U SABLE I N BACKUP(<x,            it speeds up the search. Algorithm 4 is based on this strategy.
+y>, p0 ) is true). It finds the set of p0 that meets this goal.            These three strategies significantly reduce the computation
+    As long as F IND L ARGEST BACKUP and I MPROVE are ex-              time per iteration (Line 6 - 11). While the latter two strate-
+haustive, the search is exhaustive – it will find a solution if one    gies make the search non-exhaustive, all practical datacenter
+exists. The search process is similar to an algorithm that finds       topologies have high redundancy such that in our experiments,
+two edge-disjoint spanning trees [35], because our backup              we quickly found a backup-plan even after injecting 50 succes-
+graph is composed of a more restricted spanning tree that is           sive failures. Also owing to the high redundancy in practical
+edge-disjoint with the primary tree, and an extra edge towards         topologies, the number of iterations is small since the initial p
+the backup root. The problem seems to be NP-hard although              already has a very high score, only a few hundreds below the
+we don’t have a proof yet.                                             total number of nodes. Finally, another consequence of high
+    In practice, our implementation of S EARCH is extremely            redundancy is that in practice, the search iterates with almost
+fast – it only takes 148ms on average in a simulated Jupiter           monotonically increasing scores 9 , sometimes with jumps of
+topology with 88,064 nodes [33] leveraging the following               tens or hundreds, reaching the final backup plan in tens of
+three strategies. (i) In Line 20 - 21 of Algorithm 1, we prune         iterations on average.
+enumerations as per Line 14 - 15 as long as we find a p0                   Mutation for meeting property (5) follows a similar process
+that is heuristically better than any primary trees so far (in-        as M UTATE. We omit the details due to limited space.
+cluding p). This significantly speeds up the search, as we             Calculating εbase,backup . When a node turns to its backup par-
+can immediately make progress – after return (Line 21), the            ent, its depth may change, so we also precompute εbase,backup
+search immediately starts a new iteration at Line 6 based on
+p0 , which is heuristically better than continuing mutating p.            9 I MPROVE can easily find paths while keeping all b’s edges usable, be-
+
+Note this strategy does not miss any primary trees, as the             cause of the high redundancy.
+
+
+
+
+1178     14th USENIX Symposium on Operating Systems Design and Implementation                                          USENIX Association
+                                   4                          Primary edge
+  Root              3                                         Backup edge            (1) Invalid message:       (2) Invalid message again:   Broken clock
+                                                    B                                turn to backup parent      evict myself
+                    2                                                           Own clock is broken
+                                   1                                A                                                                        Normal clock
+
+Figure 12: Node A’s depth is dependent on the failure. If node 1                    (1) Invalid message:                                     Primary edge
+                                                                                    turn to backup parent       (2) Valid message
+fails, A’s depth is 3 (A, B, 2, root). But if node 2 fails, A’s depth is 4                                                                   Backup edge
+                                                                                Parent’s clock is broken
+(A, B, 4, 3, root).
+                                                                              Figure 14: Handling a broken clock in two steps. If a node’s own
+                            Root                              Primary path
+                                           Backup root                        clock is broken, the messages from both its primary and backup
+                                                              Backup edge
+                2                                  3                          parents are marked invalid by itself (the timestamp is outside local
+    1                                                               4         ε), so it evicts itself. If a node’s parent’s clock is broken, after receiv-
+                                       A                                      ing an invalid message it turns to its backup parent, and continues
+Figure 13: A has 6 possible paths to the root, of 3 types. (1) Backup         synchronization thereafter.
+path: if the root is down, the backup path (A, 1, 2, 3) is in effect. (2)
+Primary path: when A is unaffected by failures. (3) Mixed path:
+                                                                              For the node with a broken clock, it evicts itself (no longer
+when failures affect A and some other nodes on the loop, A connects           participates in synchronization). For the node whose parent
+to the root first along the loop for one or more hops, and then along         has a broken clock, it turns to its backup parent.
+the primary path (e.g., A, 1, 2, ..., root). There are 4 possible mixed       4.3     Implementation
+paths, starting the primary paths from respective node 1, 2, 3, and 4.
+                                                                              Controller. We implement a module in the network con-
+to which a device set εbase upon timeout. The exact depth is                  troller. The module registers a function to be called by the
+failure-dependent as shown in Figure 12.                                      controller framework for failure notifications. When notified,
+   So we calculate the maximum possible depth for each node                   this module reads the current device/link/port states, and com-
+after any failures. A naive approach is to enumerate all pos-                 putes a new backup plan. For each device, it compares the
+sible combinations of failures, which can be slow. Instead,                   existing configuration and the new configuration, and only re-
+Sundial uses a simple dynamic-programming (DP) based                          configures the devices whose configuration changes, through
+scheme. If a node s turns to its backup parent b, we calculate                RPC. It also configures the TX side of both primary and
+s’s maximum possible depth s.depthbackup :                                    backup edges to send sync-messages.
+   s.depthbackup = 1 + max(b.depth primary , b.depthbackup )                  RPC Interface between the Controller and Device
+where the max function considers two possible cases: b is                     Firmware. The controller and the device firmware com-
+unaffected by failures (b.depth primary denotes b’s depth in the              municates through RPCs. These RPCs have the following
+primary tree, a deterministic value), or affected by failures.                parameters: backup parent, first timeout, and second timeout
+depthbackup can be calculated top-down.                                       which are used to configure the device hardware.
+   DP works for all nodes except the nodes on the loop in the                 Firmware. The RPC handler configures the backup parent,
+backup graph, whose DP calculations inter-depend. But we                      the first timeout, and the second timeout accordingly. The
+can easily calculate their maximum possible depths. On an                     backup parent and the second timeout are maintained in the
+L-node loop, for each node we enumerate all L + 1 possible                    firmware, and the first timeout is maintained in the hardware
+ways it connects to the root (Figure 13). So the overall time                 registers to enable failure detection in hardware. Only the
+complexity is O((N − L) + L(L + 1)) for a total of N nodes.                   backup-root has a non-zero value for the second timeout.
+4.2.2 Failure Handler in the Device Software                                     The firmware also registers a handler function for the inter-
+A daemon running in firmware serves as the failure handler                    rupt triggered by the first-timeout. This function first reconfig-
+and responds to interrupts generated by the hardware once it                  ures the hardware to accept sync-messages from the backup
+detects a failure – the hardware is reconfigured to move to                   parent; then, if the second-timeout is non-zero, it waits for the
+the backup parent based on the backup plan and set εbase to                   timeout to see if it receives any new sync-messages; if not, it
+εbase,backup . For the backup root, if an interrupt is triggered,             configures the hardware to become the root.
+the failure handler also continues to monitor incoming sync-                     We cannot reveal hardware details due to confidentiality.
+messages for the second timeout. At the second timeout, the                   4.4     Practical Considerations
+device sets itself as the primary root.                                       Concurrent connectivity failures may happen in practice,
+Handling broken clocks. If a clock is broken [12], it can                     and may not be recovered by the backup plan, which needs
+drift away faster than max_drift_rate. In Sundial, we detect                  to involve the controller. Sundial maintains the correctness of
+such clocks in two steps: (1) detect the existence of a broken                ε in this case. The only impact is that ε grows larger before
+clock when receiving an invalid message, and (2) confirm                      being recovered by the controller: if it takes 100ms to recover,
+which one is broken. Figure 14 illustrates the process. As                    ε grows up to 20µs during this time (still ∼100ns during
+such, a broken clock is isolated without affecting other clocks.              normal time). The impact is negligible, because compared to
+   The failure handler is triggered by a hardware interrupt                   single failures, concurrent failures are already rare, and only a
+upon receiving an invalid message to handle broken clocks.                    very small subset of them cannot be recovered by the backup
+
+
+
+USENIX Association                                       14th USENIX Symposium on Operating Systems Design and Implementation                         1179
+plan, as discussed below.                                                                                   Asynchronous    Synchronous
+                                                                            ×1         ×1           Hop 0
+   The most commonly seen concurrent failures are caused                                            Hop 1
+by a domain failure, which is not an issue because of the                ×1 ×1          ×1 ×1               ε↑
+                                                                                                    Hop 2
+disjoint-failure-domain condition of the backup plan (§4.2.1).                                                    ε↑
+                                                                         ×2 ×2          ×2 ×2       Hop 3
+   If cross-domain failures happen, whether they impact Sun-
+                                                                                                                           ε↑
+dial depends on their locations and time proximity. For the              ×4 ×4          ×4 ×4       Hop 4
+                                                                                                                                 Time
+nodes whose connectivity is affected, the backup plan is in-
+                                                                    (a) Synchronous messaging: expo- (b) Asynchronous messaging has much
+effective only if these failures also take down their backup        nential inflation of sync-messages. larger ε.
+parents/edges (special locations) within a short period of time
+                                                                    Figure 15: Mesh structure: higher ε due to asynchronous messaging.
+before the controller recomputes a new backup plan (time
+proximity). The chance is very small, because cross-domain          multiple other clocks, forming a mesh.
+failures are random in locations and time proximity.                (3) No master clock (no physical time). Clocks synchronize
+Small window of error before evicting a broken clock.               independently with each other without regards to a master
+The broken clock detection only happens when messages ar-           clock. For example, in DTP [21] each clock follows the fastest
+rive. There is a small time window between when the failure         of its neighbors. In this option, all clocks converge to a func-
+actually happens and when the next message arrives, during          tion (e.g., max() in DTP) of all clocks, which has nothing
+which errors could arise. This can be solved via hardware           to do with the physical time. This option is worse than (1)
+redundancy – each node physically keeps two clocks, and             and (2) because access to physical time is important for many
+each clock query reads the two clocks and checks if they            datacenter applications.
+match (their time-uncertainty ranges overlap). Once a clock         Tradeoff between (1) and (2). While (2) is clearly more fault-
+is broken, the next read immediately detects it. Additionally,      tolerant, it cannot get ε as low as (1). The reason is that
+Sundial prevents this failure to affect other clocks, because       mesh-based solutions cannot use synchronous messaging. As
+its children ignore the invalid messages.                           shown in Figure 15a, if a clock receives sync-messages from
+False positives. If a device timeouts without a failure, it will    k other clocks, synchronous messaging inflates the number
+turn to the backup parent. Such false positives are harmless,       of messages by k per hop, causing exponential inflation. So
+except extra controller processing. We do not observe false         mesh-based solutions have to use asynchronous messaging,
+positives in our experiments.                                       which has much larger ε – as shown in Figure 15b, ε increases
+                                                                    per hop from the master to the participant clocks. On the other
+4.5    Sundial’s Position in the Design Space                       hand, tree-based solutions can use synchronous messaging,
+4.5.1 Design Space of Clock Synchronization                         achieving much lower ε. §6.2 evaluates this effect.
+At the submicrosecond level, Sundial is the first to support        4.5.2 Sundial’s Design Choices
+time-uncertainty bound. We identify three key aspects of the
+                                                                    Sundial’s key contribution is in the third design choice, which
+design that a clock synchronization system must answer.
+                                                                    exhibits fundamental tradeoff between small ε and fault-
+1. Type of message: There are multiple options, synchro-            tolerance. Sundial aims to achieve the best of both worlds, by
+nization messages can either be sent directly with special-         combining tree and mesh topologies: Sundial sends messages
+ized physical layer (PHY) with zero-overhead messages, or           through a mesh, such that it still has available edges upon
+at higher layers (L2, L3, L4) with increasing bandwidth over-       failures; but the effective synchronization only happens over
+head and increasing ease of deployment.                             a primary tree, enabling it to use synchronous messaging.
+2. Noise due to message delay between a pair of clocks.                The first two design choices have clear best options, and
+The message delay in the forward and reverse directions may         they are mainly determined by hardware availability. In our
+be unequal due to queuing or asymmetric paths. There are            implementation, Sundial synchronizes neighboring devices at
+three options to deal with such noise: (1) Only synchronize be-     the L2 level as the specialized PHY layer is not available. That
+tween neighboring devices, such that there is no noise (§3.1).      said, Sundial can benefit from such a layer if it’s available.
+(2) Use multiple messages to filter out noise; (3) Tolerate the     Comparison with other schemes is in §7.
+noise. Option (1) is the best if all devices (switches and hosts)
+can participate. Otherwise, option (2) and (3) face a tradeoff      5    Application Access to Synchronized Clocks
+between noise and overhead.                                         In Sundial, the primary mechanism to access synchronized
+3. Network-wide synchronization structure: three options.           clocks is via hardware Rx/Tx timestamps. Additionally, for
+(1) Master clock distributed through a tree. A master clock         applications that want to access host clock directly, Sundial
+distributes its time to other clocks through a tree. The master     provides local host to NIC clock synchronization.
+clock can synchronize to the physical time (e.g., via GPS), so      Access via hardware timestamps. NIC and switch hard-
+that all clocks reflect the physical time.                          ware timestamps marked on the packets [29] are the pri-
+(2) Master clock distributed through a mesh. Similar to (1),        mary access mechanism, for which it provides ∼100ns time-
+but instead of a tree, each clock receives sync-messages from       uncertainty bound. Applications such as distributed databases
+
+
+
+1180    14th USENIX Symposium on Operating Systems Design and Implementation                                     USENIX Association
+       Clock value              adjustment = P·s(t) + I·o(t)                                  chronization protocol with a default sync-interval of two sec-
+                                                o(2T)                     NIC/switch clock
+                                                                                              onds. To add ε, we set εbase to 5ns×depth, and max_drift_rate
+                                  o(T)                                    CPU clock           to 200ppm. Tlast_sync is updated as follows – for root's chil-
+                         o(0)                                            o(t): clock-offset   dren, we set Tlast_sync = Tlast_msg ; but for other descendants,
+                                             s(t)=(o(t)-o(t-T))/T         s(t): clock-skew
+
+                                                                                    Time
+                                                                                              we set Tlast_sync = Tlast_msg − Trecovery to account for possible
+                     0                   T              2T          3T
+                                                                                              out-of-sync duration caused by remote connectivity failures
+Figure 16: PI controller based on clock-skew; offset and skew are
+measured periodically and an adjustment is computed using suitable                            that are oblivious to them (§3.2.2). We set Trecovery to 2s, since
+P and I constants.                                                                            it takes 2s to recover from failure.11
+                                                                                              PTP+DTP+ε: What if we could set lower sync-interval in
+that have strict ε requirements rely directly on NIC-Rx-
+                                                                                              PTP+ε? We evaluate another scheme that leverages DTP –
+timestamps marked on the last packet in a message to order
+                                                                                              DTP allows very small sync-interval (a few microseconds)
+them to provide consistency properties. Networking stacks
+                                                                                              with low bandwidth overhead by modifying the physical layer
+such as Snap [26] provide op-stream interface to applications
+                                                                                              protocol. Since DTP requires hardware support, we emulate it
+(preventing out-of-order delivery) and export the NIC times-
+                                                                                              in our testbed by setting 5µs sync-interval (much smaller than
+tamps. Telemetry and congestion control applications also
+                                                                                              90µs).12 All devices that are not direct children of the root
+rely directly on NIC timestamps to measure one-way delays.
+                                                                                              set Trecovery =100ms, where 100ms is the typical connectivity
+Host clock synchronization. We also synchronize the local                                     failure recovery time measured from datacenters.13
+host clock to the NIC clock for applications that want to                                     Huygens+ε: Huygens gathers network-wide sync-messages
+directly read the host clock (and don’t require strict guarantees                             during each 2-second sync-interval, and uses machine learn-
+on ε). We use a Proportional-Integral controller based on                                     ing to decide the best adjustment for each device at the begin-
+clock-skew between the host and NIC clocks as depicted in                                     ning of the next sync-interval. While we do not have its imple-
+Figure 16. We measure the offset, o(t) and skew, s(t), every                                  mentation, we report the best possible ε it can achieve. Specif-
+T time-units (we use T =10ms) and apply the rate adjustment                                   ically, we assume it is not affected by connectivity failures
+to the host clock to tick faster or slower. The constants P and                               because of its use of network-wide information, so Tlast_sync
+I need to be tuned in production. One challenge is that the                                   is set to the beginning time of each sync-interval (without
+two clock-measurements are subject to local delays such as                                    minus Trecovery ). We also assume it can filter out delay noises
+PCIe jitter and we use linear regression to filter the noise out.                             entirely and optimistically set εbase to 0.
+6      Evaluation                                                                             Failure injection. We evaluate the impact of failures on ε
+Through experiments in a >500-machine testbed-prototype                                       in Sundial and above schemes by injecting link failures, non-
+(§6.1) and through large-scale simulations (§6.2), we show                                    root device failures, root failures, and domain failures (where
+that Sundial’s time-uncertainty bound is ∼100ns under differ-                                 multiple devices can go down).
+ent types of failures, and discuss application improvements                                   Metrics and measurement approach. We measure ε on ev-
+enabled by Sundial in §6.3.                                                                   ery device by running a daemon in the firmware to read ε
+6.1                  Time-uncertainty Bound (ε) in Testbed                                    every 10µs. After a failure, the controller sends an RPC to
+                                                                                              configure the devices for recovery. The frequent monitoring
+6.1.1 Methodology
+                                                                                              interferes with processing RPCs that are sent by the controller
+Testbed. The testbed consists of 23 pods, 276 switches and                                    in the event of failures. As a workaround, we set a stop time
+552 servers. A pod including 12 switches and 24 servers acts                                  which allows the controller RPC to execute after the monitor-
+as a failure domain. The oscillators used in the hardware have                                ing stops. In this way, the monitoring tells us which devices
+a frequency specification of ±100ppm. The depth of the base                                   are affected by failures and their ε. But it also inflates the con-
+spanning tree in the topology is 5.                                                           troller delay, which is unfair to other schemes as they heavily
+Schemes for comparison. We compare Sundial with re-                                           rely on the controller for failure recovery. With knowledge
+cent submicrosecond-level clock synchronization schemes:                                      of the expected controller delay, we can easily restore the
+PTP [4], Huygens [13], and DTP [21]. While they do not                                        expected ε based on the measured ε (Figure 17), because ε’s
+consider time-uncertainty bound (ε) and how it is reported to                                 behavior is deterministic during failures recovery: ε keeps
+applications, we augment the designs to provide ε, according                                  increasing, and goes back to normal when the failure is recov-
+to Equation 1 in §3.1 and describe them below.
+                                                                                                 11 In favor of low ε, T
+                                                                                                                        recovery = 2 seconds is already a very optimistic setting
+Sundial: We set the sync-interval to 90µs.10 The timeout is                                   for PTP+ε, because recovery may take longer if the next sync-message is
+185µs (>2×sync-interval). The second timeout for the backup                                   also dropped by another failure that just happens at that time. Setting Trecovery
+root to elect itself is set to 180µs (185+180>4×sync-interval).                               larger results in even higher ε. But we show that even with this optimistic
+                                                                                              setting, PTP+ε still has much higher ε than Sundial.
+The backup plan has a maximum depthbackup of 6.                                                  12 This is sufficient to show the improvement of ε, even though we don’t
+PTP+ε: PTP is the most common submicrosecond-level syn-                                       have the physical layer protocol to keep the bandwidth overhead low.
+                                                                                                 13 This is already friendly to PTP+DTP+ε because to guarantee correct ε,
+    10 90µs is just enough for ∼100ns ε, although lower ε is achievable.                      Trecovery should be the maximum recovery time, which is several seconds.
+
+
+
+
+USENIX Association                                                   14th USENIX Symposium on Operating Systems Design and Implementation                                1181
+            Measured             Inflated controller delay
+  ε         Restored         Expected controller delay
+
+
+                                                                           Time
+                       Failure               RPC arrives     Monitoring stops
+                                                             & RPC executes
+      Figure 17: Restoration of ε under inflated controller delay.
+
+
+
+
+                                                                                  Figure 19: Time series of ε of a device affected by a link failure.
+                                                                                  The failure happens at 1s and the controller reacts to it near 1.1s.
+
+
+
+
+  Figure 18: CDF of ε measured across devices without failures.
+ered. To get the expected controller delay, we use its lower
+bound, the delay on the controller (without network delay),
+which is more friendly to schemes other than Sundial.
+6.1.2 ε Distribution without Failures                                             Figure 20: Blast radius of failures under different schemes. Impacted
+Figure 18 shows the distribution of ε over all devices under                      device time is the summation of per-device impacted time – duration
+different schemes. In Sundial, ε≤43ns, which matches the                          when a device stops receiving sync-messages – over all devices .
+calculated value – the deepest device in the tree has εbase of
+                                                                                  to a maximum of 84ns and goes down in just 270µs (af-
+25ns, and 90µs sync-interval leads to an additional 18ns.
+                                                                                  ter the 185µs timeout, the next message is at 270µs). Af-
+   In contrast, all other schemes have a much higher ε. In                        ter that, ε is sawtooth between 30ns and 48ns, because its
+PTP+ε and PTP+DTP+ε, devices that do not directly synchro-                        εbase is set to εbase,backup by the local recovery, which is 30ns
+nize to the root have to set Tlast_sync earlier than Tlast_msg by                 (depthbackup =6). Once the controller reconfigures the span-
+2s and 100ms respectively, to account for possible failure-                       ning tree, ε goes back to between 15ns and 33ns because its
+induced out-of-sync periods, so their ε can go up to 800µs and                    depth is 3. In PTP+ε, since the sync-message is dropped due
+20µs respectively during a sync-interval. Devices directly syn-                   to this failure, ε continues to increase for the next 2 seconds.
+chronizing to the root can set Tlast_sync to Tlast_msg and achieve                Even if the sync-message was not dropped, ε for PTP+ε (w/o
+lower ε. So their ε increases from 5ns (1-hop εbase ) to ∼400µs                   failure) remains high. PTP+DTP+ε’s ε increases to 40µs and
+and 6ns respectively (2s and 5µs sync-intervals lead to 400µs                     recovers to 20µs when the controller recovers the connectiv-
+and 1ns additional ε respectively at the end of each sync-                        ity. However, even if the controller delay was lower (50 ms),
+interval). For these devices (∼6.3% of all), PTP+DTP+ε’s                          it only reduces the peak ε to 30µs, but the normal ε is still
+low ε shows the benefit of extremely small sync-interval when                     around 20µs. Huygens+ε is not affected by failures, but its ε
+failure is not a concern. Note that if available, Sundial can                     is normally very large (200µs at median and up to 400µs).
+also benefit from DTP’s physical layer design to futher re-
+duce sync-interval. In Huygens+ε, during each 2s interval,                           The behavior is similar under other failures – ε depends on
+ε increases from 0 to 400µs. Reducing sync-interval comes                         the recovery time. For PTP+ε and PTP+DTP+ε, the recovery
+with CPU cost (Huygens already consumes 0.44% CPU of                              time depends on how long it takes for the controller to recover
+the whole cluster). However, even if the sync-interval was                        from it. For Sundial, the recovery time is much smaller as it’s
+halved, ε is still 3 orders of magnitude higher than Sundial’s.                   local. Any non-root failure recovery time is around 270µs, as
+                                                                                  is the case in Figure 19. The root failure takes slightly longer
+6.1.3 ε Distribution during Failures
+                                                                                  to recover from (365µs after the two timeouts) and ε increases
+To understand the behavior under failures, we inject 50 ran-
+                                                                                  to up to 103ns. The devices at different levels in the tree have
+dom failures over a course of 6 minutes including 24 single
+                                                                                  slightly different ε (discussed in §6.1.4).
+link failures, 23 non-root single device failures, 2 domain
+failures and 1 root failure.                                                         We now study the spatial and temporal impact range (blast
+   Figure 19 shows the time series of ε of a device affected                      radius) of failures. Figure 20 shows that Sundial’s blast radius
+by a link failure. In Sundial, ε is sawtooth between 15ns and                     is very small. Even after 50 failures, the total impacted time
+33ns during normal time, because this device has a depth of                       summarized over all devices is only 131ms. The most signifi-
+3 in the tree.14 When the link failure happens, ε increases                       cant jump happens when the root fails (40-th failure). PTP+ε
+                                                                                  and PTP+DTP+ε’s blast radius is much higher owing to their
+  14 Figure 21 shows the behavior at smaller timescales.                          longer recovery time. Note that more devices are affected by
+
+
+
+1182      14th USENIX Symposium on Operating Systems Design and Implementation                                                 USENIX Association
+failures under Sundial (401 in total) than under PTP+ε (3 in
+total) and PTP+DTP+ε (55 in total) as Sundial’s backup-plan-
+based recovery can affect remote devices as well (those under
+the subtree of the failure). Even then the total impacted time
+for Sundial remains significantly smaller.
+   PTP+ε exhibits a step function because only failures oc-
+curing close to sync-interval boundaries affect it as the sync-
+interval of 2s is longer than the time to recover in most cases.
+The impact, however, is larger than in other schemes because
+it takes 2s for the next sync-message. PTP+DTP+ε’s sync-
+interval is only 5µs and thus, every failure affects it. While
+Huygens+ε is not affected by connectivity failures, its ε re-        Figure 21: A link failure happens at 50 ms. The controller reacts to
+mains high as shown before.                                          the failure at around 150 ms.
+
+6.1.4 Microbenchmarks
+How Sundial’s different techniques improve ε. We zoom
+into details of how each technique improves ε. Specifically,
+starting with PTP+ε, we add (1) frequent sync-messages, (2)
+synchronous messaging, and (3) backup plan to it one by
+one, resulting in four schemes: PTP+ε, PTP+ε+freq_msg,
+PTP+ε+freq_msg+sync_msging, and Sundial itself.
+   Figure 21 shows the time series of ε during a link failure.
+Frequent sync-messages improve ε by an order of magnitude.               Figure 22: Distribution of ε at different levels in the tree.
+Synchronous messaging further reduces ε during normal time
+as it helps each device detect connectivity failures: as long as     also introduces time-uncertainty bound (ε) (called as error-
+a device receives a sync-message, it is connected to the root,       bound in the original version). Since it is not supported in
+so Tlast_sync can be safely set to Tlast_msg . Finally, adding the   hardware due to its complexity, we use large scale simulations
+backup plan significantly speeds up the failure recovery – ε         to demonstrate the performance characteristics.
+only increases for 270µs to a maximum of 84ns before the                Marzullo’s algorithm synchronizes clocks through a mesh,
+backup plan is activated, two orders of magnitude lower.             so it can tolerate connectivity failures but has higher ε (§4.5).
+   To show how Sundial’s backup plan handles domain                  To reconcile the different time values and ε from multiple
+failures, we also run Sundial without considering domain             clocks, each node does intersection of time-uncertainty ranges
+failures (called Sundial w/o domain). We find that if a              of different clocks as the correct time should be within all
+domain failure simultaneously takes down both the pri-               ranges. A set of master clocks (1 or more clocks synchronized
+mary and backup parents of a device, the device’s ε is like          via GPS) serve as the source of synchronization, whose ε
+PTP+ε+freq_msg+sync_msging in Figure 21. This is ex-                 is always close to zero. Broken clocks can also be detected
+pected because a down backup parent is equivalent to no              when the intersection result is empty. We simulate in a Jupiter
+backup parent. But if the failure domain is considered in the        topology [33] with 88,064 devices, where each node sends
+backup plan, ε is similar to Sundial in Figure 21, because the       sync-messages to all its neighbors to maximize the tolerance
+backup plan guarantees that no device loses both its primary         to failures. We set 2 masters to tolerate master failures. The
+and backup parents due to this domain failure. We also try           sync-interval is 90µs, same as Sundial. Figure 23 shows that
+another domain failure, which gradually takes down the pri-          during the normal time, Sundial has smaller ε than Marzullo’s
+mary and backup parents of a device, mimicing the domain             algorithm. Under failures, Marzullo’s algorithm’s ε is affected
+failure that gradually takes down multiple devices or links          insignificantly. For Sundial, ε increases during failure recov-
+(e.g., Figure 4). The result is similar.                             ery; the largest ε is 178ns, which is under the root failure.
+Distribution of ε at different levels of the tree. We plot the
+maximum ε across devices at different depths, under differ-
+ent scenarios, shown in Figure 22. Root’s ε is always 0. ε
+increases linearly with depth, which is expected as each level
+increments εbase by 5ns.
+6.2    Large-scale Simulations
+We compare Sundial vs Marzullo’s algorithm [27], an agree-
+ment algorithm for fault-tolerant clock-synchronization which
+is used by NTP [28] and TrueTime [12]. Marzullo’s algorithm          Figure 23: CDF of ε during normal time in Jupiter in simulation.
+
+
+
+
+USENIX Association                           14th USENIX Symposium on Operating Systems Design and Implementation                    1183
+                                         DTP [21]        Huygens [13] Marzullo [27] PTP boundary clock [4]                     Sundial
+             Message type              Special PHY             L3           Unspecified                 L2                         L2
+       Dealing with delay noises         Neighbor         Multi. msg        Unspecified              Neighbor                 Neighbor
+      Synchronization structure         No master        Master, mesh      Master, mesh            Master, tree            Master, mesh+tree
+    Support time-uncertainty bound          No                No                Yes                     No                        Yes
+                    Table 1: Design choices of state-of-the-art clock synchronization schemes. Italic options are the best.
+
+6.3      Application Performance Improvement                                        DTP [21] introduces a specialized PHY layer to achieve
+Distributed transactional system. We evaluate the impact                         zero bandwidth overhead of sync-messages. If this modified
+of smaller time-uncertainty bound using a load-test provided                     PHY can be standardized and productionized in the future,
+to us by Spanner team [12]. We run the load-test inside a dat-                   Sundial can readily benefit from it to have even lower sync-
+acenter. The load-test does 4KB transactions and we measure                      interval and ε. However, DTP does not reflect physical time
+commit-wait gap – time to wait out time-uncertainty before                       since it doesn’t have a master clock.
+committing the transaction. Results are in Table 2 where we                         Huygens [13] does not synchronize switches, so it uses
+show that our system improves performance by 3-4× not only                       multiple messages between each pair to filter out noises. As a
+in the median but also at the 99-th percentile.                                  result, Huygens’ sync-interval is limited, so it cannot achieve
+                                                                                 tight ε. Huygens’ main advantage is that it is implemented
+                         Baseline           With Sundial
+      Median             211µs              49µs
+                                                                                 completely in software and doesn’t require hardware support
+      99-%ile            784µs              238µs                                (other than hardware timestamps) but it does not consider
+Table 2: Sundial improves commit-wait latency by 3-4× for Spanner
+                                                                                 ε; and if incorporated, Huygens’ ε is large primarily due to
+running inside a datacenter.                                                     the large sync-interval. While it assumes clocks drift slowly
+                                                                                 during normal time, it cannot set a small max_drift_rate as the
+Congestion Control. Delay-based congestion control such                          maximum drift is subject to failures (§3.2.1); otherwise it risks
+as Swift [17] is widely used in datacenters relying on end-                      datacenter-wide application-level errors (e.g., inconsistent
+to-end RTT measurements to control sending rate. A key                           transactions), which is unacceptable.
+challenge with such schemes is how to differentiate between                         Marzullo’s algorithm [27] is the first to introduce ε but
+forward and reverse-path congestion. As an example, con-                         its ε is high because it sends messages through a mesh. PTP
+gestion in the reverse path can also inflate RTT causing a                       boundary clock [4] is based on a tree, and is not fault-tolerant.
+sender to slow down even though there is no congestion in the                       Other solutions are too expensive (e.g., GPS [22]), too
+forward path.15 Synchronized clocks solve this problem as                        complex [18, 20, 31] or do not provide physical time [30, 34,
+they enable the measurement of one-way delay (OWD) which                         36].
+can pinpoint the direction in which congestion is occurring.                     Fault tolerance in other systems. In distributed systems and
+   We perform a microbenchmark with 3 servers – A, B and                         networking, fault tolerance is provided through redundancy
+C with Swift congestion control. First, we only send traffic                     [5, 10, 14, 19, 33, 38]. However, Sundial’s backup plan cannot
+from A to B which achieves line-rate throughput. Next, we                        be chosen arbitrarily and needs to satisfy a set of properties
+introduce reverse-path congestion by adding traffic from B                       (§4.2.1) to be generic to different types of failures.
+and C to A. In Table 3, we observe A’s throughput goes down                         Ethernet uses spanning tree protocols [2, 15] that can re-
+to 50Gbps even though there was no congestion in the forward                     compute a spanning tree in a distributed fashion after a failure,
+path. Replacing RTT with OWD as measured using Sundial                           but they usually take up to a few seconds to converge [15].
+resolves this completely and A continues to send at line rate.
+                                 RTT         OWD
+                                                                                 8   Conclusion
+  No reverse congestion          80.1 Gbps   80.5 Gbps
+                                                                                 Sundial is the first submicrosecond-level clock synchroniza-
+  Reverse congestion             50.5 Gbps   80.9 Gbps                           tion system that is resilient to failures. It uses hardware-
+Table 3: Using one-way delay (OWD) improves throughput in the
+                                                                                 software codesign to quickly detect failures and recover from
+presence of reverse-path congestion.                                             them. Our evaluation shows that Sundial provides ∼100ns
+                                                                                 time-uncertainty bound under different types of failures, and
+7      Related Work                                                              improves performance in Spanner and in Swift.
+Other clock synchronization systems. Table 1 compares                            9   Acknowledgements
+state-of-the-art solutions, in the design space outlined in §4.5.                We thank our shepherd Lorenzo Alvisi and OSDI reviewers
+   15 While prioritizing the ACK may solve the problem, it is impractical in     for their helpful feedback. We also thank Arjun Singh, Jakov
+production because of two reasons. (1) Network priorities are typically tied     Seizovic, David Wetherall, David Dillow, Joe Zbiciak, and
+to business priorities; and we simply cannot send ACKs for lower business        Xian Wu for the constructive feedback, Peter Cuy, Alex Iriza,
+priority traffic on a higher network priority. (2) Sending ACKs on a higher      and Bryant Chang for guidance on implementation, Shin Mao,
+network priority precludes ACK piggybacking on data packets, thereby in-
+creasing the packets-per-second to process. This is especially detrimental for
+                                                                                 Nanfang Li, and Ioannis Giannakopoulos for help on experi-
+CPU-efficient networking stacks such as PonyExpress in Snap [26].                mental evaluation.
+
+
+
+1184      14th USENIX Symposium on Operating Systems Design and Implementation                                             USENIX Association
+References                                                           Spanner: Google’s globally-distributed database. In
+ [1] Broadcom: Timing over Packet (ToP) Pro-                         10th USENIX Symposium on Operating Systems Design
+     cessor for Precision    Timing   Applications.                  and Implementation (OSDI 12), 2012.
+     https://www.broadcom.com/products/
+     embedded-and-networking-processors/                        [13] Yilong Geng, Shiyu Liu, Zi Yin, Ashish Naik, Bal-
+     communications/bcm53903.                                        aji Prabhakar, Mendel Rosenblum, and Amin Vahdat.
+                                                                     Exploiting a natural network effect for scalable, fine-
+ [2] IEEE 802.1D Work Group, IEEE Standard for Local and             grained clock synchronization. In 15th USENIX Sympo-
+     Metropolitan Area Networks: Media Access Control                sium on Networked Systems Design and Implementation,
+     (MAC) Bridges, 2004.                                            NSDI ’18, 2018.
+ [3] CockroachDB, 2008.             https://github.com/         [14] Albert Greenberg, James R Hamilton, Navendu Jain,
+     cockroachdb/.                                                   Srikanth Kandula, Changhoon Kim, Parantap Lahiri,
+                                                                     David A Maltz, Parveen Patel, and Sudipta Sengupta.
+ [4] IEEE Standard 1588-2008, 2008.         http:                    Vl2: a scalable and flexible data center network. In
+     //ieeexplore.ieee.org/xpl/mostRecentIssue.                      Proceedings of the ACM SIGCOMM, 2009.
+     jsp?punumber=4579757.
+                                                                [15] New BPDU Handling. Understanding rapid spanning
+ [5] Redundancy N+1, N+2 vs. 2N vs. 2N+1,                            tree protocol (802.1 w). Catalyst, 2948(L3/4908G):L3.
+     2014.     https://www.datacenters.com/news/
+     redundancy-n-1-n-2-vs-2n-vs-2n-1.                          [16] Richard Koo and Sam Toueg. Checkpointing and
+                                                                     rollback-recovery for distributed systems. IEEE Trans-
+ [6] IEEE 1588 PTP and Analytics on the Cisco
+                                                                     actions on software Engineering, 1987.
+     Nexus 3548 Switch, 2017.        https://www.
+     cisco.com/c/en/us/products/collateral/                     [17] Gautam Kumar, Nandita Dukkipati, Keon Jang, Has-
+     switches/nexus-3000-series-switches/                            san MG Wassel, Xian Wu, Behnam Montazeri, Yaogong
+     white-paper-c11-731501.html.                                    Wang, Kevin Springborn, Christopher Alfeld, Michael
+                                                                     Ryan, et al. Swift: Delay is simple and effective for
+ [7] Clock Oscillators Surface Mount Type KC3225L-
+                                                                     congestion control in the datacenter. In Proceedings of
+     P2/ KC3225L-P3 Series, 2018.           https:
+                                                                     the ACM SIGCOMM, 2020.
+     //global.kyocera.com/prdct/electro/pdf/
+     kc3225l_p2p3_e.pdf.                                        [18] Leslie Lamport. Synchronizing time servers. Digital,
+                                                                     Systems Research Center, 1987.
+ [8] Juniper Precision Time Protocol Overview, 2020.
+     https://www.juniper.net/documentation/en_                  [19] Leslie Lamport et al. Paxos made simple. ACM Sigact
+     US/junos/topics/concept/ptp-overview.html.                      News, 32(4):18–25, 2001.
+ [9] Mellanox Precision Time Protocol, 2020. https:             [20] Leslie Lamport and Peter M Melliar-Smith. Byzan-
+     //docs.mellanox.com/display/ONYXv381174/                        tine clock synchronization. In Proceedings of the third
+     Precision+Time+Protocol.                                        annual ACM symposium on Principles of distributed
+                                                                     computing, pages 68–74, 1984.
+[10] Mohammad Al-Fares, Alexander Loukissas, and Amin
+     Vahdat. A scalable, commodity data center network ar-      [21] Ki Suh Lee, Han Wang, Vishal Shrivastav, and Hakim
+     chitecture. ACM SIGCOMM computer communication                  Weatherspoon. Globally synchronized time via dat-
+     review, 2008.                                                   acenter networks. In Proceedings of the 2016 ACM
+                                                                     SIGCOMM Conference, SIGCOMM ’16, 2016.
+[11] K Mani Chandy and Leslie Lamport. Distributed snap-
+     shots: Determining global states of distributed systems.   [22] Wlodzimierz Lewandowski, Jacques Azoubib, and
+     ACM Transactions on Computer Systems (TOCS), 1985.              William J Klepczynski. Gps: Primary tool for time trans-
+[12] James C. Corbett, Jeffrey Dean, Michael Epstein,                fer. Proceedings of the IEEE, 87(1):163–172, 1999.
+     Andrew Fikes, Christopher Frost, JJ Furman, Sanjay         [23] Yuliang Li, Rui Miao, Changhoon Kim, and Minlan Yu.
+     Ghemawat, Andrey Gubarev, Christopher Heiser, Pe-               Flowradar: A better netflow for data centers. In 13th
+     ter Hochschild, Wilson Hsieh, Sebastian Kanthak, Eu-            USENIX Symposium on Networked Systems Design and
+     gene Kogan, Hongyi Li, Alexander Lloyd, Sergey Mel-             Implementation (NSDI 16), 2016.
+     nik, David Mwaura, David Nagle, Sean Quinlan, Rajesh
+     Rao, Lindsay Rolig, Yasushi Saito, Michal Szymaniak,       [24] Yuliang Li, Rui Miao, Changhoon Kim, and Minlan Yu.
+     Christopher Taylor, Ruth Wang, and Dale Woodford.               Lossradar: Fast detection of lost packets in data center
+
+
+
+USENIX Association                        14th USENIX Symposium on Operating Systems Design and Implementation         1185
+       networks. In Proceedings of the 12th International on    [33] Arjun Singh, Joon Ong, Amit Agarwal, Glen Anderson,
+       Conference on Emerging Networking EXperiments and             Ashby Armistead, Roy Bannon, Seb Boving, Gaurav
+       Technologies, CoNEXT ’16, 2016.                               Desai, Bob Felderman, Paulie Germano, et al. Jupiter
+                                                                     rising: A decade of clos topologies and centralized con-
+[25] Yuliang Li, Rui Miao, Hongqiang Harry Liu, Yan                  trol in google’s datacenter network. ACM SIGCOMM
+     Zhuang, Fei Feng, Lingbo Tang, Zheng Cao, Ming                  computer communication review, 2015.
+     Zhang, Frank Kelly, Mohammad Alizadeh, and et al.
+     Hpcc: High precision congestion control. In Proceed-       [34] Roberto Solis, Vivek S Borkar, and PR Kumar. A new
+     ings of the ACM Special Interest Group on Data Com-             distributed time synchronization protocol for multihop
+     munication, 2019.                                               wireless networks. In Proceedings of the 45th IEEE
+                                                                     Conference on Decision and Control, pages 2734–2739.
+[26] Michael Marty, Marc de Kruijf, Jacob Adriaens, Christo-
+                                                                     IEEE, 2006.
+     pher Alfeld, Sean Bauer, Carlo Contavalli, Michael Dal-
+     ton, Nandita Dukkipati, William C. Evans, Steve Grib-      [35] Robert Endre Tarjan. Edge-disjoint spanning trees
+     ble, and et al. Snap: A microkernel approach to host            and depth-first search. Acta Informatica, 6(2):171–185,
+     networking. In Proceedings of the 27th ACM Sympo-               1976.
+     sium on Operating Systems Principles, 2019.
+                                                                [36] Geoffrey Werner-Allen, Geetika Tewari, Ankit Patel,
+[27] Keith Marzullo and Susan Owicki. Maintaining the time           Matt Welsh, and Radhika Nagpal. Firefly-inspired sen-
+     in a distributed system. In Proceedings of the second           sor network synchronicity with realistic radio effects. In
+     annual ACM symposium on Principles of distributed               Proceedings of the 3rd International Conference on Em-
+     computing, pages 295–305, 1983.                                 bedded Networked Sensor Systems, SenSys ’05, 2005.
+[28] D. L. Mills. Internet time synchronization: the network    [37] Nofel Yaseen, John Sonchack, and Vincent Liu. Syn-
+     time protocol. IEEE Transactions on Communications,             chronized network snapshots. In Proceedings of the
+     39(10):1482–1493, 1991.                                         2018 Conference of the ACM Special Interest Group on
+[29] Radhika Mittal, Vinh The Lam, Nandita Dukkipati,                Data Communication, SIGCOMM ’18, 2018.
+     Emily Blem, Hassan Wassel, Monia Ghobadi, Amin Vah-
+                                                                [38] Mingyang Zhang, Radhika Niranjan Mysore, Sucha
+     dat, Yaogong Wang, David Wetherall, and David Zats.
+                                                                     Supittayapornpong, and Ramesh Govindan. Under-
+     Timely: Rtt-based congestion control for the datacenter.
+                                                                     standing lifecycle management complexity of datacenter
+     SIGCOMM Comput. Commun. Rev., 2015.
+                                                                     topologies. In 16th USENIX Symposium on Networked
+[30] Luca Schenato and Federico Fiorentin. Average                   Systems Design and Implementation (NSDI 19), 2019.
+     timesynch: A consensus-based protocol for clock syn-
+                                                                [39] Shizhen Zhao, Rui Wang, Junlan Zhou, Joon Ong, Jef-
+     chronization in wireless sensor networks. Automatica,
+                                                                     frey C. Mogul, and Amin Vahdat. Minimal rewiring:
+     47(9):1878–1886, 2011.
+                                                                     Efficient live expansion for clos data center networks. In
+[31] Ulrich Schmid. Synchronized utc for distributed real-           16th USENIX Symposium on Networked Systems Design
+     time systems. Annual Review in Automatic Program-               and Implementation (NSDI 19), 2019.
+     ming, 18:101–107, 1994.
+                                                                [40] Yibo Zhu, Nanxi Kang, Jiaxin Cao, Albert Greenberg,
+[32] Alex Shamis, Matthew Renzelmann, Stanko Novakovic,              Guohan Lu, Ratul Mahajan, Dave Maltz, Lihua Yuan,
+     Georgios Chatzopoulos, Aleksandar Dragojeviunde-                Ming Zhang, Ben Y. Zhao, and et al. Packet-level teleme-
+     fined, Dushyanth Narayanan, and Miguel Castro. Fast             try in large datacenter networks. In Proceedings of the
+     general distributed transactions with opacity. SIGMOD           2015 ACM Conference on Special Interest Group on
+     ’19, 2019.                                                      Data Communication, 2015.
+
+
+
+
+1186     14th USENIX Symposium on Operating Systems Design and Implementation                            USENIX Association
+

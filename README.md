@@ -12,6 +12,7 @@ In Claude Code, add this marketplace once, then install any plugin from it:
 /plugin marketplace add heiyan-2020/hai
 /plugin install pin@hai
 /plugin install experiment@hai
+/plugin install autoresearch@hai
 ```
 
 Replace `<your-github-username>` with the GitHub account this repo lives under.
@@ -33,6 +34,7 @@ codex plugin marketplace add heiyan-2020/hai
 codex plugin add pin@hai
 codex plugin add vibe-slides@hai
 codex plugin add experiment@hai
+codex plugin add autoresearch@hai
 ```
 
 To pick up later updates:
@@ -49,6 +51,7 @@ codex plugin marketplace upgrade hai
 | [`vibe-slides`](./vibe-slides) | Author academic slide decks via a markdown DSL — extract a theme and components from a `.pptx` template, iterate on a content-only outline, then compile to `.pptx` with pptxgenjs. |
 | [`sop`](./sop) | Standard operating procedure skills for repeatable engineering and analysis workflows — submit merge/pull requests, walk through branch diffs before a merge, triage public-safe files from a mixed private branch, initialize local-only files across workspaces, analyze surprising empirical results with falsifiable hypotheses, and fix problems at the root cause instead of overfitting a patch to the one example you saw. |
 | [`experiment`](./experiment) | Run lightweight, reproducible experiments: Protocols declare artifact lineage and internal Facts materialize concrete runs as structured evidence. |
+| [`autoresearch`](./autoresearch) | Research-design skills grounded in top systems papers. `create-novelty` turns a research topic into an OSDI/SOSP-grade plan: the problem, baselines down to their root cause, an insight that makes the design obvious in hindsight, related-work deltas, and the experiments and per-novelty ablations reviewers expect. It draws on 100 dissected OSDI/SOSP papers (2016–2026). |
 
 ## Repository layout
 
@@ -65,6 +68,9 @@ hai/
 │   ├── .claude-plugin/plugin.json
 │   └── .codex-plugin/plugin.json
 ├── experiment/
+│   ├── .claude-plugin/plugin.json
+│   └── .codex-plugin/plugin.json
+├── autoresearch/
 │   ├── .claude-plugin/plugin.json
 │   └── .codex-plugin/plugin.json
 └── README.md

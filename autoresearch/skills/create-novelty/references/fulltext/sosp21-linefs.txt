@@ -1,0 +1,1158 @@
+   LineFS: Efficient SmartNIC Offload of a Distributed
+          File System with Pipeline Parallelism
+                Jongyul Kim                                             Insu Jang∗                                     Waleed Reda
+                        KAIST                                    University of Michigan                      KTH Royal Institute of Technology
+                                                                                                             Université catholique de Louvain
+
+                 Jaeseong Im                                         Marco Canini                                      Dejan Kostić
+                        KAIST                                                KAUST                           KTH Royal Institute of Technology
+
+              Youngjin Kwon                                           Simon Peter                                   Emmett Witchel
+                        KAIST                             The University of Texas at Austin                  The University of Texas at Austin
+                                                                                                                      Katana Graph
+ABSTRACT                                                                                CCS CONCEPTS
+In multi-tenant systems, the CPU overhead of distributed                                • Information systems → Distributed storage; Storage
+file systems (DFSes) is increasingly a burden to application                            class memory; • Social and professional topics → File sys-
+performance. CPU and memory interference cause degraded                                 tems management; • Networks → Network adapters; •
+and unstable application and storage performance, in par-                               Computer systems organization → System on a chip;
+ticular for operation latency. Recent client-local DFSes for                            Availability.
+persistent memory (PM) accelerate this trend. DFS offload
+to SmartNICs is a promising solution to these problems, but                             KEYWORDS
+it is challenging to fit the complex demands of a DFS onto                              Distributed file system, SmartNIC offload
+simple SmartNIC processors located across PCIe.
+    We present LineFS, a SmartNIC-offloaded, high-perfor-                               ACM Reference Format:
+mance DFS with support for client-local PM. To fully leverage                           Jongyul Kim, Insu Jang, Waleed Reda, Jaeseong Im, Marco Canini,
+the SmartNIC architecture, we decompose DFS operations                                  Dejan Kostić, Youngjin Kwon, Simon Peter, and Emmett Witchel.
+                                                                                        2021. LineFS: Efficient SmartNIC Offload of a Distributed File Sys-
+into execution stages that can be offloaded to a parallel data-
+                                                                                        tem with Pipeline Parallelism. In ACM SIGOPS 28th Symposium on
+path execution pipeline on the SmartNIC. LineFS offloads                                Operating Systems Principles (SOSP ’21), October 26–29, 2021, Vir-
+CPU-intensive DFS tasks, like replication, compression, data                            tual Event, Germany. ACM, New York, NY, USA, 16 pages. https:
+publication, index and consistency management to a Smart-                               //doi.org/10.1145/3477132.3483565
+NIC. We implement LineFS on the Mellanox BlueField Smart-
+NIC and compare it to Assise, a state-of-the-art PM DFS.
+LineFS improves latency in LevelDB up to 80% and through-                               1    INTRODUCTION
+put in Filebench up to 79%, while providing extended DFS                                In multi-tenant systems, the CPU overhead of distributed
+availability during host system failures.                                               storage services sharing the machine with the applications
+                                                                                        using them is increasingly a burden to application perfor-
+                                                                                        mance [27, 36, 41]. Due to the stagnation of CPU perfor-
+∗ Work done while at KAIST.                                                             mance [49], operators wish to dedicate as many client CPU
+                                                                                        cycles to applications as possible. However, as storage ser-
+                                                                                        vices incorporate persistent memory (PM) [5], CPU con-
+Permission to make digital or hard copies of part or all of this work for
+                                                                                        tention has increased. Various recent storage system propos-
+personal or classroom use is granted without fee provided that copies are               als for PM use client-local storage management. For example,
+not made or distributed for profit or commercial advantage and that copies              the Assise distributed file system (DFS) conducts parallel
+bear this notice and the full citation on the first page. Copyrights for third-         data eviction when per-process caches fill to capacity [18].
+party components of this work must be honored. For all other uses, contact              Similarly, Orion periodically creates radix trees to index log-
+the owner/author(s).
+SOSP ’21, October 26–29, 2021, Virtual Event, Germany
+                                                                                        structured file data, performs log garbage collection, and ex-
+© 2021 Copyright held by the owner/author(s).
+                                                                                        ecutes client arbitration protocols when data is shared [60].
+ACM ISBN 978-1-4503-8709-5/21/10.                                                       These processes consume several cores on IO-intensive client
+https://doi.org/10.1145/3477132.3483565                                                 nodes (§2.1).
+
+
+
+
+                                                                                  756
+   To reduce CPU overhead, offload of disaggregated storage                BlueField allows us full control over data and processing
+stacks is already commonplace [9, 10]. SmartNICs [2, 3, 8]                 placement across SmartNIC and host, from any machine.
+are popular for this purpose because they can implement the              • We compare LineFS performance to Assise (our baseline,
+data path for disaggregated storage operations. SmartNICs                  replicating upon each fsync()), Assise replicating in the
+support both block-level remote access protocols, such as                  background, as well as Assise+Hyperloop (offloading repli-
+NVMe over fabrics (NVMe-oF) [10], and remote direct mem-                   cation as in Hyperloop [36]). In the throughput benchmark,
+ory access (RDMA) [12]. RDMA allows access to remote PM                    LineFS outperforms all Assise variants by at least 41% and
+at byte-granularity and recent work has extended it to better              saturates the network. In addition, we execute application
+support remote file access [61], chain replication [36], and               benchmarks (LevelDB and Filebench). LineFS shows 80%
+multi-step data access operations via in-network process-                  and 27% better LevelDB latency than Assise for sequen-
+ing [53]. However, none of the existing solutions consider                 tial and random insert, respectively. LineFS exhibits 79%
+the offload needs of a complete DFS.                                       higher throughput than Assise in Filebench.
+   In this paper, we present LineFS, a SmartNIC-offloaded,               • We showcase the ability of LineFS to maintain a high level
+high-performance DFS with support for client-local PM.                     of performance even in the presence of an interfering, CPU-
+LineFS offloads processing-intensive DFS tasks, such as repli-             intensive workload (streamcluster), whose performance
+cation, data publication, and consistency management. Lever-               is only mildly impacted by LineFS’s presence. In contrast,
+aging spare SmartNIC processing capacity, LineFS reduces                   streamcluster takes longer to execute in the presence of
+network utilization by conducting file- and operation-specific             Assise by up to 43%, and LineFS performance is 227% better
+(de)compression. Finally, LineFS reduces file system fail-over             than that of Assise in this case.
+time by providing a fast failure detector and SmartNIC-based             • In addition to demonstrating quantitative benefits of LineFS,
+recovery mechanism, leveraging the SmartNIC as an isolated                 we highlight its ability to make qualitative improvements
+failure domain.                                                            to a DFS by enabling new functionality. In particular, LineFS
+   Offloading a high-performance DFS to a SmartNIC is chal-                makes it possible to compress data on the fly while running
+lenging. File systems are complex, handling highly structured              a sorting benchmark. Doing so results in up to 11% bet-
+data with sophisticated access protocols for consistency and               ter performance than the no-compression case, all while
+durability. Wimpy SmartNIC architecture and the PCIe in-                   saving considerable network bandwidth (up to 72%).
+terconnect that separates SmartNIC and host PM implies                   • Finally, we demonstrate LineFS’s ability to increase system
+that a naive offload of DFS operations will be much slower                 availability by conducting a Varmail experiment with host
+than using host CPUs. To make offload worthwhile, LineFS                   failure. Even during failure, LineFS enables Varmail to
+must hide execution and data access latencies by exploiting                maintain similar throughput levels across the replication
+opportunities for parallelization, batching, and asynchro-                 chain, as seen without failures.
+nous operation. We propose a persist-and-publish model that
+separates PM storage operations on the critical-path from
+operations that can execute asynchronously. To speed up                  2   BACKGROUND
+asynchronous publishing operations, while providing strong               Like any operating system service, DFSes consume CPU
+file system consistency properties, such as linearizability and          and memory resources. This consumption was insignificant
+prefix crash consistency [24, 57], we introduce a parallel data-         when networks and storage devices were slow relative to the
+path execution pipeline. We decompose DFS operations into                performance offered by CPUs. Currently, the performance of
+distinct execution stages that operate in a parallel pipeline.           networks and storage devices is increasing while CPU per-
+The pipeline keeps operations in order for consistency. To               formance has stagnated in both per-core performance and
+avoid pipeline execution stalls, we prefetch data across PCIe            number of cores. Thus, CPU cycles and memory bandwidth
+and organize host data structures into pipeline chunks that              have become precious commodities. In particular, modern
+can be transmitted in bulk and processed in parallel.                    PM-optimized DFSes share CPU and memory resources with
+   We make the following contributions:                                  applications in an effort to reduce PM access latency. Unfor-
+• We present the design of LineFS, a SmartNIC-offloaded,                 tunately, the low-latency access provided by these systems
+   high-performance DFS with support for client-local PM.                comes with the cost of CPU competition with applications.
+   We describe the challenges of efficient DFS SmartNIC of-                 We provide an overview of the design of PM-optimized
+   fload and show how to make it efficient by parallelizing              DFSes and the different ways in which they interfere with
+   DFS functionality that was sequential in previous systems.            host CPU and memory performance (§2.1). We then present
+• To demonstrate the benefits of LineFS, we apply it to As-              SmartNIC offload of DFS functionality as a solution to the
+   sise, a state-of-the-art DFS using client-local PM. Our im-           interference problem, while outlining the unique challenges
+   plementation uses the Mellanox BlueField SmartNIC [2].                of DFS offload to SmartNICs (§2.2).
+
+
+
+
+                                                                   757
+               Throughput (GB/s)              CPU utilization              I3. Remote storage access requests. Not all file system re-
+ # of
+ proc.
+            25GbE          100GbE          25GbE          100GbE           quests can be served locally, requiring a remote node to
+         Assise Ceph Assise Ceph        Assise Ceph Assise Ceph            serve these requests with low latency. High-priority file sys-
+   1      0.38    1.23   0.63    1.26    62%    95% 101%       96%
+   2      0.74    1.34   1.12    1.51   119% 126% 201% 146%
+                                                                           tem processing interrupts co-running applications, involving
+   4      1.30    1.40   1.98    1.56   225% 141% 380% 211%                high context switching costs when done frequently.
+   8      1.32    1.41   2.22    1.60   224% 176% 509% 211%                I4. File system consistency. To allow multiple clients access
+Table 1: CPU utilization of Assise and Ceph for dif-                       to shared file system state with consistency guarantees, dis-
+ferent numbers of benchmark processes and network                          tributed file systems have to coordinate these clients, requir-
+speeds. 100% = 1 core.                                                     ing the invocation of coordination mechanisms on multiple
+                                                                           client nodes, often with low latency requirements.
+
+2.1      Interference in PM-optimized DFSes                                Each of these tasks may execute concurrently, consuming a
+                                                                           variable amount of shared compute and memory resources.
+As PM gains popularity, new DFS designs are appearing                      The interference presents several challenges:
+that are optimized to leverage PM’s performance. A main
+                                                                           C1. Unpredictable application performance. When CPU
+design principle of these DFSes is to utilize PM storage that is
+                                                                           and memory resources are consumed by file system manage-
+located on the same machine that executes the applications
+                                                                           ment threads, application execution performance is impacted.
+using it—called client-local PM storage. Client-local storage
+                                                                           For example, application threads need to wait for CPUs to
+can reduce PM file access latency by orders of magnitude.
+                                                                           become available or are slowed down if not enough memory
+Assise [18] and Orion [60] are two recent DFSes that use
+                                                                           bandwidth is available.
+client-local PM storage.
+                                                                              CPU contention is a particularly grave performance prob-
+   While client-local PM storage can improve file system
+                                                                           lem for parallel applications that synchronize frequently,
+performance versus client-server designs, it also requires
+                                                                           such as via barriers. Spontaneous unavailability of CPUs due
+file system management tasks local to the client. These file
+                                                                           to file system task execution can create stragglers that dis-
+system tasks compete for memory and compute resources
+                                                                           proportionately slow down the entire parallel computation
+with applications. This kind of concurrent execution causes
+                                                                           as the application waits for all threads to pass a barrier.
+performance interference and takes away precious resources
+from application execution. To identify DFS resource con-                  C2. Unpredictable file system access latency and
+sumption, we measure client CPU utilization of a client-local              tail-latency. Shared resources also impact file system per-
+DFS, Assise, and compare it with a client-server DFS, Ceph.                formance. In particular, file system access latency and tail-
+Table 1 shows the result. Each client writes a 24 GB file with 4           latency can increase when latency-critical operations are de-
+KB IO size. We can see that both DFSes require a significant               layed because CPUs are busy executing application threads.
+amount of client CPU cycles. However, Assise uses up to                       This problem is exacerbated with PM. Due to the low
+60% and 2.4× more cycles than Ceph on 25GbE and 100GbE                     access latency of PM, critical file system operations often
+networks. Assise needs more CPU to perform file system                     need to finish within microseconds. Even when the CPU
+management tasks as the network bandwidth increases. Us-                   scheduler gives priority to critical file system tasks, these
+ing a 25 GbE NIC, Assise occupies 2.24 host cores to support               latencies can easily be inflated by several orders of magnitude
+8 clients while Ceph occupies 1.76 cores. Using a 100 GbE                  due to context switching and dispatch overheads.
+NIC, Assise uses 5.09 host cores for 8 clients, while Ceph                 C3. Reduced throughput. A potential solution is to parti-
+uses only 2.11.                                                            tion available CPU and memory resources among file system
+                                                                           services and applications. However, partitions have to be
+We identify the following four file system tasks of client-                provisioned for peak utilization to support high throughput.
+local DFSes that cause high CPU utilization and performance                CPUs in particular are a scarce resource in today’s systems
+interference:                                                              and under-provisioned partitions reduce throughput for ei-
+I1. Data movement and indexing. The file system invokes                    ther the file system or the applications.
+threads for data movement and organization. For example,
+Assise’s SharedFS creates many threads to apply file system
+updates to PM and to create indexing structures to optimize                2.2    DFS Offload to SmartNICs
+later reads.                                                               Offload of DFS services to a SmartNIC can be a solution to the
+I2. Replication. For availability, client-local distributed file           aforementioned problems. SmartNICs are versatile compute
+systems replicate data among client nodes, requiring invoca-               platforms that sit in the network data-path of applications.
+tion of DFS services that can accept and persist data per client           Their position makes them well-suited for offload of net-
+replica. Replication consumes memory and CPU resources.                    worked services, including distributed file systems. Indeed,
+
+
+
+
+                                                                     758
+various SmartNIC platforms [2, 3] provide features that aid in                             App A       App B
+particular the offload of disaggregated storage protocols, e.g.,                    RPC                                                        RPC
+                                                                                           LibFS       LibFS              Kernel worker
+NVMe-oF [10]. However, SmartNIC offload is not a panacea.
+Several challenges make the offload of distributed file system               Host    PM        read/write                    DMA copy
+
+functionality particularly difficult.                                                     Log A Log B       Log area             Public area
+Increased latency for host memory access. SmartNICs are                                                         publish
+PCIe expansion cards. PCIe is a high-latency interconnect
+relative to the DDR memory interconnect that CPUs enjoy                                                         NICFS
+to access memory. Accessing PM via DDR from a host CPU                    Smart
+incurs a latency on the order of 100 ns while accessing PM                 NIC
+                                                                                                              NIC Memory
+via PCIe has a latency of several 𝜇s—an order of magnitude                                 replicate
+difference. Thus, accessing PM and related file system state             Figure 1: Components and data path of a LineFS node.
+stored in host memory from the SmartNIC has high overhead
+and such access needs to be minimized or the latency needs
+to be hidden.                                                            3     LINEFS DESIGN
+Wimpy execution environment. A typical SmartNIC power
+                                                                         LineFS is a DFS designed for a cluster of nodes that use
+envelope is 25W. Compared to host CPUs that have an order
+                                                                         PM and RDMA. LineFS minimizes host CPU overheads by
+of magnitude larger power envelopes, there is no room for
+                                                                         carefully offloading DFS operations to SmartNICs. LineFS
+powerful memory or processing features. SmartNICs typ-
+                                                                         has the following design goals.
+ically opt for a wimpy processor architecture, with many
+                                                                         • Minimize host performance interference. Performance
+low-frequency cores and a small amount of cache memory.
+                                                                            and performance predictability of applications and stor-
+Mellanox BlueField. We explore DFS offload using a Mel-                     age systems suffer from competition for shared resources.
+lanox BlueField MBF1M332A SmartNIC [2]. This is a 2×25GbE                   CPUs are one of the most constrained resources in modern
+SmartNIC that contains an ARMv8 Cortex-A72 processor                        cloud servers [27, 40–42, 49, 55]. LineFS must minimize
+with 16 cores, running at 800MHz. Each Cortex-A72 core has                  competition for CPUs among applications and the DFS. To
+a 32KB L1 data cache. Two cores share 1MB of L2 cache and                   do so, LineFS offloads DFS functionality to SmartNICs.
+all cores share 6MB of L3 cache, as well as 16GB of memory,              • Minimize slowdown from offload. LineFS must mini-
+which may be DRAM or NVDIMM-N PM. BlueField runs                            mize the performance impact of DFS offload to SmartNICs.
+Linux on the Cortex-A72.                                                   To do so, LineFS rethinks the file system data path to ex-
+   BlueField is an off-path SmartNIC [41]. An RDMA switch                   ploit fine-grained data parallelism. LineFS executes the
+on the SmartNIC is capable of directly accessing SmartNIC                   data path in the background to allow foreground host com-
+and host memory. The switch can be configured to forward                    putation to continue unaffected.
+RDMA requests according to various rules. We configure                   • Leverage data-path processing opportunities. LineFS
+the switch to treat the Cortex-A72 as a discrete host, with                 shall leverage the SmartNIC’s data-path processing capa-
+its own MAC and IP address. This configuration allows the                   bility to opportunistically perform semantic-aware data
+file system full control, from any machine, over where to                   transformations. We take advantage of spare SmartNIC
+transfer data and whether to interact with the SmartNIC or                  processing capacity to perform data compression, saving
+the host.                                                                   network bandwidth for replication.
+   Treating the SmartNIC as a discrete host running Linux                • Improved availability. LineFS shall also leverage the
+focuses our work on the interconnect and wimpy execu-                       SmartNIC’s data-path processing capability to improve
+tion environment challenges described in this section, rather               DFS availability. While SmartNICs and host CPUs share
+than low-level acceleration. This is intentional. File systems              host power, SmartNICs provide independent execution
+are complex software, handling highly structured data with                  environments and can continue operating, even if the host
+sophisticated access protocols for consistency and durabil-                 operating system has failed.
+ity. CPU architectures capable of running full OSes, such
+                                                                         LineFS architecture. Like Assise [18] and Orion [60], LineFS
+as ARMv8, are well-suited for file system execution. Lower-
+                                                                         adopts a client-local DFS model that executes DFS function-
+level, in-path architectures that are optimized to process
+                                                                         ality on client machines to avoid client-server communi-
+individual network packets, such as NPU or FPGA-based
+                                                                         cation latency for PM access. In addition, LineFS carefully
+SmartNICs, would have unnecessarily complicated our of-
+                                                                         distributes DFS components among host and SmartNICs.
+fload design.
+                                                                         LineFS nodes consist of two components: LibFS and NICFS.
+                                                                         LibFSes are linked to application processes (LineFS clients)
+
+
+
+
+                                                                   759
+running on host cores. NICFS runs on SmartNICs. Figure 1                  a bottleneck (e.g., its wait queue grows beyond 5 entries),
+shows the overall design of a LineFS node.                                NICFS dynamically assigns more threads to process the stage.
+   Beyond per-node offload, LineFS follows Assise’s design
+closely. Ideas, such as user-level PM IO with per-process                 Together, these principles not only avoid overhead but also
+LibFSes and update logs, leases [32] as a consistency mech-               maintain consistency when offloading. Client logs are a nat-
+anism, and chain-replication via RDMA are inherited from                  ural way to persist file system updates in order. When pub-
+Assise [18]. LineFS also uses ZooKeeper [1] as a cluster man-             lishing and replicating, pipeline parallelism allows LineFS to
+ager to manage DFS node membership, failure detection, and                process data in client log order, providing linearizability and
+root lease arbitration (§3.4). We initially attempted SmartNIC            prefix crash consistency [24, 26, 57].
+offload of Assise’s per-node SharedFS component but found
+that, without the design principles presented in this paper,              3.2    Low-latency PM IO via LibFS
+throughput dropped by more than 30× versus the host-based                 To provide low latency PM IO, LibFS persists data to an
+version due to inefficient SmartNIC execution.                            operational log in host PM. Operational logging provides a
+                                                                          compact way for persisting (meta-)data in PM [37, 59]. LineFS
+                                                                          assigns a fraction of PM to each LibFS as a persistent write
+3.1    Design Principles                                                  log. LibFS intercepts the application’s POSIX file system calls
+Naive DFS offload to a SmartNIC leads to serious perfor-                  and writes file data and metadata to the PM log. For example,
+mance degradation due to the wimpy SmartNIC architecture                  on a create() system call, LibFS writes updated inodes and
+and data movement across PCIe. To avoid the overhead for                  directories to the PM log. A log is efficient for PM because
+offloading, LineFS follows two design principles: persist-and-            the sequential performance of PM is high and log appends
+publish and pipeline parallelism.                                         are sequential.
+Persist-and-publish. LineFS assigns a fraction of PM as a                    Reading is a two-step process: 1) LibFS searches in its
+per-client PM log (cf. Figure 1). LibFSes persist data and meta-          client-private log (the data is not yet published) and 2) if the
+data updates to their private PM logs on the host. The logs               data is not found in the log, it searches public PM. The read
+are asynchronously published to a host-local public PM and                path is performed in the host CPU without involving NICFS.
+replicated to remote PM by NICFS. This persist-and-publish                Writing requires only asynchronous communication with
+design, which is inspired by Strata’s logging and digesting               NICFS to publish and replicate the client-private logs (§3.3).
+approach [37], enables LineFS to clearly separate PM-latency
+critical operations from those that can be deferred. After                3.3    Pipelining DFS operations
+LibFS makes data and metadata durable in the host PM log                  NICFS runs two different pipelines: the publishing pipeline
+using fast host cores, NICFS publishes and replicates the                 and the replication pipeline. The publishing pipeline (§3.3.1)
+updates in the background with SmartNIC cores, saving the                 consists of four stages: fetching, validation, publication, and
+host cores from performing file system management tasks.                  acknowledgment. The replication pipeline (§3.3.2) also con-
+Pipeline parallelism. LineFS exploits pipeline parallelism                sists of four stages: fetching, validation, transfer, and acknowl-
+to publish and replicate the log. LineFS organizes DFS opera-             edgment. Both pipelines have to fetch log data to NICFS and
+tions into distinct execution stages to construct an execution            validate it. To avoid redundant data movement, the publish-
+pipeline. LineFS defines a group of log entries as a LineFS               ing and replication pipelines share the first two stages—i.e.,
+chunk, processing each chunk in parallel through the pipeline.            they operate on the same data. After the first two, they run
+LineFS takes advantage of two different types of parallelism:             their own pipeline stages.
+intra-client and inter-client. Intra-client parallelism leverages
+the pipeline to publish and replicate each client-private log             3.3.1 Publishing Client Logs. NICFS publishes client-private
+while keeping the log data in order. LineFS processes multiple            log entries to public PM in the background. After publishing
+client logs concurrently by executing the pipeline for each               log entries, LibFS reclaims them to make room for further
+client in parallel. LineFS coordinates the pipeline to linearize          updates. Publishing log entries involves memory-intensive
+shared updates (§3.4).                                                    data movement from the client-private log to public PM.
+   Pipeline parallelism provides a convenient way to man-                 Rationale. LineFS offloads publication of the log to a Smart-
+age the degree of parallelism [46]. To execute each pipeline              NIC for four reasons: (1) to reduce occupancy and load on the
+stage, NICFS assigns a thread for each stage to SmartNIC                  host CPU for data movement; (2) to reduce the overhead of
+cores from a single thread pool created at start time. When               scheduling and context switches due to DFS services; (3) to
+a LibFS log grows to the size of a LineFS chunk (e.g., 4 MB),             reduce head-of-line blocking on log writes when logs are full
+LibFS sends an RPC to NICFS to start the pipeline. NICFS                  and host CPU resources are scarce; (4) to enable ancillary
+monitors the time taken for each stage. If one stage becomes              tasks, such as compression, without CPU contention.
+
+
+
+
+                                                                    760
+ 1 Fetching       Chk1       Chk2    Chk3
+                                                                        Chk: chunk
+                                                                                           3.3.2 Replication. LineFS chain-replicates [51] the client-
+                                                                 Host to SmartNIC
+                                                                                           private log to a number of replicas using RDMA, provid-
+ 2 Validation              Chk1     Chk2    Chk3
+                                            waits for ordering
+                                                                    In SmartNIC
+                                                                                           ing availability and strong consistency among replicas. Like
+ 3 Publication In Host              Chk1        Chk2           Chk3
+                                                                                           other DFSes, fsync() guarantees durability and replication
+ 4 ACK          SmartNIC to Host
+                                            Chk1          Chk2            Chk3             of file data and metadata. Along a replication chain, each
+    Figure 2: Publishing with pipeline parallelism.                                        replica persists a primary’s client-private log to its local log.
+                                                                                           When the primary receives ACKs from all replicas, fsync()
+                                                                                           returns. Thereby, the primary and all replicas have the same
+                                                                                           view of updates.
+                                                                                              With strong consistency, replication latency directly im-
+Challenges. There are two challenges for efficient offload to                              pacts DFS write performance [36]. In turn, two factors pri-
+the SmartNIC: (1) High PCIe latency; (2) Permission checks                                 marily affect replication latency: (1) Delays in network (RDMA)
+(§3.4) and validation (e.g., prevent directory cycles in the                               request processing and (2) CPU contention between DFS
+DFS namespace) consume enough computational bandwidth                                      replication operation and co-running applications. Host-
+to saturate the relatively wimpy SmartNIC processors.                                      based approaches to providing low replication latency avoid
+   The dual challenges of communication latency and com-                                   these factors by pre-posting network operations to RDMA
+putational load suggests that overlapping these latencies can                              send-receive queue pairs (QPs) and polling for completion
+help reduce their effect on end-to-end system performance.                                 in a busy loop. To guarantee sustainable throughput and
+Approach. The persist-and-publish model allows NICFS to                                    latency, pre-posting and polling must not be delayed and
+publish the client-private log in the background, while ap-                                thus they must run on isolated CPUs.
+plication execution continues. To amortize PCIe transfer                                      Busy polling on the host CPU is not a viable option for
+overheads, LineFS batches consecutive updates into LineFS                                  multi-tenant systems because it must reserve many host
+chunks. As soon as LibFS has accumulated a single LineFS                                   CPUs just for replication processing. Unfortunately, block-
+chunk of updates, it sends an asynchronous RPC request to                                  ing for replication introduces context switch and dispatch
+NICFS to start publishing the chunk.                                                       overheads that delay network request processing, while inter-
+   As shown in Figure 2, the publishing pipeline consists                                  ference from co-running applications may cause scheduling
+of four stages (with the primary resource for the stage in                                 policies and cache effects to further delay replication pro-
+parentheses): fetching (PCIe), validation (computation), pub-                              cessing. PM-optimized DFSes exhibit less than 10𝜇s latency
+lication (PCIe and computation), and acknowledgment (PCIe                                  for small replicated updates [18], intensifying the impact of
+latency). NICFS fetches a LineFS chunk to the SmartNIC’s                                   any interference.
+memory and validates it. After passing the validation, NICFS                               Rationale. We have to find another way to provide consis-
+publishes the LineFS chunk and acknowledges it to LibFS.                                   tent DFS replication performance, even when replica CPUs
+   Publishing the chunk via PCIe causes excessive latency,                                 are highly utilized by co-tenant applications. At the same
+stalling the pipeline. Instead, LineFS uses a kernel worker                                time, DFS replication should not interfere with co-running
+thread in the host operating system to initiate asynchro-                                  applications on these replicas. Offload to a SmartNIC can
+nous host DMA [38] to publish the LineFS chunk. Instead of                                 provide us with both benefits. We can busy poll for net-
+copying PM with host cores, the DMA copy still avoids CPU                                  work events and process DFS replication operations on the
+utilization.                                                                               SmartNIC with low latency and without interference with co-
+Data-path processing opportunities. NICFS can add addi-                                    running applications on the host. LineFS offloads replication
+tional pipeline stages to utilize any spare SmartNIC process-                              for these reasons.
+ing cycles. For example, we add a stage to perform semantic-                               Challenges. Naive SmartNIC offload, where every RDMA
+aware compression called coalescing [37, 45]. Coalescing re-                               connection has an independent polling thread, would over-
+duces the amount of published data by skipping unnecessary                                 load the SmartNIC CPUs. It does not scale to many connec-
+log entries, thereby reducing write amplification and improv-                              tions. At the same time, replication processing needs to be
+ing the lifetime of PM. The stage scans a fetched chunk to                                 parallelized and scale to many SmartNIC CPUs to achieve
+find a temporarily durable write pattern (e.g., creating and                               low latency and high throughput on wimpy SmartNIC archi-
+then deleting the same file). If the stage detects the pattern, it                         tecture. We describe solutions to each challenge.
+removes the redundant log entries before building a copy list
+                                                                                           Approach (scalable, low latency RDMA request process-
+for the kernel worker. To find a coalescing opportunity, the
+                                                                                           ing). To realize low latency RDMA request processing, yet
+stage scans log entries, which is also needed for validation.
+                                                                                           scale to many connections, NICFS partitions DFS requests
+Hence, we can execute the validation and coalescing stages
+                                                                                           into two types: low latency and high throughput. They use
+together in the same core to exploit CPU cache locality.
+
+
+
+
+                                                                                     761
+                   Primary                                            Replica 1                      Primary                                                 Chk: chunk
+                                         Host                                                        1   Fetching     Chk1 Chk2 Chk3
+    LibFS                Kernel worker                 LibFS                 Kernel worker
+                                                                                                     2   Validation        Chk1 Chk2 Chk3
+                                         PM                                                    PM
+  Log A            ...                                                 ...                           A Compression (optional) Chk1 Chk2 Chk3
+       Log area            Public area                     Log area              Public area
+                                                                                                     3    Transfer                     Chk1   Chk2   Chk3
+                                                                  4' to Replica 2's log
+   1     6                        SmartNIC             4                                             Replica 1
+                                                5                                                                     4 to host (Replica 1) Chk1 Chk2 Chk3
+                     NICFS          2 A                                  NICFS                       4    Transfer
+                                                3                                                                          4' to Replica 2 Chk1 Chk2 Chk3
+  Chk1   Chk2     Chk3                               Chk1    Chk2 Chk3
+                  NIC Memory                    IB                    NIC Memory                     5     ACK                                       Chk1 Chk2   Chk3
+
+
+                               Figure 3: LineFS IO path and replication pipeline with 3 nodes (2 shown).
+
+different network ports, so LibFS performs separate RPC                                           By design, NICFS parallelizes the replication pipeline; e.g.,
+requests according to the use. For the low latency connec-                                     replicating Chk1 ( 3 ), while validating Chk2 ( 2 ), and fetch-
+tion, NICFS dedicates a thread for busy polling, pinned to a                                   ing Chk3 ( 1 ) in parallel. Similarly, replica NICFSes transfer
+SmartNIC core. For the high throughput connections, NICFS                                      each pipeline chunk to the next SmartNICs’ memory ( 4’ ) in
+maintains a worker thread pool invoked when an event oc-                                       the replication chain (except for the last replica) and, in par-
+curs (e.g., replication acknowledgments). NICFS uses the                                       allel, copy the chunk to their host-local PM log ( 4 ). The cost
+low latency connection for latency-sensitive operations (e.g.,                                 of copying is hidden by overlapping it with transferring the
+fsync() notification and lease operations) and the high                                        chunk to the next replica ( 4 and 4’ happen concurrently
+throughput connection for data-intensive operations, like                                      in Figure 3).
+replication and publication. NICFS also multiplexes RDMA                                          On fsync(), the primary’s NICFS fetches any client-private
+operations from multiple LineFS clients to reduce the num-                                     log entries that are not yet replicated and synchronously
+ber of QPs; for RDMA scalability, having a small number                                        replicates them using the replication pipeline. Unlike asyn-
+of QPs is necessary to avoid NIC cache thrashing [23] and                                      chronous replication, synchronous replication uses the low
+further reduces the busy loop thread count.                                                    latency RDMA connection to transfer the log entries quickly.
+Approach (replication). To further reduce replication la-                                      When done, the primary NICFS acknowledges successful
+tency, LineFS uses the SmartNIC to asynchronously and proac-                                   replication to LibFS ( 6 ) and fsync() can return.
+tively replicate log entries (at the granularity of chunks) be-                                Data-path processing opportunities. Optionally, NICFS
+fore LibFS calls fsync(). On fsync(), LineFS synchronously                                     can configure a compression stage ( A ) before transferring
+replicates any remaining log entries. Like the publish oper-                                   data in the replication pipeline to save network bandwidth.
+ation, NICFS uses pipeline parallelism to accelerate asyn-                                     The compression stage consumes a large amount of Smart-
+chronous replication. The replication pipeline consists of                                     NIC’s CPU resources, so NICFS monitors the wait queue
+four stages: fetch, validation, transfer, and acknowledgment                                   length at each stage of the pipeline. If the compression stage
+(ACK). Recall that the first two stages are identical to the                                   becomes a bottleneck, NICFS opportunistically disables the
+publishing pipeline and the two pipelines share these stages                                   stage.
+for efficiency.
+   Figure 3 shows LineFS’s replication IO path and pipeline.
+At the primary’s NICFS, a pipeline chunk is first fetched
+                                                                                               3.4    Shared File Management
+( 1 ) and validated ( 2 ). Then, NICFS transfers the chunk                                     LineFS linearizes concurrent accesses to shared state using
+to the next replica’s NICFS ( 3 ). After receiving the chunk,                                  leases [32]. Leases provide single-writer, multiple-reader ac-
+the replica asynchronously copies the chunk to its local PM                                    cess to files and directories. LineFS follows Assise’s lease
+log ( 4 ), and, in parallel, transfers the chunk to the next                                   management design, but offloads lease arbitration to NICFS.
+replica ( 4’ ). Finally, because the last replica does not have to                             LibFSes acquire leases from the NICFS lease manager on the
+conduct any further data replication, the penultimate replica                                  SmartNIC, instead of a host-based SharedFS. Like in Assise,
+(replica 1 in Figure 3) can directly transfer the chunk to the                                 lease management is initially rooted in the cluster manager
+last replica’s host PM log in step 4’ , saving a SmartNIC                                      and then delegated to NICFS instances, upon LibFS request.
+memory copy. Each replica sends an ACK to the primary,                                         Once a lease is granted, LibFS can access the file/directory
+after copying the pipeline chunk to the local PM log ( 5 ).                                    associated with the lease without further synchronization,
+These steps happen proactively in the background and LibFS                                     until the lease expires or is revoked. NICFS accepts published
+does not need to be informed.                                                                  log entries only if LibFS holds the correct leases for file or
+                                                                                               directory updates (as checked in the validation stage).
+
+
+
+
+                                                                                       762
+  To provide crash consistency, the DFS needs to record                  Instead, all updates go to the per-process update log, where
+granted leases, requiring persistence and replication. Repli-            NICFS can validate them upon publication.
+cation and persistence have high overhead compared to lease              NICFS fail-over. The cluster manager sends heartbeat mes-
+arbitration and thus increase the latency of lease operations.           sages to each alive NICFS every second. When the cluster
+To reduce latency on the critical path, LineFS provides filesys-         manager detects a NICFS failure, it immediately expires all
+tem access concurrently with recording leases. When grant-               leases assigned to the failed NICFS and ensures a live NICFS
+ing a lease, NICFS updates lease state only in SmartNIC mem-             replica takes over the lease management. When a NICFS fails
+ory and then carries out host PM persistence and replication             in our current prototype, the host kernel worker is informed
+asynchronously in the background, while the application                  by the cluster manager. The kernel worker, in turn, informs
+continues DFS operation using the granted lease. This does               all local LibFSes via a signal to return appropriate error codes
+not affect crash consistency, as NICFS waits until all leases            on file system access.
+are persisted and replicated when fsync() is called.                        NICFS fail-over on a SmartNIC crash is a possible alter-
+                                                                         native. If the host has a redundant (potentially ordinary)
+3.5    Extended NICFS Availability                                       RDMA NIC, LineFS can perform a fail-over to a replica NICFS.
+Software crashes are among the most common failures of                   The replica NICFS becomes the new primary NICFS for the
+data center servers [21, 28, 33]. Among these, the most in-              host and takes over replication and lease management. LibF-
+teresting software failure from a NICFS perspective is the               Ses re-acquire leases from the replica NICFS (lease state is
+failure of the host OS. In this case, the host, including DFS            replicated) and continue operation, while the local NICFS
+clients on the host, ceases operation and cannot function as             recovers. We leave this for future work.
+a DFS primary anymore. However, if the host is a replica for             Recovery. To track file system progress during NICFS down-
+other primary nodes, its service can be offloaded entirely to            time, the cluster manager maintains an epoch number. The
+NICFS and kept available, even if the host has crashed. Iso-             epoch number increments on node failure and recovery. Once
+lated NICFS operation allows LineFS to mask host fail-over               the epoch number is changed, the cluster manager notifies
+time, improving DFS availability.                                        all alive NICFSes and each NICFS persists the epoch number
+   To detect host failure, NICFS consistently monitors the               to PM. All NICFSes have a replicated history bitmap that
+host kernel worker. If NICFS detects that the kernel worker is           records what inodes have been updated during each epoch.
+not responding, it deems the host down and switches to iso-                 Once a failed NICFS restarts, it registers with the cluster
+lated NICFS operation. Isolated NICFS operation continues                manager and starts recovery. Upon recovery, NICFS reads
+to carry out replication and publication services via RDMA               the persisted epoch number and requests the history bitmap
+across PCIe, keeping the DFS node available while the host               from an online replica. To synchronize with the current file
+operating system is undergoing maintenance.                              system progress, NICFS fetches from the replica all inodes
+   Switching in and out of isolated NICFS operation is seam-             that have been recorded between its persisted epoch and the
+less. Client log and public areas in host PM must remain in              current epoch. Local update logs that touch recovered inodes
+place across host OS crashes. This is already a requirement              are invalidated. As future work, the recovery process could
+for DFS recovery after a host crash [18]. Any interrupted ker-           be optimized to make it more fine-grained.
+nel worker publication operation is restarted by NICFS. This
+is done without any data loss, as publication is idempotent.             4   IMPLEMENTATION
+When the kernel worker becomes available again, NICFS
+                                                                         We implement LineFS in x86 Linux hosts and ARM-based
+can switch out of isolated operation and submit future copy
+                                                                         Mellanox BlueField SmartNICs. LineFS is written in C with
+requests to the worker.
+                                                                         25,827 lines of code (LoC) for LibFS and 22,538 LoC for NICFS.
+                                                                         LineFS uses Intel Optane DC persistent memory modules
+3.6    Discussion                                                        in App-Direct mode, which expose PM as physical memory.
+We discuss how LineFS provides access control, fail-over,                The App-Direct mode allows LineFS to map PM directly, so
+and recovery, while offloading to NICFS.                                 LineFS directly persists data and metadata via the PMDK
+Access control. To open a file, LibFS must send an open re-              library [11], without involving the OS.
+quest to NICFS. NICFS checks file permissions and, if access                LibFS is implemented as a shared library, dynamically
+is granted, sends an RPC request to the kernel worker run-               linked into each client process’ address space. LineFS does
+ning in the host kernel. On receiving the RPC, the kernel                not require any application modification. LibFS intercepts
+worker allows LibFS to perform mmap() of file, directory, and            filesystem POSIX system calls to persist data and metadata
+file index pages in public PM. LibFS must not directly modify            to the client-private log. Currently, LibFS supports 21 sys-
+the pages, so the kernel worker maps the pages read-only.                tem calls. LibFS mmap()s the client-private log in contiguous
+
+
+
+
+                                                                   763
+virtual memory (by default 512 MB) and registers it as an              • How do various levels of DFS offload contribute to perfor-
+RDMA region to communicate with NICFS.                                   mance isolation? (§5.2.4, §5.3)
+    NICFS is a process running on the SmartNIC’s Linux OS.             • What data-path processing opportunities exist? (§5.4)
+NICFS includes RDMA communication and the file system                  • By how much can LineFS improve DFS availability (§5.5)?
+as independent layers. Using the RDMA layer, the file sys-
+tem layer communicates with local LibFSes and NICFSes in               5.1    Experimental Setup
+other nodes. NICFS uses one-sided RDMA to fetch client
+log headers and entries. The file system layer caches inodes,          Our evaluation testbed consists of 3× dual-socket Intel Xeon
+directory, and file indexes (e.g., extent tree) in SmartNIC’s          Gold 5220R servers at 2.2 GHz with 48 cores (no hyperthread-
+DRAM to avoid frequent access to host PM via PCIe. The                 ing), 96 GB DDR4-2666 DRAM, and 768 GB PM (6× 128 GB
+kernel worker is implemented as a Linux kernel module. The             Intel Optane DC persistent memory modules). All nodes run
+kernel worker publishes client-private logs to the public PM           Ubuntu 18.04 with Linux kernel version 5.3.
+area using the Intel I/OAT DMA engine [38].                            SmartNIC. We deploy a Mellanox BlueField MBF1M332A
+Fast read (LibFS). To efficiently search file data in the up-          in each node. The SmartNIC has 16× ARMv8 A72 cores with
+date log, LibFS has an in-memory hash table that locates               6 MB shared L3 cache, 16 GB DRAM, and 25Gbps network
+it. The hash table does not need to be persisted. LibFS ac-            bandwidth with RDMA. The SmartNICs are connected to
+cesses file blocks in public PM after passing a permission             a 100 GbE switch and we use RoCE [13] for RDMA. The
+check (§3.6). LibFS searches the file data in public PM via            measured memory bandwidth of our SmartNIC is 10 GB/s
+per-file extent trees [45]. LibFS does not cache extent trees          and network goodput (measured by our file benchmark) is
+in DRAM because 1) it has better performance [48], and 2)              2.2 GB/s.
+it does not require maintaining consistency between public             System configuration. We choose Assise as a baseline sys-
+PM and DRAM cache.                                                     tem because it is a client-local DFS like LineFS. Orion also
+Replication flow control (NICFS). The memory capacity                  supports the client-local model, but its source code is not
+of our SmartNIC is small (16 GB). When NICFS replicates                available. We do not compare LineFS with client-server DF-
+multiple update logs simultaneously, the SmartNIC may run              Ses, such as Ceph, because Assise demonstrated an order of
+out of memory. To avoid running out of memory, NICFS con-              magnitude faster performance than those DFSes. We config-
+sistently monitors memory consumption. When SmartNIC                   ure Assise with three settings: Assise is vanilla Assise in
+memory consumption is higher than a high watermark (e.g.,              “pessimistic” [18] mode, guaranteeing persistence on fsync(),
+70%), NICFS temporarily stops further update log replica-              just like LineFS. Assise-BgRepl additionally replicates in
+tion, draining the current replication pipeline. Once memory           the background, before fsync() is called, akin to LineFS
+utilization drops below a low watermark (e.g., 30%), NICFS             replication. Assise-BgRepl uses 3 threads for background
+resumes replication.                                                   replication (which we confirmed maximizes performance)
+                                                                       and the same 4MB chunk size, but does not implement pipeline
+Asynchronous DMA (kernel worker). To perform asyn-
+                                                                       parallelism. Assise+hyperloop adapts the replication pro-
+chronous DMA, we use the Linux I/OAT DMA kernel driver
+                                                                       tocol from Hyperloop [36], a system that offloads replica-
+from the kernel worker. NICFS batches memory copy re-
+                                                                       tion to an RDMA NIC. The source code of Hyperloop is
+quests by building a memory copy list (preserving order) and
+                                                                       unavailable, so we implemented the proposed design. Hy-
+then sends an RPC to the kernel worker. The kernel worker
+                                                                       perloop manipulates RDMA request destination addresses
+issues DMA requests in the order of the memory copy list
+                                                                       on the remote NIC via RDMA verbs. Modern RDMA NICs
+and sleeps until it receives completion notifications from the
+                                                                       (ConnectX-4 and later—our BlueField uses a ConnectX-5)
+kernel I/OAT driver.
+                                                                       disable this feature for security. To get around this prob-
+                                                                       lem, we run Assise+Hyperloop with an IO trace gener-
+                                                                       ated in advance, which specifies the modified destination
+5   EVALUATION                                                         addresses when replicating data, avoiding remote request
+We evaluate LineFS to validate our design principles when              manipulation. Our implementation is validated by the Hy-
+offloading DFSes to SmartNICs. We compare LineFS with                  perloop authors and we reproduced the results presented
+Assise [18], a state-of-the-art DFS that supports client-local         in the Hyperloop paper. Because our Hyperloop evaluation
+PM access. Our evaluation answers the following questions:             requires traces, we compare LineFS with Assise+Hyperloop
+• What latency and throughput can LineFS achieve on an                 for microbenchmarks only. To evaluate the effectiveness of
+  idle and on a busy cluster with co-running applications?             LineFS’s pipeline parallelism, we configure LineFS without
+  How does it compare to Assise? How do the various par-               it (LineFS-NotParallel), so it replicates the client-private
+  allel pipelines contribute to LineFS performance? (§5.2)             log sequentially in the background. We configure the PM log
+
+
+
+
+                                                                 764
+                           Assise                   Assise-BgRepl       Assise+Hyperloop                    Sequential read  Random read
+                           LineFS-NotParallel       LineFS                                                 Assise LineFS Assise LineFS
+                                    Replicas idle                   Replicas busy                           3,147    3,134  2,960     2,946
+ Throughput (GB/s)
+
+
+
+
+                     2.0                                                                         Table 2: Read throughput (MB/s) of Assise and LineFS
+                     1.5
+
+                     1.0
+                                                                                                     When increasing the number of clients, both LineFS and
+                     0.5
+                                                                                                 Assise become increasingly resource-bottlenecked. The max-
+                     0.0
+                               1      2     4      8        1      2         4      8            imum goodput of our microbenchmark is 2.2 GB/s. LineFS
+                                           Number of LibFS processes
+                                                                                                 saturates the maximum goodput with only two clients due
+Figure 4: Write throughput scalability when replicas
+                                                                                                 to background parallel replication, but Assise needs four
+are idle and busy.
+                                                                                                 clients. We stop at eight clients because both systems already
+                                                                                                 saturate network bandwidth.
+                                                                                                 Replicas busy. In this benchmark, we are interested in how
+size to 512 MB for both Assise and LineFS. Both DFSes use 3                                      DFS performance is affected by host resource contention due
+nodes; primary, replica-1, and replica-2.                                                        to background co-tenant activity. Hence, when co-running
+Multi-tenancy. It is common practice to run IO-intensive                                         with applications, we give the DFS higher scheduling pri-
+and CPU-intensive jobs together in the cloud [29, 34, 43].                                       ority to eliminate scheduling policy as a source of perfor-
+To evaluate the resulting interference with DFS execution,                                       mance degradation. We run streamcluster as co-runner in
+we use streamcluster from the PARSEC [20] suite v3.0 to                                          the replicas, leaving the primary for the microbenchmark.
+mimic CPU-intensive jobs. To stress the host cores, we set the                                   With a single client, all DFSes achieve similar performance
+number of threads for streamcluster equal to the number                                          to the idle case because they have a higher priority than
+of host cores. When running streamcluster with Assise                                            streamcluster and the contention is not high. As we in-
+or LineFS, we adjust the scheduling priority to evaluate the                                     crease the number of clients, all DFSes experience increased
+impact of resource contention.                                                                   host contention and none can saturate the network band-
+                                                                                                 width. LineFS experiences the least contention due to offload
+Test suite. We test LineFS with xfstests [17] and CrashMon-
+                                                                                                 and outperforms the other DFSes by 33% at scale. Note that
+key [47]. LineFS successfully passes all 75 general xfstest
+                                                                                                 Assise+Hyperloop still requires periodic host participation
+cases and all CrashMonkey tests. Also, LineFS passes all 201
+                                                                                                 for publication and posting of RDMA verbs for replication
+LevelDB unit tests and is able to run all Filebench profiles.
+                                                                                                 offload, reducing its performance. Even LineFS still requires a
+                                                                                                 kernel worker for publication, causing performance degrada-
+5.2                        Microbenchmarks                                                       tion versus the idle case. We analyze the kernel worker cost
+5.2.1 Write Throughput Scalability. Our throughput bench-                                        in §5.2.4, showing that skipping kernel worker publication in
+mark writes file data to a 12 GB file with 16 KB IO size                                         replicas allows LineFS to saturate the network bandwidth,
+sequentially and calls fsync at the end. Figure 4 shows the                                      and confirming that resource contention in replicas is a bot-
+scalability of throughput by increasing the number of DFS                                        tleneck, even when DFSes are prioritized.
+clients. Each client has its own file of the same size. We                                           In all cases, LineFS-NotParallel does not scale because
+measure throughput when the replicas’ CPU is idle (no co-                                        it does not effectively utilize SmartNIC resources. LineFS-Not
+runner) and busy.                                                                                Parallel uses 4.1 ARM cores on average, whereas LineFS
+Replicas idle. Assise shows the worst throughput with a                                          uses 5.8 cores. This result confirms that pipeline parallelism
+single client (645 MB/s). Assise synchronously replicates                                        is essential when offloading a DFS to SmartNICs.
+updates only upon fsync() and within the thread context                                          5.2.2 Read Throughput. Table 2 presents the read through-
+of the caller. Assise throughput is thus heavily dependent                                       put of LineFS and Assise. The microbenchmark runs a sin-
+on the number of client contexts. Assise-BgRepl improves                                         gle client reading a 12 GB file with 16 KB IO size locally.
+the performance by up to 124% due to replicating in the                                          For reads, LineFS does not offload any operations to Smart-
+background. LineFS performs up to 133% and 4% better than                                        NICs. The entire read data-path is performed in the host CPU.
+Assise and Assise-BgRepl, respectively. LineFS’s pipeline                                        Therefore, LineFS and Assise show similar performance in
+parallelism hides PM persistence and replication latencies,                                      both sequential and random read cases.
+achieving similar throughput to Assise-BgRepl, even with a
+more complex data-path. LineFS-NotParallel performs at                                           5.2.3 Pipeline Performance Analysis. We break down the
+least 60% worse than LineFS, demonstrating the importance                                        time taken by each pipeline stage when publishing and repli-
+of pipeline parallelism for good offload performance.                                            cating a 4 MB chunk. Figure 5 shows this result. Publish and
+
+
+
+
+                                                                                           765
+                               Fetching           Validation       Publication/Transfer      Ack                                                             Streamcluster execution time                        LineFS throughput
+                                          1,025           65                1,502              7
+
+
+
+
+                                                                                                                                                                                                                                              Throughput (MB/s)
+                                                                                                                                Execution time (s)
+                     publish                                                                    2,599                                                40
+                                                                                                                                                                                                                                      2,000
+                                          1,025          65                1,505               7
+    replication                                                                                 2,602
+                                                                                                                                                                                                                                      1,800
+                                                               Time (us)                                                                             20
+Figure 5: Publish and replication pipeline latency                                                                                                                                                                                    1,600
+breakdown.                                                                                                                                            0                                                                               1,400
+                                                                                                                                                               mcpy           ollin
+                                                                                                                                                                                    g
+                                                                                                                                                                                                       at   ch            ch
+                                                                                                                                                                                                                       bat No co
+                                                                                                                                                                                                                                 py
+                                                                                                                                                            me             Ap                   g   +b              t+
+                                                                                                                                                      CPU             DM                  ollin                  up
+                                                                                                                                                                                        Ap                   terr
+                                                                                                                                                                                  DM                  A in
+                            Streamcluster execution time (primary)                 Throughput                                                                                                       DM
+                            Streamcluster execution time (replica)                                                              Figure 7: Impact of different copying methods on
+
+
+
+
+                                                                                                      Throughput (MB/s)
+                                                                                              1,800
+Execution time (s)
+
+
+
+
+                      40                                                                                                        streamcluster execution time (left Y-axis) and LineFS
+                                                                                              1,600                             throughput (right Y-axis).
+                      20                                                                      1,400
+
+                                                                                              1,200
+                                                                                                                                                                                    Replicas idle                       Replicas busy
+                        0                                                                     1,000
+                     Streamcluster Solo run Assise              Assise-BgRepl       LineFS                                                                                      Avg. 99th 99.9th                    Avg.    99th 99.9th
+Figure 6: Performance impact of LineFS and Assise                                                                                                     Assise                      76    101       126                323 7,115      8,331
+co-execution on streamcluster execution time (left Y-                                                                                            Assise+hyperloop                 60     68     4,716                 61      78    4,125
+axis) and DFS throughput (right Y-axis).                                                                                                              LineFS                     149    187       205                149     188      204
+                                                                                                                                                            Table 3: Latency (𝜇s) when idle and busy.
+
+replication pipelines share the fetching and validation stages,                                                                 performance of streamcluster (co-running host applica-
+so their latencies are identical. As expected, fetching and pub-                                                                tion) and LineFS according to these methods. Figure 7 shows
+lication/transfer make up the largest portion of processing                                                                     the execution time of streamcluster while four LineFS
+latency due to having to cross high-latency interconnects.                                                                      clients run the throughput microbenchmark with the same
+As pipeline stage execution overlaps, this benchmark shows                                                                      scheduling priority as the streamcluster process. With DMA
+the per-stage latency that is hidden by pipeline parallelism.                                                                   polling, the kernel worker issues DMA requests to copy
+                                                                                                                                memory and waits for completion in a busy loop, which
+5.2.4 Performance Interference. To compare the performance
+                                                                                                                                is a standard implementation used in Intel SPDK [15]. DMA
+interference of LineFS and Assise, we run streamcluster
+                                                                                                                                polling + batch is an optimization of DMA polling, where
+in all nodes, including the primary. This configuration repre-
+                                                                                                                                NICFS batches memory copy requests to the kernel worker.
+sents aggressive consolidation by running an IO and CPU-
+                                                                                                                                DMA interrupt + batch means the kernel worker blocks
+intensive workload together. We run the throughput mi-
+                                                                                                                                until a DMA completion interrupt arrives, causing less con-
+crobenchmark (two DFS clients, each running a single thread)
+                                                                                                                                tention than polling-based methods. No copy skips publica-
+and streamcluster with 48 threads (using all cores on the
+                                                                                                                                tion altogether.
+node) under the same priority. Figure 6 presents the stream
+                                                                                                                                   As expected, streamcluster performs worse as LineFS
+cluster execution time and the microbenchmark through-
+                                                                                                                                uses heavier-weight host publication methods. streamcluster
+put. When running streamcluster with Assise, Assise
+                                                                                                                                performance of No copy is identical to running streamcluster
+degrades the performance of streamcluster by 72% in the
+                                                                                                                                alone. When the kernel worker uses DMA interrupt +
+primary and 66% in replicas due to resource contention. The
+                                                                                                                                batch, streamcluster performance decreases by 23% com-
+primary, where the DFS clients run, uses more host CPU and
+                                                                                                                                pared to No copy, whereas CPU memcpy makes the per-
+memory resources, causing a more severe slowdown than on
+                                                                                                                                formance drop by 61.5%. LineFS throughput shows how
+the replicas. Assise-BgRepl improves Assise’s throughput
+                                                                                                                                LineFS performs under contention with streamcluster. Un-
+by 18%, limited by contention with streamcluster. LineFS
+                                                                                                                                der contention, DMA interrupt + batch increases LineFS
+shows the best throughput, 46% better than Assise, while
+                                                                                                                                throughput by 40.3% and 5.9% compared to CPU memcpy and
+incurring minimal slowdown of streamcluster (49% and
+                                                                                                                                DMA polling + batch, respectively. Hence, we use DMA
+19% slowdown compared to the solo run for primary and
+                                                                                                                                interrupt + batch in all other benchmarks (including
+replica, respectively). This result confirms that LineFS’s de-
+                                                                                                                                §5.2.1).
+sign minimizes host performance interference while providing
+good performance.                                                                                                               5.2.5 Latency. We measure the latency of a microbench-
+Kernel worker interference. As we have seen in §5.2.1, ker-                                                                     mark that writes 16 KB of data followed by fsync() in a 12
+nel worker publication is a major source of interference with                                                                   GB file, so replication occurs at each write. This scenario is
+co-running applications. To understand the contention, we                                                                       not ideal for LineFS because, unlike throughput, LineFS can-
+implement several publication methods and evaluate the                                                                          not perform replication in the background. Table 3 reports
+
+
+
+
+                                                                                                                          766
+the statistics of our latency measurements. When replicas are
+
+
+
+
+                                                                                                                                                                  Throughput (kops/s)
+idle, LineFS’s latency is higher than that of Assise due to                                                                    Assise                    LineFS                         60
+the following reasons. 1) The hardware data-path of LineFS
+has multiple high-latency steps (cf. §5.2.3). LineFS fetches IO                        102                                                                                              40
+
+
+
+
+                                                                        Latency (us)
+data from host PM to SmartNIC memory via RDMA. After
+                                                                                                                                                                                        20
+running the pipeline stages, LineFS makes another RDMA                                 101
+
+request to ConnectX transport hardware through the SoC-
+                                                                                                                                                                                         0
+internal PCIe interconnect. 2) Due to low SmartNIC CPU                                        ead         ea
+                                                                                                             d
+                                                                                                                     ea
+                                                                                                                       d
+                                                                                                                               rit
+                                                                                                                                   e
+                                                                                                                                           rit
+                                                                                                                                               e
+                                                                                                                                                        rit
+                                                                                                                                                            e
+
+
+
+
+                                                                                                                                                                                                            l
+                                                                                                                                                                                                  r
+
+                                                                                                                                                                                                         ai
+                                                                                           .R          .R         .R
+
+
+
+
+                                                                                                                                                                                                ve
+                                                                                                                            .W          .W           .W
+clock speed, we measured that the SmartNIC’s L3 cache and
+
+
+
+
+                                                                                                                                                                                                      rm
+                                                                                         eq           d          d        q           d            c
+
+
+
+
+                                                                                                                                                                                               er
+                                                                                                    n          e                                 n
+                                                                                        S         Ra       ew           Se       Ra
+                                                                                                                                     n
+                                                                                                                                             Sy
+
+
+
+
+                                                                                                                                                                                                    Va
+                                                                                                                                                                                                s
+                                                                                                                                                                                             le
+DRAM access latency are more than 2× slower than on our                                                 Sk
+
+
+
+
+                                                                                                                                                                                         Fi
+                                                                                                    (a) LevelDB                                                     (b) Filebench
+host hardware. In contrast, Assise can make direct RDMA
+                                                                                             (lower is better, log scale)                                         (higher is better)
+requests from fast host CPUs.
+   However, when replicas are busy, LineFS’s latency is simi-           Figure 8: LevelDB latency and Filebench throughput.
+lar to when replicas are idle. In this case, LineFS shows up
+to 41× better latency than Assise. This result confirms our
+claim that LineFS minimizes interference of DFS operations                 Figure 8b shows the average throughput of Filebench
+with host applications. Assise+Hyperloop also shows good                when replicas are busy. In Fileserver, LineFS gets 79% better
+average and 99𝑡ℎ percentile latency for both cases. How-                throughput than Assise because the Fileserver workload
+ever, Hyperloop requires periodic posting of RDMA verbs by              performs writes frequently. LineFS’s write performance is
+the host CPU. If posting is delayed (e.g., due to contention),          better than Assise’s as shown in the microbenchmark re-
+Hyperloop increases latency. Due to this effect, the 99.9𝑡ℎ             sults (§5.2). Also, Fileserver does not call fsync(), so LineFS
+percentile latency of Hyperloop is 23× worse than LineFS.               is able to run all pipeline stages in the background. The
+                                                                        Varmail result shows different trends. Mail server IO char-
+                                                                        acteristics do not favor LineFS. The Varmail workload per-
+5.3    Application benchmarks                                           forms small file creation and updates followed by fsync(),
+LevelDB. We run a LevelDB performance benchmark us-                     so LineFS cannot efficiently leverage pipeline parallelism. In
+ing db_bench, distributed with LevelDB’s source code. The               addition, each time Varmail opens a file, LibFS requests a per-
+benchmark includes sequential and random object insert and              mission check to NICFS via PCIe, whereas Assise performs
+read, skewed (1% of frequently accessed objects) read, and              the permission check on the host. We identify that open()
+synchronous insert (an insert followed by fsync()). We set              takes up 9.1% of all file system calls during the Varmail ex-
+a key size of 16 B and a value size of 1 KB (default testing            periment, providing a second major reason that LineFS is
+configuration of LevelDB). We run the LevelDB performance               21% slower than Assise.
+benchmark when replicas are busy.
+   Figure 8a shows the average LevelDB latency (𝜇s) results             5.4                  Data-path Processing
+(y-axis is in log scale). As expected, LineFS and Assise per-           We investigate the opportunity for additional data-path pro-
+form similarly for read operations. LineFS has 80% better               cessing using spare SmartNIC resources and its impact on
+latency in sequential insert and 27% better latency in random           DFS performance. In particular, we evaluate how effectively
+insert than Assise. The insert performance shows similar                LineFS’s data compression saves network bandwidth and its
+trends to the write microbenchmark. In the case of synchro-             impact on replication performance. Our use case is batch
+nous insert, LineFS obtains 27% better latency (lower im-               processing. Distributed batch processing applications often
+provement than sequential insert) because of the workload’s             write intermediate data to a DFS (cf. Hadoop [52] on HDFS).
+frequent fsync() calls.                                                 The intermediate data is replicated, causing high network
+Filebench. We run the Fileserver and Varmail workloads in               bandwidth utilization. LineFS compresses the data in the
+the Filebench suite [54]. Fileserver executes file operations           primary to save network bandwidth when replicating data.
+on files of 128 KB average size. Varmail operates on smaller               To evaluate this scenario, we run a parallel batch process-
+files of 16 KB average size (emulating reading small mailbox            ing benchmark, Tencent Sort [35]. Tencent Sort performs par-
+files). We set a working set of 10K files for both benchmarks.          allel sorting, consisting of a range partitioning phase and a
+The write to read ratio of Fileserver and Varmail is 2:1 and            merge-sort phase. In the partitioning phase, each worker pro-
+1:1, respectively. Finally, Varmail frequently calls fsync()            cess partitions the input data into non-overlapping ranges,
+for its persistence semantics (emulating write-ahead logging            and stores the partitioned data to temporary files. In the
+when updating mailbox files), whereas Fileserver does not               merge-sort phase, each sort worker process reads the tempo-
+call fsync() (relaxed crash consistency).                               rary files assigned to the process, merges data from the files,
+
+
+
+
+                                                                  767
+                           Assise   LineFS-40%        LineFS-60%   LineFS-80%                  12
+                           18.72s   18.85s            18.60s       16.92s                      10                    Replica 1's
+
+
+
+
+                                                                                      kops/s
+                  10                                                                            8
+ BW consumption
+
+
+
+
+                                                                                                6                      host is
+                   8                                                                            4                     crashed
+    (Gbits/s)
+
+
+
+
+                                                                                                2                      (8 sec)
+                   6                                                                            0
+                   4                                                                                0   5      8     10          1516      20          25
+                                                                                                                          time (s)
+                   2
+                                                                                      Figure 10: Varmail throughput (time series in seconds).
+                   0
+                       0            5            10          15       20              Replica-1’s host (VM) fails at time 8s and recovers at
+                                                 time (s)
+                                                                                      time 16s.
+Figure 9: Network bandwidth consumption of Assise
+and LineFS while running Tencent Sort. LineFS-x% in-
+dicates LineFS with an input data set of x% compres-                                  throughput every second.1 While running Varmail, we crash
+sion ratio. The numbers in the legend indicate execu-                                 replica-1 by injecting a failure that reboots the host (running
+tion time of Tencent Sort.                                                            in a VM).
+                                                                                         Figure 10 shows the Varmail throughput over time. At 8
+                                                                                      seconds, NICFS in replica-1 detects the failure because the
+and sorts them. Each sort worker writes its final output to a                         kernel worker is not responsive to heartbeat messages. NICFS
+file.                                                                                 changes its copy mode to use PCIe for publishing replica-
+   We implement Tencent Sort for evaluating Assise and                                1’s log. Replica-1’s NICFS also continues replicating data
+LineFS. We configure four partitioning and four sorting                               to replica-2 while replica-1’s host system is down. Varmail
+processes in the primary node. The data set consists of 80M                           replicates data at a few hundred MB/s and we do not observe
+records. We use the Quicksort algorithm for the merge and                             a performance drop due to PCIe memory copy during the
+sort phase and radix-based range partitioning.                                        host failure window. At time 16s, the host system recovers.
+   We evaluate network bandwidth consumption and bench-                               The host kernel worker is stateless and can restart copying
+mark performance according to different compression ratios.                           without any further recovery. At time 16s, NICFS detects
+To control compression ratios, we modify the benchmark                                that the kernel worker has recovered and starts sending RPC
+input generation tool [14] to adjust the ratio of zero values in                      requests to resume host-based publication.
+input files. We create three input sets to have 40%, 60% and
+80% compression ratios respectively. For compression, NICFS                           6         RELATED WORK
+runs the Lempel-Ziv-Welch algorithm [7]. In our evaluation,                           Distributed file systems. Disk-based client-server file sys-
+the compression throughput of a single SmartNIC core is                               tems used in large scale clouds and high-performance com-
+around 200 MB/s, which is much lower than the network                                 puting systems, such as Ceph [58], LustreFS [6], GPFS [4],
+bandwidth. NICFS performs parallel compression to avoid                               GFS [30], and HDFS [52], focus on providing scalability and
+a pipeline bottleneck in the compression stage, running 16                            high availability for thousands of storage nodes. These file
+threads to execute the compression stage in our evaluation.                           systems are inherently slow with fast PM storage due to their
+To stress network bandwidth, we also run iperf3 [16] as a                             complex design and client-server architecture, motivating
+background task that contends for network bandwidth.                                  PM-optimized DFSes leveraging fast RDMA.
+   Figure 9 shows the network bandwidth consumption of                                   Various PM-optimized DFSes follow the client-server model,
+Assise and LineFS with different input sets. As expected,                             but optimize communication primitives and metadata place-
+LineFS reduces network bandwidth by 29%, 49%, and 72%                                 ment. Octopus [44] couples PM with high-performance RDMA,
+compared to Assise in LineFS-40%, LineFS-60%, and LineFS                              introducing collect-dispatch transactions to provide lower-
+-80%, respectively. We measure the time taken by the merge-                           latency access to data and metadata. Clover [56] manages
+sort phases. When the compression ratio is low, LineFS per-                           remote storage via RDMA operations and locates metadata
+formance is comparable to Assise. When the compression                                with applications. While these DFSes optimize communica-
+ratio is 80%, LineFS (16.69 seconds) performs 10.6% better                            tion overheads, the cost of accessing remote storage via the
+than Assise (18.72 seconds), while saving 72% of network                              network remains high.
+bandwidth.                                                                               Assise [18] and Orion [60] leverage the client-local model.
+                                                                                      Orion places data in local PM for “internal clients” to reduce
+5.5                    Availability                                                   network accesses, but communicates metadata updates with
+We evaluate LineFS’s extended availability in the face of                             remote metadata servers. Assise places data and metadata
+replica failures with a failure experiment using 3 nodes (one                         in the client node, eliminating network latency to access
+primary, two replicas). We run Varmail in the Filebench suite                         1 Note that printing Varmail’s throughput every second reduces Varmail
+
+on the primary node and instrument Varmail to report its                              throughput compared to §5.3.
+
+
+
+
+                                                                                768
+remote storage and metadata servers. Assise uses RDMA to               (IITP) grant, funded by the Korean government (MSIT) (No.
+replicate data and metadata. These DFSes provide superior              2018-0-00503, Research on next generation memory-centric
+performance for PM than the client-server model. However,              computing system architecture). This work is also supported
+the client-local model has to share host resources between             by a fellowship from the Erasmus Mundus Joint Doctorate
+DFS management operations and co-running applications.                 in Distributed Computing (EMJD-DC), funded by the Euro-
+SmartNIC offload. Many approaches offload host tasks to                pean Commission (EACEA) (FPA 2012-0030), and, in part, by
+SmartNICs. Floem [50] and ClickNP [39] offload network                 ERC grant 770889, NSF grant CNS-1900457, Huawei, and the
+functions like rate limiter and firewall to SmartNICs. Accel-          Texas Systems Research Consortium.
+Net [27] offloads processing TCP and SDN stack. For FPGA-
+based SmartNICs, Tonic [19] enables programmable trans-
+port protocols and hXDP [22] efficiently executes eBPF pro-
+grams. iPipe [41] proposes the actor programming model for
+                                                                       REFERENCES
+offloading applications like KV store, distributed transaction
+                                                                        [1] 2021. Apache ZooKeeper. https://zookeeper.apache.org
+systems, and real-time analytics to SoC-based SmartNICs.                [2] 2021. BlueField SmartNIC Ethernet. https://www.mellanox.com/
+E3 [42] and 𝜆-NIC [25] offload microservices to SoC-based                   products/BlueField-SmartNIC-Ethernet
+SmartNICs. FairNIC [31] and PANIC [40] address fairness                 [3] 2021. Broadcom Stingray. https://www.broadcom.com/blog/at-a-
+and performance isolation problems among competing of-                      glance--the-broadcom-stingray-ps1100r-delivers-breakthrough-
+fload tasks in SmartNICs. These approaches share the same                   performance-and-efficiency-for-nvme-of-storage-target-
+                                                                            applications
+vision with LineFS of reducing host CPU burden by offload-              [4] 2021. General Parallel File System. https://www.ibm.com/docs/en/gpfs
+ing tasks and leveraging resources in SmartNICs to accelerate           [5] 2021. Intel Optane Memory. http://www.intel.com/content/www/us/
+the offloaded tasks, but they do not address unique challenges              en/architecture-and-technology/optane-memory.html
+of DFS offload, such as handling highly structured data with            [6] 2021. Lustre File System. http://www.lustre.org
+sophisticated access protocols for consistency and durability           [7] 2021. LZ4 compression algorithm. https://en.wikipedia.org/wiki/LZ4_
+                                                                            (compression_algorithm)
+across multiple SmartNICs.                                              [8] 2021. Marvell’s Data Processing Units. https://www.marvell.com/
+   Hyperloop [36] offloads chain replication to RDMA NICs.                  products/data-processing-units.html
+Hyperloop uses the RDMA WAIT verb and remote manipu-                    [9] 2021. Network-attached Storage.         https://en.wikipedia.org/wiki/
+lation of RDMA requests for replication without involving                   Network-attached_storage
+the host CPU. Hyperloop provides stable tail latency even              [10] 2021. NVM Express over Fabrics 1.1. https://nvmexpress.org/wp-
+                                                                            content/uploads/NVMe-over-Fabrics-1.1-2019.10.22-Ratified.pdf
+when a replica’s host CPU is busy. Hyperloop focuses on                [11] 2021. pmem.io — Persistent Memory Programming. https://pmem.io
+replicated transactions, but offloading a full-fledged DFS has         [12] 2021. RDMA Consortium. http://www.rdmaconsortium.org
+to address more issues: shared file coordination, metadata             [13] 2021. RDMA over Converged Ethernet (RoCE).               https://www.
+consistency, crash consistency, and scalability by efficiently              roceinitiative.org
+utilizing SmartNICs. LineFS proposes general design ideas              [14] 2021. Sort Benchmark Home Page. http://sortbenchmark.org
+                                                                       [15] 2021. Storage Performance Development Kit. http://www.spdk.io
+when offloading DFS operations to SmartNICs.                           [16] 2021. Tool for active measurements of the maximum achievable band-
+                                                                            width on IP networks. http://software.es.net/iperf
+                                                                       [17] 2021. Xfstests. https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git
+7   CONCLUSION                                                         [18] Thomas E. Anderson, Marco Canini, Jongyul Kim, Dejan Kostić,
+LineFS proposes the persist-and-publish model and pipeline                  Youngjin Kwon, Simon Peter, Waleed Reda, Henry N. Schuh, and Em-
+                                                                            mett Witchel. 2020. Assise: Performance and Availability via Client-
+parallelism to offload a PM-optimized DFS to SmartNICs.                     local NVM in a Distributed File System. In 14th USENIX Symposium
+LineFS offloads CPU-intensive DFS tasks, like replication,                  on Operating Systems Design and Implementation (OSDI 20). USENIX
+compression, data publication, index and consistency man-                   Association, 1011–1027. https://www.usenix.org/conference/osdi20/
+agement to a SmartNIC. We implement LineFS on the Mel-                      presentation/anderson
+lanox BlueField SmartNIC and compare to Assise, a state-of-            [19] Mina Tahmasbi Arashloo, Alexey Lavrov, Manya Ghobadi, Jennifer
+                                                                            Rexford, David Walker, and David Wentzlaff. 2020. Enabling Pro-
+the-art PM DFS. LineFS improves latency in LevelDB up to                    grammable Transport Protocols in High-Speed NICs. In 17th USENIX
+80% and throughput in Filebench up to 79%, while providing                  Symposium on Networked Systems Design and Implementation (NSDI 20).
+extended DFS availability during host system failures.                      USENIX Association, Santa Clara, CA, 93–109. https://www.usenix.
+                                                                            org/conference/nsdi20/presentation/arashloo
+LineFS is available at https://github.com/casys-kaist/LineFS.          [20] Christian Bienia, Sanjeev Kumar, Jaswinder Pal Singh, and Kai Li. 2008.
+Acknowledgments. We thank the anonymous reviewers                           The PARSEC Benchmark Suite: Characterization and Architectural
+                                                                            Implications. In Proceedings of the 17th International Conference on
+and our shepherd, Manya Ghobadi, for their comments and                     Parallel Architectures and Compilation Techniques (Toronto, Ontario,
+feedback. This work is supported by an Institute of Informa-                Canada) (PACT 08). Association for Computing Machinery, New York,
+tion & communications Technology Planning & Evaluation                      NY, USA, 72–81. https://doi.org/10.1145/1454115.1454128
+
+
+
+
+                                                                 769
+[21] Robert Birke, Ioana Giurgiu, Lydia Y. Chen, Dorothea Wiesmann,                 [30] Sanjay Ghemawat, Howard Gobioff, and Shun-Tak Leung. 2003. The
+     and Ton Engbersen. 2014. Failure Analysis of Virtual and Physical                   Google File System. In Proceedings of the Nineteenth ACM Symposium
+     Machines: Patterns, Causes and Characteristics. In Proceedings of the               on Operating Systems Principles (Bolton Landing, NY, USA) (SOSP 03).
+     2014 44th Annual IEEE/IFIP International Conference on Dependable                   ACM, New York, NY, USA, 29–43. https://doi.org/10.1145/945445.
+     Systems and Networks (DSN 14). IEEE Computer Society, Washington,                   945450
+     DC, USA, 1–12. https://doi.org/10.1109/DSN.2014.18                             [31] Stewart Grant, Anil Yelam, Maxwell Bland, and Alex C. Snoeren.
+[22] Marco Spaziani Brunella, Giacomo Belocchi, Marco Bonola, Salva-                     2020. SmartNIC Performance Isolation with FairNIC: Programmable
+     tore Pontarelli, Giuseppe Siracusano, Giuseppe Bianchi, Aniello Cam-                Networking for the Cloud. In Proceedings of the Annual Conference
+     marano, Alessandro Palumbo, Luca Petrucci, and Roberto Bifulco. 2020.               of the ACM Special Interest Group on Data Communication on the
+     hXDP: Efficient Software Packet Processing on FPGA NICs. In 14th                    Applications, Technologies, Architectures, and Protocols for Computer
+     USENIX Symposium on Operating Systems Design and Implementation                     Communication (Virtual Event, USA) (SIGCOMM 20). Association
+     (OSDI 20). USENIX Association, 973–990. https://www.usenix.org/                     for Computing Machinery, New York, NY, USA, 681–693. https:
+     conference/osdi20/presentation/brunella                                             //doi.org/10.1145/3387514.3405895
+[23] Youmin Chen, Youyou Lu, and Jiwu Shu. 2019. Scalable RDMA RPC on               [32] C. Gray and D. Cheriton. 1989. Leases: An Efficient Fault-tolerant
+     Reliable Connection with Efficient Resource Sharing. In Proceedings of              Mechanism for Distributed File Cache Consistency. In Proceedings of
+     the Fourteenth EuroSys Conference 2019 (Dresden, Germany) (EuroSys                  the Twelfth ACM Symposium on Operating Systems Principles (SOSP 89).
+     19). Association for Computing Machinery, New York, NY, USA, Article                ACM, New York, NY, USA, 202–210. https://doi.org/10.1145/74850.
+     19, 14 pages. https://doi.org/10.1145/3302424.3303968                               74870
+[24] Vijay Chidambaram, Thanumalayan Sankaranarayana Pillai, Andrea C.              [33] John L. Hennessy and David A. Patterson. 2017. Computer Architecture,
+     Arpaci-Dusseau, and Remzi H. Arpaci-Dusseau. 2013. Optimistic Crash                 Sixth Edition: A Quantitative Approach (6th ed.). Morgan Kaufmann
+     Consistency. In Proceedings of the Twenty-Fourth ACM Symposium                      Publishers Inc., San Francisco, CA, USA.
+     on Operating Systems Principles (Farminton, Pennsylvania) (SOSP 13).           [34] Calin Iorgulescu, Reza Azimi, Youngjin Kwon, Sameh Elnikety, Manoj
+     Association for Computing Machinery, New York, NY, USA, 228–243.                    Syamala, Vivek Narasayya, Herodotos Herodotou, Paulo Tomita, Alex
+     https://doi.org/10.1145/2517349.2522726                                             Chen, Jack Zhang, and Junhua Wang. 2018. PerfIso: Performance
+[25] Sean Choi, Muhammad Shahbaz, Balaji Prabhakar, and Mendel Rosen-                    Isolation for Commercial Latency-Sensitive Services. In 2018 USENIX
+     blum. 2020. lambda-NIC: Interactive Serverless Compute on Pro-                      Annual Technical Conference (USENIX ATC 18). USENIX Association,
+     grammable SmartNICs. In 2020 IEEE 40th International Conference on                  Boston, MA, 519–532. https://www.usenix.org/conference/atc18/
+     Distributed Computing Systems (ICDCS 20). 67–77. https://doi.org/10.                presentation/iorgulescu
+     1109/ICDCS47774.2020.00029                                                     [35] Jie Jiang, Lixiong Zheng, Junfeng Pu, Xiong Cheng, Chongqing Zhao,
+[26] James Cipar, Greg Ganger, Kimberly Keeton, Charles B. Morrey,                       Mark R Nutter, and Jeremy D Schaub. 2016. Tencent Sort. Technical Re-
+     Craig A.N. Soules, and Alistair Veitch. 2012. LazyBase: Trading Fresh-              port. Tencent Corporation. http://sortbenchmark.org/TencentSort2016.
+     ness for Performance in a Scalable Database. In Proceedings of the 7th              pdf.
+     ACM European Conference on Computer Systems (Bern, Switzerland)                [36] Daehyeok Kim, Amirsaman Memaripour, Anirudh Badam, Yibo Zhu,
+     (EuroSys 12). Association for Computing Machinery, New York, NY,                    Hongqiang Harry Liu, Jitu Padhye, Shachar Raindel, Steven Swanson,
+     USA, 169–182. https://doi.org/10.1145/2168836.2168854                               Vyas Sekar, and Srinivasan Seshan. 2018. Hyperloop: Group-Based
+[27] Daniel Firestone, Andrew Putnam, Sambhrama Mundkur, Derek Chiou,                    NIC-Offloading to Accelerate Replicated Transactions in Multi-Tenant
+     Alireza Dabagh, Mike Andrewartha, Hari Angepat, Vivek Bhanu,                        Storage Systems. In Proceedings of the 2018 Conference of the ACM
+     Adrian Caulfield, Eric Chung, Harish Kumar Chandrappa, Somesh                       Special Interest Group on Data Communication (Budapest, Hungary)
+     Chaturmohta, Matt Humphrey, Jack Lavier, Norman Lam, Fengfen                        (SIGCOMM 18). Association for Computing Machinery, New York, NY,
+     Liu, Kalin Ovtcharov, Jitu Padhye, Gautham Popuri, Shachar Raindel,                 USA, 297–312. https://doi.org/10.1145/3230543.3230572
+     Tejas Sapre, Mark Shaw, Gabriel Silva, Madhan Sivakumar, Nisheeth              [37] Youngjin Kwon, Henrique Fingler, Tyler Hunt, Simon Peter, Emmett
+     Srivastava, Anshuman Verma, Qasim Zuhair, Deepak Bansal, Doug                       Witchel, and Thomas Anderson. 2017. Strata: A Cross Media File
+     Burger, Kushagra Vaid, David A. Maltz, and Albert Greenberg. 2018.                  System. In Proceedings of the 26th Symposium on Operating Systems
+     Azure Accelerated Networking: SmartNICs in the Public Cloud. In                     Principles (Shanghai, China) (SOSP 17). Association for Computing
+     15th USENIX Symposium on Networked Systems Design and Implemen-                     Machinery, New York, NY, USA, 460–477. https://doi.org/10.1145/
+     tation (NSDI 18). USENIX Association, Renton, WA, 51–66. https:                     3132747.3132770
+     //www.usenix.org/conference/nsdi18/presentation/firestone                      [38] Thai Le, Jonathan Stern, and Stephen Briscoe. 2017. Fast memcpy with
+[28] Daniel Ford, François Labelle, Florentina I. Popovici, Murray Stokely,              SPDK and Intel I/OAT DMA Engine. https://software.intel.com/en-
+     Van-Anh Truong, Luiz Barroso, Carrie Grimes, and Sean Quinlan. 2010.                us/articles/fast-memcpy-using-spdk-and-ioat-dma-engine
+     Availability in Globally Distributed Storage Systems. In 9th USENIX            [39] Bojie Li, Kun Tan, Layong (Larry) Luo, Yanqing Peng, Renqian Luo,
+     Symposium on Operating Systems Design and Implementation (OSDI                      Ningyi Xu, Yongqiang Xiong, Peng Cheng, and Enhong Chen. 2016.
+     10). USENIX Association, Vancouver, BC. https://www.usenix.org/                     ClickNP: Highly Flexible and High Performance Network Process-
+     conference/osdi10/availability-globally-distributed-storage-systems                 ing with Reconfigurable Hardware. In Proceedings of the 2016 ACM
+[29] Joshua Fried, Zhenyuan Ruan, Amy Ousterhout, and Adam Belay. 2020.                  SIGCOMM Conference (Florianopolis, Brazil) (SIGCOMM 16). Associ-
+     Caladan: Mitigating Interference at Microsecond Timescales. In 14th                 ation for Computing Machinery, New York, NY, USA, 1–14. https:
+     USENIX Symposium on Operating Systems Design and Implementation                     //doi.org/10.1145/2934872.2934897
+     (OSDI 20). USENIX Association, 281–297. https://www.usenix.org/                [40] Jiaxin Lin, Kiran Patel, Brent E. Stephens, Anirudh Sivaraman, and
+     conference/osdi20/presentation/fried                                                Aditya Akella. 2020. PANIC: A High-Performance Programmable NIC
+                                                                                         for Multi-tenant Networks. In 14th USENIX Symposium on Operating
+                                                                                         Systems Design and Implementation (OSDI 20). USENIX Association,
+                                                                                         243–259. https://www.usenix.org/conference/osdi20/presentation/lin
+
+
+
+
+                                                                              770
+[41] Ming Liu, Tianyi Cui, Henry Schuh, Arvind Krishnamurthy, Simon                  [52] Konstantin Shvachko, Hairong Kuang, Sanjay Radia, and Robert
+     Peter, and Karan Gupta. 2019. Offloading Distributed Applications onto               Chansler. 2010. The Hadoop Distributed File System. In 2010 IEEE 26th
+     SmartNICs Using IPipe. In Proceedings of the ACM Special Interest Group              Symposium on Mass Storage Systems and Technologies (MSST 10). 1–10.
+     on Data Communication (Beijing, China) (SIGCOMM 19). Association                     https://doi.org/10.1109/MSST.2010.5496972
+     for Computing Machinery, New York, NY, USA, 318–333. https://doi.               [53] David Sidler, Zeke Wang, Monica Chiosa, Amit Kulkarni, and Gustavo
+     org/10.1145/3341302.3342079                                                          Alonso. 2020. StRoM: Smart Remote Memory. In Proceedings of the
+[42] Ming Liu, Simon Peter, Arvind Krishnamurthy, and Phitchaya Mangpo                    Fifteenth European Conference on Computer Systems (Heraklion, Greece)
+     Phothilimthana. 2019. E3: Energy-Efficient Microservices on SmartNIC-                (EuroSys 20). Association for Computing Machinery, New York, NY,
+     Accelerated Servers. In 2019 USENIX Annual Technical Conference                      USA, Article 29, 16 pages. https://doi.org/10.1145/3342195.3387519
+     (USENIX ATC 19). USENIX Association, Renton, WA, 363–378. https:                [54] Vasily Tarasov, Erez Zadok, and Spencer Shepler. 2016. Filebench: A
+     //www.usenix.org/conference/atc19/presentation/liu-ming                              Flexible Framework for File System Benchmarking. USENIX ;login: 41,
+[43] David Lo, Liqun Cheng, Rama Govindaraju, Parthasarathy Ran-                          1 (2016).
+     ganathan, and Christos Kozyrakis. 2015. Heracles: Improving Resource            [55] Shelby Thomas, Rob McGuinness, Geoffrey M. Voelker, and George
+     Efficiency at Scale. In Proceedings of the 42nd Annual International                 Porter. 2018. Dark Packets and the End of Network Scaling. In
+     Symposium on Computer Architecture (Portland, Oregon) (ISCA 15).                     Proceedings of the 2018 Symposium on Architectures for Networking
+     Association for Computing Machinery, New York, NY, USA, 450–462.                     and Communications Systems (Ithaca, New York) (ANCS 18). Associ-
+     https://doi.org/10.1145/2749469.2749475                                              ation for Computing Machinery, New York, NY, USA, 1–14. https:
+[44] Youyou Lu, Jiwu Shu, Youmin Chen, and Tao Li. 2017. Octopus: an                      //doi.org/10.1145/3230718.3230727
+     RDMA-enabled Distributed Persistent Memory File System. In 2017                 [56] Shin-Yeh Tsai, Yizhou Shan, and Yiying Zhang. 2020. Disaggregating
+     USENIX Annual Technical Conference (USENIX ATC 17). USENIX Associ-                   Persistent Memory and Controlling Them Remotely: An Exploration
+     ation, Santa Clara, CA, 773–785. https://www.usenix.org/conference/                  of Passive Disaggregated Key-Value Stores. In 2020 USENIX Annual
+     atc17/technical-sessions/presentation/lu                                             Technical Conference (USENIX ATC 20). USENIX Association, 33–48.
+[45] Avantika Mathur, Mingming Cao, Suparna Bhattacharya, Andreas                         https://www.usenix.org/conference/atc20/presentation/tsai
+     Dilger, Alex Tomas, and Laurent Vivier. 2007. The new ext4 filesystem:          [57] Yang Wang, Manos Kapritsos, Zuocheng Ren, Prince Mahajan, Jeevitha
+     current status and future plans. In Proceedings of the Linux Symposium,              Kirubanandam, Lorenzo Alvisi, and Mike Dahlin. 2013. Robustness
+     Vol. 2. Ottawa, ON, Canada.                                                          in the Salus Scalable Block Store. In 10th USENIX Symposium on Net-
+[46] Hongyu Miao, Heejin Park, Myeongjae Jeon, Gennady Pekhimenko,                        worked Systems Design and Implementation (NSDI 13). USENIX Asso-
+     Kathryn S. McKinley, and Felix Xiaozhu Lin. 2017. StreamBox: Mod-                    ciation, Lombard, IL, 357–370. https://www.usenix.org/conference/
+     ern Stream Processing on a Multicore Machine. In 2017 USENIX An-                     nsdi13/technical-sessions/presentation/wang_yang
+     nual Technical Conference (USENIX ATC 17). USENIX Association,                  [58] Sage A. Weil, Scott A. Brandt, Ethan L. Miller, Darrell D. E. Long,
+     Santa Clara, CA, 617–629. https://www.usenix.org/conference/atc17/                   and Carlos Maltzahn. 2006. Ceph: A Scalable, High-Performance Dis-
+     technical-sessions/presentation/miao                                                 tributed File System. In 7th USENIX Symposium on Operating Systems
+[47] Jayashree Mohan, Ashlie Martinez, Soujanya Ponnapalli, Pandian Raju,                 Design and Implementation (OSDI 06). USENIX Association, Seattle,
+     and Vijay Chidambaram. 2018. Finding Crash-Consistency Bugs with                     WA. https://www.usenix.org/conference/osdi-06/ceph-scalable-high-
+     Bounded Black-Box Crash Testing. In 13th USENIX Symposium on                         performance-distributed-file-system
+     Operating Systems Design and Implementation (OSDI 18). USENIX As-               [59] Jian Xu and Steven Swanson. 2016. NOVA: A Log-structured File Sys-
+     sociation, Carlsbad, CA, 33–50. https://www.usenix.org/conference/                   tem for Hybrid Volatile/Non-volatile Main Memories. In 14th USENIX
+     osdi18/presentation/mohan                                                            Conference on File and Storage Technologies (FAST 16). USENIX Associ-
+[48] Ian Neal, Gefei Zuo, Eric Shiple, Tanvir Ahmed Khan, Youngjin Kwon,                  ation, Santa Clara, CA, 323–338. https://www.usenix.org/conference/
+     Simon Peter, and Baris Kasikci. 2021. Rethinking File Mapping for                    fast16/technical-sessions/presentation/xu
+     Persistent Memory. In 19th USENIX Conference on File and Storage                [60] Jian Yang, Joseph Izraelevitz, and Steven Swanson. 2019. Orion: A
+     Technologies (FAST 21). USENIX Association, 97–111. https://www.                     Distributed File System for Non-Volatile Main Memory and RDMA-
+     usenix.org/conference/fast21/presentation/neal                                       Capable Networks. In 17th USENIX Conference on File and Storage
+[49] Amy Ousterhout, Joshua Fried, Jonathan Behrens, Adam Belay, and                      Technologies (FAST 19). USENIX Association, Boston, MA, 221–234.
+     Hari Balakrishnan. 2019. Shenango: Achieving High CPU Efficiency                     https://www.usenix.org/conference/fast19/presentation/yang
+     for Latency-sensitive Datacenter Workloads. In 16th USENIX Sym-                 [61] Jian Yang, Joseph Izraelevitz, and Steven Swanson. 2020. FileMR:
+     posium on Networked Systems Design and Implementation (NSDI 19).                     Rethinking RDMA Networking for Scalable Persistent Memory. In 17th
+     USENIX Association, Boston, MA, 361–378. https://www.usenix.org/                     USENIX Symposium on Networked Systems Design and Implementation
+     conference/nsdi19/presentation/ousterhout                                            (NSDI 20). USENIX Association, Santa Clara, CA, 111–125. https:
+[50] Phitchaya Mangpo Phothilimthana, Ming Liu, Antoine Kaufmann, Si-                     //www.usenix.org/conference/nsdi20/presentation/yang
+     mon Peter, Rastislav Bodik, and Thomas Anderson. 2018. Floem: A
+     Programming System for NIC-Accelerated Network Applications. In
+     13th USENIX Symposium on Operating Systems Design and Implemen-
+     tation (OSDI 18). USENIX Association, Carlsbad, CA, 663–679. https:
+     //www.usenix.org/conference/osdi18/presentation/phothilimthana
+[51] Robbert Van Renesse and Fred B. Schneider. 2004. Chain Replication
+     for Supporting High Throughput and Availability. In 6th Symposium on
+     Operating Systems Design & Implementation (OSDI 04). USENIX Asso-
+     ciation, San Francisco, CA. https://www.usenix.org/conference/osdi-
+     04/chain-replication-supporting-high-throughput-and-availability
+
+
+
+
+                                                                               771
+

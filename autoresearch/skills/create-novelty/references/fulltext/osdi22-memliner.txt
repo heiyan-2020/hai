@@ -1,0 +1,1334 @@
+MemLiner: Lining up Tracing and Application
+   for a Far-Memory-Friendly Runtime
+Chenxi Wang, Haoran Ma, Shi Liu, Yifan Qiao, Jonathan Eyolfson, and Christian
+   Navasca, UCLA; Shan Lu, University of Chicago; Guoqing Harry Xu, UCLA
+
+            https://www.usenix.org/conference/osdi22/presentation/wang
+
+
+
+
+        This paper is included in the Proceedings of the
+        16th USENIX Symposium on Operating Systems
+                 Design and Implementation.
+                     July 11–13, 2022 • Carlsbad, CA, USA
+                                978-1-939133-28-1
+
+                                          Open access to the Proceedings of the
+                                          16th USENIX Symposium on Operating
+                                           Systems Design and Implementation
+                                                    is sponsored by
+                             MemLiner: Lining up Tracing and Application for
+                                   a Far-Memory-Friendly Runtime
+
+Chenxi Wang†♣                Haoran Ma†♣      Shi Liu† Yifan Qiao† Jonathan Eyolfson† Christian Navasca†
+                                             Shan Lu‡       Guoqing Harry Xu†
+                             University of California, Los Angeles†    University of Chicago‡
+
+
+
+                             Abstract                                  Most of these far-memory systems [30, 10, 63, 48, 68]
+                                                                    build on a cache-and-swap mechanism: the application’s host
+Far-memory techniques that enable applications to use re-
+                                                                    server uses local memory as a data cache. Once a page that
+mote memory are increasingly appealing in modern data cen-
+                                                                    does not reside in the local memory is accessed, a page fault
+ters, supporting applications’ large memory footprint and im-
+                                                                    is triggered and the page is fetched from a remote server
+proving machines’ resource utilization. Unfortunately, most
+                                                                    into the local memory. Good locality and effective remote-
+far-memory techniques focus on OS-level optimizations and
+                                                                    memory prefetching [50, 48] are crucial to the performance
+are agnostic to managed runtimes and garbage collections
+                                                                    of applications running in such far-memory systems.
+(GC) underneath applications written in high-level languages.
+With different object-access patterns from applications, GC            Unfortunately, the interference from garbage collection
+can severely interfere with existing far-memory techniques,         (GC) severely degrades the memory-access locality and
+breaking remote memory prefetching algorithms and causing           remote-memory prefetching for applications written in high-
+severe local-memory misses.                                         level languages (e.g., Java, Go, and Python), which are domi-
+   We developed MemLiner, a runtime technique that im-              nant in datacenter workloads. At run time, application threads
+proves the performance of far-memory systems by “lining up”         access heap objects following their program-execution paths,
+memory accesses from the application and the GC so that they        while GC threads concurrently scan the heap, performing
+follow similar memory access paths, thereby (1) reducing the        graph traversal from a set of “roots” (i.e., objects referenced
+local-memory working set and (2) improving remote-memory            by stack and global variables) to mark live objects. Object
+prefetching through simplified memory access patterns. We           accesses by these two sets of threads are uncoordinated, cre-
+implemented MemLiner in two widely-used GCs in Open-                ating two disjoint working sets, as illustrated by Figure 1(a),
+JDK: G1 and Shenandoah. Our evaluation with a range of              and causing severe performance problems.
+widely-deployed cloud systems shows MemLiner improves               Problem 1: Resource Competition. Pages swapped in for
+applications’ end-to-end performance by up to 2.5×.                 GC’s heap traversal are often not used (in near future) and
+                                                                    hence evicted by the application; conversely, pages swapped
+1    Introduction                                                   in for the application are often not needed (in near future) and
+                                                                    evicted by GC. Evicting each other’s pages, the application
+Datacenters are becoming increasingly memory con-                   and GC both suffer from severe local-memory misses and
+strained [65, 45, 40] with the ubiquitous deployment of             further compete for RDMA bandwidth for page swapping.
+in-memory data analytics and ML systems like Neo4j [52],            The more concurrent activities a GC runs , the more the re-
+Cassandra [12], Spark [74] and TensorFlow [5], which hold           source competition between GC and the application—our
+large amounts of intermediate data in memory for quick pro-         results show that running Spark with the Shenandoah con-
+cessing. To tackle this constraint, far-memory techniques           current GC [25] on the 25% memory configuration incurs
+[30, 10, 63, 58, 26] that enable applications to use remote         a 12× slowdown to the end-to-end performance, which is
+memory are increasingly appealing, backed by advances in            5× larger than the default G1 GC that reclaims memory in
+hardware and networking techniques [13, 62, 66, 23, 19, 28,         stop-the-world pauses.
+35, 49, 55, 59, 32, 8, 16, 38, 41, 33, 63, 43, 57, 37, 42, 60, 7]
+that allow remote memory to offer much lower latency and            Problem 2: Ineffective Prefetching. Monitoring the execu-
+higher bandwidth than local block devices.                          tion of a managed program, an OS-level prefetcher such as
+                                                                    [48] cannot recognize clear memory-access patterns and has
+    ♣ Contributed equally.                                          to give up prefetching. The reason is that, even if the appli-
+
+
+
+USENIX Association                             16th USENIX Symposium on Operating Systems Design and Implementation             35
+                    GC Working Set
+                                                                              by the application at some point during the execution; the
+GC Tracing Thread                                                             objects accessed by the application must be live objects at the
+                                                                              moment of the access and hence the target of GC.
+                                                                                 Second, although changing object-access order in applica-
+     App Thread                           App Thread                          tion threads would break the application semantics, changing
+                                                                              that order in GC would not. Specifically, GC threads aim to
+                    App Working Set
+                                                       Aligned
+                                                       Working Set
+                                                                              trace and mark all reachable objects in the heap, while the
+                                                                              order of that tracing and marking (e.g., which objects are
+                    (a) Current runtime                (b) MemLiner runtime
+                                                                              traced first) does not matter.
+                                                                                 Guided by these observations, the key idea behind Mem-
+Figure 1: Our main idea: the working sets of GC threads, in
+                                                                              Liner is working set alignment. MemLiner carefully reorders
+blue, and application threads, in red, during a time window
+                                                                              the objects traced by the GC threads, so that they follow a
+(a) without or (b) with the access alignment from MemLiner.
+                                                                              similar, although not identical, memory-access path of the
+                                                                              concurrent application threads (illustrated by Figure 1(b)).
+cation’s memory accesses follow a simple sequential pattern,
+                                                                              Consequently, their working sets can better overlap with each
+the combined accesses from both the application and the GC
+                                                                              other; the resource competition can be much alleviated, with
+often appear random from the OS’ perspective.
+                                                                              much reduced page faults and on-demand swaps; the appli-
+State of the Art. In the past, supporting applications that have              cation’s access patterns can be more easily recognized by
+large memory footprints (e.g., larger than the main memory                    the underlying prefetcher such as Leap [48]. All of these
+size) is not the priority of traditional GC. Although there                   are achieved in a way that is compatible with existing GC
+exists a body of work (such as Platinum [70]) on concurrent                   algorithms, without offloading the GC to another machine or
+GC, such work focuses primarily on improving throughput                       re-desgining the prefetcher.
+and reducing latency on memory-abundant servers. However,                        MemLiner must overcome several challenges.
+remote memory is designed to enable applications to use
+                                                                                 First, how to align GC threads with application threads.
+more memory than what their hosts can offer; as a result,
+                                                                              In a conventional setting, GC traces objects using a graph
+developing new GC techniques to support these applications
+                                                                              traversal starting at the root objects. To align GC’s accesses
+becomes a crucial task.
+                                                                              with application threads’, MemLiner uses a priority-based
+   Recent work Semeru [68] supports running Java programs                     algorithm—MemLiner makes application threads inform the
+on disaggregated hardware by disaggregating the traditional                   GC of the objects they are accessing; these objects, which
+JVM into two new ones, with the CPU-JVM executing the                         must be live and reachable in the object graph at that moment,
+program on the CPU server and the memory-JVM perform-                         are then immediately traced and marked by the GC, without
+ing GC on the memory server. The idea of offloading GC                        any risk of triggering page faults and expensive remote swaps.
+completely to a remote server works for Semeru where all                      To enable such communication, MemLiner leverages the read-
+the application’s memory data is located in a remote server,                  write barrier—a piece of code executed by the runtime at
+but does not suit today’s datacenters where resources are not                 each heap read/write in the application—to inform GC of
+entirely disaggregated and applications use remote memory                     the objects on the application’s access path. Details of the
+only if their local memory runs out. Furthermore, this of-                    coordination are discussed in §4.1.
+floading approach imposes extra communication overhead
+                                                                                 Second, when to break the alignment so that GC can finish
+for CPU-JVM and memory-JVM to coordinate, and extra
+                                                                              its work without unnecessary delays. Completely aligning
+computation cost on the remote memory server to run the
+                                                                              GC threads with application threads could severely delay GC
+memory-JVM, which may impose deployment challenges.
+                                                                              from reclaiming dead heap space, as application threads may
+   Another recent work AIFM [58] proposes a novel runtime                     take a long time, sometimes even the whole execution, to
+to improve the prefetching and swap performance of appli-                     access every live object. In fact, a complete alignment is
+cations running in remote-memory systems. AIFM targets                        unnecessary, as application threads may repeatedly access
+applications written in native languages (C/C++), and hence                   the same object in a short time window due to application
+cannot easily be applied to solve the GC interference problem                 semantics, like during a loop, while GC only needs to mark
+in the managed language runtime.                                              that object live once. Consequently, MemLiner allows GC
+MemLiner. This paper presents a fully-automated runtime                       to break from the alignment to work on another part of the
+technique, MemLiner, for programs written in high-level                       heap traversal from time to time. To minimize the inter-
+languages (HLLs) to efficiently use remote memory.                            ference, MemLiner prioritizes two types of objects in GC’s
+   The design of MemLiner is based on two key observations.                   unaligned accesses: (1) objects that will likely be accessed
+   First, the objects accessed by the application and the GC                  by the application soon; (2) objects that were accessed by the
+are not completely unrelated—they are just not temporally                     application not long ago and hence are likely still inside the
+aligned. The live objects traced by the GC are mostly accessed                local memory. The former is predicted based on what objects
+
+
+
+36    16th USENIX Symposium on Operating Systems Design and Implementation                                             USENIX Association
+the application just accessed; the latter is predicted based       be 1/4 of the number of cores. Concurrent tracing often uses
+on object-access history that MemLiner efficiently encodes         a snapshot-at-the-beginning (SATB) algorithm [73]—tracing
+inside the per-object pointer. Details can be found in §4.2.       traverses the heap graph from a logical snapshot of the heap;
+Results. We have integrated MemLiner into two widely used          it will not miss any live object as long as object allocation and
+GCs (G1 and Shenandoah) in OpenJDK 12. A thorough                  pointer updates made by the application since the snapshot
+evaluation with Spark, Cassandra, Neo4J, QuickCached and           are recorded and considered conservatively. G1 runs stop-the-
+DayTrade demonstrates that MemLiner improves the end-to-           world phases to reclaim memory by evacuating live objects
+end execution time by an overall of 1.48× and 1.51× under          into new regions while Shenandoah and ZGC run evacuation
+the 25% and 13% local memory configurations for the G1             also concurrently to minimize the pause time.
+GC, and 2.16× and 1.80× for the Shenandoah GC (which               Tracing Algorithm. Logically, tracing divides objects into
+runs concurrent GC threads more frequently than G1). Fur-          three colors: white, black, and gray. The white set is the set
+thermore, MemLiner improves Leap’s prefetching coverage            of objects that are candidates for reclamation. The black set
+and accuracy by 1.5× and 1.7×, respectively. Compared to           is the set of objects that can be shown to have no references
+Semeru [68], MemLiner achieves a comparable performance            going to objects in the white set, and to be reachable from
+without offloading any computation on remote servers.              the roots. Objects in the black set are not candidates for
+Key Takeway. Although there are several directions of work         reclamation. The gray set contains all objects reachable from
+on remote memory (e.g., clean-slate approaches such as             the roots but yet to be scanned.
+AIFM [58] and Kona [17], swap optimizations such as Infin-            Initially, all objects are white. Tracing implements a graph
+iSwap [30] and FastSwap [10], as well as distributed runtimes      traversal algorithm that gradually changes the color of ob-
+such as Semeru [68]), MemLiner takes an easy-to-adopt, non-        jects reachable from the roots from white to black. For each
+intrusive approach that enables performance improvements           reachable object o, tracing marks it black, retrieves all ob-
+for a wide variety of new and legacy applications. Mem-            jects referenced directly by o, and adds them into the gray set.
+Liner is orthogonal to (and complements) these existing tech-      Each iteration retrieves an object from the gray set, marks it
+niques—aligning the memory accesses between application            black, and adds more objects into the gray set. The algorithm
+and GC threads reduces thread-level interference and the           repeats until the gray set becomes empty; objects that remain
+application’s local-memory working set regardless of the un-       white can be safely reclaimed. In practice, a modern runtime
+derlying remote-access mechanisms and optimizations.               uses a bitmap to mark live objects efficiently.
+
+2   Background                                                     3   Motivation
+GC. A major benefit of high-level languages over native            In this section, we use an experiment to quantitatively demon-
+languages is their support for automated memory manage-            strate (1) how tracing and application threads interfere with
+ment—developers are released from the burden of deallo-            each other, and (2) why simply disabling concurrent tracing
+cating objects, leading to improved reliability and security.      cannot solve the problem.
+Automated memory management is enabled by garbage col-             Setup. We ran Spark Logistic Regression (LR) with the
+lection (GC), which runs when the heap has little free space.      Wikipedia dataset on OpenJDK 12 and its default G1 GC.
+The key idea of GC is simple [36]: perform a reachability          We used two machines, each with 2 Xeon(R) CPU E5-2640
+analysis to identify a transitive closure of live objects and      v3 processors, 128GB memory, 1024GB SSD, and CentOS
+reclaim objects outside the closure. Consequently, a modern        7.5, connected by RDMA over a 40Gbps InfiniBand network.
+GC algorithm has two main components: (1) tracing the heap         One machine runs Spark, using local memory and remote
+graph to compute that closure and identify live objects, and       memory on the other machine. We configured the first ma-
+(2) reclamation of dead objects, while evacuating live objects     chine to have just enough memory to host 25% of Spark’s
+to contiguous space and updating pointers.                         working set. We name the first server providing compute re-
+                                                                   source as host server and the second server providing remote
+Concurrent Tracing. To ensure the correctness of pointer
+                                                                   memory as remote server.
+updating, a conservative way of running GC is to pause all
+application threads (i.e., a stop-the-world phase) for full-heap      We compare the execution of Spark LR in two modes:
+tracing and reclamation, which incurs significant delays [53,         (1) The G1 GC’s concurrent tracing is disabled;
+47]. To address this performance limitation, starting from            (2) The G1 GC’s concurrent tracing is enabled—the default
+the G1 GC [22], which is the default GC in Oracle’s JVM,           option in G1 GC. The number of tracing threads is set to be a
+all modern garbage collectors, including Shenandoah [25]           quarter of the number of available cores, as suggested by G1.
+from Red Hat and ZGC [2] from Oracle, run the tracing phase           In both cases, the heap size of Spark LR is set to 32GB and
+concurrently with application threads to (1) leverage the many     the host server can hold up to 8GB of its heap. The execution
+available cores and (2) minimize GC pauses. For example, in        goes through application-execution phases and stop-the-world
+G1, the number of tracing threads is configured, by default, to    GC phases alternatively.
+
+
+
+USENIX Association                             16th USENIX Symposium on Operating Systems Design and Implementation             37
+                                                                                                                                                                        100%
+
+
+
+
+                                                                                                                                                   Faulty Page Source
+                     30000                                                            30000
+                                                                                                                                                                        80%                                   39%
+                                                                                                                                                                                                 65%
+ Faulty Page Index
+
+
+
+
+                                                                  Faulty Page Index
+                     27000                                                            25000                                                                             60%
+                                                                                      20000
+                     24000                                                                                                                                              40%
+                                                                                      15000
+                     21000                                                                                                                                                                                    61%
+                                                                                      10000                                                                             20%
+                     18000                                                                                                                                                                       35%
+                                                                                      5000
+                     15000                                                               0                                                                               0%
+                             0   64 128 192 256 320 384 448 512                               0   64 128 192 256 320 384 448 512                                                              CT Disabled CT Enabled
+                                   Page Fault Sequence                                              Page Fault Sequence                                                  on-demand                      prefetched
+                      (a) Page fault trace of Spark LR.            (b) Page fault trace of Spark LR with CT.                                                   (c) Prefetching effectiveness.
+Figure 2: Prefetching effectiveness for Spark LR executed atop OpenJDK 12 (with its default G1 GC): (a) trace of faulty page
+index for application threads only; (b) trace of faulty page index when concurrent tracing (CT) is enabled; (c) disabling CT
+significantly improves the effectiveness of Linux’ default swap prefetcher.
+
+
+How much interference from concurrent tracing? To have                                                   the average number of page faults encountered by application
+an intuitive look at how well prefetching may or may not work,                                           threads. The page-fault rate jumps from 3.5K per second
+we randomly sampled 512 consecutive page faults in the                                                   per thread to 9.6K per second per thread, when concurrent
+middle of Spark LR’s execution under both execution modes.                                               tracing is enabled, indicating a huge interference.
+Note that, since we collected page-fault information from
+                                                                                                                              550                                                             160
+inside the kernel and the execution under the two GC modes
+                                                                                                                              500                                                             140
+                                                                                                           Elapsed Time (s)
+
+
+
+
+                                                                                                                                                                           Elapsed Time (s)
+proceeds at vastly different paces, we cannot guarantee that
+                                                                                                                              450                                                             120
+the two samples come from the same window of application
+                                                                                                                                                                                              100
+instructions, but we do make sure that the stop-the-world GCs                                                                 400
+                                                                                                                                                                                               80
+did not occur during our samples.                                                                                             350                                                              60
+   Figure 2 (a) and (b) illustrate the virtual page index of the                                                              300                                                              40
+faulty addresses (Y-axis) ordered by when each fault occurs,
+                                                                                                                              250                                                              20
+with the sequence number shown in the X-axis. Without con-
+current tracing, each of the application threads has a clear                                                                  CT Disabled   CT Enabled                                        CT Disabled   CT Enabled
+streaming access pattern, as shown in Figure 2(a), which
+                                                                                                          (a) End-to-end execution time.                                                      (b) GC pause time.
+should be detected by an advanced prefetcher. This clear
+pattern is messed up by concurrent tracing, as shown in Fig-                                             Figure 3: Concurrent tracing improves overall performance.
+ure 2(b), making prefetching much harder.                                                                (Data is from 10 runs of each program; dots are outliers.)
+   To quantitatively measure the impact of concurrent tracing
+on prefetching, we checked 500 application-execution phases                                              Why not just disable concurrent tracing? Having seen sig-
+(i.e., the period between two stop-the-world GCs) to under-                                              nificant interference from concurrent tracing, a strawman so-
+stand, among all the page faults, how many were resolved                                                 lution is to simply disable concurrent tracing for applications
+through on-demand swaps from remote memory and how                                                       running in far-memory systems.
+many were resolved using data already brought in through                                                    Unfortunately, this strawman solution does not work.
+prefetching. Clearly, this ratio of on-demand swapping versus                                            First, modern concurrent GCs such as Shenandoah [25] and
+prefetching directly affects the application performance.                                                ZGC [2], which are designed for low-pause and used widely
+   As shown in Figure 2(c), without concurrent tracing,                                                  by latency-sensitive cloud applications, rely on concurrent
+prefetching is effective, addressing 65% of the page faults.                                             tracing to reclaim memory (also concurrently). Disabling
+Unfortunately, with concurrent tracing, this ratio greatly                                               concurrent tracing would destroy the functionality of such
+dropped to only 39%, with the remaining 61% of page faults                                               collectors. Second, even for GCs such as G1 that could
+leading to costly remote-memory accesses. Note that our ex-                                              perform tracing in a stop-the-world phase, the end-to-end
+periments use Linux’s default swap prefetcher. If an advanced                                            execution time suffers significantly without concurrent trac-
+prefetcher such as Leap [48] is used, the prefetch-ratio would                                           ing. As shown in Figure 3(a), the execution time increases
+be even higher without concurrent tracing and hence suffer                                               by 18% on average in 10 runs. The main reason is that the
+even more from the interference (see §7).                                                                aggregated stop-the-world GC periods now take 2.7× longer
+   Finally, to understand how much the interference has af-                                              without concurrent tracing, as shown in Figure 3(b). Without
+fected the working set of the execution, we also measured                                                concurrent tracing, each (fast young-generation) GC cannot
+
+
+
+38                   16th USENIX Symposium on Operating Systems Design and Implementation                                                                                                        USENIX Association
+reclaim as many dead objects in the same amount of time and      4.1     Application and GC Coordination
+has to resort to slow, full-heap GC that scans and compacts
+                                                                 To align memory accesses, application threads inform GC’s
+the whole heap space in a stop-the-world period, which is
+                                                                 tracing threads of the objects they are accessing so that tracing
+extremely time consuming. For example, the longest full-
+                                                                 threads can trace these objects immediately.
+heap GC (i.e., a single pause) in Spark LR takes 76.9 seconds,
+                                                                    To facilitate such communication, we need to instrument
+clearly an intolerable delay.
+                                                                 every heap read/write instruction so that the application can
+Key Takeway. Memory accesses from application and GC             send an object pointer to GC when it dereferences the pointer:
+threads exhibit diverse patterns, significantly increasing the   (1) At a statement that reads an object field or an array element
+application’s working set and making prefetching harder. Sim-    of the form a = b.f or a = b[i], our instrumentation pushes
+ply disabling concurrent tracing in GC would not work, as it     the corresponding address in b into a thread-local producer-
+reduces the number of local-memory misses at a cost of sig-      consumer queue (PQ), which will be read by GC during
+nificantly increased GC pause and end-to-end execution time.     tracing. (2) At a statement that writes an object field or an
+MemLiner offers a solution that can greatly reduce the num-      array element of the form b.f = a or b[i] = a, we similarly
+ber of local-memory misses and increase the effectiveness of     push the object reference in b into the PQ.
+existing prefetchers without introducing extra GC-pause time,       MemLiner implements this instrumentation through exist-
+and hence effectively reduce the end-to-end execution time.      ing read/write barriers—a piece of code that is executed by
+                                                                 modern runtimes at each heap read/write operation to record
+4   MemLiner Design and Implementation                           heap information for GC purposes. MemLiner piggybacks on
+                                                                 the existing implementation of read/write barrier in OpenJDK
+This section presents the design and implementation of Mem-      12 that intercepts both interpreted and compiled code. A PQ is
+Liner, particularly how we realize the two key ideas: (1)        created for each application (producer) thread so that no syn-
+making GC concurrently trace objects immediately after their     chronization is needed for enqueuing pointers. A GC tracing
+access by application threads (§4.1) and (2) making GC trace     (consumer) thread constantly checks PQs to retrieve pointers
+other live objects through a novel priority-based algorithm      for tracing. Consumer threads use atomic instructions when
+(§4.2) to reduce interference.                                   dequeuing object pointers. In practice, the number of applica-
+   MemLiner modifies the garbage collector inside the run-       tion threads is often larger than the number of tracing threads;
+time and the swapping system inside the kernel, while requir-    hence, there is little contention when PQs are accessed by
+ing no changes to applications. In terms of runtime changes,     multiple threads.
+MemLiner is a general mechanism that can be integrated into         To minimize the maintenance overhead, we represent each
+any modern runtime that performs concurrent tracing. This pa-    PQ as a non-blocking ring buffer. Producers and consumers
+per focuses on a design for Oracle’s OpenJDK, a commercial       do not synchronize at all—an application thread keeps writing
+JVM that supports a variety of high-level languages such as      into the queue even if it is full. As such, the application
+Java, Scala, Python, Ruby, etc. In terms of kernel changes, we   thread may overwrite entries that have not yet been picked
+build MemLiner atop paging/swap mechanisms that already          up by GC. Note that this would not cause any correctness
+exist in the OS kernel, with minimal invasion. Any swap          issues because those entries only indicate tracing priority:
+optimizations such as InfiniSwap [30] and FastSwap [10]          overwriting an entry will delay the corresponding object’s
+can be readily used to improve the swap performance for a        tracing, but the tracing of these objects will eventually happen
+MemLiner-equipped runtime. MemLiner’s runtime design is          in GC’s regular graph traversal, which will be discussed in
+independent of how remote memory is accessed; for example,       the next sub-section.
+MemLiner could also run on a clean-slate platform such as           Note that our instrumentation code at different program
+Kona [17] that access remote memory based on cache coher-        points is unlikely to enqueue the same object reference multi-
+ence, not page faults, if coherence is provided by hardware.     ple times (e.g., neighboring reads to the same data structure).
+   When a MemLiner-equipped JVM is launched, the maxi-           This is because marking an object live sets a bit in a global
+mum heap size M is specified by the user via a command-line      live bitmap. Before pushing each object reference into the
+option. A small amount of physical memory on the local ma-       queue, an application thread checks its bit from the bitmap
+chine is initially used to back up the heap (which is much       and filters it out if the bit is already set.
+smaller than M ). The heap stays entirely in local memory        4.2     MemLiner Tracing Algorithm
+until its usage exceeds the size of local memory, in which
+case, the OS kernel allocates remote memory by registering       4.2.1    Design Overview
+it as an RDMA buffer. The kernel uses an approximate LRU         A major challenge in aligning tracing and application threads
+algorithm to evict pages. MemLiner does not require any          is that GC has to compute a full closure of live objects to
+software/hardware support on remote servers, providing a         reclaim memory. Hence, it is unproductive to trace a live
+practical solution that can be readily used in today’s cloud.    object only right after it is accessed by the application, which
+
+
+
+USENIX Association                           16th USENIX Symposium on Operating Systems Design and Implementation             39
+will delay the closure computing, leading to inefficiencies in                                             Roots
+                                                                                                                       (1) In local memory
+memory reclamation.                                                                                …
+                                                                                                                        (GC should touch)
+   The key question here is: how can GC make quick progress                                                         In PC queue      Not in PC queue
+in closure computation without producing a working set that
+                                                                                                                       (2) In remote memory
+significantly departs from that of the application? On the                       Live
+                                                                                                                     used by applications soon
+one hand, after processing all objects in the PQ, we want GC                     Objects
+                                                                                                                         (GC should touch)
+to trace as many other live objects as possible, even if not
+in the PQ, to complete the closure. On the other hand, GC                                                              (3) In remote memory
+                                                                                                                   not used by applications soon
+should better not trace many objects that do not reside in local                                                          (GC should wait)
+                                                                                                       …
+memory because tracing those objects triggers page faults and
+swaps. How to reconcile these seemingly conflicting goals is
+a problem MemLiner must solve.
+                                                                                 Figure 4: Classification of reachable objects in the heap: red
+Reachable Object Classification. To better explain our trac-                     objects are being accessed by the application and shaded
+ing algorithm, we first classify all live objects at any moment                  objects are what MemLiner intends to trace.
+of the execution into three categories based on their location
+and when they are accessed by the application, as illustrated                    the read/write barrier, sent to GC via the PQ, and traced by
+in Figure 41 :                                                                   GC immediately.
+                                                                                    With the red objects in hand, the wavy objects in Category
+   (1) Objects in local memory (i.e., data cache): These ob-
+                                                                                 (2) are just a few references away. To mark these objects, we
+jects have recently been accessed by the application and have
+                                                                                 let GC trace a small number of references forward from the
+not been evicted yet. Clearly, tracing them at this moment
+                                                                                 red objects, which were retrieved from the PQs. As discussed
+(or in the near future) would not generate any page faults or
+                                                                                 above, tracing such an object will likely trigger swapping,
+interfere with the application. Many of these object (i.e., the
+                                                                                 prepaying the cost for the application to access the object
+red ones in the figure) are made known to the GC through the
+                                                                                 soon later. Note that tracing too many references forward
+PQ discussed in §4.1. However, since the PQ is designed to
+                                                                                 will not be useful, as that may bring in objects not used by
+be a ring buffer, some of these objects (i.e., the striped ones
+                                                                                 the application in the near future. In our implementation, we
+in the figure) may be missed by GC due to being overwritten
+                                                                                 limit the number of hops to 3, which is often large enough to
+in the ring buffer. How to trace them sooner rather than later
+                                                                                 cover objects in the same logical data structure [72].
+requires extra handling that we will discuss later.
+                                                                                    After red objects and wavy objects, the remaining live
+   (2) Objects in remote memory and to be used soon: Since                       objects to trace are those in Category (3) and the striped
+these objects (i.e., the wavy nodes in Figure 4) will soon be                    objects in Category (1). There are two challenges here. First,
+accessed by the application, they are typically just a few refer-                there are no easy ways to reach them from the red objects.
+ences away from the objects being accessed by the application.                   Second, to reduce memory interference, it is better to trace the
+Tracing them is also desirable—although they are currently                       striped Category (1) objects before the Category (3) objects,
+not local, they will soon be needed by the application. If                       as discussed above.
+GC triggers page faults when accessing them, the costs of                           To tackle these challenges, MemLiner makes every concur-
+handling these faults and swapping would be necessary as                         rent tracing thread alternate between two modes:
+they are “prepaid” by GC for the application.
+                                                                                    (1) When the PQ is not empty, trace objects in the PQ (i.e.,
+   (3) Objects in remote memory and not used soon: These                         red) and objects a few references forward (i.e., wavy);
+are illustrated as clear-circle objects in the figure. They were                    (2) When the PQ is empty, perform normal object-graph
+used by the application a while ago and got evicted to remote                    traversal that starts from root objects like traditional GC.
+memory. Tracing them is needed eventually but is undesirable                        Different from a traditional GC, MemLiner modifies the
+now or in the near future, as tracing them pays the high cost of                 traversal algorithm to consider whether an object o to be
+fault handling and swapping (which is entirely wasted if they                    traced is likely in local memory (i.e., whether o is a striped
+are not used by the application before their next eviction).                     Category (1) object or a Category (3) object)—if o is esti-
+Handling Different Categories in GC. MemLiner’s central                          mated to reside in local memory (i.e., a striped Category (1)
+design goal is to let GC trace objects in Category (1) and                       object), it is traced right away in GC; if not (i.e., Category
+(2) right away to maximize progress and delay tracing ob-                        (3)), MemLiner postpones processing o in its graph traversal
+jects in Category (3) to avoid unnecessary page faults and                       until a later time, optimistically hoping that o will be used
+interference. Among the different categories of objects, our                     by the application before it is encountered again in GC. Af-
+starting point is the set of red objects, which are captured by                  ter postponing a number of times (referred to as MAX _DL
+                                                                                 below) , GC processes o even if it is still estimated to be
+     1 For ease of discussion, here we do not consider cold objects staying in   remote, so that the closure computation will not be signifi-
+cache due to hot objects on the same page. We will discuss it in Section 4.3.    cantly delayed. MemLiner dynamically adjusts the value of
+
+
+
+40     16th USENIX Symposium on Operating Systems Design and Implementation                                                 USENIX Association
+                     ts (4 GC(4    Object Address (42 bits,           Algorithm 1: Allocation semantics.
+   Unused(14 bits)
+                     bits) bits)     4TB address space)
+                                                                       Input: Allocation site o = new C.
+        Figure 5: A 64-bit object pointer in MemLiner.                 Output: Object reference o.
+                                                                     1 addr ←A LLOCATE (S IZEOF (C))
+                                                                     2 o ←U PDATE P OINTER (addr , C URRENT E POCH ())
+M AX_DL, in response to the size of available heap space.            3 return o
+For example, when the available heap size is in the red zone
+(i.e., <15% available space), MAX _DL will be set to 0, let-
+ting GC quickly finish tracing and collect memory. Details of         Algorithm 2: Object read and write semantics in ap-
+this adaptive algorithm can be found in this section.                 plication threads.
+                                                                       Input: Object read/write access a = b.f or b.f = a.
+4.2.2   Object Location Estimation
+                                                                     1 E NQUEUE(PQ, b)
+                                                                     2 b ← U PDATE P OINTER (b, C URRENT E POCH ())
+Now, the only missing piece of MemLiner’s tracing algorithm
+                                                                     3 if I S R EFERENCE (a) then
+is a way to estimate whether an object is local or not. A naïve
+                                                                     4       b.f ← a ← U PDATE P OINTER(a, C URRENT E POCH())
+solution is to create a system call that allows GC to query the
+page table. However, this can be prohibitively expensive as it
+requires a system call per object visited during tracing.
+   To solve this problem, we conceptually divide the execu-             Upon the allocation of a new object o, MemLiner sets the
+tion into epochs and encode the current epoch ID into each           timestamp bits in o’s pointer to be the current epoch number
+object pointer whenever an object is accessed. Later on, dur-        (with function U PDATE P OINTER in Algorithm 1).
+ing concurrent tracing, this epoch ID will allow the GC to              Whenever an object is read/written in an application thread
+estimate how recently an object was accessed and hence how           like b.f = a or a = b.f (Algorithm 2), MemLiner updates the
+likely it is still in local memory.                                  timestamp ts in the dereferenced pointer b to be the current
+Epoch. Given our goal of estimating whether an object is in          epoch ID. Furthermore, if a and b.f are also object references,
+local memory, we define an epoch to be an execution period           we write an updated pointer of a into b.f , indicating that
+in which the set of pages in local memory that belongs to the        soon the object referenced by b.f will be accessed through
+JVM process are relatively stable (i.e., they do not change          a. Again, this instrumentation is implemented through read-
+much). This set changes as new pages of this JVM process             /write barriers.
+are swapped in and old pages are swapped out. When the                  Note that we use Algorithm 1 and Algorithm 2 to illus-
+change becomes significant (e.g., larger than N % of the total       trate the high-level logic. Our implementation actually inserts
+number of JVM pages), a new epoch starts. We modify the              assembly code for efficiency. Changing object pointers in
+kernel swap system to keep track of the pages in the cache and       the JVM would not cause problems for actual memory ac-
+determine the start of a new epoch. A global epoch counter is        cesses—although each pointer represents a virtual address,
+maintained in the JVM and its address is passed into the swap        the barriers we use mask pointers so that only the last 42 bits
+system. This epoch counter starts from zero and is increased         are used to access memory.
+by one whenever a new epoch starts.
+                                                                     4.2.3   MemLiner Tracing Algorithm
+Timestamp. In the JVM, virtual addresses of objects are rep-
+resented as references, which are essentially pointers with a        Algorithm 3 shows GC’s tracing logic, which was summa-
+strong type. In a 64-bit JVM, the format of an object refer-         rized in §4.2.1. The algorithm takes two queue data structures
+ence is shown in Figure 5. Recall that our need is to estimate       as input: TQ is a standard tracing queue (already used by the
+whether an object is in local memory from a reference/pointer        JVM) that contains references yet to be explored in object
+of the object (e.g., recorded in a field of another object) during   graph traversal; it is initialized with a set of object references
+GC’s graph traversal. Our idea here is to modify the pointer         in the stack and global variables (i.e., roots). PQ, as dis-
+format by reserving 4 unused bits as a timestamp (ts in Fig-         cussed earlier, is the producer-consumer queue that contains
+ure 5) that indicates the epoch in which the pointer was last        references of red objects sent to GC by application threads.
+dereferenced—once the epoch ID reaches 15, the next epoch               As discussed in §4.2.1, every tracing thread of MemLiner
+ID goes back to 0. Dereferencing the pointer accesses the            alternates between two modes. In the default mode, tracing
+target object (i.e., bringing the object to local memory if it       loops over the tracing queue TQ, shown in Line 2-13 in Algo-
+is remote). As such, if the timestamp is close to the current        rithm 3, to perform normal graph traversal. Whenever PQ is
+epoch, the object is likely in local memory (i.e., Category          not empty (Line 3), the tracing thread interrupts the normal
+(1)) and GC should follow the pointer to trace the object;           traversal and switches to the other mode to handle the (red)
+otherwise, the object may not be local (i.e., Category (3)),         objects in PQ (Line 4); this logic is listed in Algorithm 4 and
+and GC should postpone tracing it.                                   will be discussed shortly.
+
+
+
+USENIX Association                              16th USENIX Symposium on Operating Systems Design and Implementation               41
+ Algorithm 3: Main tracing logic in MemLiner’s GC.                   Algorithm 4: Tracing logic for red and Category-(2)
+  Input: (1) Producer-consumer queue PQ; (2) tracing queue           objects.
+        TQ.                                                           Input: (1) Producer-consumer queue PQ; (2) regular
+  Output: Fully marked live bitmap for all live objects.                     tracing queue TQ.
+1 Function T R A C I N G (TQ, PQ):                                  1 Function T R A C E R E D A N D C A T E G O R Y 2(TQ, PQ):
+2    while TQ 6= ∅ do                                               2    while PQ 6= ∅ do
+3         if PQ 6= ∅ then                                           3         o ← D EQUEUE(PQ)
+4             T RACE R EDA ND C ATEGORY 2(TQ, PQ)                   4         E XPLORE(o, TQ, 0)
+5          Tuple ho, dl i ← D EQUEUE(TQ)                               Input: (1) Object reference o; (2) tracing queue TQ; (3)
+6          if D IFF(TS(o), C URRENT E POCH()) > δ ∧dl <                       current exploration depth depth.
+             MAX_DL then                                             5 Function E X P L O R E (o, TQ, depth):
+ 7              E NQUEUE(TQ, ho, dl + 1i)                            6    M ARK L IVE B IT M AP(o)
+ 8              Continue                                             7    foreach Non-null reference-type field f ∈ o do
+9          if C HECK L IVE B IT M AP(o) = 0 then                     8         Object reference p ← o.f
+10              M ARK L IVE B IT M AP(o)                             9         if depth < MAX_Depth then
+11              foreach Non-null reference-type field f ∈ o do      10              E XPLORE(p, TQ, depth + 1)
+12                  Object reference p ← o.f                        11         else
+13                  E NQUEUE(TQ, hp, 0i)                            12                E NQUEUE(TQ, hp, 0i)
+
+
+
+
+   In the default mode, each iteration of the tracing loop re-      as discussed in §4.2.1, following long reference chains can
+trieves a 2-tuple ho, dl i from TQ, representing an object ref-     swap in objects that may not be needed by the application in
+erence o and a delay limit dl . MemLiner compares TS(o)             the near future, leading to wasted efforts.
+with the current epoch ID (Line 6). If these two IDs are close         Marking an object live flips its corresponding bit in a global
+to each other (D IFF(TS(o), C URRENT E POCH()) ≤ δ), Mem-           live bitmap (Line 6); as a result, the regular graph traversal
+Liner goes ahead to mark this object in the global live bitmap      (Algorithm 3) would not mark it again if it is encountered
+(Line 10) and pushes all the non-null object references stored      there. Once the tracing of the red and Category-(2) objects is
+in this object into the tracing queue TQ (Line 13). Otherwise,      done, GC resumes the normal graph traversal in Algorithm 3.
+MemLiner estimates that the object is not in the cache and             In modern GC with concurrent tracing, each tracing thread
+hence pushes this tuple back into TQ (Line 7), hoping that the      works on its own tracing queue TQ. MemLiner modifies each
+application will use this object and bring it to the cache before   tracing thread to run Algorithm 3 so that the work on TQ
+the next time it is dequeued in tracing. To avoid pushing back      is interrupted if there are outstanding red objects in a PQ.
+an object too many times, which would delay the comple-             Each application thread independently pushes red objects into
+tion of closure computation, MemLiner uses a delay limit dl ,       its thread-local PQ while each tracing thread can consume
+which is initialized to 0. Every time a tuple is pushed back,       objects from all PQs. This design makes it possible to en-
+its dl is incremented (Line 7). Once it becomes MAX_DL              able work stealing between threads to balance the number
+(i.e., the additional check at Line 6), GC is forced to mark        of red and Category-(2) objects processed by these threads.
+the object. MAX_DL is auto-tuned based on the amount of             The read/write barrier is already used in existing GC algo-
+available heap space (discussed shortly).                           rithms, such as G1, Shenandoah and ZGC, as well as other
+   The other mode of tracing red objects is triggered when          far-memory techniques such as AIFM [58]. To further reduce
+PQ is not empty, as illustrated in Algorithm 4. Similar to          MemLiner’s overhead at each read/write barrier, we only need
+the default tracing loop, each iteration of the loop (Line 2) in    to push the object reference o (64 bit) onto the queue with a
+Algorithm 4 retrieves an object reference from PQ, calling          very small number of instructions.
+a recursive function E XPLORE to not only mark red objects          Autotuning of MAX_DL. How much delay should be intro-
+themselves, but also trace a few references forward to mark         duced to tracing depends on how urgently GC must be com-
+objects in Category (2), which may be soon used by the appli-       pleted. As a result, we develop an autotuner that dynamically
+cation. We use a recursive function here to control the number      adjusts the value of MAX_DL in response to the available
+of references (i.e., data structure depth) to be explored—once      heap size. The rationale is straightforward: if the heap is
+depth exceeds a constant MAX_Depth (Line 9, 3 by default),          almost full, there is an urgent need to complete GC and hence
+the function does not further explore the object graph, but         we should use a small value for MAX_DL; on the contrary,
+instead, pushes these unexplored references into the regular        if the heap is mostly available, delaying GC will not have a
+tracing queue TQ (Line 12) so that they can be traced later         large impact on memory and hence we use a large value for
+in a normal graph traversal without priority. This is because,      MAX_DL to minimize interference.
+
+
+
+42   16th USENIX Symposium on Operating Systems Design and Implementation                                        USENIX Association
+   MemLiner uses two thresholds for heap availability: 15%          to 0—even if tracing is delayed, the delay length is set to 0,
+and 50%. When the percentage of available memory is lower           effectively allowing GC to move in a normal pace.
+than 15%, the JVM is in a red zone. If the percentage is
+between 15% and 50%, it is in a yellow zone. The JVM is
+                                                                    5    GC-Specific Optimizations
+in a green zone if the amount of available memory is higher         We have implemented MemLiner in both the JVM’s default
+than 50% of the heap size. MemLiner monitors heap usage             G1 GC [22] and Red Hat’s Shenandoah GC [25], which are
+upon allocations and uses three values for MAX_DL: 0, 2, and        two representative GCs widely used in cloud settings. G1 is
+4 respectively if the heap falls in the red, yellow, and green      a generational GC that optimizes for throughput with stop-
+zone. These thresholds were empirically chosen and worked           the-world pauses while Shenandoah is a concurrent GC that
+well for all our applications.                                      minimizes the time of each pause by concurrently tracing and
+                                                                    compacting objects. Shenandoah optimizes for latency at the
+4.3   Discussion                                                    cost of reduced throughput. Our goal is to demonstrate that
+MemLiner performs adaptation in two dimensions: (1) adapt-          MemLiner can be easily integrated into both GC algorithms,
+ing timestamps based on the swap behavior and (2) adapting          providing performance benefits for different kinds of (e.g.,
+MAX_DL based on heap availability. The swap behavior                latency-sensitive or batching) workloads.
+correlates with interference and heap availability correlates          One challenge in MemLiner is its reliance on read and
+with GC urgency. We elaborate on how (1) and (2) work in            write barriers, which, if used naïvely, can incur a significant
+harmony to make MemLiner achieve superior performance.              runtime overhead. This section discusses our optimizations to
+   For (1), MemLiner uses the timestamp mechanism to re-            mitigate the overhead. With these optimizations, MemLiner’s
+duce the interference between GC and application threads.           barrier introduces an average of 2% and 5% overheads,
+For example, if the cached pages rarely change (i.e., the ap-       respectively, to Shenandoah and G1, when the application
+plication has excellent locality or the local memory size is        runs entirely with local memory. Such low overheads are due
+large enough), the interference is minimal and hence it would       to the following reasons:
+not create performance issues if MemLiner does not deviate             First, Shenandoah already utilizes both read and write bar-
+much from an existing GC. Indeed, our algorithm makes the           riers for concurrent tracing and concurrent evacuation. Mem-
+global epoch change slowly and timestamps in most pointers          Liner only inserts few instructions into the existing barriers,
+are the same as the current epoch ID. Algorithm 3 would             incurring negligible overheads.
+trace most objects in TQ without delays. This is a desired             Second, the original G1 only uses the write barrier. Naïvely
+property—when resources are not constrained, MemLiner               adding the read barrier into G1 can cause a much higher
+would not incur overhead because GC can trace objects and           overhead. We develop the following three optimizations that
+reclaim memory in a timely fashion.                                 successfully filter out a significant fraction of object accesses:
+   Conversely, if the set of cached pages frequently changes        Optimization #1: The enqueue operation of MemLiner’s bar-
+(i.e., the application has poor locality or the cache size is       riers is enabled only when concurrent tracing is in progress.
+small), the interference is significant and MemLiner should         When concurrent tracing is not running, it is unnecessary to
+perform differently from an existing GC. Indeed, the global         add any objects into the PQ.
+epoch moves at a fast speed. As such, the timestamps in most        Optimization #2: G1 is a generational GC that splits the
+pointers are different from the current epoch ID. In other          heap into a young and an old generation. Concurrent tracing
+words, most objects in the heap are Category-(3) objects            scans only old-to-old references (to compute garbage ratio
+that are not in local memory. Consequently, Algorithm 3             for each region in the old-gen), meaning that references in the
+would delay the marking of most objects and thus make slow          young generation are not traced in concurrent tracing at all.
+progress. This is also a desired property—tracing should            Based on this insight, our read barrier filters out all references
+“yield” to the application when local memory resource is            in the young generation—there is no need to update their
+tight and application threads are constantly accessing remote       timestamps or add them in PQ because these references are
+memory. In this case, MemLiner imposes a delay to GC, and           not traced in G1’s concurrent tracing anyways.
+the delay is bounded by MAX_DL.                                     Optimization #3: Our read barrier does not need to update
+   For (2), we use heap availability to dynamically adjust          timestamps for objects whose pointer timestamp is the same
+MAX_DL, enabling MemLiner to “override” the policy made             as the epoch ID. Essentially, we use a check that first com-
+under (1) in urgent situations. For example, if the application     pares the pointer timestamp with the epoch ID and updates
+is experiencing frequent changes in cached pages (indicating        the timestamp only if they do not have the same value. The
+interference) while the heap is almost full, the policy under (1)   larger the local memory percentage is, the less frequently the
+would delay tracing, which can, in turn, delay the completion       epoch changes and hence more objects can benefit from this
+of GC and subsequently trigger an undesired full-heap collec-       optimization. This explains why when the percentage of local
+tion. In this case, our adaptation under (2) would determine        memory increases, MemLiner’s overhead does not increase
+that the heap is in the red zone and thus change MAX_DL             proportionally (as shown in Figure 7).
+
+
+
+USENIX Association                             16th USENIX Symposium on Operating Systems Design and Implementation               43
+6      Limitations                                                            Spark [74]          Dataset              Size
+                                                                           MLlib KMeans
+MemLiner is designed for managed applications running on                                    Wikipedia France [4]      1.1GB
+                                                                               (SKM)
+a managed runtime and thus not applicable to native applica-                 Spark Linear
+tions such as those written in C/C++. Furthermore, MemLiner                                 Wikipedia English [4]      3GB
+                                                                          Regression (SLR)
+is designed to optimize throughput (by reducing interference               Spark Transitive                        1.5M edges
+                                                                                              Synthetic graph
+and improving prefetching), not latency. However, it does not               Closure (STC)                         384K vertices
+increase the application latency (i.e., making remote access               Cassandra [12]        Workload            Operation
+longer) or the GC pause time. For the Shenandoah GC, its                   Update Intensive      Update 50%
+                                                                                                                      10M ops
+pauses are already very short because operations requiring                     (CUI)             Insert 50%
+a pause do not involve many remote accesses and their time                  Read Intensive        Read 50%
+                                                                                                                      10M ops
+is not changed much by MemLiner. For G1, by lining up                          (CRI)             Insert 50%
+the tracing and application’s memory accesses, MemLiner                                          Insert 50%
+                                                                           Insert Intensive
+makes concurrent tracing more efficient, thereby significantly                                   Update 25%           10M ops
+                                                                                (CII)
+reducing the frequency of triggering full-heap collections.                                       Read 25%
+However, it does not reduce the per-collection pause time.                    Neo4j [52]          Dataset             Size
+   As shown in our evaluation, the more remote memory an                      PageRank                             14M edges
+                                                                                            Wikipedia Turkish [4]
+application uses, the more effective MemLiner’s optimization.                  (NPR)                              544K vertices
+However, when a large percentage of the working set fits into             Triangle Counting                        14M edges
+                                                                                            Wikipedia Turkish [4]
+                                                                               (NTR)                              544K vertices
+local memory, MemLiner’s effectiveness reduces. In fact, if
+                                                                          Degree Centrality                        8.5M edges
+this percentage exceeds 50%, MemLiner’s performance is on                                    Dogster Friends [4]
+                                                                               (NDC)                              451K vertices
+par with that of the original JVM.
+                                                                          QuickCached [3]         Workload           Operation
+   The other limitation is that MemLiner focuses on reducing
+                                                                          Write Dominant          Insert 60%
+interference between the application and concurrent tracing                                                           9M ops
+                                                                              (QWD)               Read 40%
+threads. Application threads may also interfere with mem-
+                                                                           Read Dominant          Insert 20%
+ory reclamation threads if the GC performs concurrent recla-                                                          9M ops
+                                                                              (QRD)               Read 80%
+mation (such as Shenandoah and ZGC). MemLiner cannot
+                                                                           DayTrader [34]         Workload              Size
+reduce this type of interference.
+                                                                             Tradesoap           Synthetic set       12288 users
+7      Evaluation                                                              (DTS)              of stocks         8192 sessions
+
+7.1     Experiment Setup                                                    Table 1: Applications and datesets used for G1.
+We implemented MemLiner on top of OpenJDK 12 (v 12.0.2)
+and Linux (v 5.4.0). Our swap system is based upon our
+re-implementation of FastSwap [10]2 , which provides good             between the number of applications and the number of tracing
+swap performance. We implemented it on top of G1 and                  threads. For instance, for G1, we follow Oracle’s recommen-
+Shenandoah. Implementing MemLiner in other GCs would                  dation [56] by setting the number of parallel GC threads to be
+be straightforward in the future.                                     5 × (core number)/8, and the number of concurrent tracing
+Environment. We ran our experiments with two ma-                      threads to be 1/4 of the parallel GC threads. With this ratio
+chines, each with two Xeon(R) CPU E5-2640 v3 processors,              and a per-thread PQ of 1024 entries, we rarely saw overwrites
+128GB memory, one 1TB SSD, and one 40 Gbps Mellanox                   in our experiments (with our filtering optimizations stated
+ConnectX-3 InfiniBand network adapter. They are connected             above). However large the heap is, as long as this ratio re-
+by one Mellanox 100 Gbps InfiniBand switch. One machine               mains the same, the size of PQ does not need to change; so
+runs the JVM process while the other provides remote mem-             does the work done by MemLiner.
+ory via RDMA. All our experiments used a 32GB heap and
+                                                                      Applications. To evaluate MemLiner, we used a range of
+4K pages.
+                                                                      cloud applications including Apache Spark [74] (3.0.0), the
+   Although our application heap size is relatively small (com-
+                                                                      de-facto data analytics system, Apache Cassandra [12] (3.11),
+pared to the size of main memory on our machines), the per-
+                                                                      a widely used distributed database, Neo4j [52] (4.3.2), a graph
+formance of a remote-memory application depends on how
+                                                                      database, QuickCached [3], a Java implementation of Mem-
+much of its working set can fit into local memory and how
+                                                                      cached, as well as DayTrader [34], IBM’s open-source ap-
+many (application and GC) threads are used, not on how large
+                                                                      plication emulating an online stock trading system. These
+local memory is. In particular, MemLiner’s key data structure
+                                                                      applications cover a wide spectrum of text and graph analyt-
+is a per-thread PQ (i.e., TQ is not key to MemLiner as it is
+                                                                      ics, web services, machine learning tasks, and database query
+GC’s original data structure). PQ’s size depends on the ratio
+                                                                      tasks. For each application, their workloads and datasets are
+     2 Its original implementation was incompatible with OpenJDK12.   reported in Table 1.
+
+
+
+44     16th USENIX Symposium on Operating Systems Design and Implementation                                      USENIX Association
+                    SKM                   SLR                     STC                     CUI                     CRI                     CII
+            200
+                                                      300                     800                                             800
+                              400                                                                     600
+            150                                                               600                                             600
+  Time(s)
+
+
+
+
+                                                      200                                             400
+            100                                                               400                                             400
+                              200
+                                                      100                                             200
+            50                                                                200                                             200
+
+             0                 0                        0                      0                       0                       0
+                  25%   13%         25%   13%               25%   13%               25%   13%               25%   13%               25%    13%
+                     NPR               NTR                     NDC                     QWD                     QRD                     DTS
+            600                                       600
+                              400                                             200                     200
+                                                                                                                              200
+                              300                     400                     150                     150
+  Time(s)
+
+
+
+
+            400
+                              200                                             100                     100
+                                                      200                                                                     100
+            200
+                              100                                             50                      50
+
+             0                 0                        0                      0                       0                       0
+                  25%   13%         25%         13%         25%         13%         25%         13%         25%         13%         25%         13%
+                                    All Local (100%) App+GC               Unmodified JVM GC             MemLiner GC
+                                    All Local (100%) App                  Unmodified JVM App            MemLiner App
+
+
+
+Figure 6: Performance comparisons between G1 GC (yellow bars) and MemLiner (green bars) under two local memory ratios:
+25% and 13%; each bar is split into application (bottom with light colors) and GC (top with dark colors) time in seconds. The
+two dashed lines show application time and total time with unmodified JVM and 100% local memory (no swaps).
+
+
+  The memory access patterns of our applications can be                        Local Memory        G1 GC           Shenandoah GC
+categorized into three types:                                                  Configuration App    GC     All  App     GC     All
+                                                                                25% Local    1.45× 1.65× 1.48× 1.88× 15.33× 2.16×
+• Mostly sequential access patterns: Spark applications op-                     13% Local    1.46× 1.79× 1.51× 1.60× 6.20× 1.80×
+  erate over RDDs. An RDD is an object array or serialized
+  primitive array. Each application thread exhibits clear mem-                 Table 2: Speedups provided by MemLiner for G1 and Shenan-
+  ory access patterns, e.g., streaming or stride.                              doah. (speedup: the average time under each configuration
+                                                                               using the unmodified JVM divided by that using MemLiner)
+• Random access patterns: QuickCached (a key-value store)
+  and DayTrader (stock trading simulation) exhibit quite
+  random memory access patterns.                                               mary of these performance improvements (for the application,
+• Mixed access patterns: Take Cassandra as an example.                         GC, and end-to-end performance) is reported in Table 2.
+  Each read/update operation goes through several micro-                          We also compared the number of swap-in pages between
+  operations. Different micro-operations have different mem-                   MemLiner and the unmodified JVM: MemLiner reduces an
+  ory access patterns, i.e., the MemTable loading exhibits                     average of 81% of on-demand swap-ins and 56% of total
+  a good streaming memory access pattern and some other                        swap-ins (including both on-demand and prefetching swaps).
+  calculations access memory randomly. Both Cassandra and                         Compared with running the whole application in local
+  Neo4j belong to this category.                                               memory with no swapping (illustrated by dashed lines in
+   Our experiments considered two local memory ratios: 25%,                    Figure 6), the unmodified JVM incurs 2.17× and 3.73× slow-
+and 13% of the total Java heap size (32GB), which are con-                     downs under the 25% and 13% local memory configurations,
+sistent with local memory ratios used in prior work [58, 68].                  respectively. MemLiner brings them down to 1.47× and
+We enforced these ratios with cgroup.                                          2.48×.
+                                                                               Details. For several workloads (e.g., SLR, STC, CUI, NDC,
+7.2         Performance with G1 GC                                             QWD and DTS), the default JVM’s GC time increases dra-
+                                                                               matically when the local memory ratio drops from 25% to
+Overall. Figure 6 compares the performance of the baseline                     13%. This is because when memory resources are tight, con-
+(the default G1 GC) and MemLiner under two different local                     current tracing becomes slow with many local-memory cache
+memory ratios: 25%, and 13%. As shown, MemLiner offers                         misses. It sometimes cannot finish a complete closure before
+better performance over the baseline JVM for all workloads,                    the heap is full, causing the JVM to pause all application
+1.48× speedup on average under 25% local memory and                            threads and run a time-consuming full-heap GC. Fortunately,
+1.51× speedup on average under 13% local memory. A sum-                        MemLiner brings down that GC cost, enabling concurrent
+
+
+
+USENIX Association                                    16th USENIX Symposium on Operating Systems Design and Implementation                            45
+tracing to quickly compute the closure by following the appli-                                       Spark                           Neo4j
+                                                                                      4000                            600
+cations’ accesses and reducing full-heap GCs.
+   Cassandra’s performance degrades drastically under 13%
+
+
+
+
+                                                                           Time (s)
+                                                                                                                      400
+local memory. In addition to more frequent full-heap GCs,                             2000
+this also stems from data spilling. When the memory usage                                                             200
+exceeds a certain ratio (e.g., 2/3) of the heap size, Cassandra
+automatically spills data from memory to disk. Since con-                                0                              0
+                                                                                             25% 13%25% 13%25% 13%          25% 13%25% 13%25% 13%
+current tracing under a tighter local-memory budget becomes                                    SKM    SLR    STC              NPR    NTR    NDC
+
+much slower, the memory consumption frequently exceeds                                   All Local           Unmodified JVM             MemLiner
+that ratio, triggering spilling and slowing down the applica-
+tion. In these large-scale systems, GC can actually impact the
+performance of applications in many unexpected ways.                      Figure 8: Performance comparison with Shenandoah GC [25].
+
+                                                                             Spark Programs                       Dataset                    Size
+                    4.0                      SKM Unmodified JVM           MLlib KMeans (SKM)                 Wikipedia Polish [4]            1GB
+  Normalized Time
+
+
+
+
+                                             SKM MemLiner                 Spark Linear Regression
+                    3.5                                                                                      Wikipedia Polish [4]            1GB
+                                             STC Unmodified JVM                   (SLR)
+                    3.0
+                                             STC MemLiner                 Spark Transitive Closure                                     1.5M edges
+                    2.5                                                           (STC)
+                                                                                                               Synthetic Graph
+                                                                                                                                      384K vertices
+                    2.0                                                      Neo4J Programs                          Dataset              Size
+                    1.5                                                          PageRank                                              7.6M edges
+                                                                                                             Wikipedia Slovak [4]
+                    1.0                                                           (NPR)                                               291K vertices
+                              20        40     60      80     100            Triangle Counting                                         7.6M edges
+                                                                                                             Wikipedia Slovak [4]
+                                   Local Memory Ratio (%)                         (NTR)                                               291K vertices
+                                                                                      Degree Centrality                                4.4M edges
+                                                                                                             Wikipedia min-nan [4]
+Figure 7: Performance comparisons for SKM and STC be-                                     (NDC)                                       429K vertices
+tween the unmodified JVM and MemLiner under different                                 Table 3: Benchmarks and datasets for Shenandoah.
+local memory configurations.
+                                                                          and evacuates objects in the young generation. This leads
+Different Local Memory Configurations. We ran SKM and                     to excellent data locality after evacuation. However, under
+STC with various local-memory ratio configurations and re-                Shenandoah GC, the JVM runs concurrent tracing much more
+port the performance in Figure 7. As shown, the lower the                 frequently to scan the full heap to identify and collect garbage.
+ratio, the higher the benefit MemLiner provides. For both                 Those tracing threads exhibit particularly poor locality. To
+applications, the turning point is around 50%—MemLiner                    evaluate Shenandoah, we had to use smaller datasets (Table
+and the baseline have about the same performance when the                 3) for a tolerable running time.
+local memory ratio reaches 50% or above.                                     As illustrated in Figure 8 and summarized in Table 2, Mem-
+                                                                          Liner achieves an overall 2.16× and 1.80× speedup com-
+7.3                 Performance with Shenandoah GC
+                                                                          pared to the unmodified JVM under 25% and 13% local
+To demonstrate the generality of MemLiner, we implemented                 memory, respectively. MemLiner reduces an average of 82%
+MemLiner in a second garbage collector: Shenandoah[25],                   on-demand swap-ins and 56% of total swap-ins under 25% lo-
+a widely-used highly-concurrent low-pause GC developed                    cal memory, while it reduces 79% of on-demand swap-ins and
+by Red Hat. It performs not only concurrent tracing but also              22% of total swap-ins under 13% local memory. As shown in
+concurrent object evaluation to minimize pauses.                          Table 2, MemLiner provides tremendous improvements for
+   Shenandoah provides great latency benefits under sufficient            Shenandoah’s GC performance, because the unmodified JVM
+local memory. However, it has extremely poor performance                  frequently triggers full-heap stop-the-world GC.
+with remote memory involved. For example, the slowdowns
+                                                                          7.4          Comparisons with Other Systems
+under 25% memory for our Spark and Neo4j applications are
+constantly above 10× and 4×, respectively. Compared to                    Leap [48] is an advanced OS-level prefetcher. It uses a major-
+Neo4j, Spark applications usually have much larger working                vote algorithm to determine how to do prefetches. In cases
+sets, leading to more remote accesses. Such a large over-                 where no clear access patterns are seen, Leap aggressively
+head highlights the problem of running many concurrent GC                 prefetches consecutive pages. Although this strategy may
+threads that do not align with the application’s memory access.           improve performance for native applications whose memory
+In particular, Shenandoah is not a generational GC (while G1              accesses often fall into large arrays, it often hurts managed
+is). In G1, when the young generation, which contains short-              applications such as Spark, as GC’s pointer-chasing behavior
+lived objects, is full, the JVM suspends application threads              often makes prefetched consecutive pages useless.
+
+
+
+46                  16th USENIX Symposium on Operating Systems Design and Implementation                                       USENIX Association
+           700                                                       70
+                                                                     60                                                       300
+
+
+
+
+                                                     Percentage(%)
+
+
+
+
+                                                                                                                    Time(s)
+           500                                                       50
+                                                                                                                              200
+ Time(s)
+
+
+
+
+                                                                     40
+           300                                                       30                                                       100
+                                                                     20
+                                                                                                                                0
+           100                                                       10                                                                SLR        STC     SKM
+                                                                      0                                                             Semeru GC       MemLiner GC
+                    SLR SKM STC NPR NTR NDC                               A C A C A C A C A C A C                                   Semeru App      MemLiner App
+                 Unmodified JVM GC    MemLiner GC
+                                                                          SLR SKM STC NPR NTR NDC
+                                                                                                                                    MemLiner on Semeru Swap GC
+                 Unmodified JVM App   MemLiner App                        Unmodified JVM  MemLiner                                  MemLiner on Semeru Swap App
+
+                   (a) Leap: Running time            (b) Leap: Accuracy(A) and Coverage(C)                                     (c) Semeru: Running time
+Figure 9: Performance comparisons with Leap and Semeru; Semeru crashed on NPR, NTR, and NDC (i.e., Neo4j applications).
+
+
+   Our hypothesis is that even aggressive prefetchers like Leap                     to JVM and Semeru’s extra computation load on memory
+cannot handle the interference of GC, and that by aligning the                      servers, we ran the same three Spark applications under 25%
+memory accesses of GC with application threads, MemLiner                            local memory on top of (1) Semeru, (2) MemLiner on Se-
+can improve application performance under Leap just like                            meru’s swap system (i.e., a modified version of NVMe-over-
+under less aggressive prefetchers. To test our hypothesis, we                       fabrics [1]), and (3) MemLiner on FastSwap [10], which is
+compared MemLiner with the unmodified JVM (default G1                               the default swap system MemLiner builds on. We ran Semeru
+GC) both using Leap as the prefetcher. This experiment was                          with one CPU server and two memory servers—the Java heap
+conducted on three Spark applications: SLR, SKM, STC,                               is partitioned between the memory servers.
+and three Neo4j applications: NPR, NTR, NDC, under 25%                                 As shown in Figure 9(c) , MemLiner’s performance is com-
+local memory.                                                                       parable with Semeru when using Semeru’s swap system, and
+   As shown in Figure 9(a), compared with the unmodified                            is much better than Semeru when using MemLiner’s default
+JVM on Leap, MemLiner improves the overall performance                              swap system. The reason is that, even though Semeru com-
+by an average of 1.6× and reduces 58% of on-demand swap-                            pletely eliminates GC tracing threads from the local machine,
+ins, as well as 53% of total swap-ins on average. To un-                            it has to perform a great deal of coordination between servers
+derstand whether MemLiner improves Leap’s prefetching                               to handle cross-server references, incurring communication
+effectiveness, we additionally measured Leap’s prefetching                          overheads. We would have also liked to run Semeru directly
+accuracy (i.e., the percentage of page faults hitting on the                        over FastSwap, but this was not feasible due to Semeru’s
+swap cache among prefetched pages) and coverage (i.e., the                          runtime-kernel co-design that prevents Semeru from easily
+percentage of swap cache hits among all page faults) with                           adapting to different swap systems.
+and without MemLiner. As shown in Figure 9(b), MemLiner                                We could not directly compare Memliner with AIFM [58]
+helps Leap deliver higher accuracy and coverage. We still ob-                       as AIFM targets native languages (C/C++) applications and
+served that MemLiner is not as useful for STC and NTR as it                         requires rewriting programs. However, the major idea behind
+is for the two applications. This is because the number of live                     AIFM—swapping at the object granularity—is orthogonal to
+objects in STC during concurrent tracing is relatively small,                       MemLiner. MemLiner can also benefit from a redesigned
+leading to shorter tracing time and better access patterns. For                     swap system that performs object-level swapping.
+NTR, its application threads exhibit random memory accesses
+                                                                                    7.5              More Detailed Results
+themselves. Hence, Leap cannot detect clear patterns even if
+MemLiner has already eliminated much of the interference.                                                   SKM                      STC                 SLR
+Semeru [68] is a memory-disaggregated runtime, where the                                             30
+                                                                                    Footprint (GB)
+
+
+
+
+entire Java heap is backed by physical memory on memory
+                                                                                      Memory
+
+
+
+
+servers and the CPU server’s local memory is used as an in-                                          20
+clusive cache. Semeru completely redesigned the JVM so that
+all the garbage collection is offloaded from the CPU server                                          10
+to the memory servers, through special lightweight JVMs
+running there. Applications execute on the CPU server with
+                                                                                                           50 100                 100 200               150       300
+absolutely no GC interference, at the cost of extra computa-                                                                  Time Elapsed (s)
+tion on memory servers (i.e., two extra cores for each memory                                        Unmodified JVM Pre-GC                       MemLiner Pre-GC
+server to run the offloaded lightweight JVM).                                                        Unmodified JVM Post-GC                      MemLiner Post-GC
+   Here, to evaluate whether MemLiner can achieve similar
+performance as Semeru, without Semeru’s intrusive changes                           Figure 10: Memory footprints for SKM, STC, and SLR,
+                                                                                    between unmodified JVM and MemLiner under 25% rate.
+
+
+USENIX Association                                   16th USENIX Symposium on Operating Systems Design and Implementation                                           47
+Memory Reclamation Impact. Since MemLiner postpones                access in the user space. AIFM outperforms swap-based tech-
+tracing objects estimated to be remote, it may delay memory        niques by bypassing the kernel data plane. However, to use
+reclamation. To understand the impact of such a delay, we          AIFM, applications have to be rewritten (with new primitives),
+collected post-GC memory footprints for STC, SKM, and              which can significantly hinder its practical use.
+SLR executed atop the unmodified JVM and MemLiner under            Modern Garbage Collectors. Modern GCs, including Ora-
+25% local memory configuration. Figure 10 reports, for each        cle’s Garbage-First (G1) GC [22], Red Hat’s Shenandoah
+program, both its pre-GC and post-GC memory footprints. As         GC [25], Azul’s pauseless GC [21], and C4 [64], all use
+shown, for all three workloads, MemLiner incurs insignificant      concurrent tracing. Some also perform concurrent memory
+delays in memory reclamation and only a slight increase            compaction [39, 2]. As big data systems gain popularity,
+in the peak memory consumption. This is because tracing            there is a line of work that develops systems for applications
+of each remote object can only be postponed a few times            running on the cloud [24, 53, 54, 51, 67], on NUMA ma-
+(i.e., MAX_DL); when the available heap runs low, MAX_DL           chines [29], as well as using non-volatile memory [67, 71, 9].
+becomes 0 and we do not postpone GC at all.                        Yak [53] is a region-based big-data-friendly GC. Taurus [47]
+Epoch Estimation Effectiveness. We collected the number            coordinates GC efforts among workers in a distributed sys-
+of objects that are scanned from PQ and TQ for three Spark         tem. Facade [54] uses region-based memory management
+applications under 25% local memory. The ratio of objects          to reduce GC costs for Big Data applications. Gerenuk [51]
+scanned from PQ over total objects scanned during the con-         develops a compiler analysis and runtime system that enable
+current tracing phase is 45%, 42%, and 11% respectively            native representation of data for managed analytics systems
+for SLR, SKM and STC. We also evaluated MemLiner after             such as Spark and Hadoop. Espresso [71] and Panthera [67]
+disabling epoch estimation: we saw an overall performance          are designed for systems with non-volatile memory. Plat-
+degradation of 8.6%, 8.8% and 11.3% respectively, for SLR,         inum [70] aims to reduce tail latency for interactive applica-
+SKM and STC under 25% local memory.                                tions. NUMAGiC [29] is a GC that provides efficiency by
+8    Related Work                                                  considering NUMA features.
+                                                                      Semeru [68] and Mako [46] are both GCs developed for
+Far Memory. Due to rapid technological advances in network         memory disaggregation. While they both achieve superior
+controllers, it has become practical to reorganize resources       performance via compute offloading (e.g., running concur-
+into disaggregated clusters [32, 18, 27, 15]. A disaggregated      rent tracing and evacuation on memory servers), offloading
+cluster can increase the hardware resource utilization and has     introduces numerous challenges in resource utilization and
+the potential to overcome fundamental hardware limits, such        cluster scheduling. AIFM [58] performs GC-like memory
+as the critical “memory capacity wall” [14, 44, 43, 67, 20, 38,    compaction to eliminate dead objects to reduce read/write am-
+7, 11]. A body of techniques [10, 30, 6, 58, 68, 61, 63, 68, 31,   plification. This approach is orthogonal to MemLiner, which
+69] have been developed to enable applications to use remote       leverages tracing for prefetching.
+memory and efficiently access remote data.
+   Among these techniques, a mainstream approach [10, 30,          9   Conclusion
+6] is to provide transparent remote memory access with swap
+mechanisms where the running application is not aware of           This paper presents MemLiner, a runtime technique that re-
+remote memory, which is mapped into the application host           duces the GC-application interference by aligning the mem-
+server as a swap partition. The host server reserves a certain     ory accesses of application and tracing threads. We classify
+amount of local memory as a software-managed data cache.           reachable objects into three categories and treat objects in
+Once the program accesses a page that does not reside in           each category in a different way to achieve the two seemingly
+the data cache, it triggers a page fault, and the swap system      conflicting goals. Our promising results with two produc-
+fetches the page from a remote memory server via RDMA.             tion GCs demonstrate that MemLiner can be readily used in
+   A traditional swap system was designed for slow and rare        today’s datacenters.
+accesses to disks, not for fast and frequent accesses to remote
+memory via RDMA. Having realized this speed discrepancy,           Acknowledgments
+existing techniques have performed a variety of optimizations,
+e.g., removing redundant block layers [30], leveraging multi-      We thank the anonymous reviewers for their valuable and
+queues [10], or performing per-application prefetching [48],       thorough comments. We are grateful to our shepherd Auro-
+all to maximize the paging/swap efficiency. Despite these          jit Panda for his feedback. This work is supported by NSF
+commendable efforts, these techniques need to pay a “trans-        grants CNS-1703598, CNS-1763172, CNS-1764039, CNS-
+parency tax”—since all remote accesses go through the OS           1907352, CNS-1956180, CNS-2007737, CNS-2006437,
+kernel, which incurs a non-trivial overhead. To mitigate such      CNS-2128653, CNS-2106838, CCF-2119184, ONR grant
+a software-introduced overhead, work such as AIFM [58]             N00014-18-1-2037, and research grants from Facebook, Mi-
+provides primitives for developers to perform efficient remote     crosoft, and Cisco.
+
+
+
+48   16th USENIX Symposium on Operating Systems Design and Implementation                                  USENIX Association
+A     Artifact Appendix                                            • Install the MLNX OFED driver:
+A.1     Artifact Summary                                             MemLiner has only been tested on Ubuntu 18.04 with
+                                                                     MLNX-OFED-4.9-2.2.4.0. The driver should be installed
+MemLiner is a managed runtime built for a memory-                    all participating servers.
+disaggregated cluster where each managed application runs
+on one server and uses both local memory and remote mem-
+ory located on another server. When launched on MemLiner,              # @all participating servers
+the process fetches data from the remote server via the paging         # Remove the incompatible libraries
+system. MemLiner reduces the local-memory working set                  sudo apt remove ibverbs-providers:amd64
+and improves the remote-memory prefetching by lining up                librdmacm1:amd64 librdmacm-dev:amd64
+the memory accesses from application and GC threads. Mem-              libibverbs-dev:amd64 libopensm5a
+Liner is transparent to applications and can be integrated in          libosmvendor4 libosmcomp3 -y
+any existing GC algorithms, such as G1 and Shenandoah.
+A.2     Artifact Check-list                                            # Download and install the MLNX OFED driver
+                                                                       curl https://content.mellanox.com/ofed/
+• Hardware: Intel servers with InfiniBand
+                                                                       MLNX_OFED-4.9-2.2.4.0/MLNX_OFED_LINUX
+• Run-time environment: OpenJDK 12.02, Linux-5.4, Ubuntu              -4.9-2.2.4.0-ubuntu18.04-x86_64.tgz
+  18.04 with MLNX-OFED 4.9-2.2.4.0                                    --output MLNX_OFED.tgz
+• Public link:        https://github.com/uclasystem/                   tar -xzf MLNX_OFED.tgz
+  MemLiner                                                             sudo MLNX_OFED/mlnxofedinstall
+• Code licenses: The GNU General Public License (GPL)                 --add-kernel-support
+
+A.3     Description
+                                                                       # Enable the openidb and opensmd services
+A.3.1    MemLiner’s Codebase                                           sudo systemctl enable openibd
+MemLiner contains the following three components:                      sudo systemctl start openibd
+• the Linux kernel, which includes a modified swap system,             sudo systemctl enable opensmd
+                                                                       sudo systemctl start opensmd
+• the Java Virtual Machine (JVM) with MemLiner,
+• necessary shell scripts and configuration files.
+A.3.2    Deploying MemLiner                                        • Configure and install the MemLiner RDMA module:
+To build MemLiner, the first step is to download its source
+code:                                                                  # Assign the IP of a memory server into:
+                     git clone                                         # @CPU server
+      git@github.com:uclasystem/MemLiner.git                           # MemLiner/rswap/client/rswap_rdma.c
+                                                                       char ip[] = "10.0.0.4"; # IP of memory server
+   When deploying MemLiner, install the components in the              # @memory server
+following order: (1) install the kernel and the RDMA module            # MemLiner/rswap/server/rswap_server.cpp
+on all participating servers; (2) install the JVM with Mem-            const char *ip_str = "10.0.0.4";
+Liner on the server that runs the process; (3) connect the
+participating servers before running applications.                     # Build the MemLiner RDMA module
+Kernel Installation. We first discuss how to build and install         # @CPU server
+the kernel.                                                            cd MemLiner/rswap/client
+• Modify grub and set transparent_hugepage to                          make clean && make
+  madvise:                                                             # @memory server
+                                                                       cd MemLiner/rswap/server
+      sudo vim /etc/default/grub                                       make clean && make
+      + transparent_hugepage=madvise
+
+• Install the kernel and restart the machine:                      Install the MemLiner (JVM). We next discuss the steps to
+                                                                   build and install the MemLiner JVM on the CPU server.
+      cd MemLiner/Kernel
+      sudo ./build_kernel.sh build                                 • Download Oracle JDK 12 to build the MemLiner
+      sudo ./build_kernel.sh install                                 JVM:
+
+
+
+USENIX Association                              16th USENIX Symposium on Operating Systems Design and Implementation    49
+     # @CPU server                                               # Add a Spark worker into cgroup, memctl.
+     # Assume jdk 12.02 is under path:                           # Its sub-process, executor, falls into the same
+     # ${HOME}/jdk-12.0.2                                        cgroup.
+     cd MemLiner/JDK                                             # @CPU server
+     ./configure -with-boot-jdk=${HOME}/jdk-                     # Modify the function start_instance under:
+     12.0.2 --with-debug-level=release                           # Spark/sbin/start-slave.sh
+     make JOBS=32                                                cgexec -sticky -g memory:memctl
+                                                                 "${SPARK_HOME}/sbin" /sparkdaemon.sh
+     # Run the applications with the built JVM.                  start $CLASS $WORKER_NUM -webui-port
+     # The built JVM (MemLiner) is under:                        "$WEBUI_PORT" $PORT_FLAG $PORT_NUM
+     MemLiner/JDK/build/                                         $MASTER "$@"
+     linux-x86_64-server-release/jdk
+                                                             • Launch the Spark cluster:
+                                                               Certain JVM options need to be added to run the Mem-
+                                                               Liner. We use the Spark as an example here. Please
+ A.3.3    Running Applications                                 refer to the MemLiner’s code repository for more details
+                                                               about how to run other applications.
+ To run applications, we first need to connect the CPU and
+ memory servers. Next, we mount the remote memory pool           # @CPU server
+ as a swap partition on the CPU server. When the applica-        # Replace the Spark default configuration
+ tion uses more memory than the limit set by cgroup, its         cd ${spark-home-dir}/conf
+ data will be swapped out to remote memory via RDMA.             cp MemLiner/config-files/spark-confs/
+ • Launch memory servers:                                        spark-defaults-memliner.conf
+                                                                 spark-defaults.conf
+
+       # @memory server
+                                                                 # Launch the Spark master and worker services
+       cd MemLiner/rswap/server
+                                                                 ${spark-home-dir}/sbin/start-all.sh
+       ./rswap-server
+
+                                                             • Run Spark applications:
+ • Connect       the    CPU      server    with   memory       Specify the Spark application name and local memory
+   servers:                                                    ratio, e.g., 25% or 13%, and then execute the applica-
+                                                               tions:
+       # @CPU server                                             # @CPU server
+       cd MemLiner/rswap/client                                  # Para#1 application: lr, km, tc
+       ./manage_rswap_client.sh install                          # Para#2 mem_local_ratio: 25, 13
+                                                                 MemLiner/app-scripts/memliner.sh
+                                                                 ${application} ${mem_local_ratio}
+ • Set a cache size limit for an application:
+                                                               More details of MemLiner’s installation and deployment
+       # For example, create a cgroup with a 9GB               can be found in MemLiner’s code repository.
+       memory limit.
+       # @CPU server
+       # Create the cgroup with the name memctl
+       # $USER is the username of the account
+       sudo cgcreate -t $USER -a $USER -g
+       memory:/memctl
+
+       # Set the memory limit to 9GB
+       echo 9g > /sys/fs/cgroup/memory/
+       memctl/memory.limit_in_bytes
+
+
+ • Add a Spark executor into cgroup:
+
+
+
+50   16th USENIX Symposium on Operating Systems Design and Implementation                        USENIX Association
+  References                                                    [14] K. Asanović, R. Bodik, B. C. Catanzaro, J. J. Gebis,
+                                                                     P. Husbands, K. Keutzer, D. A. Patterson, W. L.
+   [1] NVMe    over  fabrics.       http://                          Plishker, J. Shalf, S. W. Williams, and K. A. Yelick.
+       community.mellanox.com/s/article/                             The landscape of parallel computing research: A
+       what-is-nvme-over-fabrics-x.                                  view from berkeley. Technical Report UCB/EECS-
+                                                                     2006-183, EECS Department, University of Califor-
+   [2] The Z garbage collector. https://wiki.
+                                                                     nia, Berkeley, Dec 2006.
+       openjdk.java.net/display/zgc/Main.
+                                                                [15] L. A. Barroso. Warehouse-scale computing: Entering
+   [3] QuickCached.    https://github.com/                           the teenage decade. In ISCA, 2011.
+       QuickServerLab/QuickCached, 2017.
+                                                                [16] M. N. Bojnordi and E. Ipek. PARDIS: A pro-
+   [4] Konect network datasets. http://konect.cc/                    grammable memory controller for the DDRx interfac-
+       networks/, 2021.                                              ing standards. In ISCA, pages 13–24, 2012.
+
+   [5] M. Abadi, P. Barham, J. Chen, Z. Chen, A. Davis,         [17] I. Calciu, M. T. Imran, I. Puddu, S. Kashyap, H. A.
+       J. Dean, M. Devin, S. Ghemawat, G. Irving, M. Isard,          Maruf, O. Mutlu, and A. Kolli. Rethinking software
+       M. Kudlur, J. Levenberg, R. Monga, S. Moore, D. G.            runtimes for disaggregated memory. In ASPLOS,
+       Murray, B. Steiner, P. Tucker, V. Vasudevan, P. War-          pages 79–92, 2021.
+       den, M. Wicke, Y. Yu, and X. Zheng. Tensorflow: A
+                                                                [18] A. Carbonari and I. Beschasnikh. Tolerating faults
+       system for large-scale machine learning. In OSDI,
+                                                                     in disaggregated datacenters. In HotNets-XVI, pages
+       pages 265–283, 2016.
+                                                                     164–170, 2017.
+   [6] M. K. Aguilera, N. Amit, I. Calciu, X. Deguillard,       [19] CCIX. Cache coherent interconnect for accelera-
+       J. Gandhi, P. Subrahmanyam, L. Suresh, K. Tati,               tors. https://www.ccixconsortium.com/,
+       R. Venkatasubramanian, and M. Wei. Remote mem-                2018.
+       ory in the age of fast networks. In SoCC, pages
+       121–127, 2017.                                           [20] L. Chen, J. Zhao, C. Wang, T. Cao, J. Zigman, H. Vo-
+                                                                     los, O. Mutlu, F. Lv, X. Feng, G. H. Xu, and H. Cui.
+   [7] M. K. Aguilera, K. Keeton, S. Novakovic, and S. Sing-         Unified holistic memory management supporting mul-
+       hal. Designing far memory data structures: Think              tiple big data processing frameworks over hybrid
+       outside the box. In HotOS, pages 120–126, 2019.               memories. ACM Trans. Comput. Syst., 2022.
+
+   [8] J. Ahn, S. Yoo, O. Mutlu, and K. Choi. Pim-              [21] C. Click, G. Tene, and M. Wolf. The pauseless gc
+       enabled instructions: A low-overhead, locality-aware          algorithm. In VEE, pages 46–56, 2005.
+       processing-in-memory architecture. In ISCA, pages
+       336–348, 2015.                                           [22] D. Detlefs, C. Flood, S. Heller, and T. Printezis.
+                                                                     Garbage-first garbage collection. In ISMM, pages
+   [9] S. Akram, J. B. Sartor, S. M. Blackburn, K. S. McKin-         37–48, 2004.
+       ley, and L. Eeckhout. Write-rationing garbage col-
+                                                                [23] A. Dragojević, D. Narayanan, M. Castro, and O. Hod-
+       lection for hybrid memories. In PLDI, pages 62–77,
+                                                                     son. FaRM: Fast remote memory. In NSDI, pages
+       2018.
+                                                                     401–414, 2014.
+  [10] E. Amaro, C. Branner-Augmon, Z. Luo, A. Ouster-          [24] L. Fang, K. Nguyen, G. Xu, B. Demsky, and S. Lu.
+       hout, M. K. Aguilera, A. Panda, S. Ratnasamy, and             Interruptible tasks: Treating memory pressure as in-
+       S. Shenker. Can far memory improve job throughput?            terrupts for highly scalable data-parallel programs. In
+       In EuroSys, 2020.                                             SOSP, pages 394–409, 2015.
+  [11] S. Angel, M. Nanavati, and S. Sen. Disaggregation        [25] C. H. Flood, R. Kennke, A. Dinn, A. Haley, and
+       and the application. In HotCloud, 2020.                       R. Westrelin. Shenandoah: An open-source concur-
+                                                                     rent compacting garbage collector for openjdk. In
+  [12] Apache.   Apache cassandra.             https://              PPPJ, pages 13:1–13:9, 2016.
+       cassandra.apache.org, 2021.
+                                                                [26] J. Fried, Z. Ruan, A. Ousterhout, and A. Belay.
+  [13] K. Asanovic. Firebox: A hardware building block for           Caladan: Mitigating interference at microsecond
+       2020 warehouse-scale computers. In FAST, 2014.                timescales. In OSDI, pages 281–297, 2020.
+
+
+
+USENIX Association                         16th USENIX Symposium on Operating Systems Design and Implementation         51
+ [27] P. X. Gao, A. Narayan, S. Karandikar, J. Carreira,       [40] A. Lagar-Cavilla, J. Ahn, S. Souhlal, N. Agarwal,
+      S. Han, R. Agarwal, S. Ratnasamy, and S. Shenker.             R. Burny, S. Butt, J. Chang, A. Chaugule, N. Deng,
+      Network requirements for resource disaggregation.             J. Shahid, G. Thelen, K. A. Yurtsever, Y. Zhao, and
+      In OSDI, pages 249–264, 2016.                                 P. Ranganathan. Software-defined far memory in
+                                                                    warehouse-scale computers. In ASPLOS, pages 317–
+ [28] GenZ.    Genz consortium.                  http://            330, 2019.
+      genzconsortium.org/, 2019.
+                                                               [41] B. C. Lee, E. Ipek, O. Mutlu, and D. Burger. Ar-
+ [29] L. Gidra, G. Thomas, J. Sopena, M. Shapiro, and               chitecting phase change memory as a scalable dram
+      N. Nguyen. NumaGiC: A garbage collector for big               alternative. In ISCA, pages 2–13, 2009.
+      data on big NUMA machines. In ASPLOS, pages
+      661–673, 2015.                                           [42] H. Lim, D. Han, D. G. Andersen, and M. Kaminsky.
+                                                                    MICA: A holistic approach to fast in-memory key-
+ [30] J. Gu, Y. Lee, Y. Zhang, M. Chowdhury, and K. G.              value storage. In NSDI, pages 429–444, 2014.
+      Shin. Efficient memory disaggregation with infin-
+                                                               [43] K. Lim, J. Chang, T. Mudge, P. Ranganathan, S. K.
+      iswap. In NSDI, pages 649–667, 2017.
+                                                                    Reinhardt, and T. F. Wenisch. Disaggregated memory
+                                                                    for expansion and sharing in blade servers. In ISCA,
+ [31] Z. Guo, Y. Shan, X. Luo, Y. Huang, and Y. Zhang.
+                                                                    pages 267–278, 2009.
+      Clio: A hardware-software co-designed disaggre-
+      gated memory system. In ASPLOS, pages 417–433,           [44] K. Lim, Y. Turner, J. R. Santos, A. AuYoung,
+      2022.                                                         J. Chang, P. Ranganathan, and T. F. Wenisch. System-
+                                                                    level implications of disaggregated memory. In
+ [32] S. Han, N. Egi, A. Panda, S. Ratnasamy, G. Shi, and           HPCA, pages 1–12, 2012.
+      S. Shenker. Network support for resource disaggrega-
+      tion in next-generation datacenters. In HotNets, pages   [45] C. Lu, K. Ye, G. Xu, C. Xu, and T. Bai. Imbalance
+      10:1–10:7, 2013.                                              in the cloud: An analysis on Alibaba cluster trace. In
+                                                                    Big Data, pages 2884 – 2892, 2017.
+ [33] Hewlett-Packard. The machine: A new kind of
+      computer. https://www.hpl.hp.com/research/systems-       [46] H. Ma, S. Liu, C. Wang, Y. Qiao, M. D. Bond,
+      research/themachine/, 2015.                                   S. M. Blackburn, M. Kim, and G. H. Xu. Mako: A
+                                                                    low-pause, high-throughput evacuating collector for
+ [34] IBM. Daytrader. https://www.ibm.com/                          memory-disaggregated datacenters. In PLDI, pages
+      docs/en/linux-on-systems?topic=                               92–107, 2022.
+      bad-daytrader, 2021.
+                                                               [47] M. Maas, T. Harris, K. Asanović, and J. Kubiatowicz.
+ [35] Intel.     Intel high performance com-                        Taurus: A holistic language runtime system for coor-
+      puting  fabrics.          https://www.                        dinating distributed managed-language applications.
+      intel.com/content/www/us/en/                                  In ASPLOS, pages 457–471, 2016.
+      high-performance-computing-fabrics/,
+                                                               [48] H. A. Maruf and M. Chowdhury. Effectively prefetch-
+      2019.
+                                                                    ing remote memory with Leap. In USENIX ATC,
+                                                                    pages 843–857, 2020.
+ [36] R. Jones, A. Hosking, and E. Moss. The Garbage
+      Collection Handbook: The Art of Automatic Memory         [49] Mellanox.         Connectx-6 single/dual-port
+      Management. Chapman & Hall/CRC, 1st edition,                  adapter   supporting   200gb/s   with     vpi.
+      2011.                                                         http://www.mellanox.com/page/
+                                                                    products_dyn?product_family=265&
+ [37] A. Kalia, M. Kaminsky, and D. G. Andersen. Using              mtag=connectx_6_vpi_card, 2019.
+      RDMA efficiently for key-value services. In SIG-
+      COMM, pages 295–306, 2014.                               [50] S. Mittal. A survey of recent prefetching techniques
+                                                                    for processor caches. ACM Comput. Surv., 49(2),
+ [38] K. Keeton. The Machine: An architecture for                   2016.
+      memory-centric computing. In ROSS, 2015.
+                                                               [51] C. Navasca, C. Cai, K. Nguyen, B. Demsky, S. Lu,
+ [39] H. Kermany and E. Petrank. The Compressor: Con-               M. Kim, and G. H. Xu. Gerenuk: Thin computa-
+      current, incremental, and parallel compaction. In             tion over big native data using speculative program
+      PLDI, pages 354–363, 2006.                                    transformation. In SOSP, pages 538–553, 2019.
+
+
+
+52   16th USENIX Symposium on Operating Systems Design and Implementation                           USENIX Association
+  [52] Neo4j. Neo4j graph data platform. https://               [65] M. Tirmazi, A. Barker, N. Deng, M. E. Haque, Z. G.
+       neo4j.com, 2021.                                              Qin, S. Hand, M. Harchol-Balter, and J. Wilkes. Borg:
+                                                                     The next generation. In EuroSys, 2020.
+  [53] K. Nguyen, L. Fang, G. Xu, B. Demsky, S. Lu,
+       S. Alamian, and O. Mutlu. Yak: A high-performance        [66] M. Tork, L. Maudlej, and M. Silberstein. Lynx: A
+       big-data-friendly garbage collector. In OSDI, pages           SmartNIC-driven accelerator-centric architecture for
+       349–365, 2016.                                                network servers. In ASPLOS, pages 117–131, 2020.
+
+  [54] K. Nguyen, K. Wang, Y. Bu, L. Fang, J. Hu, and           [67] C. Wang, H. Cui, T. Cao, J. Zigman, H. Volos,
+       G. Xu. FACADE: A compiler and runtime for (almost)            O. Mutlu, F. Lv, X. Feng, and G. H. Xu. Panthera:
+       object-bounded big data applications. In ASPLOS,              Holistic memory management for big data process-
+       pages 675–690, 2015.                                          ing over hybrid memories. In PLDI, pages 347–362,
+                                                                     2019.
+  [55] OpenCAPI. Open coherent accelerator processor in-        [68] C. Wang, H. Ma, S. Liu, Y. Li, Z. Ruan, K. Nguyen,
+       terface. https://opencapi.org/, 2018.                         M. D. Bond, R. Netravali, M. Kim, and G. H. Xu.
+                                                                     Semeru: A memory-disaggregated managed runtime.
+  [56] Oracle.        Garbage first garbage collector
+                                                                     In OSDI, pages 261–280, 2020.
+       tuning.           https://www.oracle.com/technical-
+       resources/articles/java/g1gc.html, 2020.                 [69] C. Wang, Y. Qiao, H. Ma, S. Liu, Y. Zhang, W. Chen,
+                                                                     R. Netravali, M. Kim, and G. H. Xu. Canvas: Iso-
+  [57] J. Ousterhout, A. Gopalan, A. Gupta, A. Kejriwal,             lated and adaptive swapping for multi-applications
+       C. Lee, B. Montazeri, D. Ongaro, S. J. Park, H. Qin,          on remote memory. https://arxiv.org/abs/
+       M. Rosenblum, S. Rumble, R. Stutsman, and S. Yang.            2203.09615, 2022.
+       The RAMCloud storage system. ACM Trans. Comput.
+       Syst., 33(3):7:1–7:55, Aug. 2015.                        [70] M. Wu, Z. Zhao, Y. Yang, H. Li, H. Chen, B. Zang,
+                                                                     H. Guan, S. Li, C. Lu, and T. Zhang. Platinum: A
+  [58] Z. Ruan, M. Schwarzkopf, M. K. Aguilera, and A. Be-           cpu-efficient concurrent garbage collector for tail-
+       lay. AIFM: High-performance, application-integrated           reduction of interactive services. In USENIX ATC,
+       far memory. In OSDI, pages 315–332, 2020.                     pages 159–172, 2020.
+
+  [59] S. M. Rumble. Infiniband verbs performance.              [71] M. Wu, Z. Ziming, L. Haoyu, L. Heting, C. Haibo,
+       https://ramcloud.atlassian.net/                               Z. binyu, and G. Haibing. Espresso: Brewing Java for
+       wiki/display/RAM/Infiniband+Verbs+                            more non-volatility. In ASPLOS, pages 70–83, 2018.
+       Performance, 2010.
+                                                                [72] G. Xu, M. Arnold, N. Mitchell, A. Rountev, E. Schon-
+  [60] S. Seshadri, M. Gahagan, S. Bhaskaran, T. Bunker,             berg, and G. Sevitsky. Finding low-utility data struc-
+       A. De, Y. Jin, Y. Liu, and S. Swanson. Willow: A              tures. In PLDI, pages 174–186, 2010.
+       user-programmable SSD. In OSDI, pages 67–80,
+                                                                [73] T. Yuasa. Real-time garbage collection on general-
+       2014.
+                                                                     purpose machines. Journal of Systems and Software,
+                                                                     11(3):181–198, 1990.
+  [61] Y. Shan, Y. Huang, Y. Chen, and Y. Zhang. LegoOS:
+       A disseminated, distributed OS for hardware resource     [74] M. Zaharia, M. Chowdhury, M. J. Franklin,
+       disaggregation. In OSDI, pages 69–87, 2018.                   S. Shenker, and I. Stoica. Spark: Cluster comput-
+                                                                     ing with working sets. HotCloud, page 10, Berkeley,
+  [62] V. Shrivastav, A. Valadarsky, H. Ballani, P. Costa,           CA, USA, 2010.
+       K. S. Lee, H. Wang, R. Agarwal, and H. Weather-
+       spoon. Shoal: A network architecture for disaggre-
+       gated racks. In NSDI, pages 255–270, 2019.
+
+  [63] D. Sidler, Z. Wang, M. Chiosa, A. Kulkarni, and
+       G. Alonso. StRoM: Smart remote memory. In Eu-
+       roSys, 2020.
+
+  [64] G. Tene, B. Iyengar, and M. Wolf. C4: The contin-
+       uously concurrent compacting collector. In ISMM,
+       pages 79–88, 2011.
+
+
+
+USENIX Association                         16th USENIX Symposium on Operating Systems Design and Implementation         53
+
