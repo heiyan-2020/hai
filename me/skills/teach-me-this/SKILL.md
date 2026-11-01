@@ -1,30 +1,33 @@
 ---
 name: teach-me-this
-description: "Train the user's research ability with a published paper they have not read. Instead of summarizing it, the tutor hides the paper's content and makes the user rediscover it in four stages through Socratic questioning: find the research problem from messy phenomena, derive the solution from minimal hints, design the key experiments, then apply and extend the idea; it ends with feedback on how the user did and what to train next. Use this whenever the user hands over a paper (PDF, arXiv or DOI link, or title) and wants to be trained, quizzed, tested, or taught through questions rather than told: 'teach me this', 'train me with this paper', 'quiz me on this paper without spoiling it', '用这篇论文训练我', '带我推一遍这篇论文', 'don't tell me the answer', or wants to practice problem finding, research taste, or experiment design on a real paper. Also use it to resume an unfinished session (a `.teach-me-this/` directory exists). Do not use it when the user just wants a summary or explanation of a paper."
+description: "Train the user's research ability with a published paper they have not read. Instead of summarizing it, the tutor turns the paper into 2–3 exercises (find the research problem from messy observations, design the solution, design the key experiments, or transfer the idea). For each exercise the user writes one complete answer, the tutor scores it against a fixed rubric, then reveals what the paper did, and the user analyzes the gap. It ends with feedback on each ability and what to train next. Use this whenever the user hands over a paper (PDF, arXiv or DOI link, title, or pasted text) and wants to be trained, quizzed, tested, or taught through exercises rather than told: 'teach me this', 'train me with this paper', 'quiz me on this paper without spoiling it', '用这篇论文训练我', '带我推一遍这篇论文', 'don't tell me the answer', or wants to practice problem finding, research taste, or experiment design on a real paper. Also use it to resume an unfinished session (a `.teach-me-this/` directory exists). Do not use it when the user just wants a summary or explanation of a paper."
 ---
 
 # Teach Me This
 
-The output of this skill is not a summary, a plan or a finished artifact. It is a change in the learner's head: after the session they can do a bit better what the paper's authors did, which is to see a problem in messy observations, find the idea that solves it, and know what evidence would prove it.
+The output of this skill is a change in the learner's head: after the session they can do a bit better what the paper's authors did. That means seeing a problem in messy observations, finding the idea that solves it, and knowing what evidence would prove it.
 
-So the tutor's job is the opposite of the usual one. It holds the full answer and gives away as little as possible, as late as possible. Every fact the tutor says is one the learner no longer gets to find. The learner has not read the paper.
+The method is **attempt first, then compare**. For each exercise the learner works alone and writes one complete answer. Only then does the tutor show what the authors did. The learning comes from the full attempt and from the gap between the attempt and the paper. It does not come from a long chain of small hints. A tutor who leads the learner step by step to the answer turns the exercise into "guess what I am thinking". The session gets long, the answers get vague, and the score says nothing.
+
+The learner has not read the paper.
 
 ## The session at a glance
 
-0. **Prepare.** Get the paper, write a private answer card, set up the progress file.
-1. **Find the problem.** Give background and messy phenomena. The learner states the research problem.
-2. **Derive the solution.** Give one seed hint. Guide the learner step by step to the paper's key ideas.
-3. **Design the experiments.** Summarize problem and method formally. The learner proposes the research questions the evaluation must answer, then designs the experiments.
-4. **Apply and extend.** Give prepared scenarios. The learner applies or extends the idea.
-5. **Feedback.** Assess each ability with evidence, and recommend what to train next.
+0. **Prepare.** Get the paper, read the learner's log, pick 2–3 exercises, write the card.
+1. **Run each exercise**, in four steps:
+   1. **Brief and task.** Give the material and say exactly what a complete answer contains.
+   2. **Attempt.** The learner writes one complete answer. The tutor does not coach.
+   3. **Score, then reveal.** Score the answer against the rubric and write the score down. Then show the score and what the paper did.
+   4. **Gap analysis.** The learner says what the authors saw that they did not, and why. The tutor asks at most one follow-up question.
+2. **Feedback.** Report the rubric scores per ability, name the patterns, and recommend what to train next.
 
-Talk to the learner in their language. Keep each turn short, and ask one question at a time.
+A session takes about an hour: 15–25 minutes per exercise. Talk to the learner in their language.
 
 ## Step 0: Prepare
 
 ### Learner profile
 
-Default: a computer science PhD student with no publications yet, who wants to build the skills of finding research problems and solving them with their technical knowledge. Use what the user says about themselves instead, if anything. Do not ask unless the paper is far outside their field and you cannot tell what background to assume.
+Default: a computer science PhD student with no publications yet, who wants to learn to find research problems and to solve them with their technical knowledge. If the user says something about themselves, use that instead. Do not ask unless the paper is far outside their field and you cannot tell what background to assume.
 
 ### Workspace
 
@@ -35,114 +38,103 @@ Use `.teach-me-this/<slug>/` under the current working directory. `<slug>` is sh
 ├── .gitignore         # "*"
 └── <slug>/
     ├── paper.txt      # extracted full text
-    ├── card.md        # the answer card (private)
-    └── progress.md    # session state and transcript notes
+    ├── card.md        # the answer card
+    └── progress.md    # session state, the learner's answers, scores
 ```
 
-If `<slug>/progress.md` already exists, this is a resumed session: read `card.md` and `progress.md`, remind the learner in one or two lines where they were (the stage and the open question, in their own words from last time, without revealing anything new), and continue.
+If `<slug>/progress.md` already exists, this is a resumed session. Read `card.md` and `progress.md`. Tell the learner in one or two lines where they are (which exercise and which step), and continue from there.
 
 ### Get the paper
 
 - PDF: `pdftotext <file> paper.txt` (without `-layout`, which interleaves two-column text). If pdftotext is missing, read the PDF with the Read tool.
 - arXiv / DOI / URL: fetch the PDF, then extract as above. For arXiv, `https://arxiv.org/pdf/<id>` works.
+- Pasted text: save it as `paper.txt`.
 - Title only: search for an open PDF (author page, USENIX, arXiv, ACM open access). If none is found, ask the user for the file.
 
-Check that the text is complete: it has the introduction, the design and the evaluation. A paper without an evaluation section cannot support stage 3; tell the user.
+Check that the text is complete: it has the introduction, the design and, if there is one, the evaluation.
 
-### Write the answer card
+### Read the learner's log
 
-The card is the tutor's private dissection: background, problem, challenges, solution, evidence, a schedule of which fact may be said in which stage, and the material, hints and targets for every stage. The format and rules are in `references/answer-card.md`, and six worked examples from OSDI/SOSP Best Papers are in `references/examples/`.
+Read `~/.teach-me-this/log.md` if it exists. It has the rubric scores from earlier papers. If one dimension is weak again and again (for example "states the cost of the design"), prefer an exercise that trains it, and say so in one line when you start.
 
-**Write it through a subagent.** Whatever you write with a file tool appears in the user's terminal, and so would the answers. Spawn one subagent with the prompt in `references/dissect-prompt.md`, filled in with the paths. It reads the paper, writes `card.md`, and replies with only the paper type and a one-line confirmation. Wait for it.
+### Pick the exercises and write the card
 
-If you cannot spawn a subagent, write the card yourself. Before you do, tell the user: "I'm about to write the answer card to a file. Don't expand the file contents in your terminal." Never print card content in a chat message.
+Read `references/answer-card.md` and follow it. It says how to pick exercises, how to write the brief, the task and the rubric, and gives the card template. Then read the one example in `references/examples/` whose paper type is closest, and match its depth.
 
-Then read `card.md` yourself. Check two things before starting:
-- Each stage-1 phenomenon, against the reveal schedule: does any of them already say a stage-2 fact? If so, fix the card.
-- The paper's key numbers in the card appear in `paper.txt` (grep a few).
+Write the card yourself, directly to `card.md`, in English. The learner does not open it. Never print card content in a chat message before its reveal step.
+
+Before you start, check the card:
+- No brief contains the answer to its own exercise or to a later one. No observation is an experiment that tests the paper's own claim.
+- Each rubric criterion can be checked against the text of an answer: someone else, given the same answer, would give the same score.
+- A few of the card's numbers appear in `paper.txt` (grep for them).
 
 ### Start the progress file
-
-Write `progress.md` with this header, then add to it after every learner turn (see "Progress file" below):
 
 ```markdown
 # <paper title>
 Learner: <profile>
-Stage: 1
-Hints used: (none yet)
+Exercises: 1 <ability> · 2 <ability> · 3 <ability>
+Current: exercise 1, step brief
 ```
 
-Tell the learner in one line that the paper is prepared and that they should not open `.teach-me-this/<slug>/card.md`, then start stage 1.
+Tell the learner in one line that the paper is ready and how many exercises there are, then start exercise 1.
 
-## Every turn: classify the learner's message first
+## Step 1: Run each exercise
 
-The hardest part of this skill is not the stages. It is staying in the current stage while the learner asks questions, pushes for the answer, or wanders. So before replying, decide which kind of message this is.
+### 1. Brief and task
 
-**1. An attempt at the current stage's question.** Compare it with the stage's target checklist in the card.
-- Say specifically which part is right, in a sentence, using the learner's own terms. Do not praise in general terms.
-- For the gap, ask a question that makes the learner look at it. Use the card's "common wrong turns" when the attempt matches one.
-- If the attempt made no progress over their previous one, give the next level of the hint ladder.
-- When the core checklist items are covered, the stage is done, even if the learner's answers are scattered over several turns. Do not demand the authors' wording.
+Give the card's brief (background and material), then the task, word for word in meaning. The task always says what a complete answer contains, for example: "In 4–6 sentences: what fails, the root cause, the obvious fix someone would try first and why it fails, and which observations support this. Say which observation, if any, is unrelated." Then add:
 
-**2. A question to fill in background knowledge.** The learner may ask what something is ("what is DDIO?", "how does Paxos work?"). This is expected and good.
-- If the concept is in the card's safe background, answer it at the level needed, concisely.
-- If the honest answer would reveal a protected fact or term (check the reveal schedule), say that the question is close to the answer, and ask what they think. You may answer the part of it that is plain background.
-- Then return to the current stage. Restate the open question in one sentence. Do not move on to the next stage, and do not add a new hint because a question was asked. The learner asked about a concept, not for progress.
+- Write the whole answer in one message, the way you would write it to your advisor.
+- You may ask background questions, and you may ask for one hint.
 
-**3. Pressure to reveal ("just tell me", "I don't know").** Give the next hint level, not the answer. Give the bottom-out only after L3 has been given and the learner is still stuck, or after they say twice that they want to skip. Record every bottom-out; it goes into the feedback. A learner who skips is not failing; say what they will lose, briefly, then respect it.
+### 2. Attempt
 
-**4. A different but reasonable answer.** Sometimes the learner proposes a real problem or a valid design that is not the paper's. Do not call it wrong. Say that it is a real direction, add in one line what its cost or open question would be, and then steer toward the paper's version through the phenomena: "Your idea is about X. Look at phenomenon 3 again: does X explain that?" The goal is to train them, not to make them guess what the authors thought. If their alternative is truly better in some respect, say so; it is worth noting in the feedback.
+While the learner works, do not coach. Classify each message:
 
-**5. A meta request.** Pausing, changing their profile, going back, or skipping a whole stage: do it and record it.
+- **A background question** ("what is DDIO?"). Answer it briefly if the card lists it as safe background. If the honest answer would give away part of the exercise's answer, say so and do not answer that part. Then restate the task in one sentence.
+- **A hint request.** Give the card's hint for this exercise. There is only one. Record it.
+- **A partial answer, a question-shaped guess ("is it X?"), or thinking aloud.** Do not judge it. Do not say whether it is right. Ask for the complete answer: "Write it out completely, with your reasons, and I'll score it."
+- **A complete answer that leaves out a part the task asked for.** Ask once: "You have not written <part>. Do you want to add it, or should I score it as it is?" This is about form only. Do not hint at the content.
+- **"I don't know" / skip.** Ask once whether they want the hint. If they still want to skip, score what they have written and go on to the reveal.
+- **A meta request** (pause, go back, change profile, skip the exercise): do it and record it.
 
-Before sending any reply, check it against the reveal schedule. Look for any fact, number or term that belongs to a later stage, and for "helpful" summaries that state what the learner has not yet said. Also check that the reply ends with exactly one question.
+### 3. Score, then reveal
 
-## Stage 1: Find the problem
+First score the answer against the card's rubric, and write the scores into `progress.md`. Write them before you show anything. Do not change a score after the reveal.
 
-Give the card's background, then all the phenomena in the card's order, as a numbered list. You may adapt wording and language, but keep each phenomenon a raw observation: no explanation, no causal link, and no ranking of which ones matter. The mess is the exercise. Then ask what research problem they see.
+For each criterion: **Yes**, **Partial** or **No**, with a short quote from the answer as evidence.
+- Yes means the answer states it. It does not count if a generous reader could read it into the answer.
+- An idea that is right but in different words from the authors' gets Yes. Do not demand their vocabulary.
+- An idea that differs from the paper but is well argued counts if it meets the criterion. Note it as an alternative, and say in one line what it costs compared with the paper's choice.
 
-The learner's first answers are usually too wide ("performance is bad") or jump to a solution ("use a faster consensus"). For a too-wide answer, ask which phenomenon it explains and which it does not. For a solution, ask what problem it solves and which phenomenon shows that problem.
+Then send one message with:
+1. The score table: criterion, score, quote, and one line of reason.
+2. The card's "paper's answer" for this exercise. Paper terms may be used from here on.
+3. The card's "also tell" items: the parts of the paper this session does not train, told briefly so that the next exercise has its base.
+4. The gap question: "Compare with your answer. What did the authors see or assume that you did not, and why do you think you missed it?"
 
-When the core checklist is covered and the difference from the paper's problem is small, the stage ends. State the paper's problem formally (the card's target), and say which parts the learner found and which you are adding. Then start stage 2.
+### 4. Gap analysis
 
-## Stage 2: Derive the solution
+The learner's gap analysis is part of the training. Record it verbatim (short) in `progress.md`.
+- If it is specific ("I took the session as the unit for granted and never asked what else it is the unit of"), acknowledge it in one line and move to the next exercise.
+- If it is generic ("I should think more deeply"), ask one follow-up question about the weakest criterion: "Look at criterion 2. Which observation would have led you there?" Then move on, whatever the answer.
 
-Give the seed hint and nothing else. Then follow the card's Path. Let the learner propose; when their idea hits one of the paper's challenges, present it as a concrete situation where their design breaks ("A reader reads position 7, then the leader crashes. What does the new leader put at 7?"), not as a list of challenges. Each wall the learner gets past is one key idea they found.
+Do not reopen the exercise or score it again.
 
-Hints in this stage must stay small. A hint that names the mechanism gives the stage away. When unsure, give the lower level.
+## Step 2: Feedback
 
-The stage ends when the core checklist items are covered, even if spread over many turns and in rough form.
-
-## Stage 3: Design the experiments
-
-An idea without an experiment that tests it is only a story. So this stage is not optional, even when the learner is tired.
-
-1. Give the card's formal summary of problem and method. This is the first point where the paper's names and terms may be used.
-2. Ask: what research questions must the evaluation answer to convince a reviewer? Compare with the card's key questions. Ask about what is missing ("Your design moves cost somewhere. Which question checks what that costs?").
-3. Then, for each key question in turn, ask the learner to design the experiment: baselines, workload, metric, and what result would support or refute the claim. Critique with the card's "what a weak design gets wrong" and reviewer probes. After their design, tell them briefly what the paper did and what it found, and where the paper itself fell short.
-
-Only the 2–4 key experiments, not the paper's whole evaluation.
-
-## Stage 4: Apply and extend
-
-Understanding a paper is the first level; using and extending it is the next. This is hard to do on demand, so the card has prepared scenarios. Present one at a time: give the setup and the guiding question, and let the learner reason. Use the card's good directions to judge and to give hints, but treat them as examples. A different idea that is well argued counts. If the learner has their own extension, welcome it and probe it the same way: which assumption of the paper does it change, and what evidence would it need?
-
-Two scenarios are usually enough. Ask the learner if they want the third.
-
-## Step 5: Feedback
-
-Read `references/feedback.md` and follow it. In short: for each ability (problem finding, solution derivation, experiment design, application and extension), give an assessment backed by quotes from the learner's own answers and the hint levels they needed. Name one or two patterns across stages, and give concrete recommendations for what to practice next. Write the feedback into `progress.md`, and append a short entry to `~/.teach-me-this/log.md`, so progress across papers is visible. Read the earlier entries in that log first; if a pattern repeats, say so.
+Read `references/feedback.md` and follow it. In short: report the rubric scores per ability with quotes, rate the quality of the gap analyses, name one or two patterns across exercises (and across papers, from the log), and give concrete recommendations for what to practice next. Write the feedback into `progress.md` and append the scores to `~/.teach-me-this/log.md`.
 
 ## Progress file
 
-After each learner turn, update `progress.md`: the current stage, hint levels used per stage (and per key idea in stage 2), which checklist items are covered, and the learner's answers as short verbatim quotes with the turn they came from. Keep it terse. It has three uses: resuming after a break or after context is compressed, keeping the stage state honest, and grounding the final feedback in what the learner actually said.
+Update `progress.md` after every learner message: current exercise and step, hints used, the learner's complete answer (verbatim, or close to verbatim if long), the scores with their quotes, and the gap analysis. It serves three purposes: resuming after a break or after the context is compressed, keeping the scores honest, and grounding the feedback.
 
 ## Common failure modes
 
-- **Drifting to the next stage after a side question.** The learner asks what a term means, you answer, and then "naturally" continue with the next stage's material. Always return to the open question.
-- **The helpful recap.** "So you've found that the append waits for ordering, and since readers lag..." The second clause is a stage-2 fact the learner never said.
-- **Phenomena that explain themselves.** "Latency is high because of ordering" is a conclusion. Show what someone would see, not why.
-- **Accepting vague answers.** "The system is slow" covers no checklist item. Ask which phenomenon it explains.
-- **Over-correcting toward the authors' wording.** Do not demand their words. When the idea is there, accept it.
-- **Several questions per turn.** The learner answers the easiest one. Ask one.
-- **Lecturing.** If a reply has more than a short paragraph of your own content, outside of background explanations and the stage-3 summary, you are probably giving too much away.
+- **Coaching during the attempt.** Saying "that's half right, now think about..." turns the exercise back into guessing what the tutor thinks. During the attempt the tutor answers background questions, gives the one hint, and asks for a complete answer. Nothing else.
+- **Generous scoring.** Rewriting a vague answer into a precise one in your head, then scoring the precise one. Score only what is written. If you need a word that is not in the answer to justify a Yes, the score is Partial.
+- **Scoring after revealing.** Once you have shown the paper's answer, every answer looks closer to it than it was. Score first and write the score down.
+- **Lecturing in the reveal.** The reveal is the card's short answer for this exercise, not a summary of the whole section. The learner can read the paper afterwards.
+- **Teaching every part of the paper.** The session trains abilities. It does not cover the paper. Parts with no exercise are told in "also tell", in a few lines each.
+- **A brief that explains itself.** "Latency is high because of ordering" is a conclusion. The brief shows what someone would see, not why.

@@ -1,148 +1,144 @@
 # Answer card: how to write one
 
-An answer card is the tutor's private dissection of one paper. The tutor writes it before the first question and never shows it. Every stage of the session is driven from it: what to show, which hint comes next, when an answer is close enough, and what must stay hidden until later.
+An answer card is the tutor's private plan for one paper. It holds 2–3 exercises. For each exercise it has the material to give, the task, a rubric fixed before the learner answers, and the paper's answer to reveal afterwards.
 
-Worked examples are in `examples/`. Read at least one before writing a card, preferably the one whose paper type matches the paper at hand:
+Worked examples are in `examples/`. Read the one whose paper type is closest:
 
-| Example | Paper type | What its stage 1 looks like |
-|---------|------------|-----------------------------|
-| `sosp24-lazylog.md` | new system, latency | a trace, a forbidden config knob, a consumer's requirement |
-| `sosp25-rearchitecting-the-thread.md` | new system, architecture | hardware counters, a failed tuning attempt, scaling curves |
-| `osdi21-pollux.md` | new system, scheduling / ML | job completion times, users' habits, training curves |
-| `osdi23-triangulating-python-perform.md` | tool, measurement | confusing profiler output, overhead numbers |
-| `osdi16-early-detection-of.md` | tool, reliability (study-driven) | postmortems, ticket statistics, an audit |
-| `sosp21-using-lightweight-formal.md` | verification / methodology | review questions nobody could answer; no speedup plots in stage 3 |
+| Example | Paper type | Exercises |
+|---------|------------|-----------|
+| `sosp24-lazylog.md` | new system, latency | problem · solution · experiments |
+| `sosp25-rearchitecting-the-thread.md` | new system, architecture | problem · solution · experiments |
+| `osdi21-pollux.md` | new system, scheduling / ML | problem · solution · experiments |
+| `osdi23-triangulating-python-perform.md` | tool, measurement | problem · solution · experiments |
+| `osdi16-early-detection-of.md` | tool, reliability (study-driven) | problem · solution · transfer |
+| `sosp21-using-lightweight-formal.md` | verification / methodology | problem · solution · transfer |
 
 ## Why the card exists
 
-Two failures ruin this kind of training, and both come from improvising during the conversation:
+The tutor decides three things in advance, before the learner is in front of it:
 
-- **Leaking.** Under pressure ("just tell me"), or while answering a side question, the tutor says a fact that belongs to a later stage. Once said, it cannot be unsaid, and the learner never gets to find it.
-- **Drifting.** Without a fixed target, the tutor accepts a vague answer, or keeps pushing toward its own idea rather than the paper's.
+- **What the learner sees before answering.** A brief that already contains the answer makes the exercise pointless.
+- **What counts as a good answer.** Without a rubric written in advance, the tutor scores by impression. The impression is generous, and it drifts towards whatever the learner said.
+- **What to reveal afterwards.** It is short and prepared, so the reveal does not turn into a lecture.
 
-The card fixes both in advance: a reveal schedule says which fact may be said in which stage, hints are written before the learner is under pressure, and each stage has a target with a checklist.
+## Abilities and rubric dimensions
 
-## Rules that hold across the whole card
+Every rubric criterion is tagged with one of these dimensions. They are the same for every paper, so that the log can compare papers and show which dimension stays weak.
 
-- **Reveal schedule.** Every fact that carries the paper's idea is assigned to the earliest stage where it may be said. Before writing each stage's material, check it against the schedule. A phenomenon in stage 1 that already states the stage-2 insight makes stage 2 pointless.
-- **No author vocabulary before its stage.** The paper's coined terms ("lazy ordering", the system name) name the answer. Use plain words until the stage that reveals them.
-- **Ground everything in the paper.** Numbers, baselines and observations come from the paper's text. Where a phenomenon is a re-telling (the paper states a measurement; the card describes how an engineer would run into it), keep the numbers the paper reports. Do not invent results.
-- **Language.** Write the card in English. The tutor speaks to the learner in the learner's language.
+**Problem finding**
+- `P-cause`: names the root cause, not a symptom ("the append waits for ordering", not "latency is high").
+- `P-strawman`: names the obvious fix a practitioner would try first, and why it fails (the constraint it breaks, or the cause it misses).
+- `P-signal`: combines several observations; sets aside the one that is unrelated.
+- `P-goal`: states the goal so that a solution can be judged against it (what must be kept, what must improve).
+
+**Solution design**
+- `S-insight`: states the fact about the problem or workload that the design exploits.
+- `S-mechanism`: the mechanism is concrete enough to build.
+- `S-correct`: says why it is correct or safe, including the failure case that threatens it.
+- `S-cost`: says what the design pays for, and when that cost is bad.
+
+**Experiment design**
+- `E-claim`: tests the headline claim against the strongest fair baseline.
+- `E-cost`: tests the cost of the design and its worst case.
+- `E-ablation`: isolates the contribution of each key idea.
+- `E-refute`: a workload and metric whose result could refute the claim (tails, realistic load, not only the friendly case).
+
+**Transfer**
+- `T-assumption`: names which assumption of the paper the scenario changes.
+- `T-insight`: judges whether the insight still holds, not only whether the mechanism can be copied.
+- `T-evidence`: proposes a change and the evidence that would show it works.
+
+## Picking the exercises
+
+- **2–3 exercises.** The default is problem finding, then solution design, then experiment design. Use transfer instead of experiment design when the paper's evaluation is thin (no real baselines, preliminary numbers) or when the learner's log shows transfer is the weak ability.
+- **Prefer the weak dimensions.** If `~/.teach-me-this/log.md` shows a dimension scored No or Partial on several papers, pick an exercise that has a criterion for it.
+- **Each exercise trains one central idea.** The session does not cover the paper. When the paper has many parts (an architecture with five modules, a system with six optimizations), the solution exercise targets the one or two ideas that follow directly from the core problem. Everything else goes into "also tell".
+- **Exercises chain.** The reveal of exercise N gives what the brief of exercise N+1 needs. The solution exercise starts from the paper's problem statement, not from the learner's.
+
+## Writing the brief
+
+The brief is the only material the learner gets. It shows what a practitioner would see. It never shows why.
+
+For a **problem-finding** exercise: a short neutral background, then 3–5 numbered observations.
+- One observation each, in at most two sentences. Do not join two unrelated things into one item.
+- Concrete: the paper's numbers, a named tool or setting, a quoted complaint.
+- No causal claim and no author vocabulary. "p50 put latency is 1.5 ms even at 5% load" is an observation. "Ordering on the critical path causes latency" is the answer.
+- Strawmen. The brief may show one obvious fix being tried and failing (a benchmark, an incident, a refused proposal). For the other obvious fixes, show only the constraint, as a plain fact, and leave the learner to come up with the fix it rules out. The tutor notes list every strawman the rubric expects.
+- At most one distractor: true and plausible, but unrelated. Mark it in the tutor notes.
+- Do not write one observation per part of the paper. The observations serve the core problem only.
+- Nothing in a brief may answer a later exercise. Never use an experiment that tests the paper's own claim (its system against baselines, or its ablations) as an observation. Measurements of existing systems that show the problem are fine. When a later rubric criterion builds on something a brief showed, its Yes must require more than repeating it.
+
+For a **solution** exercise: the problem statement (the paper's, as revealed in exercise 1), then 3–5 facts about the setting that a practitioner could know, such as how applications use the API, what the workload looks like, or what the hardware does. Include the facts the insight rests on, mixed with neutral facts. Do not describe any mechanism.
+
+For an **experiment** exercise: the formal summary of the problem and the method, with the paper's names, and the claims the authors make.
+
+For a **transfer** exercise: one scenario that changes one assumption the paper relies on, or that moves its insight to another system.
+
+## Writing the task
+
+The task says what a complete answer contains, in general terms, with a length. It never names the paper's content. Examples:
+
+- Problem: "In 4–6 sentences: what fails, the root cause, the obvious fix someone would try first and why it fails, and which observations support this. Say which observation, if any, is unrelated."
+- Solution: "Describe your design: (a) the one fact about the problem or workload it exploits, (b) the mechanism, (c) why it is correct, including the failure case that most threatens it, (d) what it costs and when that cost is bad."
+- Experiments: "List the 2–3 research questions the evaluation must answer. For the most important one, give the baselines, the workload, the metric, and the result that would refute the claim. For the others, one line each."
+- Transfer: "Which assumption of the paper changes here? Does the insight still hold? What would you change, and what evidence would show that it works?"
+
+## Writing the rubric
+
+3–5 criteria per exercise, each tagged with a dimension. For each: what **Yes** looks like for this paper, and what counts as **Partial**. Write it so that another tutor, given the same answer, would give the same score.
+
+- Yes needs the idea stated, in any words. "Something has to know which task a message belongs to" is Yes for "a persistent global coordinator is needed". "Maybe an index?" is not.
+- List any known valid alternatives that also earn Yes.
+
+## The hint
+
+One hint per exercise, given only when the learner asks. It points at where to look ("look at what the writers do with the return value"). It never names the mechanism or the cause.
+
+## The paper's answer
+
+What the reveal shows, in 4–8 sentences, in plain words, now with the paper's terms. For the experiment exercise: what the paper ran, what it found, and where its evaluation falls short. Add the section numbers of the paper so the learner can read further.
+
+## Common gaps
+
+Typical differences between attempts and the paper. For each, the one follow-up question to ask in the gap analysis.
 
 ## Template
 
-Copy this structure. Section names are fixed so the tutor can find things; the content under each is free-form.
+Section names are fixed so the tutor can find things.
 
 ```markdown
 # <Paper title>
 <Venue'Year> · <authors / institution> · <link>
-Paper type: <new system | tool | measurement | verification | ...>
-> Spoiler: this card dissects the paper. Do not read it if you want to train on this paper.
+Paper type: <new system | tool | measurement | verification | design article | ...>
 
 ## Dissection
-- Background: <what the field looks like; what a reader must know>
-- Problem: <the one problem the paper solves, as the authors would state it>
+- Background: <what the field looks like>
+- Problem: <the one problem, as the authors would state it>
 - Challenges: <why it is hard; what breaks the obvious approaches>
 - Solution: <the key ideas, each as insight → design → which failure it removes>
 - Evidence: <the main results, with numbers>
 
-## Reveal schedule
-| Fact | Earliest stage |
-|------|----------------|
-| ... | 1 / 2 / 3 / 4 |
+Safe background (may be explained whenever asked): <concepts>
+Protected terms (not before the reveal of exercise N): <term (N)>, ...
 
-Protected terms (do not say before the stage shown): <term (stage)>, ...
-Safe background (may be explained whenever asked): <concepts>, ...
+## Exercise 1: <ability> — <one line>
+### Brief
+<background and material, as given to the learner>
+Tutor notes: <what each item points at; which one is the distractor>
+### Task
+<what a complete answer contains, with a length>
+### Hint
+<one hint>
+### Rubric
+1. [<dimension>] <criterion>. Yes: <...>. Partial: <...>.
+2. ...
+### Paper's answer
+<4–8 sentences; section numbers>
+### Also tell
+<parts of the paper this session does not train, a few lines each; what the next brief needs>
+### Common gaps
+- <gap> → <follow-up question>
 
-## Stage 1: Find the problem
-### Background to give
-<A short, neutral setup. Describe the world the learner works in, not the paper's argument.>
-
-### Phenomena
-<4–6 numbered observations, in the order shown to the learner. See "Writing phenomena" below.>
-Tutor notes: <which phenomena are load-bearing, which one is the distractor, and what each is meant to point at>
-
-### Hint ladder
-- L1: <a nudge about where to look>
-- L2: <a sharper question that narrows the space>
-- L3: <a near-statement that leaves only the final step to the learner>
-- Bottom-out: <state the problem; used only after L3 fails or the learner explicitly gives up>
-
-### Target
-<The problem statement, 2–4 sentences.>
-Checklist (the stage ends when the core items are covered in the learner's own words):
-- [core] <element>
-- [core] <element>
-- [detail] <nice to have>
-
-### Common wrong turns
-- <a plausible but wrong framing> → <the question that redirects it>
-
-## Stage 2: Derive the solution
-### Seed hint
-<The single hint given at the start of stage 2. It points at where the insight comes from, never at the mechanism.>
-
-### Path
-<The likely route from the learner's first idea to the paper's design. For each step: the naive move the learner is likely to make, the obstacle (from the paper's challenges or rejected alternatives) to present as "your idea hits this wall", and what getting past it looks like.>
-
-### Hint ladder
-<L1–L3 and bottom-out, as in stage 1. One ladder per key idea if the paper has several.>
-
-### Target
-<The key ideas, each as insight → design → why it removes the failure.>
-Checklist:
-- [core] ...
-- [detail] ...
-
-## Stage 3: Design the experiments
-### Summary to give
-<The formal statement of problem and method, given at the start of stage 3. This is where protected terms may first be used.>
-
-### Key research questions
-<2–4 questions the evaluation must answer, each with why a reviewer would insist on it. Pick the ones that test the core claims; leave out the paper's secondary experiments.>
-
-### Key experiments
-<For each question: baselines, workload, metric, the paper's setup and result, and what a weak design gets wrong (wrong baseline, unfair comparison, cherry-picked workload, missing tail metric, missing ablation).>
-
-### Reviewer probes
-<Questions to ask about the learner's design, from a reviewer's point of view.>
-
-## Stage 4: Apply and extend
-### Scenarios
-<2–3 scenarios. Each changes one assumption the paper relies on, or moves its insight to another system. For each: the setup to give, the guiding question, and one or two directions that would count as good answers. These are not the only valid answers.>
+## Exercise 2: ...
+(same sections)
 ```
-
-## Writing phenomena
-
-Stage 1 trains the skill of turning raw observations into a research problem. The phenomena are the whole exercise, so they deserve the most care.
-
-**Write what someone would actually see.** A phenomenon is what you notice while running an experiment, operating a system, reading a trace, or hearing a complaint. "p50 put latency is 1.5 ms even at 5% load" is a phenomenon. "Ordering on the critical path causes high latency" is the authors' conclusion; it is the answer, not a phenomenon.
-
-Checks for each phenomenon:
-
-- **No causal claim.** It reports what happened, not why. The learner supplies the why.
-- **No author vocabulary.** Use plain words, never the paper's coined terms or its framing.
-- **Concrete.** Numbers from the paper, a named tool or setting, a quoted complaint. Vague phenomena ("performance is bad") give the learner nothing to reason with.
-- **Partial.** Each phenomenon shows one piece. The problem appears only when several are combined.
-
-Checks for the set:
-
-- **Messy order.** Do not present them in the order of the paper's argument. Real observations arrive out of order.
-- **One distractor.** Include one observation that is true and plausible but unrelated to the problem (a GC pause, a misconfigured client). It trains the learner to separate signal from noise. Mark it in the tutor notes.
-- **Constraints show up too.** If the problem has a constraint that rules out an obvious fix (durability, compatibility, cost), include a phenomenon where that constraint bites, so the learner discovers it rather than being told.
-- **Nothing from stage 2.** Check the set against the reveal schedule. The facts that make the solution possible belong to stage 2's hints.
-
-## Writing hints
-
-Hints go from general to specific. Each level should leave the learner something real to do.
-
-- L1 points at where to look ("look at what the writers do with the return value").
-- L2 asks a question that narrows the space ("when do readers actually read?").
-- L3 nearly states the answer and leaves the last step ("what if the order only had to exist by the time someone reads?").
-- Bottom-out states it. It is given only when L3 fails or the learner explicitly gives up, and the feedback records that it was used.
-
-A stage can need more than one ladder. In stage 2 there is usually one per key idea, and later ladders are only reached after the learner has the earlier idea.
-
-## Picking the key experiments
-
-A paper's evaluation is broad. Pick the 2–4 questions that test its core claims: usually the headline benefit, the cost the design pays for it (and the worst case where that cost shows), and one ablation per key idea. For each, note what a weak design would get wrong; this is where most of the learner's feedback in stage 3 comes from.

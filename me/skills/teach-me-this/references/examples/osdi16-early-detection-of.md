@@ -1,7 +1,6 @@
 # Early Detection of Configuration Errors to Reduce Failure Damage
 OSDI'16 · Tianyin Xu, Xinxin Jin, Peng Huang, Yuanyuan Zhou, Shan Lu, Long Jin, Shankar Pasupathy / UCSD, University of Chicago, NetApp · https://www.usenix.org/conference/osdi16/technical-sessions/presentation/xu
 Paper type: tool / reliability (study-driven: a code study of six systems, then a tool built on its findings)
-> Spoiler: this card dissects the paper. Do not read it if you want to train on this paper.
 
 ## Dissection
 - Background: Large systems have hundreds of settings (HDFS 164, YARN 116, HBase 125, Apache 97, Squid 216, MySQL 462). Config errors are a major cause of cloud outages; an erroneous fail-over config caused a 2.5-hour Google App Engine outage in 2010. The same config file is pushed to thousands of nodes and persists across reboots, so redundancy and restarts do not help. Sysadmins mostly test configs black-box: start the system, run a small workload, watch.
@@ -14,125 +13,91 @@ Paper type: tool / reliability (study-driven: a code study of six systems, then 
   Also: merge equal or subset checkers; drop checkers whose code already ran before the call site; invoke after the root → nobody user switch, before serving or joining the cluster; optional periodic thread for errors that appear after the check (TOCTTOU).
 - Evidence: detects 29 of 37 new errors (78.4%) and 15 of 21 historical ones (71.4%); conf spellchecker detects 11 and 7 fewer. All type/format and option/range errors are found; file-path errors 9/12 and 5/7; "other" 7/13 and 3/6. On 830 real config files from mailing lists and forums: 282 true errors, 3 false alarms; 37.5%–87.8% of the errors per system can only be seen on the local environment. False alarms in 3 parameters (2 YARN, 1 HBase), at most 1.7% (2/116 in YARN), all from missed control dependencies. Checkers run in under 1 s (max 780 ms, HBase HMaster; Apache 0.6 ms). Setup is 4–7 lines per system, 31 for MySQL. Misses come from values passed to shell commands and from paths merged with request content.
 
-## Reveal schedule
-| Fact | Earliest stage |
-|------|----------------|
-| Config errors cause big outages; same config on many nodes; sysadmins test black-box | 1 |
-| COMP-A ticket numbers (47.6% / 75% / diagnosis time); Squid, MapReduce, HDFS fail-over, Apache core-dump incidents | 1 |
-| Many reliability settings have no startup check and are not read at startup | 1 (learner should find this) |
-| Hand-written checks are incomplete; the constraint depends on how the value is used | 1 |
-| Learning from many configs fails because configs are copies; type inference is too coarse | 1 (as wrong turns) / 2 (as walls) |
-| The using code is itself the complete check | 2 (seed points at it; learner should find it) |
-| Failure depends on the value reaching the operation, not on the trigger; drop the conditions | 2 |
-| Static data-flow slice from the getter, backward context, cut when indeterminate | 2 |
-| Side effects; rewrite calls to semantic checks; sandbox/VM rejected | 2 |
-| Existing error signals as the verdict; drop checkers without one | 2 |
-| Where to run (end of init, after user switch), periodic re-check | 2 |
-| Names PCheck, "LC error", "checker"; all §4 numbers | 3 |
-| Limits: shell commands, request-dependent values, legal but unsuitable values, file contents | 3 (probes) / 4 |
+Safe background (may be explained whenever asked): HDFS HA and fencing, NameNode/DataNode, TaskTracker, Squid log rotation, Apache core dumps, errno and Java exceptions, static taint analysis and program slicing, LLVM and Soot, TOCTTOU, conf spellchecker as a type-inference tool, the idea of learning config rules from many machines.
+Protected terms (not before the reveal of exercise N): "latent configuration error", "LC error" (1); PCheck, "checker", "check utility", "emulating late execution", "execution emulation", "usage-implied checking" (2).
 
-Protected terms: "latent configuration error", "LC error" (3); PCheck (3); "emulating late execution", "execution emulation" (3); "checker" as the paper's artifact (2, only after the learner proposes generated check code); "check utility" (2, only after the learner proposes replacing calls); "usage-implied checking" (2, bottom-out only).
-Safe background: HDFS HA and fencing, NameNode/DataNode, TaskTracker, Squid log rotation, Apache core dumps, errno and Java exceptions, static taint analysis and program slicing, LLVM and Soot, TOCTTOU, conf spellchecker as a type-inference tool, the idea of learning config rules from many machines.
-
-## Stage 1: Find the problem
-### Background to give
+## Exercise 1: Problem finding — why do some config errors do so much damage?
+### Brief
 You are on the reliability team of a company that runs Hadoop (HDFS, YARN, HBase) and a web tier (Apache, Squid, MySQL) on a few thousand machines. Config changes go through code review, then a rollout tool copies the same file to every node in a role. The pre-rollout test is: start the service on a canary, send it some traffic, watch logs and dashboards for a while. You have been asked to look at last year's config-related incidents and say what the team should build.
 
-### Phenomena
-1. Postmortem, Squid proxy. Someone set `diskd_program` to a path that did not exist. Startup log: clean. Traffic: normal for days. At the next log rotation, Squid hung and hogged the CPU for 7+ hours. Diagnosis took 48 hours: 26 rounds of back-and-forth, 5 collections of logs and traces, 2 patches that did not fix it. The final fix added a startup check that the path exists. A reviewer noted it does not look at file type or permissions.
-2. A RegionServer died with OutOfMemoryError two days after a deploy. Its heap setting was a valid number that parsed fine at startup; the week's load was simply larger than the person who chose it expected.
-3. Ticket statistics shared by a storage vendor you buy from. Config tickets where the system started cleanly and the error showed up later are 47.6% of all config tickets, but 75% of the high-severity ones. Diagnosis time, normalized to the average ticket: mean 1.14 vs. 0.87, median 1.70 vs. 0.41 for errors caught at startup.
-4. Staging drill for HDFS high availability. The cluster had been serving normally. The team killed the active NameNode. Fail-over never completed: the fencing step threw IllegalArgumentException parsing `dfs.ha.fencing.ssh.connect-timeout` (a typo), and the whole HDFS was unavailable. A note in the drill report: "We only saw this because we killed the active NameNode. We cannot do that on every config push."
-5. A teammate's audit. Apache's startup code for `CoreDumpDirectory` checks that the path exists and is a directory. In the crash handler, Apache calls chdir to it; the process has no permission, chdir fails, and no core dump is written. Elsewhere, one path setting is used by chdir in one place and by open(O_CREAT) in another. Counts from the audit: of 44 reliability-related HDFS settings, 41 have no startup check at all; for MySQL, 6 of 43 have none and 6 more have only a partial one. HDFS has 164 settings, MySQL 462. The teammate's note: "Writing these checks by hand means knowing every use of every value. They also go stale as the code changes."
-6. Hadoop issue thread. `mapred.local.dir` pointed to a directory with the wrong owner, on many nodes. "When I ran jobs on a big cluster, some map tasks never got started." TaskTrackers caught the exception, retried, and looped forever; restarting did not help. Request in the thread: "TaskTracker should check whether it can access the local dir at the initialization time, before taking any tasks." A Java developer on your team says their usual quick fix for such bugs is to read the setting in a class constructor, "but this object is only created when the first job runs."
+1. Squid: a `diskd_program` path that did not exist passed a clean startup and days of normal traffic. At the next log rotation Squid hung and hogged the CPU for over 7 hours, and diagnosis took 48 hours.
+2. In a staging drill for HDFS high availability, the team killed the active NameNode, and fail-over never completed: the fencing step threw IllegalArgumentException on a typo in `dfs.ha.fencing.ssh.connect-timeout`, and all of HDFS was unavailable. The drill report says: "We only saw this because we killed the active NameNode. We cannot do that on every config push."
+3. Ticket statistics from a storage vendor you buy from: config errors that showed up after a clean startup are 47.6% of all config tickets, but 75% of the high-severity ones. Their median diagnosis time, normalized to the average ticket, is 1.70, against 0.41 for errors caught at startup.
+4. A teammate's audit: of 44 reliability-related HDFS settings, 41 have no startup check at all; for MySQL, 6 of 43 have none and 6 more have only a partial one. The teammate's note: "One value can be used in many places in the code, and those uses change as the code changes."
+5. A RegionServer died with OutOfMemoryError two days after a deploy. Its heap setting was a valid number that parsed fine at startup; the week's load was larger than the person who chose it expected.
 
-Tutor notes: 1, 4 and 6 are the core pattern (startup looks fine, the value is used only on a rare path, failure lands when that path is needed, and it hits many nodes at once). 3 says these errors are the expensive ones. 5 is the constraint that rules out "just write more startup checks": the right check depends on how the value is used, and there are too many values. 4 also carries a constraint: the rare path cannot be triggered on purpose in production. The last line of 1 and the constructor remark in 6 repeat it: partial fixes keep missing cases. 2 is the distractor: it is late too, but the value is legal; nothing in the code rejects it. It is a sizing problem, outside this paper's scope. Do not let the learner build the problem around resource tuning.
-
-### Hint ladder
-- L1: In 1, 4 and 6, when was the bad value first read by the program?
-- L2: Your canary test starts the service and sends traffic. Which of these settings does that test ever touch? What do they have in common?
-- L3: The fixes in 1, 5 and 6 all try to check at startup by hand and all miss cases. So the problem is "catch errors in settings that startup never uses, at startup, without ___ and without ___". Fill the blanks from 4 and 5.
-- Bottom-out: state the target below.
-
-### Target
-Settings for fail-over, error handling, log rotation and similar paths are not used or checked at startup, so an error in them passes every startup test and canary. It surfaces only when the rare path runs, often under an existing failure, on every node that got the file. The result is severe outages and long diagnosis. Hand-written startup checks are missing or incomplete, because the correct constraint depends on how each value is used, and there are hundreds of values. The problem: detect these errors at startup, automatically, without hand-written rules and without having to trigger the rare path.
-Checklist:
-- [core] The bad values are in settings used only on late, rare paths; startup and canaries never touch them.
-- [core] Damage is high because the error shows up exactly when the safety net is needed, and on all nodes at once.
-- [core] Hand-written checks do not scale and are incomplete; the rare path cannot be triggered on demand.
-- [detail] These errors take longer to diagnose and dominate high-severity tickets.
-- [detail] Restart and redundancy do not help, because the bad value persists in the file on every node.
-
-### Common wrong turns
+Tutor notes: 1 and 2 are the core pattern: startup looks fine, the value is used only on a rare path, and failure lands when that path is needed, on every node that got the file. 3 says these errors are the expensive ones. 2 shows one strawman being tried, "test the rare path before rollout", and the constraint that kills it (the drill quote). 4 shows only a constraint: the learner should come up with the strawman it kills, "write the missing startup checks by hand", which means knowing every use of every value and goes stale as the code changes. 5 is the distractor: it is late too, but the value is legal and nothing in the code rejects it. It is a sizing problem, outside this paper's scope.
+### Task
+In 4–6 sentences: what fails, the root cause, the obvious fix someone would try first and why it fails, and which observations support this. Say which observation, if any, is unrelated.
+### Hint
+In observations 1 and 2, when did the program first read the bad value? Does your canary test ever touch those settings?
+### Rubric
+1. [P-cause] The bad values sit in settings that are read only on rare paths (fail-over, error handling, log rotation), so startup and canary tests never touch them. Yes: says the value is not used or checked at startup, only when the rare path runs. Partial: "config testing is weak" or "errors are found late" without saying why startup misses them.
+2. [P-strawman] The obvious fixes and why they fail: write the missing startup checks by hand (the learner's own; they need every use of every value and go stale, observation 4), or test the rare path (it cannot be triggered on demand, observation 2). Yes: names both fixes, each with why it fails. Partial: names one, or names a fix without the reason.
+3. [P-signal] Damage is high because the error appears exactly when the safety net is needed, and on all nodes at once; the heap case is unrelated. Yes: uses 1–3 for the damage (outage, severity or diagnosis time) and sets aside 5 with a reason (the value is legal; no operation rejects it). Partial: does one of the two.
+4. [P-goal] A goal a solution can be judged against: detect these errors at startup, automatically, without hand-written rules and without triggering the rare path. Yes: states when detection must happen and both "without" conditions. Partial: "catch config errors earlier".
+### Paper's answer
+Many settings for fail-over, error handling, backup and log rotation are not read or checked at startup; they are read only when the rare path runs. The paper calls errors in them latent configuration (LC) errors. They pass every startup test and canary, then break the safety net exactly when it is needed. The same file sits on thousands of nodes and persists across reboots, so redundancy and restarts do not help. At COMP-A they are 47.6% of config issues but 75% of the high-severity ones, and they take longer to diagnose. A study of 182 reliability-related settings in six systems finds 37 (20.3%) exposed to LC errors; 14.0%–93.2% of these settings have no startup check, and existing checks are incomplete because the right constraint depends on how the value is used. The problem: detect LC errors at startup, automatically, without hand-written rules and without large config datasets.
+### Also tell
+Two obvious automatic approaches do not work. Learning "normal" values needs many independent configs, but data centers copy one config to every node, and paths, IPs and hostnames differ by machine by design. Type inference (conf spellchecker) knows "this is a file" but not how the file is used. The next brief starts from the problem statement above.
+### Common gaps
 - "Test configs better before rollout" → Which test would have touched `diskd_program` or the fencing timeout without killing a NameNode or waiting for log rotation?
-- "Learn normal values from all our machines" → Your rollout copies one file to every node. How many independent samples does that give? And what is the "normal" value of a local path or an IP address?
-- "Use a type checker for config values" → In 5, the value is a directory that exists. What would a type checker say about it?
-- "It is about resource sizing" (from 2) → In 1, 4 and 6, was the value a plausible-but-too-small number, or something an operation flatly rejects?
+- "Learn normal values from all our machines" → Your rollout copies one file to every node. How many independent samples does that give? And what is the "normal" value of a local path?
+- "Use a type checker for config values" → A core dump directory exists and is a directory, but the process cannot enter it. What would a type checker say?
+- Built the problem around resource sizing (from 5) → In 1 and 2, was the value a plausible-but-too-small number, or something an operation flatly rejects?
 
-## Stage 2: Derive the solution
-### Seed hint
-In every incident you looked at, something in the program did eventually notice the bad value. Look at what noticed it, and how much that piece of code knows about what the value must be.
+## Exercise 2: Solution design — catch late-use errors at startup, without rules
+### Brief
+The problem (from exercise 1): errors in settings used only on rare paths escape startup testing. They must be detected at startup, automatically, without hand-written rules and without triggering the rare path. Some facts about the code and the operators:
 
-### Path
-1. Learner proposes generating startup checks from types or rules. Wall: the constraint depends on use (chdir needs execute permission, open(O_CREAT) needs write on the parent, freopen with "a" needs append). Rules or types miss these; conf spellchecker only flags a file that is neither readable nor writable. Ask: where in the code is the full constraint already written down?
-2. Learner sees that the consuming operation (chdir, open, parseInt) is the complete check, and proposes "run the fail-over code at startup". Wall: that code runs only after a NameNode crash; you cannot cause one. Ask: does chdir fail because a crash happened, or because of the path it got?
-3. Learner proposes running only the instructions that carry the value from the getter to the operation, and drops the conditions around them. Wall (missing context): the call also needs other variables (freopen's mode and stream; values read from the network; parts built from request content) that may not exist at startup. Ask: which of these can you compute from the code alone, and what do you do with the rest? Good answer: backtrack to constants where possible; cut the slice where the value is indeterminate, accepting misses over wrong verdicts. Also: following control flow too would pull in everything (over-tainting); follow data flow, but keep simple guards like `if (p != NULL)`.
-4. Wall (side effects): the extracted code runs inside the live process. exec would replace the process image; a slice could create or delete files; freopen on the error log closes stderr. Learner may say "run it in a sandbox or VM". Ask: who sets up that VM on every node, at every startup? Good answer: do not make the call; check its arguments by the call's meaning (access/stat for files, reachability for addresses), copy globals to locals, drop calls you do not understand along with what follows.
-5. Wall (no verdict): the rehearsal ran. How do you know the value was bad? Good answer: reuse the program's own failure signals (exceptions, errno, branches that lead to exit or error logs); if a slice has none, it cannot tell you anything, so drop it.
-6. Where and when to run. Ask: if the process starts as root and switches to nobody during startup, when should the check run? (After the switch, before serving or joining the cluster.) What if someone deletes the directory an hour after startup? (Re-run periodically.)
-Also discuss: why does running on the real host matter, compared with checking the config file as text? (Missing paths, unreachable IPs, wrong owners are facts about this machine.)
+1. Apache's startup code checks that `CoreDumpDirectory` exists and is a directory. In the crash handler, Apache calls chdir to it; the process has no permission, chdir fails, and no core dump is written.
+2. In one system, the same path setting is passed to chdir in one function and to open with O_CREAT in another.
+3. The HDFS fencing code reads the timeout string from the configuration loaded at startup and passes it to parseInt. This code runs only after the active NameNode has crashed.
+4. The services start as root and switch to user nobody during initialization, then start serving or join the cluster.
+5. The ops team refuses any check that needs extra setup on each node, such as a VM per node.
 
-### Hint ladder
-Idea 1 (the using code is the check, and it does not need the trigger):
-- L1: In the Apache audit, the startup check passed and chdir failed. Which of the two knew the real constraint?
-- L2: For the fencing timeout, what decides whether parseInt throws: the NameNode crash, or the string?
-- L3: If you could run just the steps from "read the setting" to "use it", without the "if crashed" around them, what would you need to make them runnable?
-- Bottom-out: extract the data-flow slice from the getter to the consuming operations, drop the trigger conditions, fill in context that can be computed statically, cut where it cannot, and run the slice at the end of startup on the real host.
-Idea 2 (rehearse without side effects):
-- L1: What would happen to the live process if the slice called freopen on stderr, or exec?
-- L2: To know whether open(path, O_CREAT) would fail, what do you actually need to look at?
-- L3: Could you swap each risky call for a function that answers "would this call fail with these arguments?"
-- Bottom-out: rewrite calls into semantic checks (access/stat, reachability), keep state changes local, skip file contents and packets, remove unknown calls and what follows; no VM needed.
-Idea 3 (the verdict comes from the program):
-- L1: When the real fail-over broke, how did the program show it?
-- L2: Which such signals exist in Java and in C?
-- Bottom-out: catch exceptions, check return codes/errno, treat paths that must reach exit/abort/error logging as failures; drop slices with no signal.
+Tutor notes: 1 and 3 are the insight (the operation that uses the value is the full check, and its outcome depends on the value, not on the crash). 2 shows that the constraint depends on the use, so one generic check per setting is not enough. 4 is neutral here; it matters for where the check runs, which is in "also tell". 5 is the constraint that rules out running risky code in a sandbox.
+### Task
+Describe your design: (a) the one fact about the problem or the code it exploits, (b) the mechanism, (c) why it is correct and safe, including the failure case that most threatens it, (d) what it costs and when that cost is bad.
+### Hint
+In each incident, something in the program did finally notice the bad value. Look at what noticed it, and at what decided whether it failed: the crash, or the value.
+### Rubric
+1. [S-insight] The code that uses the value already holds its full constraint, and whether it fails depends on the value reaching it, not on the trigger. Yes: states both halves in any words. Partial: only one ("reuse the program's code" without saying the trigger is not needed, or "skip the crash condition" without saying why the use is the check).
+2. [S-mechanism] Extract the steps from reading the setting to its uses, drop the trigger conditions around them, and run them at the end of startup on the real host. Yes: extraction from read to use, dropped conditions, and when and where it runs, in any words; handling of missing context is not required. Partial: "run the fail-over code at startup", or extraction without saying what happens to the trigger conditions.
+3. [S-correct] The extracted code runs in the live process, so it must not change the process or the machine: replace side-effecting calls with checks of their arguments by the call's meaning (access/stat for files, reachability for addresses), keep writes local, drop calls whose effects are unknown. Yes: names the side-effect risk (exec, file create/delete, freopen on stderr) and checks arguments instead of making the calls. Partial: names the risk but answers it with a sandbox or VM (ruled out by fact 5), or with "be careful".
+4. [S-cost] What it cannot check, and what it trades. Yes: names at least one class it misses (context unknown at startup: values from the network, request content, shell commands) and says it prefers a miss to a wrong verdict, or names that a check at startup says nothing about changes after startup. Partial: only startup time, or "some overhead" with no case.
+### Paper's answer
+PCheck (C via LLVM, Java via Soot) emulates late execution at startup. From developer-specified config getters, static taint tracking follows data flow, not control flow, and extracts the instructions that transform, propagate and use each value; trigger conditions are dropped. Needed context is recovered by backtracking (for example freopen's mode "a"); where it is indeterminate, such as network reads or request content, the slice is cut. The result is wrapped into checkers that run at a developer-annotated point at the end of initialization, on the real host. Side-effecting calls are rewritten into check utilities (freopen → access/stat, network calls → reachability), globals are copied into locals, file contents and send/recv are skipped, and unknown library calls such as system() are removed with the instructions after them. A sandbox or VM was rejected because sysadmins would have to set it up. The verdict comes from the program's own signals: Java exceptions, return values and errno of known C calls, and instructions post-dominated by exit, abort, throw or error logging; checkers with no such signal are dropped.
+### Also tell
+- Placement and upkeep: equal or subset checkers are merged; checkers whose code already ran before the call site are dropped; checkers run after the root → nobody switch, before serving or joining the cluster; an optional periodic thread catches errors that appear after the check (TOCTTOU). Setup is 4–7 lines per system, 31 for MySQL.
+- Results: 29 of 37 new LC errors (78.4%) and 15 of 21 historical ones (71.4%), 11 and 7 more than conf spellchecker; all type/format and range errors found. On 830 real config files: 282 true errors, 3 false alarms; 37.5% (HDFS) to 87.8% (Apache) of the errors show only on the local host. False alarms in 3 parameters, at most 1.7% (YARN, 2/116), all from missed control dependencies. Checkers run in under 1 s (HBase HMaster 780 ms, Apache 0.6 ms). Misses: values passed to shell commands, paths merged with request content.
+- Where the evaluation falls short: side-effect freedom is checked only by reading the generated IR; checkers cover only 18 of 97 Apache, 45 of 216 Squid and 32 of 462 MySQL settings; 37 of 58 benchmark errors come from the authors' own study; legal but unsuitable values (small heap, short timeout) are out of scope.
+### Common gaps
+- Generated checks from types or rules → chdir needs execute permission, open(O_CREAT) needs write permission on the parent. Where in the code is that requirement already written down?
+- "Run the fail-over code at startup" → That code runs only after a NameNode crash. Does parseInt throw because of the crash, or because of the string?
+- Followed control flow as well as data flow → If every branch that depends on the value is pulled in, how much of the program ends up in the check?
+- Ignored missing context → freopen also needs a mode and a stream, and some values come from the network. Which can you compute from the code alone, and what do you do with the rest?
+- Proposed a sandbox → Who sets up that VM on every node, at every startup?
+- No verdict → The rehearsal ran. How do you know the value was bad?
+- No placement → The process starts as root and switches to nobody. When must the check run? And what if the directory is deleted an hour later?
 
-### Target
-1. The operation that consumes a value already encodes its full constraint, and its outcome depends on the value, not on the trigger. So extract the slice from the config getter to the use by static data-flow taint tracking, drop the trigger conditions, recover static context, cut where context is unknown, and run it at the end of startup on the real host.
-2. Rehearsal must not change the process or the machine. So replace side-effecting calls with argument checks based on call semantics, keep writes local, and remove unknown calls; this avoids a sandbox that sysadmins would have to set up.
-3. The program's own error signals give the verdict; checks with no signal are dropped.
-Checklist:
-- [core] The code that uses the value is the check; derive checks from it, not from rules.
-- [core] Only the use matters, not the trigger, so the rare path need not happen.
-- [core] Side effects must be removed by checking arguments, not making calls.
-- [core] A verdict needs existing failure signals.
-- [detail] Missing context: compute statically or cut; accept misses.
-- [detail] Run after the user switch and before serving; re-run periodically; drop checks whose code already ran.
-
-## Stage 3: Design the experiments
-### Summary to give
-Problem: latent configuration (LC) errors sit in settings that are not used at startup, mostly fail-over and error-handling settings, so they escape testing and break the system when the rare path runs. Method (PCheck, for C via LLVM and Java via Soot): from developer-specified config getters, static taint tracking extracts the instructions that transform, propagate and use each value. It recovers the needed context by backtracking and wraps the result into checkers. Side-effecting calls are rewritten into check utilities; the verdict comes from exceptions, error codes, and exit or error-log paths. Checkers are inserted at a developer-annotated point at the end of initialization, with optional periodic runs.
-
-### Key research questions
-1. Does it catch real LC errors, and more than existing tools? This is the headline claim. A reviewer will also ask whether it works beyond the errors that inspired the design.
-2. Does it work on real configs in the wild, and does running on the local environment matter? This tests idea 1's claim that use-based checks catch what text-based tools cannot.
-3. What does it cost: false alarms, startup time, developer effort? A tool that blocks startup on false alarms, or needs heavy annotation, will not be deployed.
-
-### Key experiments
-1. Detection. Benchmarks: 37 new LC errors from the study plus 21 historical errors that caused real failures, collected from prior studies (the control set). Baseline: conf spellchecker. Metric: number detected, split by error type. Result: 29/37 (78.4%) and 15/21 (71.4%), 11 and 7 more than conf spellchecker; type/format and range errors all found; misses are values used in shell commands or combined with request content. Weak designs: using synthetic errors from mutation tools (ConfErr), which are mostly caught by the system's own startup checks and so are not latent; testing only on the study's own errors; reporting one total without per-type breakdown, which hides where it fails.
-2. Real config files. 830 files from mailing lists, ServerFault and StackOverflow, for five systems (Squid excluded). Result: 282 true errors, 3 false alarms; 37.5% (HDFS) to 87.8% (Apache) of errors are visible only on the native environment (missing paths, unreachable IPs, undefined environment variables). Weak design: checking the file as strings on a build machine, which loses exactly these errors.
-3. Cost. False positives: run checkers on default configs and the 830 files, and inspect the generated IR. Result: 3 parameters with false alarms, at most 1.7% (YARN, 2/116), all from missed control dependencies. Time: under 1 s per process (HBase HMaster 780 ms; Squid 93.8 ms due to a public-IP setting; Apache 0.6 ms). Setup: 4–7 lines per system, 31 for MySQL. Weak designs: measuring runtime throughput instead of startup delay; counting false alarms only on configs known to be broken.
-
-### Reviewer probes
-- Side-effect freedom is checked only by reading the generated IR. What test would show that checkers never change files or process state?
-- Coverage: checkers exist for all HDFS/YARN/HBase settings, but only 18 of 97 Apache, 45 of 216 Squid, 32 of 462 MySQL settings. How many errors hide in the rest?
-- 37 of 58 benchmark errors come from the authors' own study. Is the 21-error control set large enough?
-- The check passed at startup; the directory is deleted an hour later. How often does periodic checking run, and what does it cost?
-- A value that is valid but unsuitable (small heap, short timeout) is out of scope. How much of the high-severity ticket pool is that?
-
-## Stage 4: Apply and extend
-### Scenarios
-1. Values that go to a shell. Setup: some settings are concatenated into a shell command string and passed to system(); the tool removes such calls because their effects are unknown, so it misses these errors. Question: how can you check them without running the command? Good directions: model the first token as an executable path and check that it exists and is executable; give known commands their own semantic checks. For values merged with request content, rehearse with representative values (the paper names this as future work), and say how that risks false alarms.
-2. Check before rollout, not at startup. Setup: the team wants to reject a bad config in the rollout tool, before it reaches thousands of nodes. Question: what changes if checkers run as a separate program when the config file changes? Good directions: the standalone program no longer has to protect the live process's state, but must still avoid external effects, and it must include the config parsing code (easy when parsing is modular, as in HDFS/YARN/HBase; hard when parsing is mixed with initialization). It must run on, or emulate, each target host's environment, since many errors are host-specific.
-3. Legal but wrong (the stage-1 distractor). Setup: heap sizes and timeouts that parse fine but fail under load days later. Question: can the "rehearse the use" idea reach these? Good directions: the use (allocation, waiting) does not fail on its own; you need a model of the workload or resource usage (profiles, past peaks) to rehearse against, so this becomes a dynamic, not a static, check. A good answer says which part of the original insight breaks: there is no failing operation to borrow.
+## Exercise 3: Transfer — check before rollout instead of at startup
+### Brief
+The method so far (PCheck): checkers extracted from the code that uses each setting run inside the service at the end of its initialization, on the real host, with side-effecting calls replaced by argument checks. The team now wants to reject a bad config in the rollout tool, before it reaches thousands of nodes. The plan: whenever a config file changes, run the checkers as a separate program, not inside each starting service.
+### Task
+Which assumption of the paper changes here? Does the insight still hold? What would you change, and what evidence would show that it works? 5–8 sentences.
+### Hint
+List what the checkers relied on when they ran inside the starting service on its own machine. Which of those does a separate program still have?
+### Rubric
+1. [T-assumption] The checkers no longer run inside the live process, after its initialization, on the target host. Yes: names both the process side (initialized state, the parsed config) and the host side (the target machine's files, permissions, network). Partial: names only one.
+2. [T-insight] The insight still holds (the using code is the check; the trigger is not needed), but errors that depend on the target host are at risk. Yes: separates the insight, which holds, from the environment, which changes, and names host-specific errors (missing paths, wrong owners, unreachable IPs). Partial: only "it works" or "it breaks", without that split.
+3. [T-evidence] A concrete change and evidence for it. Yes: at least two of: include the config parsing code in the program; run it on, or emulate, each target host's environment; still avoid external effects (process state matters less, files and network still matter). Plus evidence, for example running both versions on the same real configs and comparing which errors each catches, split into host-specific and not. Partial: a change with no evidence, or evidence with no change.
+### Paper's answer
+The use-based insight does not depend on running inside the service, so it carries over. What changes is the setting. A separate program no longer has to protect the live process's state, but it must still avoid external effects on files and the network. It must contain the config parsing code; this is easy when parsing is modular, as in HDFS, YARN and HBase, and hard when parsing is mixed with initialization. Most important, it must run on, or emulate, each target host. In the paper's study of 830 real config files, 37.5% (HDFS) to 87.8% (Apache) of the errors show only on the native environment: missing paths, unreachable IPs, undefined environment variables. A check of the file as text on a build machine loses exactly these.
+### Also tell
+Two other limits, if time allows. Values concatenated into a shell command go to system(), which PCheck removes; one direction is to treat the first token as an executable path and check that it exists and is executable. Paths merged with request content could be rehearsed with representative values, which the paper names as future work, at the risk of false alarms. Legal but unsuitable values (the heap case from exercise 1) are out of reach: there is no failing operation to borrow, so a check would need a workload or resource model and become dynamic.
+### Common gaps
+- Checked the file as text on a build machine → A missing path, an unreachable IP, a wrong owner: on which machine are those facts true?
+- Dropped side-effect handling ("it is not the live service anymore") → The program still runs on a machine with real files. What does an open with O_CREAT do there?
+- Forgot config parsing → Where does the separate program get the parsed value from, and what if parsing is mixed with initialization?
+- No evidence → On which set of configs would you compare the two versions, and which split of the errors would show the difference?
