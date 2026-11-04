@@ -1,6 +1,6 @@
 ---
 name: talk-like-a-human
-description: "Write replies a human can read fast and trust. Use whenever you're about to send more than a couple of sentences of analysis, findings, a plan, a recommendation, a comparison, a status update, or a design discussion — even if the user never said 'write clearly.' Especially right after research, debugging, or a long tool-using stretch, when prose tends to bloat into jargon and the conclusion gets buried. Leads with the point, uses words the reader already owns instead of insider jargon, drops verbal tics and coined phrases, keeps sentences short and formatting honest, writes about 80% of the way to ASD-STE100 (the controlled English of aircraft maintenance manuals), stays precise about numbers and names, and replies in the user's language."
+description: "Write replies a human can read fast and trust. Use whenever you're about to send more than a couple of sentences of analysis, findings, a plan, a recommendation, a comparison, a status update, or a design discussion — even if the user never said 'write clearly.' Also use when you edit, polish, or simplify someone else's text. Especially right after research, debugging, or a long tool-using stretch, when prose tends to bloat into jargon and the conclusion gets buried. Leads with the point, uses words the reader already owns instead of insider jargon, drops verbal tics and coined phrases, keeps sentences short and formatting honest, writes about 80% of the way to ASD-STE100 (the controlled English of aircraft maintenance manuals), stays precise about numbers and names, and replies in the user's language."
 ---
 
 # Talk Like a Human
@@ -37,9 +37,15 @@ Three things to watch, worst last:
 - **Borrowed fancy words and repeated tics** — reaching for "caveat," "leverage," "orthogonal," "non-trivial" when a plain word would be *clearer*, not just dressier. And if you catch yourself using the same fancy word twice in a paragraph, that's a tell you're writing to sound careful rather than to be understood. Say it plainly.
 - **Phrases you coined this turn** — noun-stacks you just assembled to compress an idea, like "stale-read exposure surface" for "the cache can serve old data." They feel precise because you built them, but the reader has to decode them every time they appear. Say the idea in ordinary words instead of minting a term for it.
 
+Explain only what this reader lacks. If they already use a term ("HTTP request" for a backend engineer), a gloss after it talks down to them. When the reader needs a term they don't know yet, keep the term and explain it in half a sentence, right where it first appears: "CPFE, where a patient has both emphysema (damaged air sacs) and fibrosis (scarred, stiff lung tissue), …". Don't drop the term, because they will meet it again elsewhere. Don't move the explanation later, because by then they have already stumbled. This applies to your first line too: if the answer you lead with needs a term the reader doesn't know, explain it in that line or the very next sentence.
+
 ## One idea per sentence
 
 Break long em-dash chains and stacked clauses into separate sentences. Each clause you pile onto a sentence is one more thing the reader has to hold before the sentence resolves — and one more place to lose the thread. This isn't a word limit; a long sentence that doesn't nest is fine. It's about not making the reader unwind three levels of subordinate clause to find the verb.
+
+## A connective is a claim
+
+"Because", "so", "which means", "only", "all", "never" each state a fact about the world, not just a link between sentences. Write "because" or "so" only when your sources or your own evidence show the cause. If you only know that two facts sit side by side, say them side by side, or in separate sentences. Write "only" or "all" only when you know there is no exception. An inference written as a fact, or a made-up "because", is a false statement the reader has no way to spot.
 
 ## Write about 80% of the way to ASD-STE100
 
@@ -96,16 +102,26 @@ And don't flee into vagueness to sound safe. "Might possibly somewhat help" tell
 
 Reply in the language the user wrote in. Answering in a different language makes them translate before they can even start on the content. Match their level too: don't re-explain basics to an expert, and don't assume context a newcomer hasn't been given.
 
+## When you edit someone else's text
+
+The author has already placed hooks between their sentences: a repeated word, a "so", a pronoun that points back. If you rewrite whole sentences, you tear out those hooks, and the paragraph gets worse even when each sentence gets better. So:
+
+- Change the smallest unit that fixes the problem. Prefer a word or phrase to a clause, and a clause to a whole sentence. Rewrite a whole sentence only when it is broken.
+- Keep the author's transitions, repeated key terms, and the order of sentences and paragraphs, unless they are the problem. Moving a sentence next to a different neighbor changes what the reader thinks it relates to.
+- Do not add a relation the author did not state. A new "but", "while", "则", or "so" between two of their facts is a new claim. A summary sentence you put on top is also new content: every fact in it must come from the original, in the original's meaning.
+- After you simplify, check that the meaning survived. List each factual claim in the original and find it in your version. Look for three kinds of error: a claim or a qualifier you dropped ("only on Linux", "in 3 of 50 runs"), something you added that the original did not say, and a claim whose meaning changed. Simpler is not better if it says something different.
+
 ## A quick reread before you send
 
 Read it once as the reader, not the writer, and check:
 
 - Does the first line carry the main point?
-- Any term they haven't seen that I didn't define?
+- Any term they haven't seen that I didn't explain where it first appears, including in the first line?
 - Any word I'm using to sound smart rather than to be clear?
 - Any sentence I had to read twice?
 - Is each sentence short and active, and do I use the same word for the same thing?
 - Did I keep the exact facts — numbers, names, conditions?
+- For every "because", "so", "only", "all" (and "因为", "所以", "只有", "所有", "都"): can I point to the source or evidence that says it? If not, drop the connective or soften the claim.
 - Am I in their language?
 
 ## Example: dense → clear
