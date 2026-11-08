@@ -14,10 +14,12 @@ In Claude Code, add this marketplace once, then install any plugin from it:
 /plugin install experiment@hai
 /plugin install autoresearch@hai
 /plugin install me@hai
+/plugin install safeguard@hai
 ```
 
-Replace `<your-github-username>` with the GitHub account this repo lives under.
-After installing, run `/reload-plugins`. The skill or command names are then
+For Safeguard, configure its translation provider in `/plugin` and restart Claude.
+Safeguard requires Claude Code Mods APIs and is not available in Codex.
+For skill plugins, after installing, run `/reload-plugins`. The skill or command names are then
 namespaced by plugin, e.g. `/pin:pin-aware-agent`.
 
 To pick up later updates:
@@ -55,6 +57,7 @@ codex plugin marketplace upgrade hai
 | [`experiment`](./experiment) | Run lightweight, reproducible experiments: Protocols declare artifact lineage and internal Facts materialize concrete runs as structured evidence. |
 | [`autoresearch`](./autoresearch) | Research-design skills grounded in top systems papers. `create-novelty` turns a research topic into an OSDI/SOSP-grade plan: the problem, baselines down to their root cause, an insight that makes the design obvious in hindsight, related-work deltas, and the experiments and per-novelty ablations reviewers expect. It draws on 100 dissected OSDI/SOSP papers (2016–2026). |
 | [`me`](./me) | Human-centered skills: the goal is that you understand more, not that the agent finishes the task. `teach-me-this` hides a paper you have not read behind a private answer card, then turns it into 2–3 exercises: find the research problem from messy observations, design the solution, design the key experiments, or transfer the idea. You write a complete answer, it is scored against a fixed rubric, then the paper's answer is revealed and you analyze the gap. It ends with feedback per ability and a log that tracks weak spots across papers. |
+| [`safeguard`](./safeguard) | Claude Code only: automatic English input translation and local after-send JSONL context auditing, with native UI diagnostics. |
 
 ## Repository layout
 
@@ -79,6 +82,8 @@ hai/
 ├── me/
 │   ├── .claude-plugin/plugin.json
 │   └── .codex-plugin/plugin.json
+├── safeguard/             # Claude Code Mods API only
+│   └── .claude-plugin/plugin.json
 └── README.md
 ```
 
@@ -86,9 +91,9 @@ hai/
 
 1. Put the plugin in its own subdirectory.
 2. Add `.claude-plugin/plugin.json` for Claude Code.
-3. Add `.codex-plugin/plugin.json` for Codex.
+3. For plugins that support Codex, add `.codex-plugin/plugin.json`.
 4. Add an entry to `.claude-plugin/marketplace.json` with `"source": "./<dir>"`.
-5. Add an entry to `.agents/plugins/marketplace.json` with `"source": { "source": "local", "path": "./<dir>" }`.
+5. For plugins that support Codex, add an entry to `.agents/plugins/marketplace.json` with `"source": { "source": "local", "path": "./<dir>" }`.
 6. Commit and push. Claude Code users get it with `/plugin marketplace update hai`; Codex users get it with `codex plugin marketplace upgrade hai`.
 
 Claude Code plugin entries omit `version`, so every pushed commit is treated as
