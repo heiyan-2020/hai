@@ -1,5 +1,6 @@
 import { translate } from './translate.js'
 import { createAudit, auditStart, registerTrace, settleAudit, showAudit, endAudit } from './audit.js'
+import { PROGRESS_PANE, renderProgress, hideProgress } from './progress.js'
 import { HAN } from './common.js'
 import { createDisplay, renderDisplay, scheduleDisplay, stopDisplay, displayCommand } from './display.js'
 
@@ -19,6 +20,12 @@ export function register(on, configured) {
     return next(e)
   })
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => renderDisplay($, display, e, next))
+  on('ui.render', { component: 'Pane' }, async ($, e, next) => renderProgress($, display, e, next))
+  on('ui.close', { id: PROGRESS_PANE }, async ($, e, next) => {
+    display.progressPane = false; display.progressPlaced = false
+    if (e.origin === 'person') display.progressDismissed = true
+    return next(e)
+  })
   on('classic.SessionStart', async ($, e, next) => {
     registerTrace(audit, e.transcript_path, e.cwd)
     return next(e)
@@ -52,6 +59,7 @@ export function register(on, configured) {
   })
   on('session.end', async ($, e, next) => {
     stopDisplay(display)
+    try { await hideProgress($, display) } catch { /* The surface may already be closed. */ }
     try { await endAudit($, audit) } catch { /* No direct terminal output. */ }
     return next(e)
   })

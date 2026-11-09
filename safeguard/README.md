@@ -24,7 +24,19 @@ Use `/safeguard-audit` to inspect diagnostics. The plugin never edits skill file
 Enable **Translate assistant display to Chinese** in `/plugin` → Safeguard →
 Configure. English responses stream normally. After the turn finishes, visible
 assistant text blocks are translated in the background and replaced in place in
-the terminal. Native Markdown rendering is retained. Tool rows, permission
+the terminal. Native Markdown rendering is retained.
+
+A single live progress pane shows the active block number, a short source excerpt,
+elapsed seconds, and a completed/total bar. In wide terminals it docks at the upper
+right; if the native UI defers the pane at narrow widths, a compact pinned status
+shows the same progress. It does not repeatedly post toasts. Each assistant block
+also carries a waiting, translating, translated, unchanged, or failed label.
+Counts cover currently visible distinct text blocks plus any in-flight block;
+scrolling can change the total. A failed block counts as processed and is called
+out separately. The translation API provides no within-request percentage.
+The panel closes three seconds after completion and closes immediately when
+original display is selected. Closing it manually keeps it dismissed until
+`/safeguard-display zh` is run; compact status remains available. Tool rows, permission
 dialogs, thinking blocks, and nonterminal surfaces are not rewritten.
 
 This sends assistant prose to your configured translation provider as well as

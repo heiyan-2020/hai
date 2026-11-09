@@ -4,7 +4,8 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 import pyte
 artifacts=Path(tempfile.mkdtemp(prefix='sg-display-artifacts-'))
-screen=pyte.Screen(120,45);stream=pyte.ByteStream(screen)
+columns=int(os.environ.get('SG_TEST_COLUMNS','160'))
+screen=pyte.Screen(columns,45);stream=pyte.ByteStream(screen)
 def shown():return '\n'.join(screen.display)
 SOURCE='The check is complete.\n\nRun `printf hello`.\n\n```sh\nprintf hello\n```'
 requests=[];translations=[]
@@ -15,7 +16,7 @@ class Mock(BaseHTTPRequestHandler):
   if self.path.endswith('/chat/completions'):
    translations.append(p);text=p['messages'][-1]['content']
    display='Simplified Chinese' in p['messages'][0]['content']
-   if display:time.sleep(1)
+   if display:time.sleep(4)
    value={'text':text.replace('The check is complete.','检查已完成。').replace('Run ','运行 ') if display else text,'is_english':True}
    self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(json.dumps({'choices':[{'finish_reason':'stop','message':{'content':json.dumps(value)}}]}).encode());return
   requests.append(p);self.send_response(200);self.send_header('Content-Type','text/event-stream');self.end_headers()
@@ -31,7 +32,7 @@ env={k:v for k,v in os.environ.items() if not k.startswith(('ANTHROPIC_','CLAUDE
 env.update(HOME=str(root),CLAUDE_CONFIG_DIR=str(cc),ANTHROPIC_BASE_URL=base,ANTHROPIC_AUTH_TOKEN='fake-key',CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1',TERM='xterm-256color',NO_PROXY='127.0.0.1,localhost')
 settings={'pluginConfigs':{'safeguard':{'options':{'api_base':base+'/v1','api_key':'fake','model':'fake','audit':False,'translate_output':True}}}}
 cli=shutil.which('claude');sid=str(uuid.uuid4());plugin=str(Path(sys.argv[1]).resolve())
-master,slave=pty.openpty();fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',45,120,0,0))
+master,slave=pty.openpty();fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',45,columns,0,0))
 p=subprocess.Popen([cli,'--plugin-dir',plugin,'--settings',json.dumps(settings),'--model','claude-opus-5-5','--tools','','--system-prompt','English system.','--session-id',sid,'hello'],stdin=slave,stdout=slave,stderr=slave,cwd=root,env=env,start_new_session=True);os.close(slave)
 buffer=b'';allout=b'';saw_english=False
 def until(predicate,timeout=40):
@@ -59,7 +60,15 @@ def until(predicate,timeout=40):
     os.write(master,b'\r');buffer=b''
  raise TimeoutError('Timed out')
 try:
+ until(lambda:'翻译中 #1' in shown() and '2s' in shown(),65)
+ progress_rows=[(i,line) for i,line in enumerate(screen.display) if '翻译中 #1' in line]
+ assert len(progress_rows)==1,'Progress UI stacked instead of updating'
+ if columns>=144:
+  assert progress_rows[0][0]<10 and progress_rows[0][1].find('翻译中')>columns//2,'Progress not at upper right'
+ assert '0/1' in shown() and '正在翻译 #1' in shown(),'Progress or block marker absent'
+ (artifacts/'progress-running.txt').write_text(shown())
  until(lambda:'检查已完成' in shown(),65)
+ assert '已翻译 #1' in shown(),'Translated block marker absent'
  assert 'printf hello' in shown(),'Code rendering changed'
  (artifacts/'display-tui-chinese.txt').write_text(shown())
  assert saw_english,'Original stream not shown'
@@ -81,7 +90,7 @@ try:
  records=[json.loads(x) for x in traces[0].read_text().splitlines()]
  assistant=[r for r in records if r.get('type')=='assistant']
  assert assistant and '检查已完成' not in json.dumps(assistant,ensure_ascii=False)
- print(json.dumps({'tui_chinese_replacement':True,'original_toggle':True,'cache_reused':True,'protected_code_not_sent':True,'followup_history_english':True,'jsonl_assistant_original':True,'model_requests':len(requests)}),flush=True)
+ print(json.dumps({'progress_single_live_panel':True,'columns':columns,'tui_chinese_replacement':True,'original_toggle':True,'cache_reused':True,'protected_code_not_sent':True,'followup_history_english':True,'jsonl_assistant_original':True,'model_requests':len(requests)}),flush=True)
 finally:
  try:os.killpg(p.pid,signal.SIGTERM);p.wait(timeout=5)
  except Exception:pass

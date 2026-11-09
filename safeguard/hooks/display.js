@@ -1,4 +1,5 @@
 import { HAN } from './common.js'
+import { refreshProgress, stopProgress, hideProgress, rowStatus } from './progress.js'
 
 // Protect fenced code (including unfinished fences), inline code, and link targets.
 // Tokens are checked before restoration, so a translation cannot silently change code.
@@ -63,14 +64,15 @@ export async function translateDisplay($, text, options) {
 
 export function createDisplay(options) {
   return { options, enabled: options.translate_output === true, active: false, closed: false,
-    rows: new Map(), cache: new Map(), timer: null, busy: false, warned: false }
+    rows: new Map(), cache: new Map(), timer: null, busy: false, warned: false,
+    nextRow: 1, current: null, progressTimer: null, progressRefresh: null, progressClose: null, progressPane: false, progressPlaced: false, progressDismissed: false, hadProgress: false, lastProgress: null }
 }
 
 export function rememberRow(state, e) {
   const text = e.props.text
   const old = state.rows.get(e.requestId)
   state.rows.delete(e.requestId)
-  state.rows.set(e.requestId, { text, visible: e.props.onScreen !== null, attempted: old?.text === text && old.attempted })
+  state.rows.set(e.requestId, { number: old?.number || state.nextRow++, text, visible: e.props.onScreen !== null, attempted: old?.text === text && old.attempted })
   while (state.rows.size > 64) state.rows.delete(state.rows.keys().next().value)
 }
 
@@ -81,17 +83,17 @@ export async function drainDisplay($, state) {
   state.busy = true
   for (const value of state.rows.values()) if (value.text === row.text) value.attempted = true
   state.cache.set(row.text, { status: 'pending' })
+  state.current = { ...row, startedAt: Date.now() }
+  refreshProgress($, state)
+  $.ui.invalidate('ui.render')
   try {
     const translated = await translateDisplay($, row.text, state.options)
     state.cache.set(row.text, { status: 'done', text: translated })
   } catch {
     state.cache.set(row.text, { status: 'failed' })
-    if (!state.warned && !state.closed) {
-      state.warned = true
-      $.ui.toast('Response translation failed; keeping the original. /safeguard-display retry to try again.', { timeoutMs: 4000 })
-    }
+
   } finally {
-    state.busy = false
+    state.busy = false; state.current = null
     // Memory is per-session and bounded; no translated assistant text is persisted.
     let size = 0
     for (const [key, value] of [...state.cache].reverse()) {
@@ -99,7 +101,7 @@ export async function drainDisplay($, state) {
       if (size > 1000000) state.cache.delete(key)
     }
     while (state.cache.size > 128) state.cache.delete(state.cache.keys().next().value)
-    if (!state.closed) { $.ui.invalidate('ui.render'); scheduleDisplay($, state) }
+    if (!state.closed) { $.ui.invalidate('ui.render'); scheduleDisplay($, state); refreshProgress($, state) }
   }
 }
 
@@ -114,6 +116,7 @@ export function scheduleDisplay($, state) {
 
 export function stopDisplay(state) {
   state.closed = true
+  stopProgress(state)
   if (state.timer) state.timer.cancel()
   state.timer = null
 }
@@ -122,10 +125,14 @@ export async function renderDisplay($, state, e, next) {
   if (e.surface !== 'terminal' || !state.enabled || state.closed) return next(e)
   rememberRow(state, e)
   scheduleDisplay($, state)
-  const cached = state.cache.get(e.props.text)
-  return cached?.status === 'done'
-    ? next({ ...e, props: { ...e.props, text: cached.text } })
-    : next(e)
+  refreshProgress($, state)
+  const row = state.rows.get(e.requestId), cached = state.cache.get(e.props.text)
+  const body = await next(cached?.status === 'done' ? { ...e, props: { ...e.props, text: cached.text } } : e)
+  const { Box, Text } = $.ui.resolve(e)
+  const status = rowStatus(state, row)
+  return Box({ flexDirection: 'column', children: [
+    Text({ dimColor: true, color: status.color, children: [status.text] }), body
+  ] })
 }
 
 export async function displayCommand($, state, e) {
@@ -135,10 +142,12 @@ export async function displayCommand($, state, e) {
     for (const row of state.rows.values()) if (!state.cache.has(row.text)) row.attempted = false
     state.warned = false; state.enabled = true
   } else if (action === 'original' || action === 'off') state.enabled = false
-  else if (action === 'zh' || action === 'on') state.enabled = true
+  else if (action === 'zh' || action === 'on') { state.enabled = true; state.progressDismissed = false }
   else if (!action) state.enabled = !state.enabled
   else { $.ui.toast('Usage: /safeguard-display [zh|original|retry]'); return {} }
   $.ui.toast(state.enabled ? 'Chinese display enabled. Assistant prose is sent to your translation provider; model history stays unchanged.' : 'Showing original assistant text.')
+  if (!state.enabled) await hideProgress($, state)
+  else { state.lastProgress = null; refreshProgress($, state) }
   scheduleDisplay($, state)
   $.ui.invalidate('ui.render')
   return {}
