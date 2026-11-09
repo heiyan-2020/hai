@@ -1,16 +1,24 @@
 import { translate } from './translate.js'
 import { createAudit, auditStart, registerTrace, settleAudit, showAudit, endAudit } from './audit.js'
 import { HAN } from './common.js'
+import { createDisplay, renderDisplay, scheduleDisplay, stopDisplay, displayCommand } from './display.js'
 
 export function register(on, configured) {
   const options = { api_base: 'https://api.deepseek.com', model: 'deepseek-flash', audit: true, ...configured }
   const audit = createAudit(options)
+  const display = createDisplay(options)
   on('session.start', async ($, e, next) => {
     await auditStart($, audit, e)
     await $.command.register({ name: 'safeguard-audit', description: 'Show local after-send audit findings; nothing is sent to the model.' })
+    await $.command.register({ name: 'safeguard-display', description: 'Switch assistant display between Chinese and original text.', argumentHint: '[zh|original|retry]', immediate: true })
     if (!options.api_key && !options.api_key_file) $.ui.toast('Configure the Safeguard translation API key in /plugin. Submitted prompts are blocked until configured.')
     return next(e)
   })
+  on('turn.start', async ($, e, next) => {
+    display.active = true
+    return next(e)
+  })
+  on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => renderDisplay($, display, e, next))
   on('classic.SessionStart', async ($, e, next) => {
     registerTrace(audit, e.transcript_path, e.cwd)
     return next(e)
@@ -34,12 +42,19 @@ export function register(on, configured) {
   })
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
+    if (!e.agentId) {
+      display.active = false
+      scheduleDisplay($, display)
+      if (display.enabled) $.ui.invalidate('ui.render')
+    }
     try { await settleAudit($, audit) } catch { /* UI/audit failures never rewrite a model response. */ }
     return result
   })
   on('session.end', async ($, e, next) => {
+    stopDisplay(display)
     try { await endAudit($, audit) } catch { /* No direct terminal output. */ }
     return next(e)
   })
   on('command.run', { command: 'safeguard-audit' }, async ($) => showAudit($, audit))
+  on('command.run', { command: 'safeguard-display' }, async ($, e) => displayCommand($, display, e))
 }

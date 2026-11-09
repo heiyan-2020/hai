@@ -57,7 +57,7 @@ codex plugin marketplace upgrade hai
 | [`experiment`](./experiment) | Run lightweight, reproducible experiments: Protocols declare artifact lineage and internal Facts materialize concrete runs as structured evidence. |
 | [`autoresearch`](./autoresearch) | Research-design skills grounded in top systems papers. `create-novelty` turns a research topic into an OSDI/SOSP-grade plan: the problem, baselines down to their root cause, an insight that makes the design obvious in hindsight, related-work deltas, and the experiments and per-novelty ablations reviewers expect. It draws on 100 dissected OSDI/SOSP papers (2016–2026). |
 | [`me`](./me) | Human-centered skills: the goal is that you understand more, not that the agent finishes the task. `teach-me-this` hides a paper you have not read behind a private answer card, then turns it into 2–3 exercises: find the research problem from messy observations, design the solution, design the key experiments, or transfer the idea. You write a complete answer, it is scored against a fixed rubric, then the paper's answer is revealed and you analyze the gap. It ends with feedback per ability and a log that tracks weak spots across papers. |
-| [`safeguard`](./safeguard) | Claude Code only: automatic English input translation and local after-send JSONL context auditing, with native UI diagnostics. |
+| [`safeguard`](./safeguard) | Claude Code only: automatic English input translation, optional Chinese response display, and local after-send JSONL context auditing. |
 
 ## Repository layout
 

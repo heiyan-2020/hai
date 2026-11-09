@@ -19,6 +19,27 @@ On hosts without secure credential storage, leave the key option unset and set
 file private (`chmod 600` on Unix), outside the plugin and any repository.
 Use `/safeguard-audit` to inspect diagnostics. The plugin never edits skill files.
 
+## Optional Chinese response display
+
+Enable **Translate assistant display to Chinese** in `/plugin` → Safeguard →
+Configure. English responses stream normally. After the turn finishes, visible
+assistant text blocks are translated in the background and replaced in place in
+the terminal. Native Markdown rendering is retained. Tool rows, permission
+dialogs, thinking blocks, and nonterminal surfaces are not rewritten.
+
+This sends assistant prose to your configured translation provider as well as
+submitted input. Fenced code, inline code, and link destinations are masked
+locally and restored exactly. This option is off by default.
+
+`/safeguard-display original` shows original text; `/safeguard-display zh` enables
+Chinese display for this session; `/safeguard-display retry` retries failed
+translations. These commands only affect the UI and do not start model turns.
+The original English remains in JSONL and subsequent model requests. Translations
+are cached only in bounded session memory. A failed or truncated translation
+leaves the original visible; no response text is lost. Very large text blocks
+(over 100,000 characters) also keep the original. Restarting may translate visible
+history again. This is turn-complete translation, not token-by-token translation.
+
 The input is translated automatically on Enter. Failed/incomplete translations,
 changed code/URL literals and remaining Chinese drop the submission. This first
 version accepts text only. Language and semantic judgments partly rely on the
@@ -61,6 +82,10 @@ Run `claude plugin test` in this directory for isolated unit tests. The reposito
 also includes `tests/integration.py`, a real-CLI integration test using mock APIs
 and fake credentials. Run `python3 tests/integration.py .` from this plugin
 directory; Python is only needed for this development test.
+For the real terminal test on macOS/Linux, install `pyte` in a development Python
+environment and run `python3 tests/tui_integration.py .`. It checks actual screen
+replacement, original/Chinese toggling, code masking, unchanged follow-up model
+history, and unchanged assistant JSONL, using localhost APIs and fake credentials.
 
 ## Data flow and visibility
 
@@ -72,7 +97,8 @@ client and credentials. This plugin does not implement a model API proxy.
 
 The plugin does not append its audit findings, rule files, translation key, or
 translation instruction to model context. Audit reads and source-file matching
-are local. Chinese text elsewhere in existing context, files, skills, or tool
+are local. Optional response display translation sends masked assistant prose
+to the translation provider, but never writes the translation into model history. Chinese text elsewhere in existing context, files, skills, or tool
 results may already reach the model before the after-send audit reports it.
 
 This does not promise invisibility to Anthropic. Claude Code owns request
