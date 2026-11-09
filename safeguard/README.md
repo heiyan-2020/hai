@@ -19,6 +19,25 @@ On hosts without secure credential storage, leave the key option unset and set
 file private (`chmod 600` on Unix), outside the plugin and any repository.
 Use `/safeguard-audit` to inspect diagnostics. The plugin never edits skill files.
 
+## Translation request settings
+
+DeepSeek models use `thinking: {"type":"disabled"}` and `reasoning_effort: "none"`
+by default. This is shared by input translation and optional display translation.
+Other model names do not receive these DeepSeek-specific fields. The **Disable
+DeepSeek thinking** option can be turned off for a provider that needs its defaults.
+
+**Translation max output tokens** defaults to **32768** and accepts integer values
+from 256 through 131072 (for example 65536). Set it in `/plugin` → Safeguard →
+Configure. It is a generation ceiling, not a target length; provider limits still
+apply. Input or output truncated by the provider is never accepted as complete.
+
+Failed display rows now show a safe reason: HTTP status, network failure, timeout,
+output truncation with the configured token limit, invalid/empty JSON, language
+validation, or changed protected literals. Raw provider errors, prompts, and
+credentials are never included in the label. The original stays visible, and
+`/safeguard-display retry` retries the failed blocks. Older versions discarded
+these details, so a previous generic failure cannot be diagnosed retroactively.
+
 ## Optional Chinese response display
 
 Enable **Translate assistant display to Chinese** in `/plugin` → Safeguard →

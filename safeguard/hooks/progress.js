@@ -96,7 +96,7 @@ export async function renderProgress($, state, e, next) {
 export function rowStatus(state, row) {
   const cached = state.cache.get(row.text), id = '#' + row.number
   if (cached?.status === 'done') return { text: (cached.text === row.text ? '原文 · 无需翻译 ' : '已翻译 ') + id, color: 'green' }
-  if (cached?.status === 'failed') return { text: '翻译失败 ' + id + ' · 保留原文 · /safeguard-display retry', color: 'yellow' }
+  if (cached?.status === 'failed') return { text: '翻译失败 ' + id + ' · ' + (cached.error?.summary || '未分类错误') + ' · 保留原文 · /safeguard-display retry', color: 'yellow' }
   if (cached?.status === 'pending') return { text: '正在翻译 ' + id, color: 'cyan' }
   if (row.attempted) return { text: '原文 ' + id + ' · 译文缓存已释放', color: 'gray' }
   return { text: (state.active ? '等待回答结束 ' : '等待翻译 ') + id, color: 'gray' }

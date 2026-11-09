@@ -8,15 +8,19 @@ columns=int(os.environ.get('SG_TEST_COLUMNS','160'))
 screen=pyte.Screen(columns,45);stream=pyte.ByteStream(screen)
 def shown():return '\n'.join(screen.display)
 SOURCE='The check is complete.\n\nRun `printf hello`.\n\n```sh\nprintf hello\n```'
-requests=[];translations=[]
+requests=[];translations=[];failures=0
 class Mock(BaseHTTPRequestHandler):
  def log_message(self,*args):pass
  def do_POST(self):
+  global failures
   p=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
   if self.path.endswith('/chat/completions'):
    translations.append(p);text=p['messages'][-1]['content']
    display='Simplified Chinese' in p['messages'][0]['content']
-   if display:time.sleep(4)
+   if display:
+    time.sleep(4)
+    if not failures:
+     failures+=1;self.send_response(503);self.end_headers();return
    value={'text':text.replace('The check is complete.','检查已完成。').replace('Run ','运行 ') if display else text,'is_english':True}
    self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(json.dumps({'choices':[{'finish_reason':'stop','message':{'content':json.dumps(value)}}]}).encode());return
   requests.append(p);self.send_response(200);self.send_header('Content-Type','text/event-stream');self.end_headers()
@@ -67,20 +71,24 @@ try:
   assert progress_rows[0][0]<10 and progress_rows[0][1].find('翻译中')>columns//2,'Progress not at upper right'
  assert '0/1' in shown() and '正在翻译 #1' in shown(),'Progress or block marker absent'
  (artifacts/'progress-running.txt').write_text(shown())
+ until(lambda:'HTTP 503' in shown(),65)
+ assert 'The check is complete.' in shown() and len(requests)==1
+ (artifacts/'failure-readable.txt').write_text(shown())
+ os.write(master,b'/safeguard-display retry\r')
  until(lambda:'检查已完成' in shown(),65)
  assert '已翻译 #1' in shown(),'Translated block marker absent'
  assert 'printf hello' in shown(),'Code rendering changed'
  (artifacts/'display-tui-chinese.txt').write_text(shown())
  assert saw_english,'Original stream not shown'
  display=[r for r in translations if 'Simplified Chinese' in r['messages'][0]['content']]
- assert len(display)==1,len(display)
+ assert len(display)==2,len(display)
  assert 'printf hello' not in display[0]['messages'][1]['content']
  buffer=b'';os.write(master,b'/safeguard-display original\r')
  until(lambda:'The check is complete.' in shown(),15)
  assert len(requests)==1,'Display command sent a model message'
  buffer=b'';os.write(master,b'/safeguard-display zh\r')
  until(lambda:'检查已完成' in shown(),15)
- assert len([r for r in translations if 'Simplified Chinese' in r['messages'][0]['content']])==1
+ assert len([r for r in translations if 'Simplified Chinese' in r['messages'][0]['content']])==2
  buffer=b'';os.write(master,b'continue\r');until(lambda:len(requests)>=2,30)
  history=json.dumps(requests[-1]['messages'],ensure_ascii=False)
  assert SOURCE in [b.get('text') for m in requests[-1]['messages'] if m['role']=='assistant' for b in m['content'] if isinstance(b,dict)]
@@ -90,7 +98,7 @@ try:
  records=[json.loads(x) for x in traces[0].read_text().splitlines()]
  assistant=[r for r in records if r.get('type')=='assistant']
  assert assistant and '检查已完成' not in json.dumps(assistant,ensure_ascii=False)
- print(json.dumps({'progress_single_live_panel':True,'columns':columns,'tui_chinese_replacement':True,'original_toggle':True,'cache_reused':True,'protected_code_not_sent':True,'followup_history_english':True,'jsonl_assistant_original':True,'model_requests':len(requests)}),flush=True)
+ print(json.dumps({'readable_HTTP_failure_and_retry':True,'progress_single_live_panel':True,'columns':columns,'tui_chinese_replacement':True,'original_toggle':True,'cache_reused':True,'protected_code_not_sent':True,'followup_history_english':True,'jsonl_assistant_original':True,'model_requests':len(requests)}),flush=True)
 finally:
  try:os.killpg(p.pid,signal.SIGTERM);p.wait(timeout=5)
  except Exception:pass
